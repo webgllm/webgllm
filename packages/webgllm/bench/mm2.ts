@@ -268,6 +268,102 @@ ${L.join("\n")}
 }
 
 /**
+ * RGBA4 weights, h2 activations, R rows (R / 4 row groups) × T tokens per
+ * fragment; output k (MRT) is row group k / (T / 2), tokens 2·(k % (T/2))
+ * and +1 as a pair texel. `sameActs`: every fragment reads token rows 0..T-1
+ * (timing only: is it delivery or cache?). `outputs`: write only that many
+ * (timing only).
+ */
+function tileKernel(
+  R: number,
+  T: number,
+  o: { sameActs?: boolean; outputs?: number; fold?: boolean } = {}
+) {
+  const groups = R / 4
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  if (o.fold) {
+    // The scale times 15 into each step: no per-block sums per row, and
+    // one row group's weights live at a time.
+    for (let G = 0; G < groups; G++)
+      line(`vec4 d${G} = 15.0 * texelFetch(uS, ivec2(kb, g + ${G}), 0);`)
+    for (let t = 0; t < T; t++) line(`float s${t} = 0.0;`)
+    for (let j = 0; j < 8; j++) {
+      line(`{`)
+      for (let t = 0; t < T; t++) {
+        line(`  vec4 a${t} = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, ${o.sameActs ? "" : "m0 + "}${t}), 0));`)
+        line(`  s${t} += dot(a${t}, vec4(1.0));`)
+      }
+      for (let G = 0; G < groups; G++) {
+        line(`  {`)
+        for (const r of [0, 1, 2, 3])
+          line(`    vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g + ${G}), 0);`)
+        for (let t = 0; t < T; t++)
+          line(`    acc${t}_${G} += d${G} * vec4(dot(w0, a${t}), dot(w1, a${t}), dot(w2, a${t}), dot(w3, a${t}));`)
+        line(`  }`)
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++)
+      for (let G = 0; G < groups; G++)
+        line(`acc${t}_${G} -= (8.0 / 15.0) * d${G} * s${t};`)
+  } else {
+  for (let G = 0; G < groups; G++)
+    line(`vec4 d${G} = texelFetch(uS, ivec2(kb, g + ${G}), 0);`)
+  for (let t = 0; t < T; t++) {
+    line(`float s${t} = 0.0;`)
+    for (let G = 0; G < groups; G++) line(`vec4 b${t}_${G} = vec4(0.0);`)
+  }
+  const m = o.sameActs ? "" : "m0 + "
+  for (let j = 0; j < 8; j++) {
+    line(`{`)
+    for (let G = 0; G < groups; G++)
+      for (const r of [0, 1, 2, 3])
+        line(`  vec4 w${G}${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g + ${G}), 0);`)
+    for (let t = 0; t < T; t++) {
+      line(`  { vec4 a = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, ${m}${t}), 0));`)
+      line(`    s${t} += dot(a, vec4(1.0));`)
+      for (let G = 0; G < groups; G++)
+        line(`    b${t}_${G} += vec4(dot(w${G}0, a), dot(w${G}1, a), dot(w${G}2, a), dot(w${G}3, a));`)
+      line(`  }`)
+    }
+    line(`}`)
+  }
+  for (let t = 0; t < T; t++)
+    for (let G = 0; G < groups; G++)
+      line(`acc${t}_${G} += d${G} * (15.0 * b${t}_${G} - 8.0 * s${t});`)
+  }
+  const accs: Array<string> = []
+  for (let t = 0; t < T; t++)
+    for (let G = 0; G < groups; G++) accs.push(`vec4 acc${t}_${G} = vec4(0.0);`)
+  const total = (groups * T) / 2
+  const n = o.outputs ?? total
+  const outs: Array<string> = []
+  const writes: Array<string> = []
+  for (let k = 0; k < n; k++) {
+    const G = Math.floor(k / (T / 2))
+    const tp = k % (T / 2)
+    outs.push(`layout(location = ${k}) out uvec4 o${k};`)
+    writes.push(`o${k} = packH2(acc${2 * tp}_${G}, acc${2 * tp + 1}_${G});`)
+  }
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+${outs.join("\n")}
+void main() {
+  int g = int(gl_FragCoord.x) * ${groups};
+  int m0 = int(gl_FragCoord.y) * ${T};
+  ${accs.join(" ")}
+  for (int kb = 0; kb < uKb; kb++) {
+${L.join("\n")}
+  }
+  ${writes.join("\n  ")}
+}`
+}
+
+/**
  * gate|up fused with SwiGLU: each fragment computes gate rows 4g.. and up
  * rows 4g.. (row group g + uHalfG) for 2 tokens, 8 rows sharing each
  * activation fetch, and writes silu(gate) · up: 8 halves.
@@ -794,7 +890,9 @@ async function shapes(gpu: Gpu, batch: number) {
     ["350M gate+up as 2 K-slices", 18432, 512],
     ["350M down as 2 K-slices", 2048, 2304],
     ["350M down as 4 K-slices", 4096, 1152],
-    ["350M down as 8 K-slices", 8192, 576]
+    ["350M down as 8 K-slices", 8192, 576],
+    ["LFM3 gate+up as 2 K-slices", 30720, 1024],
+    ["LFM3 down as 4 K-slices", 8192, 1920]
 ] as const) {
     const blocks = K / 32
     const G = N / 4
@@ -815,8 +913,7 @@ async function shapes(gpu: Gpu, batch: number) {
               { weights: "rgba4", acts: "f16", tokens: 1 }
             ]
           : [
-              { weights: "rgba4", acts: "h2", tokens: 4 },
-              { weights: "rgba4", acts: "h2", tokens: 2 }
+              { weights: "rgba4", acts: "h2", tokens: 4 }
             ]
       for (const v of variants) {
         const T = v.tokens
@@ -863,15 +960,22 @@ async function shapes(gpu: Gpu, batch: number) {
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
-      for (const [rows, T] of [] as Array<[number, number]>) {
-        // 2 rows: half a row group per fragment, so fragments cover N / 2.
-        const width = (N / rows)
-        const outs = [0, 1].map(() => gpu.texture(gl.RGBA32UI, width, M / T))
-        const program = gpu.program(
-          rows === 2
-            ? shapeKernel(2, T).replace("int g = int(gl_FragCoord.x) * 1;", "int g = int(gl_FragCoord.x) / 2;")
-            : shapeKernel(rows, T)
+      for (const [rows, T, label2, opts] of [
+        [4, 4, "", {}],
+        [4, 4, " fold", { fold: true }],
+        [8, 2, " fold", { fold: true }],
+        [8, 4, " fold", { fold: true }],
+        [4, 8, " fold", { fold: true }],
+        [12, 2, " fold", { fold: true }],
+        [16, 2, " fold", { fold: true }]
+      ] as Array<[number, number, string, { sameActs?: boolean; outputs?: number; fold?: boolean }]>) {
+        if (N % rows) continue
+        const width = N / rows
+        const count = opts.outputs ?? (rows * T) / 8
+        const outs = [0, 1].map(() =>
+          Array.from({ length: count }, () => gpu.texture(gl.RGBA32UI, width, M / T))
         )
+        const program = gpu.program(tileKernel(rows, T, opts))
         const run = (i: number) =>
           gpu.run({
             name: "mm",
@@ -891,9 +995,9 @@ async function shapes(gpu: Gpu, batch: number) {
           best = Math.min(best, (performance.now() - t0) / 10)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} shape ${rows}x${T} rgba4 h2: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
+          `MM2 ${label} ${N}x${K} M=${M} tile ${rows}x${T}${label2}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
         )
-        for (const t of outs) gpu.delete(t)
+        for (const set of outs) for (const t of set) gpu.delete(t)
       }
       gpu.delete(aF16)
       gpu.delete(aH2)
