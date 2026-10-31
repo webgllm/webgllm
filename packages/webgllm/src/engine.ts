@@ -331,11 +331,12 @@ export class Engine {
       gateUp: this.pair(2 * I, M),
       act: this.h2(I, M),
       ffnOut: this.pair(D, 2 * M),
-      lastNormed: this.h2(D, 1),
+      lastNormed: this.h2(D, SPLIT_ROWS),
+      /** Logits: logitRows rows per token, for up to SPLIT_ROWS tokens. */
       logits: this.gpu.texture(
         GL.RGBA32F,
         OUT_WIDTH,
-        Math.ceil(c.vocabSize / 4 / OUT_WIDTH)
+        Math.ceil(c.vocabSize / 4 / OUT_WIDTH) * SPLIT_ROWS
       ),
       /** Per token: 0, 1 seen (repetition penalty), 2 never drawn. Same rows as the logits. */
       mask: this.gpu.texture(
@@ -343,15 +344,24 @@ export class Engine {
         OUT_WIDTH * 4,
         Math.ceil(c.vocabSize / 4 / OUT_WIDTH)
       ),
-      chunkMax: this.gpu.texture(GL.RGBA32F, Math.ceil(c.vocabSize / CHUNK), 1),
+      /** Per token (row): each chunk's largest logit, and its rank. */
+      chunkMax: this.gpu.texture(
+        GL.RGBA32F,
+        Math.ceil(c.vocabSize / CHUNK),
+        SPLIT_ROWS
+      ),
       chunkRank: this.gpu.texture(
         GL.RGBA32F,
         Math.ceil(c.vocabSize / CHUNK),
-        1
+        SPLIT_ROWS
       ),
-      /** Pixel r: the chunk ranked r. */
-      chunkByRank: this.gpu.texture(GL.RGBA32F, MAX_CHUNKS, 1),
-      candidates: this.gpu.texture(GL.RGBA32F, CHUNK / 4 + 1, MAX_CHUNKS),
+      /** Pixel (r, row): the chunk ranked r. */
+      chunkByRank: this.gpu.texture(GL.RGBA32F, MAX_CHUNKS, SPLIT_ROWS),
+      candidates: this.gpu.texture(
+        GL.RGBA32F,
+        CHUNK / 4 + 1,
+        MAX_CHUNKS * SPLIT_ROWS
+      ),
       /** Split matmuls' partial sums: widest output × (rows × slices). */
       partial: this.gpu.texture(
         GL.RGBA32F,
@@ -1017,10 +1027,7 @@ export class Engine {
     ownSums = true
   ) {
     const { hiddenSize } = this.config
-    if (!ownSums) {
-      if (rowIn < 0) this.rms(x, 0, rows)
-      else this.rms(x, rowIn, 1)
-    }
+    if (!ownSums) this.rms(x, Math.max(rowIn, 0), rows)
     this.gpu.run({
       name: "norm",
       program: this.gpu.program(K.NORM_TO_H2),
@@ -1419,6 +1426,8 @@ export class Engine {
     this.draft = null
     if (count < 1 || count > d.rows)
       throw new Error(`Can't keep ${count} of a ${d.rows}-token batch.`)
+    // All kept: nothing to undo (a guess may have moved the cache on).
+    if (count === d.rows) return
     if (count < d.rows) {
       const rows = this.config.convKernel - 1
       for (const layer of this.layers) {
@@ -1452,7 +1461,6 @@ export class Engine {
    */
   private async forwardGuess() {
     if (this.position + 1 > this.contextLength) return
-    this.draft = null
     const at = this.position
     await this.forwardBatch([0], undefined, true)
     this.guessAt = at
@@ -1530,18 +1538,71 @@ export class Engine {
     penalty: number,
     guess = false
   ): Promise<{ ids: Int32Array; logits: Float32Array }> {
+    return (await this.pick(row, 1, chunks, penalty, [], guess))[0]
+  }
+
+  /** Rows of logits per token in the logits texture. */
+  private get logitRows() {
+    return Math.ceil(this.config.vocabSize / 4 / OUT_WIDTH)
+  }
+
+  /**
+   * `candidates` for rows [row0, row0 + rows) of the last batch at once:
+   * one head pass, one pick, one readback. `drafts` are the batch's inputs
+   * after its first (row i + 1's input is drafts[i]): row r's penalty
+   * counts drafts before it as seen, as drawing them one by one would.
+   * With `guess`, the last row's likeliest token is read forward (see
+   * forwardGuess).
+   */
+  async pick(
+    row0: number,
+    rows: number,
+    chunks: number,
+    penalty: number,
+    drafts: Array<number>,
+    guess = false
+  ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
-    this.head(row)
+    if (rows > 1 && !this.embedding.rgba4) {
+      // The other output heads take one row at a time.
+      const out = []
+      for (let r = 0; r < rows; r++) {
+        out.push(
+          ...(await this.pick(
+            row0 + r,
+            1,
+            chunks,
+            penalty,
+            [],
+            guess && r === rows - 1
+          ))
+        )
+      }
+      return out
+    }
+    this.head(row0, rows)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
+    const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as [
+      number,
+      number,
+      number,
+      number
+    ]
+    const picking = {
+      uOutW: { int: OUT_WIDTH },
+      uPenalty: penalty,
+      uLogitRows: { int: this.logitRows },
+      uExtra: { ivec4: extra }
+    }
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_MAX),
       inputs: { uLogits: b.logits, uMask: b.mask },
-      uniforms: { uOutW: { int: OUT_WIDTH }, uPenalty: penalty },
+      uniforms: picking,
       output: b.chunkMax,
-      rect: { x: 0, y: 0, width: total, height: 1 }
+      rect: { x: 0, y: 0, width: total, height: rows }
     })
     this.gpu.run({
       name: "pick",
@@ -1549,7 +1610,7 @@ export class Engine {
       inputs: { uMax: b.chunkMax },
       uniforms: { uChunks: { int: total } },
       output: b.chunkRank,
-      rect: { x: 0, y: 0, width: total, height: 1 }
+      rect: { x: 0, y: 0, width: total, height: rows }
     })
     this.gpu.run({
       name: "pick",
@@ -1557,26 +1618,24 @@ export class Engine {
       inputs: { uRank: b.chunkRank },
       uniforms: { uChunks: { int: total } },
       output: b.chunkByRank,
-      rect: { x: 0, y: 0, width: count, height: 1 }
+      rect: { x: 0, y: 0, width: count, height: rows }
     })
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_GATHER),
       inputs: { uLogits: b.logits, uMask: b.mask, uByRank: b.chunkByRank },
-      uniforms: {
-        uOutW: { int: OUT_WIDTH },
-        uPenalty: penalty
-      },
+      uniforms: { ...picking, uCount: { int: count } },
       output: b.candidates,
-      rect: { x: 0, y: 0, width: CHUNK / 4 + 1, height: count }
+      rect: { x: 0, y: 0, width: CHUNK / 4 + 1, height: count * rows }
     })
     const texels = CHUNK / 4 + 1
     if (guess) {
-      // The likeliest token as the next forward's input, on the GPU.
+      // The last row's likeliest token as the next forward's input.
       this.gpu.run({
         name: "pick",
         program: this.gpu.program(K.CANDIDATE_ARGMAX),
         inputs: { uCand: b.candidates },
+        uniforms: { uCandRow: { int: (rows - 1) * count } },
         output: b.ids,
         rect: { x: 0, y: 0, width: 1, height: 1 }
       })
@@ -1585,30 +1644,39 @@ export class Engine {
       x: 0,
       y: 0,
       width: texels,
-      height: count
+      height: count * rows
     })
     // Read it forward while the candidates go back to the CPU (see guess).
     if (guess) await this.forwardGuess()
     const data = await pending()
-    const ids = new Int32Array(count * CHUNK)
-    const logits = new Float32Array(count * CHUNK)
-    for (let r = 0; r < count; r++) {
-      const chunk = Math.round(data[(r * texels + CHUNK / 4) * 4])
-      for (let i = 0; i < CHUNK; i++) {
-        ids[r * CHUNK + i] = chunk * CHUNK + i
-        logits[r * CHUNK + i] = data[r * texels * 4 + i]
+    const out = []
+    for (let r = 0; r < rows; r++) {
+      const ids = new Int32Array(count * CHUNK)
+      const logits = new Float32Array(count * CHUNK)
+      for (let k = 0; k < count; k++) {
+        const at = (r * count + k) * texels
+        const chunk = Math.round(data[(at + CHUNK / 4) * 4])
+        for (let i = 0; i < CHUNK; i++) {
+          ids[k * CHUNK + i] = chunk * CHUNK + i
+          logits[k * CHUNK + i] = data[at * 4 + i]
+        }
       }
+      out.push({ ids, logits })
     }
-    return { ids, logits }
+    return out
   }
 
-  /** The output head on one row of the last batch: logits into the logits texture. */
-  private head(row: number) {
+  /**
+   * The output head on rows [row0, row0 + rows) of the last batch: logits
+   * into the logits texture, logitRows rows per token (only RGBA4 heads take
+   * more than one).
+   */
+  private head(row0: number, rows = 1) {
     const b = this.buffers
     const e = this.embedding
-    this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, 1, row)
+    this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) {
-      this.headRgba4(e)
+      this.headRgba4(e, rows)
       return
     }
     this.gpu.run({
@@ -1654,21 +1722,19 @@ export class Engine {
    * The output head through RGBA4 weights, split along K in
    * TUNING.headSplit slices (added up by one more pass).
    */
-  private headRgba4(e: GpuMatrix) {
+  private headRgba4(e: GpuMatrix, rows: number) {
     const b = this.buffers
     const split = Math.max(1, Math.min(TUNING.headSplit, e.blocks))
-    const sliceRows = Math.ceil(e.groups / OUT_WIDTH)
+    const sliceRows = this.logitRows
+    const height = split * rows * sliceRows
     let target = b.logits
     if (split > 1) {
       const p = b.partial
-      if (p.width >= OUT_WIDTH && p.height >= split * sliceRows) target = p
+      if (p.width >= OUT_WIDTH && p.height >= height) target = p
       else {
-        if (
-          !this.headScratch ||
-          this.headScratch.height < split * sliceRows
-        ) {
+        if (!this.headScratch || this.headScratch.height < height) {
           if (this.headScratch) this.gpu.delete(this.headScratch)
-          this.headScratch = this.f32(OUT_WIDTH * 4, split * sliceRows)
+          this.headScratch = this.f32(OUT_WIDTH * 4, height)
         }
         target = this.headScratch
       }
@@ -1689,19 +1755,24 @@ export class Engine {
         uG: { int: e.groups },
         uOutW: { int: OUT_WIDTH },
         uSliceRows: { int: sliceRows },
-        uKbSlice: { int: Math.ceil(e.blocks / split) }
+        uKbSlice: { int: Math.ceil(e.blocks / split) },
+        uRows: { int: rows }
       },
       output: target,
-      rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * sliceRows }
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height }
     })
     if (split === 1) return
     this.gpu.run({
       name: "head",
       program: this.gpu.program(K.HEAD_SUM),
       inputs: { uP: target },
-      uniforms: { uSplit: { int: split }, uSliceRows: { int: sliceRows } },
+      uniforms: {
+        uSplit: { int: split },
+        uSliceRows: { int: sliceRows },
+        uRows: { int: rows }
+      },
       output: b.logits,
-      rect: { x: 0, y: 0, width: OUT_WIDTH, height: sliceRows }
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: rows * sliceRows }
     })
   }
 
@@ -1710,7 +1781,12 @@ export class Engine {
     const c = this.config
     const b = this.buffers
     this.head(row)
-    const all = await this.gpu.read(b.logits)
+    const all = await this.gpu.read(b.logits, {
+      x: 0,
+      y: 0,
+      width: OUT_WIDTH,
+      height: this.logitRows
+    })
     return all.subarray(0, c.vocabSize)
   }
 

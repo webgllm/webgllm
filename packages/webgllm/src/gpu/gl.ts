@@ -71,7 +71,10 @@ export type Pass = {
   /** Sampler uniform name → texture. */
   inputs: Record<string, Texture>
   /** Integer uniforms go as `{ int: n }`; plain numbers are floats. */
-  uniforms?: Record<string, Uniform | { int: number }>
+  uniforms?: Record<
+    string,
+    Uniform | { int: number } | { ivec4: [number, number, number, number] }
+  >
   /**
    * The texture drawn into, or several of one size (multiple render
    * targets: the shader's output `location` i writes texture i).
@@ -374,6 +377,7 @@ export class Gpu {
       if (loc === null) continue
       if (typeof value === "number") gl.uniform1f(loc, value)
       else if ("int" in value) gl.uniform1i(loc, value.int)
+      else if ("ivec4" in value) gl.uniform4i(loc, ...value.ivec4)
       else if (value.length === 2) gl.uniform2f(loc, value[0], value[1])
       else if (value.length === 3)
         gl.uniform3f(loc, value[0], value[1], value[2])

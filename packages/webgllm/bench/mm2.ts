@@ -26,6 +26,8 @@ type Variant = {
   weights: "rgba4" | "bytes"
   acts: "f16" | "h2"
   tokens: 1 | 2 | 4
+  /** Weights, activations and block sums as mediump (half precision on Metal?). */
+  half?: boolean
 }
 
 function kernel(v: Variant) {
@@ -85,6 +87,12 @@ function kernel(v: Variant) {
       : T === 2
         ? "o0 = packH2(acc0, acc1);"
         : "o0 = packH2(acc0, acc1);\n  o1 = packH2(acc2, acc3);"
+  if (v.half) {
+    for (let i = 0; i < L.length; i++)
+      L[i] = L[i]
+        .replace(/\bvec4 (w\d|a|b\d) /g, "mediump vec4 $1 ")
+        .replace(/\bfloat (s\d) /g, "mediump float $1 ")
+  }
   return `${HEADER}
 vec4 h2pick(uvec4 u, int hi) { return hi == 1 ? h2hi(u) : h2lo(u); }
 uniform ${v.acts === "f16" ? "sampler2D" : "usampler2D"} uA;
@@ -706,7 +714,10 @@ async function shapes(gpu: Gpu, batch: number) {
               { weights: "rgba4", acts: "f16", tokens: 1 }
             ]
           : [
-              { weights: "rgba4", acts: "h2", tokens: 2 }
+              { weights: "rgba4", acts: "h2", tokens: 2 },
+              { weights: "bytes", acts: "h2", tokens: 2 },
+              { weights: "rgba4", acts: "h2", tokens: 4 },
+              { weights: "bytes", acts: "h2", tokens: 4 }
             ]
       for (const v of variants) {
         const T = v.tokens
@@ -742,7 +753,7 @@ async function shapes(gpu: Gpu, batch: number) {
           best = Math.min(best, (performance.now() - t0) / n)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }

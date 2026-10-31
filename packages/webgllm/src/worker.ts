@@ -52,6 +52,13 @@ const DRAFT_MATCH = 2
  */
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
+/**
+ * Drafts are used while recent draft batches kept at least this many
+ * drafts on average (over the last DRAFT_WINDOW): otherwise guessing,
+ * which a draft batch gives up, does more.
+ */
+const DRAFT_MIN_KEPT = 0.75
+const DRAFT_WINDOW = 8
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -355,6 +362,13 @@ async function generate(request: GenerateRequest) {
       guesses.filter(Boolean).length >= GUESS_MIN_HITS * guesses.length)
   // The token guessed with the last distribution, or -1.
   let guessed = -1
+  // Drafts kept per recent draft batch (see DRAFT_MIN_KEPT).
+  const draftsKept: Array<number> = []
+  const drafting = () =>
+    request.speculative !== false &&
+    (draftsKept.length < DRAFT_WINDOW / 2 ||
+      draftsKept.reduce((a, b) => a + b, 0) >=
+        DRAFT_MIN_KEPT * draftsKept.length)
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
@@ -379,6 +393,33 @@ async function generate(request: GenerateRequest) {
     const logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
     return sampler.distribution(logits)
+  }
+  // On the GPU: the distributions after rows 0..rows-1 of a batch whose
+  // inputs after the first are `drafts`, in one pass and one readback.
+  const distributions = async (
+    rows: number,
+    drafts: Array<number>,
+    guess: boolean
+  ) => {
+    const picked = await engine.pick(
+      0,
+      rows,
+      sampling.top_k,
+      sampling.repetition_penalty,
+      drafts,
+      guess
+    )
+    if (guess && engine.guessing) {
+      const { ids, logits } = picked[rows - 1]
+      let best = 0
+      for (let i = 1; i < logits.length; i++)
+        if (logits[i] > logits[best]) best = i
+      guessed = ids[best]
+    }
+    return picked.map(({ ids, logits }) => {
+      const d = sampler.distribution(logits)
+      return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }
+    })
   }
 
   // When the template opens the thinking itself (LFM3 with thinking on ends
@@ -417,9 +458,12 @@ async function generate(request: GenerateRequest) {
         // Already read: draw the next token (and guess the one after).
         engine.keepGuess()
         model.cached.push(token)
+        // Guess the next token unless drafts follow (then a batch of them
+        // gets more done than overlapping the wait).
         const more =
           stats.outputTokens < maxTokens - 1 &&
-          engine.position < engine.contextLength - 1
+          engine.position < engine.contextLength - 1 &&
+          (!drafting() || lookupDraft(history, 1, DRAFT_MATCH).length === 0)
         token = draw(await distribution(0, more && guessing()))
         going = emit(token)
         continue
@@ -431,7 +475,7 @@ async function generate(request: GenerateRequest) {
     const drafts = lookupDraft(
       history,
       Math.min(
-        request.speculative === false ? 0 : DRAFTS,
+        drafting() ? DRAFTS : 0,
         maxTokens - stats.outputTokens - 1,
         engine.contextLength - engine.position - 1
       ),
@@ -441,17 +485,20 @@ async function generate(request: GenerateRequest) {
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
     // Row i's distribution checks draft i + 1; the first draft it rejects
     // is replaced by a token drawn from what's left, and the rest dropped.
+    // Guess the token after the last row (good if every draft is kept).
+    const guessLast =
+      guessing() &&
+      drafts.length === 0 &&
+      stats.outputTokens + drafts.length < maxTokens - 1 &&
+      engine.position < engine.contextLength - 1
+    const all = onGpu
+      ? await distributions(batch.length, drafts, guessLast)
+      : null
     let kept = 1
     let next = -1
     for (let i = 0; i < batch.length && going; i++) {
       const last = i + 1 === batch.length
-      const d = await distribution(
-        i,
-        last &&
-          guessing() &&
-          stats.outputTokens < maxTokens - 1 &&
-          engine.position < engine.contextLength - 1
-      )
+      const d = all ? all[i] : await distribution(i, last && guessLast)
       if (last) {
         next = draw(d)
         break
@@ -464,9 +511,14 @@ async function generate(request: GenerateRequest) {
       kept++
       going = emit(batch[i + 1]) && !stopped.has(id)
     }
-    // A guess is only made after the last row, all drafts kept: nothing to
-    // take back then (and the guess has moved the cache on).
-    if (drafts.length && !engine.guessing) engine.accept(kept)
+    // A draft turned down: the guess (made for all drafts kept) goes first,
+    // then the batch back to the tokens kept.
+    if (drafts.length) {
+      if (engine.guessing && kept < batch.length) engine.dropGuess()
+      engine.accept(kept)
+      draftsKept.push(kept - 1)
+      if (draftsKept.length > DRAFT_WINDOW) draftsKept.shift()
+    }
     model.cached.push(...batch.slice(0, kept))
     if (!going || next < 0) break
     token = next

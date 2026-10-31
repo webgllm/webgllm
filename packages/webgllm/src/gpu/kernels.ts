@@ -405,7 +405,7 @@ function headRgba4Source(o: { zeros: boolean }) {
       : `const vec4 z = vec4(8.0);`
   )
   for (const j of [0, 1, 2, 3]) {
-    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, 0), 0);`)
+    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, r), 0);`)
     line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
   }
   line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
@@ -430,12 +430,16 @@ uniform int uG;
 uniform int uOutW;
 uniform int uSliceRows;
 uniform int uKbSlice;
+uniform int uRows;
 out vec4 o;
 void main() {
+  // Row (slice · uRows + r) · uSliceRows + yl: token r's slice.
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
-  int slice = y / uSliceRows;
-  int g = (y - slice * uSliceRows) * uOutW + x;
+  int block = y / uSliceRows;
+  int slice = block / uRows;
+  int r = block - slice * uRows;
+  int g = (y - block * uSliceRows) * uOutW + x;
   vec4 acc = vec4(0.0);
   if (g < uG) {
     int kb0 = slice * uKbSlice;
@@ -452,16 +456,21 @@ ${L.join("\n")}
 }`
 }
 
-/** The output head's slices (see `headRgba4`) added up: texel (x, y). */
+/**
+ * The output head's slices (see `headRgba4`) added up: texel (x, y) of
+ * token y / uSliceRows.
+ */
 export const HEAD_SUM = `${HEADER}
 uniform sampler2D uP;
 uniform int uSplit;
 uniform int uSliceRows;
+uniform int uRows;
 out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 acc = vec4(0.0);
-  for (int s = 0; s < uSplit; s++) acc += texelFetch(uP, ivec2(p.x, p.y + s * uSliceRows), 0);
+  for (int s = 0; s < uSplit; s++)
+    acc += texelFetch(uP, ivec2(p.x, p.y + s * uRows * uSliceRows), 0);
   o = acc;
 }`
 
@@ -642,7 +651,7 @@ out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
-  int m = uRowIn < 0 ? y : uRowIn;
+  int m = y + max(uRowIn, 0);
   float r = rmsScale(m);
   vec4 a = texelFetch(uX, ivec2(2 * x, m), 0) * r * texelFetch(uNorm, ivec2(2 * x, 0), 0);
   vec4 b = texelFetch(uX, ivec2(2 * x + 1, m), 0) * r * texelFetch(uNorm, ivec2(2 * x + 1, 0), 0);
@@ -1142,24 +1151,34 @@ void main() {
  * wide) marks tokens seen (1: repetition penalty) or never to draw (2).
  */
 const PENALIZED = `
-float penalized(float v, uint m) {
+uniform int uLogitRows;
+uniform ivec4 uExtra;
+/*
+ * Token id's logit with the repetition penalty for row r of a batch: the
+ * mask's seen tokens, and the batch's drafts before row r (uExtra: draft i
+ * is row i + 1's input, so rows after it have seen it).
+ */
+float penalized(float v, uint m, int id, int r) {
   if (m == 2u) return -1e30;
-  if (m == 1u) return v < 0.0 ? v * uPenalty : v / uPenalty;
+  bool seen = m == 1u;
+  for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) seen = true;
+  if (seen) return v < 0.0 ? v * uPenalty : v / uPenalty;
   return v;
 }
-vec4 chunkTexel(int c, int t) {
+vec4 chunkTexel(int c, int t, int r) {
   int texel = c * 64 + t;
   ivec2 p = ivec2(texel % uOutW, texel / uOutW);
-  vec4 v = texelFetch(uLogits, p, 0);
+  vec4 v = texelFetch(uLogits, ivec2(p.x, p.y + r * uLogitRows), 0);
   int base = 4 * p.x;
+  int id = 4 * texel;
   return vec4(
-    penalized(v.x, texelFetch(uMask, ivec2(base, p.y), 0).x),
-    penalized(v.y, texelFetch(uMask, ivec2(base + 1, p.y), 0).x),
-    penalized(v.z, texelFetch(uMask, ivec2(base + 2, p.y), 0).x),
-    penalized(v.w, texelFetch(uMask, ivec2(base + 3, p.y), 0).x));
+    penalized(v.x, texelFetch(uMask, ivec2(base, p.y), 0).x, id, r),
+    penalized(v.y, texelFetch(uMask, ivec2(base + 1, p.y), 0).x, id + 1, r),
+    penalized(v.z, texelFetch(uMask, ivec2(base + 2, p.y), 0).x, id + 2, r),
+    penalized(v.w, texelFetch(uMask, ivec2(base + 3, p.y), 0).x, id + 3, r));
 }`
 
-/** Each 256-logit chunk's largest (penalized) logit: x = chunk index. */
+/** Each 256-logit chunk's largest (penalized) logit: x = chunk index, y = row. */
 export const CHUNK_MAX = `${HEADER}
 uniform sampler2D uLogits;
 uniform usampler2D uMask;
@@ -1169,9 +1188,10 @@ ${PENALIZED}
 out vec4 o;
 void main() {
   int c = int(gl_FragCoord.x);
+  int r = int(gl_FragCoord.y);
   float mx = -1e30;
   for (int t = 0; t < 64; t++) {
-    vec4 v = chunkTexel(c, t);
+    vec4 v = chunkTexel(c, t, r);
     mx = max(mx, max(max(v.x, v.y), max(v.z, v.w)));
   }
   o = vec4(mx, 0.0, 0.0, 0.0);
@@ -1184,10 +1204,11 @@ uniform int uChunks;
 out vec4 o;
 void main() {
   int c = int(gl_FragCoord.x);
-  float mine = texelFetch(uMax, ivec2(c, 0), 0).x;
+  int row = int(gl_FragCoord.y);
+  float mine = texelFetch(uMax, ivec2(c, row), 0).x;
   int rank = 0;
   for (int i = 0; i < uChunks; i++) {
-    float v = texelFetch(uMax, ivec2(i, 0), 0).x;
+    float v = texelFetch(uMax, ivec2(i, row), 0).x;
     if (v > mine || (v == mine && i < c)) rank++;
   }
   o = vec4(float(rank), 0.0, 0.0, 0.0);
@@ -1200,9 +1221,10 @@ uniform int uChunks;
 out vec4 o;
 void main() {
   int r = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
   int c = 0;
   for (int i = 0; i < uChunks; i++) {
-    if (int(texelFetch(uRank, ivec2(i, 0), 0).x) == r) c = i;
+    if (int(texelFetch(uRank, ivec2(i, row), 0).x) == r) c = i;
   }
   o = vec4(float(c), 0.0, 0.0, 0.0);
 }`
@@ -1217,13 +1239,17 @@ uniform usampler2D uMask;
 uniform sampler2D uByRank;
 uniform int uOutW;
 uniform float uPenalty;
+uniform int uCount;
 ${PENALIZED}
 out vec4 o;
 void main() {
+  // Row row · uCount + k: row's chunk ranked k.
   int t = int(gl_FragCoord.x);
-  int r = int(gl_FragCoord.y);
-  int c = int(texelFetch(uByRank, ivec2(r, 0), 0).x);
-  o = t < 64 ? chunkTexel(c, t) : vec4(float(c), 0.0, 0.0, 0.0);
+  int y = int(gl_FragCoord.y);
+  int row = y / uCount;
+  int k = y - row * uCount;
+  int c = int(texelFetch(uByRank, ivec2(k, row), 0).x);
+  o = t < 64 ? chunkTexel(c, t, row) : vec4(float(c), 0.0, 0.0, 0.0);
 }`
 
 /**
@@ -1233,17 +1259,18 @@ void main() {
  */
 export const CANDIDATE_ARGMAX = `${HEADER}
 uniform sampler2D uCand;
+uniform int uCandRow;
 out uvec4 o;
 void main() {
   float best = -3e38;
   int at = 0;
   for (int t = 0; t < 64; t++) {
-    vec4 v = texelFetch(uCand, ivec2(t, 0), 0);
+    vec4 v = texelFetch(uCand, ivec2(t, uCandRow), 0);
     for (int c = 0; c < 4; c++) {
       if (v[c] > best) { best = v[c]; at = 4 * t + c; }
     }
   }
-  int chunk = int(texelFetch(uCand, ivec2(64, 0), 0).x + 0.5);
+  int chunk = int(texelFetch(uCand, ivec2(64, uCandRow), 0).x + 0.5);
   o = uvec4(uint(chunk * 256 + at), 0u, 0u, 0u);
 }`
 
