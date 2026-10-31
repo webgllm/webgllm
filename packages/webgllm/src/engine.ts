@@ -236,7 +236,7 @@ export class Engine {
   /** Positions the full-attention caches hold now (see reserve). */
   private kvPositions = 0
   /** Chunked attention's partial results, made when first needed (see attend). */
-  private chunkBufs: [Texture, Texture, Texture] | null = null
+  private chunkBufs = new Map<number, Array<Texture>>()
   private readonly kvBlockRows: number
   /** Tokens per prompt batch: options.batchSize, scaled to the model (see configure). */
   batchSize: number
@@ -432,10 +432,16 @@ export class Engine {
       convOut: this.h2(D, M),
       qkvg: this.pair(qkvg, 2 * M),
       q: this.f32(c.numHeads * c.headDim, M),
-      scores: this.gpu.texture(
-        GL.RGBA32F,
-        Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)),
-        c.numHeads * Math.min(M, this.scoreRows())
+      /**
+       * One per head of a group (see headGroup), member i's scores: rows
+       * for scoreRows queries of every head, between them.
+       */
+      scores: Array.from({ length: this.headGroup() }, () =>
+        this.gpu.texture(
+          GL.RGBA32F,
+          Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)),
+          (c.numHeads / this.headGroup()) * Math.min(M, this.scoreRows())
+        )
       ),
       attnOut: this.h2(qDims, M),
       gateUp: this.pair(2 * I, M),
@@ -561,18 +567,34 @@ export class Engine {
   }
 
   /**
-   * Chunked attention's partial results: weighted values (two textures)
-   * and (max, sum), for `rows` (query, chunk) pairs at least.
+   * Query heads of a KV head that an attention fragment takes together:
+   * the most that divides the group, with the chunks' 3 textures per head
+   * (see attendChunk) within the GPU's render targets.
    */
-  private chunkBuffers(rows: number) {
-    if (this.chunkBufs && this.chunkBufs[0].height >= rows) return this.chunkBufs
+  private headGroup() {
+    const c = this.config
+    const group = c.numHeads / c.numKvHeads
+    let G = Math.min(group, Math.floor(this.gpu.limits.maxDrawBuffers / 3))
+    while (group % G) G--
+    return G
+  }
+
+  /**
+   * Chunked attention's partial results, for `rows` (query, chunk) pairs
+   * at least: per head of a group, weighted values (two textures) and
+   * (max, sum).
+   */
+  private chunkBuffers(rows: number, G: number) {
+    const have = this.chunkBufs.get(G)
+    if (have && have[0].height >= rows) return have
     const c = this.config
     const height = Math.max(rows, this.scoreRows() * ATTEND_CHUNKS)
-    this.chunkBufs?.forEach((t) => this.gpu.delete(t))
-    this.chunkBufs = [0, 1, 2].map(() =>
-      this.gpu.texture(GL.RGBA32F, (c.numHeads * c.headDim) / 8, height)
-    ) as [Texture, Texture, Texture]
-    return this.chunkBufs
+    have?.forEach((t) => this.gpu.delete(t))
+    const bufs = Array.from({ length: 3 * G }, () =>
+      this.gpu.texture(GL.RGBA32F, (c.numHeads * c.headDim) / 8 / G, height)
+    )
+    this.chunkBufs.set(G, bufs)
+    return bufs
   }
 
   private vector(values: Float32Array, rows = 1) {
@@ -1546,17 +1568,26 @@ export class Engine {
     // sit side by side and a slice holds more queries. More keys than that
     // go in segments: each segment's scores, then its chunks of weighted
     // values (attendChunk), and at the end all chunks combined.
+    // A fragment takes G query heads (a row group) sharing a KV head:
+    // scores of member i in texture i.
     const group = c.numHeads / c.numKvHeads
-    const panelRows = b.scores.height
+    const G = this.headGroup()
+    const rowGroups = c.numHeads / G
+    const scoreTex = b.scores
+    const sIn = Object.fromEntries(
+      scoreTex.map((t, i) => [i === 0 ? "uS" : `uS${i}`, t])
+    )
+    const panelRows = scoreTex[0].height
+    const scoreWidth = scoreTex[0].width
     for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
       const widest = Math.ceil((pos0 + rows - j0) / 4)
-      const segTexels = Math.min(widest, b.scores.width, TUNING.scoreTexels)
+      const segTexels = Math.min(widest, scoreWidth, TUNING.scoreTexels)
       const segmentsMax = Math.ceil(widest / segTexels)
-      const panels = Math.max(1, Math.floor(b.scores.width / segTexels))
+      const panels = Math.max(1, Math.floor(scoreWidth / segTexels))
       let slice = Math.min(
         rows - m0,
-        Math.max(1, Math.floor((panels * panelRows) / c.numHeads))
+        Math.max(1, Math.floor((panels * panelRows) / rowGroups))
       )
       // Chunks per segment: up to ATTEND_CHUNKS of at least
       // attendChunkTexels texels (fewer where segments are many).
@@ -1578,7 +1609,7 @@ export class Engine {
       const keys = pos0 + m0 + slice - j0
       const kt = Math.ceil(keys / 4)
       const chunkTexels = texelsPer(Math.min(kt, segTexels))
-      const total = c.numHeads * slice
+      const total = rowGroups * slice
       const ring = {
         uRows: { int: slice },
         uM0: { int: m0 },
@@ -1590,7 +1621,7 @@ export class Engine {
       const scores = (sj0: number, sKeys: number) =>
         this.gpu.run({
           name: "scores",
-          program: this.gpu.program(K.scores(c.headDim)),
+          program: this.gpu.program(K.scores(c.headDim, G)),
           inputs: { uQ: b.q, uK: layer.kv },
           uniforms: {
             ...ring,
@@ -1601,7 +1632,7 @@ export class Engine {
             uGroup: { int: group },
             uTotalRows: { int: total }
           },
-          output: b.scores,
+          output: G === 1 ? scoreTex[0] : scoreTex,
           rect: {
             x: 0,
             y: 0,
@@ -1626,7 +1657,7 @@ export class Engine {
           slice * chunks <= chunkRows)
       ) {
         // Long key ranges: chunks of keys in parallel, then combined.
-        const chunkBufs = this.chunkBuffers(slice * chunks)
+        const chunkBufs = this.chunkBuffers(slice * chunks, G)
         let chunk0 = 0
         for (let s = 0; s < segments; s++) {
           const sj0 = j0 + 4 * s * segTexels
@@ -1635,8 +1666,8 @@ export class Engine {
           scores(sj0, sKeys)
           this.gpu.run({
             name: "attend",
-            program: this.gpu.program(K.attendChunk(c.headDim)),
-            inputs: { uS: b.scores, uV: layer.kv },
+            program: this.gpu.program(K.attendChunk(c.headDim, G)),
+            inputs: { ...sIn, uV: layer.kv },
             uniforms: {
               ...ring,
               uJ0: { int: sj0 },
@@ -1651,7 +1682,7 @@ export class Engine {
             rect: {
               x: 0,
               y: chunk0 * slice,
-              width: qDims / 8,
+              width: qDims / 8 / G,
               height: slice * sChunks
             }
           })
@@ -1659,11 +1690,9 @@ export class Engine {
         }
         this.gpu.run({
           name: "attend",
-          program: read(K.attendCombine(c.headDim, c.attentionGate)),
+          program: read(K.attendCombine(c.headDim, c.attentionGate, G)),
           inputs: {
-            uP0: chunkBufs[0],
-            uP1: chunkBufs[1],
-            uP2: chunkBufs[2],
+            ...Object.fromEntries(chunkBufs.map((t, k) => [`uP${k}`, t])),
             ...qkvgInputs
           },
           uniforms: {
@@ -1683,8 +1712,8 @@ export class Engine {
       scores(j0, keys)
       this.gpu.run({
         name: "attend",
-        program: read(K.attend(c.headDim, c.attentionGate)),
-        inputs: { uS: b.scores, uV: layer.kv, ...qkvgInputs },
+        program: read(K.attend(c.headDim, c.attentionGate, G)),
+        inputs: { ...sIn, uV: layer.kv, ...qkvgInputs },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),

@@ -1121,15 +1121,35 @@ ivec2 kvAt(int x, int slot) {
 }`
 
 /**
+ * The heads one attention fragment handles: G query heads sharing a KV
+ * head, so each key and value is read once for all of them. Scores of
+ * member i go to texture i (uS, uS1, ...), one row group per G heads.
+ */
+const sNames = (G: number) =>
+  Array.from({ length: G }, (_, i) => (i === 0 ? "uS" : `uS${i}`))
+
+/** A score texel of head h's texture (its member h % G). */
+const scoreAt = (G: number) => {
+  if (G === 1) return "vec4 S(int h, ivec2 p) { return texelFetch(uS, p, 0); }"
+  const names = sNames(G)
+  let body = `texelFetch(${names[G - 1]}, p, 0)`
+  for (let i = G - 2; i >= 0; i--)
+    body = `hm == ${i} ? texelFetch(${names[i]}, p, 0) : ${body}`
+  return `vec4 S(int h, ivec2 p) { int hm = h % ${G}; return ${body}; }`
+}
+
+/**
  * Attention scores, 4 keys per texel, for the uRows queries from uM0: row
- * h * uRows + (m - uM0) holds query m of head h against keys uJ0 + 4x ..
- * + 3. With uRing > 0 the cache is a ring of that many rows (position j at
- * row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
+ * g * uRows + (m - uM0) of texture i holds query m of head g·G + i
+ * against keys uJ0 + 4x .. + 3 (G heads per fragment, sharing their KV
+ * head's keys). With uRing > 0 the cache is a ring of that many rows
+ * (position j at row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
  * (later than the query, outside the sliding window, past uKeys) get -1e30.
  */
-function scoresSource(headDim: number) {
+function scoresSource(headDim: number, G: number) {
   const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
   return `${HEADER}
 uniform sampler2D uQ;
 uniform usampler2D uK;
@@ -1145,17 +1165,21 @@ uniform int uKt;
 uniform int uPanelRows;
 uniform int uTotalRows;
 ${KV_AT}
-out vec4 o;
+${members.map((i) => `layout(location = ${i}) out vec4 o${i};`).join("\n")}
 void main() {
   // Panels of uKt texels side by side, each holding uPanelRows rows: row r
-  // (query m of head h, r = h · uRows + m − uM0) at (panel · uKt + x, y).
+  // (query m of row group g, r = g · uRows + m − uM0) at (panel · uKt + x, y).
   int panel = int(gl_FragCoord.x) / uKt;
   int x = int(gl_FragCoord.x) - panel * uKt;
   int y = panel * uPanelRows + int(gl_FragCoord.y);
-  int h = y / uRows;
-  if (y >= uTotalRows) { o = vec4(-1e30); return; }
-  int m = uM0 + (y - h * uRows);
-  int kh = h / uGroup;
+  if (y >= uTotalRows) {
+    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    return;
+  }
+  int g = y / uRows;
+  int m = uM0 + (y - g * uRows);
+  int h0 = g * ${G};
+  int kh = h0 / uGroup;
   int qpos = uPos0 + m;
   // The 4 keys' rows (masked ones read row 0 and are dropped below), and
   // each query texel read once for all 4.
@@ -1166,38 +1190,49 @@ void main() {
     live[c] = !(j[c] - uJ0 >= uKeys || j[c] > qpos || (uWindow > 0 && qpos - j[c] >= uWindow));
     row[c] = live[c] ? (uRing > 0 ? j[c] % uRing : j[c]) : 0;
   }
-  if (!any(live)) { o = vec4(-1e30); return; }
+  if (!any(live)) {
+    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    return;
+  }
   ivec2 p0 = kvAt(kh * ${U}, row.x);
   ivec2 p1 = kvAt(kh * ${U}, row.y);
   ivec2 p2 = kvAt(kh * ${U}, row.z);
   ivec2 p3 = kvAt(kh * ${U}, row.w);
-  vec4 acc = vec4(0.0);
+  ${members.map((i) => `vec4 acc${i} = vec4(0.0);`).join(" ")}
   for (int u = 0; u < ${U}; u++) {
-    vec4 qa = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u, m), 0);
-    vec4 qb = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u + 1, m), 0);
     uvec4 k0 = texelFetch(uK, ivec2(p0.x + u, p0.y), 0);
     uvec4 k1 = texelFetch(uK, ivec2(p1.x + u, p1.y), 0);
     uvec4 k2 = texelFetch(uK, ivec2(p2.x + u, p2.y), 0);
     uvec4 k3 = texelFetch(uK, ivec2(p3.x + u, p3.y), 0);
-    acc += vec4(
-      dot(qa, h2lo(k0)) + dot(qb, h2hi(k0)),
-      dot(qa, h2lo(k1)) + dot(qb, h2hi(k1)),
-      dot(qa, h2lo(k2)) + dot(qb, h2hi(k2)),
-      dot(qa, h2lo(k3)) + dot(qb, h2hi(k3)));
+    vec4 l0 = h2lo(k0), u0 = h2hi(k0), l1 = h2lo(k1), u1 = h2hi(k1);
+    vec4 l2 = h2lo(k2), u2 = h2hi(k2), l3 = h2lo(k3), u3 = h2hi(k3);
+${members
+  .map(
+    (i) => `    {
+      vec4 qa = texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u, m), 0);
+      vec4 qb = texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u + 1, m), 0);
+      acc${i} += vec4(dot(qa, l0) + dot(qb, u0), dot(qa, l1) + dot(qb, u1),
+        dot(qa, l2) + dot(qb, u2), dot(qa, l3) + dot(qb, u3));
+    }`
+  )
+  .join("\n")}
   }
-  o = mix(vec4(-1e30), acc, vec4(live));
+  ${members.map((i) => `o${i} = mix(vec4(-1e30), acc${i}, vec4(live));`).join("\n  ")}
 }`
 }
 
 /**
  * Softmax over a query's scores, the weighted sum of values (uV: h2 cache),
  * times the head's sigmoid gate (from the q|k|v|gate projection at texel
- * uGateTexel). h2 output: 8 dims of one head per texel.
+ * uGateTexel). h2 output: 8 dims of one head per texel. Scores as
+ * scoresSource(G) leaves them.
  */
-function attendSource(headDim: number, gate: boolean) {
+function attendSource(headDim: number, gate: boolean, G: number) {
   const U = headDim / 8
   return `${HEADER}
-uniform sampler2D uS;
+${sNames(G)
+  .map((n) => `uniform sampler2D ${n};`)
+  .join("\n")}
 uniform usampler2D uV;
 uniform usampler2D uQKVG;
 uniform int uRows;
@@ -1211,6 +1246,7 @@ uniform int uKt;
 uniform int uPanelRows;
 uniform int uVOff;
 ${KV_AT}
+${scoreAt(G)}
 out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
@@ -1218,7 +1254,7 @@ void main() {
   int h = x / ${U};
   int u = x - h * ${U};
   int kh = h / uGroup;
-  int r = h * uRows + (m - uM0);
+  int r = (h / ${G}) * uRows + (m - uM0);
   int panel = r / uPanelRows;
   int row = r - panel * uPanelRows;
   int sx = panel * uKt;
@@ -1229,10 +1265,10 @@ void main() {
   vec4 m1 = vec4(-1e30);
   int i = 0;
   for (; i + 1 < texels; i += 2) {
-    m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
-    m1 = max(m1, texelFetch(uS, ivec2(sx + i + 1, row), 0));
+    m0 = max(m0, S(h, ivec2(sx + i, row)));
+    m1 = max(m1, S(h, ivec2(sx + i + 1, row)));
   }
-  if (i < texels) m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
+  if (i < texels) m0 = max(m0, S(h, ivec2(sx + i, row)));
   m0 = max(m0, m1);
   float mx = max(max(m0.x, m0.y), max(m0.z, m0.w));
   int vx = uVOff + kh * ${U} + u;
@@ -1243,8 +1279,8 @@ void main() {
   vec4 hi1 = vec4(0.0);
   for (i = 0; i < texels; i += 2) {
     bool two = i + 1 < texels;
-    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx);
-    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx) : vec4(0.0);
+    vec4 e0 = exp(S(h, ivec2(sx + i, row)) - mx);
+    vec4 e1 = two ? exp(S(h, ivec2(sx + i + 1, row)) - mx) : vec4(0.0);
     l4 += e0 + e1;
     ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
     ivec4 j1 = j0 + 4;
@@ -1280,16 +1316,21 @@ void main() {
 
 /**
  * Attention for long key ranges, part 1: like attend, but over one chunk
- * of uChunkTexels score texels, so many fragments share a query's keys.
- * Row (uChunk0 + c) · uSliceQ + (m - uM0): chunk c of query m (several
- * passes, one per segment of a long key range, fill rows side by side). Outputs the chunk's
- * softmax-weighted sum of values (dims 0..3 and 4..7, relative to the
- * chunk's own max) and (max, sum of weights); attendCombine adds chunks.
+ * of uChunkTexels score texels, so many fragments share a query's keys,
+ * and for the G heads of a row group at once (each value read once for
+ * them all). Fragment x: row group x / U, dims 8(x % U)..; row (uChunk0
+ * + c) · uSliceQ + (m - uM0): chunk c of query m (several passes, one per
+ * segment of a long key range, fill rows side by side). Outputs, for
+ * member i, the chunk's softmax-weighted sum of values (dims 0..3 and
+ * 4..7, relative to the chunk's own max) and (max, sum of weights) at
+ * locations 3i..3i+2; attendCombine adds chunks.
  */
-function attendChunkSource(headDim: number) {
+function attendChunkSource(headDim: number, G: number) {
   const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
+  const names = sNames(G)
   return `${HEADER}
-uniform sampler2D uS;
+${names.map((n) => `uniform sampler2D ${n};`).join("\n")}
 uniform usampler2D uV;
 uniform int uRows;
 uniform int uRing;
@@ -1303,53 +1344,66 @@ uniform int uSliceQ;
 uniform int uChunkTexels;
 uniform int uChunk0;
 ${KV_AT}
-layout(location = 0) out vec4 o0;
-layout(location = 1) out vec4 o1;
-layout(location = 2) out vec4 o2;
+${members
+  .map(
+    (i) => `layout(location = ${3 * i}) out vec4 o${3 * i};
+layout(location = ${3 * i + 1}) out vec4 o${3 * i + 1};
+layout(location = ${3 * i + 2}) out vec4 o${3 * i + 2};`
+  )
+  .join("\n")}
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
   int qi = y % uSliceQ;
   // Chunk c of this pass's keys: rows from chunk uChunk0 on.
   int c = y / uSliceQ - uChunk0;
-  int h = x / ${U};
-  int u = x - h * ${U};
-  int kh = h / uGroup;
-  int r = h * uRows + qi;
+  int g = x / ${U};
+  int u = x - g * ${U};
+  int kh = (g * ${G}) / uGroup;
+  int r = g * uRows + qi;
   int panel = r / uPanelRows;
   int row = r - panel * uPanelRows;
   int sx = panel * uKt;
   int texels = (uKeys + 3) / 4;
   int t0 = c * uChunkTexels;
   int t1 = min(texels, t0 + uChunkTexels);
-  vec4 m0 = vec4(-1e30);
-  vec4 m1 = vec4(-1e30);
-  int i = t0;
-  for (; i + 1 < t1; i += 2) {
-    m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
-    m1 = max(m1, texelFetch(uS, ivec2(sx + i + 1, row), 0));
+  int vx = uVOff + kh * ${U} + u;
+${members
+  .map(
+    (i) => `  float mx${i};
+  {
+    vec4 m0 = vec4(-1e30);
+    vec4 m1 = vec4(-1e30);
+    int i = t0;
+    for (; i + 1 < t1; i += 2) {
+      m0 = max(m0, texelFetch(${names[i]}, ivec2(sx + i, row), 0));
+      m1 = max(m1, texelFetch(${names[i]}, ivec2(sx + i + 1, row), 0));
+    }
+    if (i < t1) m0 = max(m0, texelFetch(${names[i]}, ivec2(sx + i, row), 0));
+    m0 = max(m0, m1);
+    mx${i} = max(max(m0.x, m0.y), max(m0.z, m0.w));
   }
-  if (i < t1) m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
-  m0 = max(m0, m1);
-  float mx = max(max(m0.x, m0.y), max(m0.z, m0.w));
-  if (mx < -1e29) {
+  vec4 l${i} = vec4(0.0);
+  vec4 lo${i} = vec4(0.0);
+  vec4 hi${i} = vec4(0.0);`
+  )
+  .join("\n")}
+${
+  G === 1
+    ? `  if (mx0 < -1e29) {
     // Every key in the chunk masked: it adds nothing.
     o0 = vec4(0.0);
     o1 = vec4(0.0);
     o2 = vec4(-1e30, 0.0, 0.0, 0.0);
     return;
   }
-  int vx = uVOff + kh * ${U} + u;
-  vec4 l4 = vec4(0.0);
-  vec4 lo = vec4(0.0);
-  vec4 hi = vec4(0.0);
   vec4 lo1 = vec4(0.0);
   vec4 hi1 = vec4(0.0);
-  for (i = t0; i < t1; i += 2) {
+  for (int i = t0; i < t1; i += 2) {
     bool two = i + 1 < t1;
-    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx);
-    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx) : vec4(0.0);
-    l4 += e0 + e1;
+    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx0);
+    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx0) : vec4(0.0);
+    l0 += e0 + e1;
     ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
     ivec4 j1 = j0 + 4;
     if (uRing > 0) {
@@ -1364,51 +1418,96 @@ void main() {
     uvec4 b1 = texelFetch(uV, kvAt(vx, j1.y), 0);
     uvec4 b2 = texelFetch(uV, kvAt(vx, j1.z), 0);
     uvec4 b3 = texelFetch(uV, kvAt(vx, j1.w), 0);
-    lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
-    hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
+    lo0 += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
+    hi0 += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
     lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
     hi1 += e1.x * h2hi(b0) + e1.y * h2hi(b1) + e1.z * h2hi(b2) + e1.w * h2hi(b3);
   }
-  o0 = lo + lo1;
-  o1 = hi + hi1;
-  o2 = vec4(mx, dot(l4, vec4(1.0)), 0.0, 0.0);
+  lo0 += lo1;
+  hi0 += hi1;`
+    : `  // (A member whose keys are all masked here sums nothing: its max is
+  // -1e30, so exp(score - max) is exp(0) = 1 for masked keys; its weights
+  // are zeroed below.)
+  for (int i = t0; i < t1; i++) {
+    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    if (uRing > 0) j0 = j0 - (j0 / uRing) * uRing;
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    vec4 al0 = h2lo(a0), ah0 = h2hi(a0), al1 = h2lo(a1), ah1 = h2hi(a1);
+    vec4 al2 = h2lo(a2), ah2 = h2hi(a2), al3 = h2lo(a3), ah3 = h2hi(a3);
+${members
+  .map(
+    (i) => `    {
+      vec4 e = exp(texelFetch(${names[i]}, ivec2(sx + i, row), 0) - mx${i});
+      l${i} += e;
+      lo${i} += e.x * al0 + e.y * al1 + e.z * al2 + e.w * al3;
+      hi${i} += e.x * ah0 + e.y * ah1 + e.z * ah2 + e.w * ah3;
+    }`
+  )
+  .join("\n")}
+  }`
+}
+${members
+  .map(
+    (i) => `  bool dead${i} = mx${i} < -1e29;
+  o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
+  o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
+  o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
+  )
+  .join("\n")}
 }`
 }
 
 /**
  * Attention for long key ranges, part 2: query m's chunks (attendChunk)
- * rescaled to the largest max and added up, times the head's gate, as h2.
+ * rescaled to the largest max and added up, times the head's gate, as h2
+ * (one head's 8 dims per texel). Head h's chunks are member h % G's
+ * textures (uP{3i}..uP{3i+2}), at row group h / G's texels.
  */
-function attendCombineSource(headDim: number, gate: boolean) {
+function attendCombineSource(headDim: number, gate: boolean, G: number) {
   const U = headDim / 8
+  const P = Array.from({ length: 3 * G }, (_, k) => `uP${k}`)
+  // Texture k (of 3) of head h's member hm.
+  const fetch = (k: number) => {
+    let body = `texelFetch(uP${3 * (G - 1) + k}, p, 0)`
+    for (let i = G - 2; i >= 0; i--)
+      body = `hm == ${i} ? texelFetch(uP${3 * i + k}, p, 0) : ${body}`
+    return body
+  }
   return `${HEADER}
-uniform sampler2D uP0;
-uniform sampler2D uP1;
-uniform sampler2D uP2;
+${P.map((n) => `uniform sampler2D ${n};`).join("\n")}
 uniform usampler2D uQKVG;
 uniform int uM0;
 uniform int uSliceQ;
 uniform int uChunks;
 uniform int uGateTexel;
 out uvec4 o;
+int hm;
+vec4 P0(ivec2 p) { return ${fetch(0)}; }
+vec4 P1(ivec2 p) { return ${fetch(1)}; }
+vec4 P2(ivec2 p) { return ${fetch(2)}; }
 void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y);
   int h = x / ${U};
+  hm = h % ${G};
+  int px = (h / ${G}) * ${U} + (x - h * ${U});
   int qi = m - uM0;
   float mx = -1e30;
   for (int c = 0; c < uChunks; c++)
-    mx = max(mx, texelFetch(uP2, ivec2(x, c * uSliceQ + qi), 0).x);
+    mx = max(mx, P2(ivec2(px, c * uSliceQ + qi)).x);
   float l = 0.0;
   vec4 lo = vec4(0.0);
   vec4 hi = vec4(0.0);
   for (int c = 0; c < uChunks; c++) {
-    ivec2 p = ivec2(x, c * uSliceQ + qi);
-    vec2 ml = texelFetch(uP2, p, 0).xy;
+    ivec2 p = ivec2(px, c * uSliceQ + qi);
+    vec2 ml = P2(p).xy;
     float w = exp(ml.x - mx);
     l += ml.y * w;
-    lo += w * texelFetch(uP0, p, 0);
-    hi += w * texelFetch(uP1, p, 0);
+    lo += w * P0(p);
+    hi += w * P1(p);
   }
   ${
     gate

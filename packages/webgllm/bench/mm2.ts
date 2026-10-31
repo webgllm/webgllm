@@ -206,68 +206,6 @@ ${L.join("\n")}
 }
 
 /**
- * RGBA4 weights, h2 activations, `rows` × `tokens` = 8 per fragment, one
- * RGBA32UI output of 8 halves (rows × tokens, token-major).
- */
-function shapeKernel(rows: number, T: number) {
-  const L: Array<string> = []
-  const line = (s: string) => L.push(`    ${s}`)
-  const groups = Math.ceil(rows / 4)
-  for (let G = 0; G < groups; G++) line(`vec4 d${G} = texelFetch(uS, ivec2(kb, g + ${G}), 0);`)
-  for (let t = 0; t < T; t++) line(`vec4 b${t}[${groups}]; float s${t} = 0.0;`)
-  for (let t = 0; t < T; t++) for (let G = 0; G < groups; G++) line(`b${t}[${G}] = vec4(0.0);`)
-  for (let j = 0; j < 8; j++) {
-    line(`{`)
-    for (let r = 0; r < rows; r++)
-      line(
-        `  vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${(r % 4) * 8 + j}, g + ${r >> 2}), 0);`
-      )
-    const half = j & 1 ? "h2hi" : "h2lo"
-    for (let t = 0; t < T; t++) {
-      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
-      line(`    s${t} += dot(a, vec4(1.0));`)
-      for (let G = 0; G < groups; G++) {
-        const comps = [0, 1, 2, 3].map((c) => {
-          const r = G * 4 + c
-          return r < rows ? `dot(w${r}, a)` : "0.0"
-        })
-        line(`    b${t}[${G}] += vec4(${comps.join(", ")});`)
-      }
-      line(`  }`)
-    }
-    line(`}`)
-  }
-  for (let t = 0; t < T; t++)
-    for (let G = 0; G < groups; G++)
-      line(`acc${t}_${G} += d${G} * (15.0 * b${t}[${G}] - 8.0 * s${t});`)
-  const accs: Array<string> = []
-  for (let t = 0; t < T; t++) for (let G = 0; G < groups; G++) accs.push(`vec4 acc${t}_${G} = vec4(0.0);`)
-  // 8 output halves: rows 8 → acc0_0, acc0_1; 4×2 → acc0_0, acc1_0;
-  // 2×4 → xy of acc0..3.
-  const write =
-    rows === 8
-      ? "o = packH2(acc0_0, acc0_1);"
-      : rows === 4
-        ? "o = packH2(acc0_0, acc1_0);"
-        : "o = packH2(vec4(acc0_0.xy, acc1_0.xy), vec4(acc2_0.xy, acc3_0.xy));"
-  return `${HEADER}
-uniform usampler2D uA;
-uniform sampler2D uW;
-uniform sampler2D uS;
-uniform int uKb;
-out uvec4 o;
-void main() {
-  int g = int(gl_FragCoord.x) * ${groups};
-  int m0 = int(gl_FragCoord.y) * ${T};
-  ${accs.join(" ")}
-  for (int kb = 0; kb < uKb; kb++) {
-${L.join("\n")}
-  }
-  ${write}
-}`
-}
-
-/**
  * RGBA4 weights, h2 activations, R rows (R / 4 row groups) × T tokens per
  * fragment; output k (MRT) is row group k / (T / 2), tokens 2·(k % (T/2))
  * and +1 as a pair texel. `sameActs`: every fragment reads token rows 0..T-1
