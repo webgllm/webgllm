@@ -140,6 +140,11 @@ export const TUNING = {
   f16MinRows: 64,
   /** 1: reads of candidates nothing runs behind (no guess) block rather than poll a fence. */
   blockingReads: 1,
+  /**
+   * 1: split matmuls' partial sums as halves (RGBA16F), half the bytes
+   * their consumers read (set before the model loads).
+   */
+  halfPartials: 1,
   /** 1: the pick's argmax from the chunk maxima's positions, its loops with constant bounds. */
   fastPick: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
@@ -570,7 +575,9 @@ export class Engine {
       ),
       /** Split matmuls' partial sums: widest output × (rows × slices). */
       partial: this.gpu.texture(
-        GL.RGBA32F,
+        TUNING.halfPartials > 0 && this.gpu.canRender([GL.RGBA16F])
+          ? GL.RGBA16F
+          : GL.RGBA32F,
         Math.max(2 * c.intermediateSize, qkvg, 3 * D) / 4,
         SPLIT_ROWS * 32
       )
