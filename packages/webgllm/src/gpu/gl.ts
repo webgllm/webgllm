@@ -133,6 +133,15 @@ export class Gpu {
   /** Pass names not to draw: for timing what the rest costs (results are wrong). */
   skip = new Set<string>()
   /**
+   * Render-area hints for tile-based GPUs, which otherwise may load and
+   * store a whole output texture for a pass that draws a corner of it:
+   * 1 scissors each pass to its rect, 2 invalidates the rect first (it's
+   * overwritten), 3 both. Scissoring cut a 1-pixel pass into a 4096×512
+   * texture from 151 to 60 µs on a PowerVR GPU (invalidating, to 76; both,
+   * 146).
+   */
+  hints = 1
+  /**
    * Pass names to draw twice, into the same target (no new render pass):
    * for timing what their fragments cost beyond the pass itself.
    */
@@ -522,6 +531,20 @@ export class Gpu {
       y: 0,
       width: outputs[0].width,
       height: outputs[0].height
+    }
+    if (this.hints & 1) {
+      gl.enable(gl.SCISSOR_TEST)
+      gl.scissor(rect.x, rect.y, rect.width, rect.height)
+    } else gl.disable(gl.SCISSOR_TEST)
+    if (this.hints & 2) {
+      gl.invalidateSubFramebuffer(
+        gl.FRAMEBUFFER,
+        outputs.map((_, i) => gl.COLOR_ATTACHMENT0 + i),
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height
+      )
     }
     // Bands of rows, each its own draw, so no single draw runs long enough
     // to trip the GPU watchdog: by fragments, and by the reads they make.

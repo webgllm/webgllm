@@ -629,6 +629,20 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
       bestBig = Math.min(bestBig, (performance.now() - t0) / 300)
     }
     log(`PASS 1 pixel into 4096x512 f32, chained: ${(bestBig * 1000).toFixed(1)} µs per pass`)
+    for (const hints of [1, 2, 3]) {
+      gpu.hints = hints
+      for (let i = 0; i < 50; i++) runBig(i)
+      await gpu.finish()
+      let bestHint = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 300; i++) runBig(i)
+        await gpu.finish()
+        bestHint = Math.min(bestHint, (performance.now() - t0) / 300)
+      }
+      log(`PASS 1 pixel into 4096x512 f32, hints ${hints === 1 ? "scissor" : hints === 2 ? "invalidate" : "scissor+invalidate"}: ${(bestHint * 1000).toFixed(1)} µs per pass`)
+    }
+    gpu.hints = 0
     // Same output texture every pass (an atlas: each pass draws its own
     // 1-pixel spot), reading textures that aren't attached: no framebuffer
     // switch between passes.

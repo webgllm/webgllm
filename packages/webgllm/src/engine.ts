@@ -132,6 +132,8 @@ export const TUNING = {
    * of nothing but dots (see MATMUL_F16); 0: they dequantize as they read.
    */
   f16Matmul: 1,
+  /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
+  renderHints: 1,
   /** 1: the f16 matmul's dots in mediump (faster where it's half precision, less exact). */
   f16Half: 0,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
@@ -2587,6 +2589,7 @@ export class Engine {
     const b = this.buffers
     const rows = batch.length
     const pos0 = this.position
+    this.gpu.hints = TUNING.renderHints
     this.reserve(pos0 + rows)
     if (!idsOnGpu) {
       this.gpu.write(
