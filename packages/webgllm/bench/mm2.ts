@@ -34,6 +34,12 @@ type Variant = {
   paired?: boolean
   /** Scale folded into each step (no per-block sums held per token). */
   fold?: boolean
+  /**
+   * The zero point taken off each weight before the dots (weights in
+   * -1..1): no per-token activation sums, and no cancellation between two
+   * large sums, so the dots can run in half precision.
+   */
+  centered?: boolean
 }
 
 function kernel(v: Variant) {
@@ -68,6 +74,19 @@ function kernel(v: Variant) {
     }
     // Drop the shared preamble (d and the per-token block sums).
     L.splice(0, 1 + T)
+  } else if (v.weights === "rgba4" && v.centered) {
+    line(`vec4 zc = vec4(8.0 / 15.0);`)
+    for (let j = 0; j < 8; j++) {
+      line(`{`)
+      for (const r of [0, 1, 2, 3])
+        line(`  vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0) - zc.${"xyzw"[r]};`)
+      for (let t = 0; t < T; t++) {
+        line(`  { vec4 a = ${act(String(j), t)};`)
+        line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++) line(`acc${t} += (15.0 * d) * b${t};`)
   } else if (v.weights === "rgba4" && v.paired) {
     // Each h2 texel jj fetched once: features 8jj..8jj+3 (lo), +4..+7 (hi).
     for (let jj = 0; jj < 4; jj++) {
@@ -848,6 +867,65 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
   if (params.batch === 0) return
 }
 
+/**
+ * A plain f16 matmul: weights already dequantized to RGBA16F (texel
+ * (c * uKq + kq, row % uH) holds row's k = 4kq..4kq+3, c = row / uH),
+ * activations RGBA16F (texel (kq, m)). Each fragment: R rows × T tokens,
+ * only dots in the loop; outputs h2 pairs.
+ */
+function pureKernel(R: 4 | 8, T: 4 | 8, half: boolean, unroll = 2, acts: "f16" | "h2" = "f16") {
+  const P = half ? "mediump " : ""
+  const L: Array<string> = []
+  const line = (x: string) => L.push(`    ${x}`)
+  if (acts === "h2")
+    for (let t = 0; t < T; t++)
+      for (let u = 0; u < unroll; u += 2) line(`uvec4 u${t}_${u} = texelFetch(uA, ivec2((kq + ${u}) / 2, m0 + ${t}), 0);`)
+  for (let u = 0; u < unroll; u++) {
+    line(`{ int q = kq + ${u};`)
+    for (let r = 0; r < R; r++) line(`  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + q, wy + ${r}), 0);`)
+    for (let t = 0; t < T; t++) {
+      line(
+        acts === "h2"
+          ? `  { ${P}vec4 a = ${u & 1 ? "h2hi" : "h2lo"}(u${t}_${u & ~1});`
+          : `  { ${P}vec4 a = texelFetch(uA, ivec2(q, m0 + ${t}), 0);`
+      )
+      for (let h = 0; h < R / 4; h++)
+        line(
+          `    acc${t}_${h} += vec4(${[0, 1, 2, 3].map((r) => `dot(w${4 * h + r}, a)`).join(", ")}); }`.replace(/ }$/, h === R / 4 - 1 ? " }" : "")
+        )
+    }
+    line(`}`)
+  }
+  const accs: Array<string> = []
+  for (let t = 0; t < T; t++) for (let h = 0; h < R / 4; h++) accs.push(`acc${t}_${h}`)
+  const vecs = accs
+  const outs: Array<string> = []
+  const writes: Array<string> = []
+  for (let k = 0; k < vecs.length / 2; k++) {
+    outs.push(`layout(location = ${k}) out uvec4 o${k};`)
+    writes.push(`o${k} = packH2(${vecs[2 * k]}, ${vecs[2 * k + 1]});`)
+  }
+  return `${HEADER}
+uniform ${half ? "mediump " : ""}sampler2D uW;
+uniform ${acts === "h2" ? "usampler2D" : `${half ? "mediump " : ""}sampler2D`} uA;
+uniform int uKq;
+uniform int uH;
+${outs.join("\n")}
+void main() {
+  int g = int(gl_FragCoord.x);
+  int m0 = int(gl_FragCoord.y) * ${T};
+  int row = g * ${R};
+  int c = row / uH;
+  int wx = c * uKq;
+  int wy = row - c * uH;
+  ${accs.map((a) => `vec4 ${a} = vec4(0.0);`).join(" ")}
+  for (int kq = 0; kq < uKq; kq += ${unroll}) {
+${L.join("\n")}
+  }
+  ${writes.join("\n  ")}
+}`
+}
+
 async function shapes(gpu: Gpu, batch: number, only?: string) {
   const gl = gpu.gl
   const params = { batch }
@@ -958,8 +1036,25 @@ void main() { o = ${read}; }`)
     const wUnorm8 = randomTexture(gl.RGBA8, blocks * 16, G)
     const scales = gpu.texture(gl.RGBA16F, blocks, G)
     for (const M of [params.batch ?? 512]) {
-      const aF16 = gpu.texture(gl.RGBA16F, K / 4, M)
-      const aH2 = gpu.texture(gl.RGBA32UI, K / 8, M)
+      // Random halves in [0.125, 0.25): no texture is constant.
+      const halves = (n: number) => {
+        const h = new Uint16Array(n)
+        for (let i = 0; i < n; i++) {
+          seed = (seed * 1664525 + 1013904223) >>> 0
+          h[i] = 0x3000 | (seed >>> 22)
+        }
+        return h
+      }
+      const aF16 = gpu.texture(gl.RGBA16F, K / 4, M, {
+        format: gl.RGBA,
+        type: gl.HALF_FLOAT,
+        pixels: halves((K / 4) * M * 4)
+      })
+      const aH2 = gpu.texture(gl.RGBA32UI, K / 8, M, {
+        format: gl.RGBA_INTEGER,
+        type: gl.UNSIGNED_INT,
+        pixels: new Uint32Array(halves((K / 8) * M * 8).buffer)
+      })
       const flops = 2 * N * K * M
       const variants: Array<Variant> =
         M === 1
@@ -973,9 +1068,14 @@ void main() { o = ${read}; }`)
             ]
           : [
               { weights: "rgba4", acts: "h2", tokens: 4 },
-              { weights: "bytes", acts: "h2", tokens: 4 },
-              { weights: "unorm8", acts: "h2", tokens: 4 },
-              { weights: "words", acts: "h2", tokens: 4 }
+              { weights: "rgba4", acts: "f16", tokens: 4 },
+              { weights: "rgba4", acts: "h2", tokens: 4, half: true },
+              { weights: "rgba4", acts: "f16", tokens: 4, half: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, centered: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, centered: true, half: true },
+              { weights: "rgba4", acts: "f16", tokens: 4, centered: true, half: true },
+              { weights: "rgba4", acts: "h2", tokens: 8, centered: true, half: true },
+              { weights: "rgba4", acts: "f16", tokens: 4, half: true, noSum: true }
             ]
       for (const v of variants) {
         const T = v.tokens
@@ -1018,7 +1118,7 @@ void main() { o = ${read}; }`)
           best = Math.min(best, (performance.now() - t0) / n)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}${v.centered ? " centered" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
@@ -1060,6 +1160,54 @@ void main() { o = ${read}; }`)
           `MM2 ${label} ${N}x${K} M=${M} tile ${rows}x${T}${label2}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
+      }
+      if (M > 1) {
+        // Plain f16 matmul on pre-dequantized weights (wrapped at 4096 rows).
+        const H = Math.min(N, 4096)
+        const cols = Math.ceil(N / H)
+        const wF16 = gpu.texture(gl.RGBA16F, cols * (K / 4), H, {
+          format: gl.RGBA,
+          type: gl.HALF_FLOAT,
+          pixels: halves(cols * (K / 4) * H * 4)
+        })
+        for (const [R, T, half, unroll, acts] of [
+          [4, 4, false, 2, "f16"],
+          [4, 4, false, 2, "h2"],
+          [4, 4, true, 2, "f16"],
+          [4, 4, true, 2, "h2"],
+          [4, 8, true, 2, "f16"],
+          [4, 8, true, 2, "h2"],
+          [8, 4, true, 2, "h2"]
+        ] as Array<[4 | 8, 4 | 8, boolean, number, "f16" | "h2"]>) {
+          const count = (R * T) / 8
+          const outs = [0, 1].map(() =>
+            Array.from({ length: count }, () => gpu.texture(gl.RGBA32UI, N / R, M / T))
+          )
+          const program = gpu.program(pureKernel(R, T, half, unroll, acts))
+          const run = (i: number) =>
+            gpu.run({
+              name: "mm",
+              program,
+              inputs: { uW: wF16, uA: acts === "h2" ? aH2 : aF16 },
+              uniforms: { uKq: { int: K / 4 }, uH: { int: H } },
+              output: outs[i % 2]
+            })
+          run(0)
+          run(1)
+          await gpu.finish()
+          let best = Infinity
+          for (let round = 0; round < 3; round++) {
+            const t0 = performance.now()
+            for (let i = 0; i < 10; i++) run(i)
+            await gpu.finish()
+            best = Math.min(best, (performance.now() - t0) / 10)
+          }
+          log(
+            `MM2 ${label} ${N}x${K} M=${M} PURE f16 ${R}x${T}${half ? " half" : ""} acts ${acts}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
+          )
+          for (const set of outs) for (const t of set) gpu.delete(t)
+        }
+        gpu.delete(wF16)
       }
       gpu.delete(aF16)
       gpu.delete(aH2)

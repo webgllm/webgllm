@@ -127,6 +127,13 @@ export const TUNING = {
   scoreTexels: 2048,
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
+  /**
+   * 1: those matmuls dequantize the weights to f16 first, then run a matmul
+   * of nothing but dots (see MATMUL_F16); 0: they dequantize as they read.
+   */
+  f16Matmul: 1,
+  /** 1: the f16 matmul's dots in mediump (faster where it's half precision, less exact). */
+  f16Half: 0,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
   /** ...and at most this many (readers add them up). */
@@ -1215,6 +1222,44 @@ export class Engine {
     return { uPairSplit: { int: p.split }, uSliceStride: { int: p.stride } }
   }
 
+  /**
+   * The f16 prompt matmul's scratch: one matrix's dequantized weights (rows
+   * wrapped into columns uHd tall) and the activations as RGBA16F. Null
+   * until a prompt needs it; false where RGBA16F can't be drawn into.
+   */
+  private f16: { w: Texture; a: Texture; hd: number } | null | false = null
+
+  private f16Scratch() {
+    if (this.f16 !== null) return this.f16
+    if (!this.gpu.canRender([GL.RGBA16F])) return (this.f16 = false)
+    const mats = this.layers
+      .flatMap((l) => [
+        l.conv?.inProj,
+        l.conv?.outProj,
+        l.attention?.qkvg,
+        l.attention?.o,
+        l.gateUp,
+        l.down
+      ])
+      .filter((m): m is GpuMatrix => !!m && m.rgba4)
+    const max = this.gpu.limits.maxTextureSize
+    // The column height that fits every matrix in the least texture.
+    let best: { hd: number; width: number } | null = null
+    for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
+      const width = Math.max(...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4)))
+      if (width <= max && (!best || width * hd < best.width * best.hd))
+        best = { hd, width }
+    }
+    if (!best) return (this.f16 = false)
+    const kMax = Math.max(...mats.map((m) => m.K))
+    this.f16 = {
+      w: this.gpu.texture(GL.RGBA16F, best.width, best.hd),
+      a: this.gpu.texture(GL.RGBA16F, kMax / 4, this.capacity),
+      hd: best.hd
+    }
+    return this.f16
+  }
+
   /** out (a pair tensor) = a · wᵀ for `rows` tokens of h2 activations. */
   private matmul(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
     const bits = w.bits
@@ -1248,9 +1293,68 @@ export class Engine {
         w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
       )
       const slices = Math.ceil(w.blocks / kbSlice)
+      const f = TUNING.f16Matmul > 0 ? this.f16Scratch() : false
+      if (f) {
+        const kq = w.K / 4
+        this.gpu.run({
+          name: "dequant",
+          program: this.gpu.program(K.dequantRgba4({ zeros: !!w.zeros })),
+          inputs: {
+            uW: w.quants,
+            uS: w.scales,
+            ...(w.zeros && { uZ: w.zeros })
+          },
+          uniforms: {
+            uKb: { int: w.blocks },
+            uH: { int: w.rowsPerColumn },
+            uRowTexels: { int: w.rowTexels },
+            uKq: { int: kq },
+            uHd: { int: f.hd },
+            uN: { int: w.N }
+          },
+          output: f.w,
+          rect: {
+            x: 0,
+            y: 0,
+            width: Math.ceil(w.N / f.hd) * kq,
+            height: Math.min(f.hd, w.N)
+          },
+          work: 3
+        })
+        this.gpu.run({
+          name: "dequant",
+          program: this.gpu.program(K.H2_TO_F16),
+          inputs: { uA: a },
+          output: f.a,
+          rect: {
+            x: 0,
+            y: 0,
+            width: kq,
+            height: Math.min(quadRows * 4, f.a.height)
+          }
+        })
+        const kqSlice = kbSlice * 8
+        this.gpu.run({
+          name: "matmul",
+          program: this.gpu.program(K.matmulF16({ half: TUNING.f16Half > 0 })),
+          inputs: { uW: f.w, uA: f.a },
+          uniforms: {
+            uKq: { int: kq },
+            uHd: { int: f.hd },
+            uSliceRows: { int: quadRows },
+            uKqSlice: { int: kqSlice }
+          },
+          output: [out, partner],
+          rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
+          // (Per K texel: 4 rows' weights and 4 tokens' activations.)
+          work: kqSlice * 8
+        })
+        this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
+        return
+      }
       this.gpu.run({
         name: "matmul",
-        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
+        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros, half: this.precision === "mediump" })),
         inputs: weights,
         uniforms: {
           ...shape,

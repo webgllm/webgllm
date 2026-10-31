@@ -335,7 +335,10 @@ ${L.join("\n")}
  * to output 0 and 4q + 2, 4q + 3 to output 1, as pair texels, at row
  * s · uSliceRows + q for K-slice s (pfq reads them).
  */
-function matmulQuadSource(o: { zeros: boolean }) {
+function matmulQuadSource(o: { zeros: boolean; half?: boolean }) {
+  // Half: each block's dots and sums in mediump (full rate on GPUs with
+  // half-precision ALUs); the scaled block results add up in highp.
+  const P = o.half ? "mediump " : ""
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -345,16 +348,16 @@ function matmulQuadSource(o: { zeros: boolean }) {
       : `const vec4 z = vec4(8.0);`
   )
   line(
-    `vec4 b0 = vec4(0.0); vec4 b1 = vec4(0.0); vec4 b2 = vec4(0.0); vec4 b3 = vec4(0.0);`
+    `${P}vec4 b0 = vec4(0.0); ${P}vec4 b1 = vec4(0.0); ${P}vec4 b2 = vec4(0.0); ${P}vec4 b3 = vec4(0.0);`
   )
-  line(`float s0 = 0.0; float s1 = 0.0; float s2 = 0.0; float s3 = 0.0;`)
+  line(`${P}float s0 = 0.0; ${P}float s1 = 0.0; ${P}float s2 = 0.0; ${P}float s3 = 0.0;`)
   for (let j = 0; j < 8; j++) {
     line(`{`)
     for (const r of [0, 1, 2, 3])
-      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
+      line(`  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
     const half = j & 1 ? "h2hi" : "h2lo"
     for (const t of [0, 1, 2, 3]) {
-      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`  { ${P}vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
       line(`    s${t} += dot(a, vec4(1.0));`)
       line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
     }
@@ -390,6 +393,106 @@ void main() {
   vec4 acc3 = vec4(0.0);
   for (int kb = kb0; kb < kb1; kb++) {
 ${L.join("\n")}
+  }
+  o0 = packH2(acc0, acc1);
+  o1 = packH2(acc2, acc3);
+}`
+}
+
+/**
+ * RGBA4 weights (see matmulQuad's layout) dequantized to f16 for the f16
+ * prompt matmul: texel (c · uKq + kq, y) holds row c · uHd + y's weights
+ * 4kq .. 4kq + 3, (q − zero) · scale. Rows past the matrix are zero.
+ */
+function dequantRgba4Source(o: { zeros: boolean }) {
+  return `${HEADER}
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  vec4 w = texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0);
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  float z = ${o.zeros ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))" : "8.0"};
+  o = (15.0 * w - z) * d;
+}`
+}
+
+/** h2 activations (8 halves a texel) as RGBA16F (4 a texel), for the f16 matmul. */
+export const H2_TO_F16 = `${HEADER}
+uniform usampler2D uA;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  uvec4 u = texelFetch(uA, ivec2(x / 2, int(gl_FragCoord.y)), 0);
+  o = (x & 1) == 1 ? h2hi(u) : h2lo(u);
+}`
+
+/**
+ * The prompt matmul on f16 weights (DEQUANT_RGBA4's layout) and RGBA16F
+ * activations: 4 rows × 4 tokens per fragment, nothing but dots in the
+ * loop; with `half`, each dot in mediump (full rate where the GPU has
+ * half-precision ALUs), added up in highp. Output as matmulQuad's: tokens 4q, 4q + 1 to o0
+ * and 4q + 2, 4q + 3 to o1, at row s · uSliceRows + q for K-slice s.
+ */
+function matmulF16Source(o: { half: boolean }) {
+  const P = o.half ? "mediump " : ""
+  return `${HEADER}
+uniform ${P}sampler2D uW;
+uniform ${P}sampler2D uA;
+uniform int uKq;
+uniform int uHd;
+uniform int uSliceRows;
+uniform int uKqSlice;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out uvec4 o1;
+void main() {
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 4 * (y - slice * uSliceRows);
+  int row = 4 * g;
+  int c = row / uHd;
+  int wx = c * uKq;
+  int wy = row - c * uHd;
+  int kq0 = slice * uKqSlice;
+  int kq1 = min(uKq, kq0 + uKqSlice);
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  vec4 acc2 = vec4(0.0);
+  vec4 acc3 = vec4(0.0);
+  for (int kq = kq0; kq < kq1; kq++) {
+    ${P}vec4 w0 = texelFetch(uW, ivec2(wx + kq, wy), 0);
+    ${P}vec4 w1 = texelFetch(uW, ivec2(wx + kq, wy + 1), 0);
+    ${P}vec4 w2 = texelFetch(uW, ivec2(wx + kq, wy + 2), 0);
+    ${P}vec4 w3 = texelFetch(uW, ivec2(wx + kq, wy + 3), 0);
+    ${P}vec4 a;
+    a = texelFetch(uA, ivec2(kq, m0), 0);
+    acc0 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 1), 0);
+    acc1 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 2), 0);
+    acc2 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 3), 0);
+    acc3 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
   }
   o0 = packH2(acc0, acc1);
   o1 = packH2(acc2, acc3);
@@ -2032,6 +2135,8 @@ export function withSplit(source: string, split: number) {
 }
 
 export const matmulQuad = memo(matmulQuadSource)
+export const dequantRgba4 = memo(dequantRgba4Source)
+export const matmulF16 = memo(matmulF16Source)
 
 const quadCache = new Map<string, Map<string, string>>()
 /**
