@@ -69,10 +69,14 @@ function resolve(url) {
 
 /** `/bundle/src/worker.js` → packages/webgl/src/worker.ts, bundled. */
 async function bundle(path, res) {
+  // /bundle-tjs/… is the transformers-js package's source, for comparisons.
+  const base = path.startsWith("/bundle-tjs/")
+    ? join(repo, "packages/transformers-js")
+    : pkg
   const entry = normalize(
-    join(pkg, path.replace(/^\/bundle\//, "").replace(/\.js$/, ".ts"))
+    join(base, path.replace(/^\/bundle(-tjs)?\//, "").replace(/\.js$/, ".ts"))
   )
-  if (!entry.startsWith(pkg)) return res.writeHead(404, isolation).end()
+  if (!entry.startsWith(base)) return res.writeHead(404, isolation).end()
   try {
     const out = await build({
       entryPoints: [entry],
@@ -94,7 +98,10 @@ async function bundle(path, res) {
 
 createServer((req, res) => {
   const path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)
-  if (req.method === "GET" && path.startsWith("/bundle/"))
+  if (
+    req.method === "GET" &&
+    (path.startsWith("/bundle/") || path.startsWith("/bundle-tjs/"))
+  )
     return void bundle(path, res)
   if (req.method === "POST") {
     let body = ""
