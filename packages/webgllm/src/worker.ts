@@ -241,12 +241,6 @@ async function load(
     lap("weights")
     timings.weightsReading = Math.round(engine.loadMs.reading)
     timings.weightsUploading = Math.round(engine.loadMs.uploading)
-    // Ready as far as the page can tell: the shaders compile and the self-
-    // check runs next (seconds on a phone's first load of new code) while
-    // the person reads or types. A request now waits for them (it awaits
-    // this load), so it's only ever later than it would be, not wrong.
-    if (!signal.aborted)
-      post({ type: "ready", model, timings: { ...timings, readyAt: Math.round(performance.now() - t0) } })
     timings.toRgba4 = Math.round(engine.loadMs.convert)
     timings.repackOnnx = Math.round(repackTime.ms)
     repackTime.ms = 0
