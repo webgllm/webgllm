@@ -3,6 +3,7 @@
  * forward pass a batch of tokens at a time, keeping the attention cache and
  * the convolutions' state on the GPU between calls.
  */
+import { attentionError } from "./attention-check.js"
 import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
@@ -150,6 +151,8 @@ export const TUNING = {
   draftMatch: 2,
   draftMinKept: 0.75,
   guessDrafts: 0,
+  /** Queries per scores slice (0: from the batch size; see scoreRows). */
+  scoreRows: 0,
   /** 1: few-row conv blocks draw their output and new state in one pass. */
   fuseConv: 1,
   /**
@@ -568,6 +571,7 @@ export class Engine {
 
   /** Queries of each head per attention slice: a quarter of a batch, 32 to 128. */
   private scoreRows() {
+    if (TUNING.scoreRows > 0) return TUNING.scoreRows
     return Math.min(SCORE_ROWS_LARGE, Math.max(SCORE_ROWS, this.baseBatch / 4))
   }
 
@@ -646,7 +650,13 @@ export class Engine {
     if (this.group) return this.group
     const c = this.config
     const group = c.numHeads / c.numKvHeads
-    let G = Math.min(group, Math.floor(this.gpu.limits.maxDrawBuffers / 3))
+    // (The combine reads 3 textures a member plus up to 4 of the q|k|v|gate
+    // projection's: within the GPU's texture units.)
+    let G = Math.min(
+      group,
+      Math.floor(this.gpu.limits.maxDrawBuffers / 3),
+      Math.floor((this.gpu.limits.maxTextureUnits - 4) / 3)
+    )
     while (
       G > 1 &&
       (!this.mrt.chunks ||
@@ -1112,6 +1122,32 @@ export class Engine {
         this.reset()
       }
     }
+  }
+
+  /**
+   * Attention on this GPU against the CPU's (see attentionError): a short
+   * prompt read as usual, then with chunked attention forced on. Returns
+   * the largest relative error (about 2e-4 where the GPU gets it right).
+   */
+  async selfCheck() {
+    const tokens = Array.from(
+      { length: 40 },
+      (_, i) => (i * 7919 + 13) % this.config.vocabSize
+    )
+    let worst = await attentionError(this, tokens)
+    if (TUNING.attendChunkTexels > 0) {
+      const saved = TUNING.attendChunkTexels
+      const savedDecode = TUNING.attendChunkTexelsDecode
+      TUNING.attendChunkTexels = 1
+      TUNING.attendChunkTexelsDecode = 1
+      try {
+        worst = Math.max(worst, await attentionError(this, tokens.slice(0, 24)))
+      } finally {
+        TUNING.attendChunkTexels = saved
+        TUNING.attendChunkTexelsDecode = savedDecode
+      }
+    }
+    return worst
   }
 
   /**
@@ -2599,8 +2635,10 @@ export class Engine {
         if (probe && !layer.attention.ring && keys <= 2 ** this.kvShift) {
           await probe(i, "kv", async () => {
             const width = (2 * kvDims) / 4
-            if (this.kvDebug?.width !== width || this.kvDebug.height < keys)
+            if (this.kvDebug?.width !== width || this.kvDebug.height < keys) {
+              if (this.kvDebug) this.gpu.delete(this.kvDebug)
               this.kvDebug = this.f32(2 * kvDims, Math.max(keys, this.capacity))
+            }
             this.gpu.run({
               program: this.gpu.program(K.H2_TO_F32),
               inputs: { uX: kvCache },

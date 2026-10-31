@@ -22,9 +22,17 @@ precision highp isampler2D;
 /* Halves of an h2 texel: elements 0..3 and 4..7. */
 vec4 h2lo(uvec4 u) { return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); }
 vec4 h2hi(uvec4 u) { return vec4(unpackHalf2x16(u.z), unpackHalf2x16(u.w)); }
+/* Clamped to half's range: overflow saturates alike on every GPU (the spec
+   leaves packHalf2x16 of a too-large value to the implementation). */
 uvec4 packH2(vec4 a, vec4 b) {
+  a = clamp(a, -65504.0, 65504.0);
+  b = clamp(b, -65504.0, 65504.0);
   return uvec4(packHalf2x16(a.xy), packHalf2x16(a.zw), packHalf2x16(b.xy), packHalf2x16(b.zw));
 }
+/* Component i of v, as a select: some compilers get v[i] wrong when i
+   varies by fragment. */
+float comp(vec4 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+uint comp(uvec4 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
 /* Texel x (features 4x..4x+3) of token m in a pair tensor. */
 uniform int uPairSplit;
 uniform int uSliceStride;
@@ -571,7 +579,7 @@ ${L.join("\n")}
  */
 function embedFoldSource(o: { zeros: boolean; part: "values" | "rms" | "scaled" }) {
   const zero = o.zeros
-    ? "float(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0)[r])"
+    ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))"
     : "8.0"
   const main =
     o.part === "values"
@@ -616,7 +624,7 @@ vec4 embedTexel(int x, int y) {
   int c = x * 4;
   int kb = c >> 5;
   int j = c & 31;
-  float d = texelFetch(uS, ivec2(col * uKb + kb, gr), 0)[r];
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
   vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0) + 0.5);
   return d * (q - ${zero});
 }
@@ -683,7 +691,7 @@ function embedSource(o: {
   rgba4?: boolean
 }) {
   const zero = o.zeros
-    ? "float(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0)[r])"
+    ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))"
     : "8.0"
   let fetch: string
   if (o.rgba4) {
@@ -698,7 +706,7 @@ function embedSource(o: {
   o = d * (q - ${zero});`
   } else if (o.bits === 4) {
     fetch = `uvec4 t = texelFetch(uW, ivec2(col * uRowTexels + kb * 4 + r, gr), 0);
-  uint word = j < 16 ? t[j >> 2] : t[(j - 16) >> 2];
+  uint word = comp(t, j < 16 ? j >> 2 : (j - 16) >> 2);
   uvec4 shifts = j < 16 ? uvec4(0u, 8u, 16u, 24u) : uvec4(4u, 12u, 20u, 28u);
   vec4 q = vec4((uvec4(word) >> shifts) & 15u);
   o = d * (q - ${zero});`
@@ -706,7 +714,7 @@ function embedSource(o: {
     fetch = `o = d * vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0));`
   } else {
     fetch = `uvec4 t = texelFetch(uW, ivec2(col * uRowTexels + kb * 8 + r * 2 + (j >> 4), gr), 0);
-  uint word = t[(j & 15) >> 2];
+  uint word = comp(t, (j & 15) >> 2);
   vec4 q = vec4(ivec4(uvec4(word) << uvec4(24u, 16u, 8u, 0u)) >> 24);
   o = d * q;`
   }
@@ -730,7 +738,7 @@ void main() {
   int c = x * 4;
   int kb = c >> 5;
   int j = c & 31;
-  float d = texelFetch(uS, ivec2(col * uKb + kb, gr), 0)[r];
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
   ${fetch}
 }`
 }
@@ -1347,6 +1355,10 @@ void main() {
     l4 += e0 + e1;
     ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
     ivec4 j1 = j0 + 4;
+    // Zero-weighted lanes past the last key read the last key's row, not
+    // rows that may be unwritten or outside the cache (0 · NaN is NaN).
+    j0 = min(j0, ivec4(uJ0 + uKeys - 1));
+    j1 = min(j1, ivec4(uJ0 + uKeys - 1));
     if (uRing > 0) {
       j0 = j0 - (j0 / uRing) * uRing;
       j1 = j1 - (j1 / uRing) * uRing;
@@ -1369,7 +1381,7 @@ void main() {
   float l = dot(l4, vec4(1.0));
   ${
     gate
-      ? `float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
+      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
   float scale = 1.0 / (l * (1.0 + exp(-gate)));`
       : "float scale = 1.0 / l;"
   }
@@ -1476,6 +1488,10 @@ ${
     l0 += e0 + e1;
     ivec4 j0 = sj0 + 4 * i + ivec4(0, 1, 2, 3);
     ivec4 j1 = j0 + 4;
+    // Zero-weighted lanes past the last key read the last key's row, not
+    // rows that may be unwritten or outside the cache (0 · NaN is NaN).
+    j0 = min(j0, ivec4(uJ0 + uKeys - 1));
+    j1 = min(j1, ivec4(uJ0 + uKeys - 1));
     if (uRing > 0) {
       j0 = j0 - (j0 / uRing) * uRing;
       j1 = j1 - (j1 / uRing) * uRing;
@@ -1499,7 +1515,7 @@ ${
   // -1e30, so exp(score - max) is exp(0) = 1 for masked keys; its weights
   // are zeroed below.)
   for (int i = t0; i < t1; i++) {
-    ivec4 j0 = sj0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j0 = min(sj0 + 4 * i + ivec4(0, 1, 2, 3), ivec4(uJ0 + uKeys - 1));
     if (uRing > 0) j0 = j0 - (j0 / uRing) * uRing;
     uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
     uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
@@ -1581,7 +1597,7 @@ void main() {
   }
   ${
     gate
-      ? `float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
+      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
   float scale = 1.0 / (l * (1.0 + exp(-gate)));`
       : "float scale = 1.0 / l;"
   }
@@ -1790,7 +1806,8 @@ void main() {
   for (int t = 0; t < 64; t++) {
     vec4 v = chunkTexel(best, t, uRow);
     for (int c = 0; c < 4; c++) {
-      if (v[c] > b) { b = v[c]; at = 4 * t + c; }
+      float vc = comp(v, c);
+      if (vc > b) { b = vc; at = 4 * t + c; }
     }
   }
   o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
@@ -1953,8 +1970,8 @@ void main() {
   vec4 low = grp < 2 ? lo : hi;
   vec4 high = grp == 0 ? h0 : grp == 1 ? h1 : grp == 2 ? h2 : h3;
   int k = 8 * n + (w >> 2) + 2 * grp;
-  float sc = sc8(float(texelFetch(uW, ivec2(t0 + 48 + (k >> 2), gr), 0)[k & 3]));
-  float d = texelFetch(uS, ivec2(col * uKb + sb, gr), 0)[r];
+  float sc = sc8(float(comp(texelFetch(uW, ivec2(t0 + 48 + (k >> 2), gr), 0), k & 3)));
+  float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
   o = (d * sc) * (low + 16.0 * high - 32.0);
 }`
 

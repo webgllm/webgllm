@@ -95,12 +95,6 @@ function post(message: WorkerRequest) {
     worker.onmessage = handleMessage
     worker.onerror = (event) =>
       failWorker(event.message || "The model's worker stopped.")
-    // Workers can't see touch points; iPads (Mac user agent) need them to
-    // get phone-size batches.
-    worker.postMessage({
-      type: "device",
-      touchPoints: navigator.maxTouchPoints || 0
-    })
   }
   worker.postMessage(message)
 }

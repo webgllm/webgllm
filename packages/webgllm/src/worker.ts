@@ -69,23 +69,16 @@ const DEFAULT_MAX_TOKENS = 4096
 /** Below this much room for a reply, the chat is too long to answer. */
 const MIN_REPLY_TOKENS = 32
 
-/** Drops an engine's GPU memory now rather than whenever it's collected. */
-const release = (engine: Engine) =>
-  engine.gpu.gl.getExtension("WEBGL_lose_context")?.loseContext()
-
-/** The page's touch points (sent by the client: a worker can't read them). */
-let touchPoints = 0
+/** Frees an engine's GPU memory now (see Gpu.dispose). */
+const release = (engine: Engine) => engine.gpu.dispose()
 
 /**
- * Prompt tokens per forward batch (the engine scales it up for smaller
- * models). A big GPU needs big batches to stay busy; phones and tablets
- * keep small ones, for memory (iOS caps a page's GPU memory). iPads report
- * a Mac's user agent: touch points give them away.
+ * Prompt tokens per forward batch, the same on every device (the engine
+ * scales it up for smaller models): bigger batches read prompts faster on
+ * every GPU tried (2.4× on a Mac, 15% on a Pixel than 128), for ~170 MiB
+ * more buffers with LFM3.
  */
-const promptBatch = () =>
-  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) || touchPoints > 1
-    ? 128
-    : 512
+const PROMPT_BATCH = 512
 
 class Superseded extends Error {
   constructor() {
@@ -153,15 +146,21 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
   }
 }
 
+/** Attention's largest relative error the self-check passes (right: ~2e-4). */
+const SELF_CHECK_MAX = 1e-2
+
 async function load(
   model: WebGlTextModel,
-  signal: AbortSignal
+  signal: AbortSignal,
+  /** Without multiple render targets: after a failed self-check. */
+  plain = false
 ): Promise<Loaded> {
   const meta = modelMeta(model)
   // The GPU first: a browser or GPU that can't run the model says so before
   // a gigabyte downloads.
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    batchSize: promptBatch()
+    batchSize: PROMPT_BATCH,
+    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
   })
   try {
     // Before a gigabyte downloads: the weight textures' width.
@@ -221,6 +220,19 @@ async function load(
     if (signal.aborted) throw new Superseded()
     await engine.warmUp()
     if (signal.aborted) throw new Superseded()
+    // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
+    // tries again with the simplest passes, then says so (not gibberish).
+    const error = await engine.selfCheck()
+    if (signal.aborted) throw new Superseded()
+    if (!(error <= SELF_CHECK_MAX)) {
+      if (plain) {
+        throw new GpuError(
+          `This GPU computes attention wrong (relative error ${error.toExponential(1)}).`
+        )
+      }
+      release(engine)
+      return await load(model, signal, true)
+    }
     return { model, engine, tokenizer, cached: [] }
   } catch (error) {
     // A failed or superseded load frees its textures now.
@@ -539,9 +551,7 @@ async function generate(request: GenerateRequest) {
 let queue: Promise<void> = Promise.resolve()
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type === "device") {
-    touchPoints = data.touchPoints
-  } else if (data.type === "tune") {
+  if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
     void startLoad(data.model).catch(() => undefined)

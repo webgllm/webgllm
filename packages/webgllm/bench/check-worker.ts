@@ -914,6 +914,12 @@ async function smoke(params: {
   await engine.forward(prompt.slice(0, 8))
   await engine.forward(prompt.slice(8, 9))
   engine.reset()
+  {
+    // The worker's load-time check (see Engine.selfCheck).
+    const t = performance.now()
+    const error = await engine.selfCheck()
+    log(`SELF CHECK: attention relative error ${error.toExponential(2)} in ${(performance.now() - t).toFixed(0)} ms`)
+  }
   // As the worker does it: candidates picked on the GPU (top 50, penalty
   // 1.1), the likeliest drawn (greedy, for a repeatable reply).
   const pick = async (row: number) => {

@@ -10,6 +10,8 @@
 export type GpuLimits = {
   maxTextureSize: number
   maxDrawBuffers: number
+  /** Textures a pass can read (MAX_TEXTURE_IMAGE_UNITS: at least 16). */
+  maxTextureUnits: number
   renderer: string
 }
 
@@ -160,6 +162,7 @@ export class Gpu {
     this.limits = {
       maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE) as number,
       maxDrawBuffers: gl.getParameter(gl.MAX_DRAW_BUFFERS) as number,
+      maxTextureUnits: gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS) as number,
       renderer: String(
         debug
           ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL)
@@ -204,8 +207,11 @@ export class Gpu {
     const program = gl.createProgram()
     if (!program) throw new GpuError("Couldn't create a program.")
     gl.attachShader(program, this.vertexShader)
-    gl.attachShader(program, this.shader(gl.FRAGMENT_SHADER, source))
+    const fragment = this.shader(gl.FRAGMENT_SHADER, source)
+    gl.attachShader(program, fragment)
     gl.linkProgram(program)
+    // (Flagged for deletion: freed with the program.)
+    gl.deleteShader(fragment)
     if (
       !gl.getProgramParameter(program, gl.LINK_STATUS) &&
       !gl.isContextLost()
@@ -282,7 +288,35 @@ export class Gpu {
     }
     const bytes = width * height * (TEXEL_BYTES[internal] ?? 16)
     this.bytes += bytes
-    return { id: this.nextId++, tex, width, height, internal, bytes }
+    const texture = { id: this.nextId++, tex, width, height, internal, bytes }
+    this.live.add(texture)
+    return texture
+  }
+
+  /** Textures made and not yet deleted (for dispose). */
+  private live = new Set<Texture>()
+
+  /**
+   * Frees everything this context holds, now: every texture, framebuffer
+   * and program deleted and the deletes finished, then the context lost.
+   * (Losing the context alone leaves the memory to the browser's own
+   * timing: a page that loads another model at once can hold both.)
+   */
+  dispose() {
+    const gl = this.gl
+    if (!gl.isContextLost()) {
+      for (const t of [...this.live]) this.delete(t)
+      for (const fb of this.framebuffers.values()) gl.deleteFramebuffer(fb)
+      this.framebuffers.clear()
+      for (const p of this.programs.values()) gl.deleteProgram(p.program)
+      this.programs.clear()
+      gl.deleteShader(this.vertexShader)
+      for (const fence of this.paced) gl.deleteSync(fence)
+      gl.finish()
+    }
+    this.lastOutput = null
+    this.paced.length = 0
+    gl.getExtension("WEBGL_lose_context")?.loseContext()
   }
 
   /** Writes `pixels` into a rectangle of a texture. */
@@ -317,18 +351,57 @@ export class Gpu {
     const count = internals.length
     if (count > this.limits.maxDrawBuffers) return false
     if (count > (gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) as number)) return false
+    const integer = (internal: number) =>
+      internal === GL.RGBA32UI || internal === GL.R32UI || internal === GL.R8UI
     const textures = internals.map((internal) => this.texture(internal, 1, 1))
-    const fb = gl.createFramebuffer()
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
-    textures.forEach((t, i) =>
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t.tex, 0)
-    )
-    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-    this.boundFb = null
-    gl.deleteFramebuffer(fb)
-    textures.forEach((t) => this.delete(t))
-    return ok
+    try {
+      // Drawn and read back, not just "complete": some drivers accept a
+      // framebuffer they then draw wrong. Target i gets (i + 1, 2, 3, 4).
+      const outs = internals
+        .map((internal, i) =>
+          integer(internal)
+            ? `layout(location = ${i}) out uvec4 o${i};`
+            : `layout(location = ${i}) out vec4 o${i};`
+        )
+        .join("\n")
+      const sets = internals
+        .map((internal, i) =>
+          integer(internal)
+            ? `o${i} = uvec4(${i + 1}u, 2u, 3u, 4u);`
+            : `o${i} = vec4(${i + 1}.0, 2.0, 3.0, 4.0);`
+        )
+        .join(" ")
+      const program = this.program(
+        `#version 300 es\nprecision highp float;\n${outs}\nvoid main() { ${sets} }`
+      )
+      this.run({
+        program,
+        inputs: {},
+        output: count === 1 ? textures[0] : textures,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer(count === 1 ? textures[0] : textures))
+      let ok = true
+      internals.forEach((internal, i) => {
+        gl.readBuffer(gl.COLOR_ATTACHMENT0 + i)
+        const got = integer(internal) ? new Uint32Array(4) : new Float32Array(4)
+        if (integer(internal))
+          gl.readPixels(0, 0, 1, 1, gl.RGBA_INTEGER, gl.UNSIGNED_INT, got)
+        else gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, got)
+        // (Single-channel formats read back their first channel only.)
+        const channels = internal === GL.R32UI || internal === GL.R8UI ? 1 : 4
+        for (let c = 0; c < channels; c++)
+          if (got[c] !== (c === 0 ? i + 1 : c + 1)) ok = false
+      })
+      gl.readBuffer(gl.COLOR_ATTACHMENT0)
+      return ok && gl.getError() === gl.NO_ERROR
+    } catch {
+      return false
+    } finally {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      this.boundFb = null
+      textures.forEach((t) => this.delete(t))
+    }
   }
 
   /** Whether the GPU has run out of memory (a texture it couldn't make). */
@@ -348,7 +421,9 @@ export class Gpu {
       }
     }
     this.gl.deleteTexture(texture.tex)
+    this.live.delete(texture)
     this.bytes -= texture.bytes
+    if (this.lastOutput === texture) this.lastOutput = null
   }
 
   private framebuffer(output: Texture | Array<Texture>) {
@@ -395,6 +470,11 @@ export class Gpu {
     const gl = this.gl
     const { program } = pass
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
+    if (program.samplers.length > this.limits.maxTextureUnits) {
+      throw new GpuError(
+        `This GPU reads ${this.limits.maxTextureUnits} textures in a pass; one needs ${program.samplers.length}.`
+      )
+    }
     this.lastOutput = outputs[0]
     gl.useProgram(program.program)
     let unit = 0
@@ -515,8 +595,12 @@ export class Gpu {
   /** Reads a pixel of the last pass's output: returns once the GPU has done it. */
   private readBack() {
     const t = this.lastOutput
-    if (!t || this.isLost) return
+    if (this.isLost) return
     const gl = this.gl
+    if (!t) {
+      gl.finish()
+      return
+    }
     const float = t.internal === gl.RGBA32F || t.internal === gl.RGBA16F
     const fb = this.framebuffer(t)
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb)

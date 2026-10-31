@@ -231,6 +231,60 @@ async function runWebgl(text: string) {
   worker.terminate()
 }
 
+/**
+ * ?run=switch: one worker switching between the 350M and LFM3 a few times,
+ * a short reply after each load, as the app does when you pick another
+ * model (each switch must free the last model's GPU memory first).
+ */
+async function runSwitch() {
+  const worker = new Worker("/bundle/src/worker.js", { type: "module" })
+  const models = (params.get("models") ?? "LiquidAI/LFM2.5-350M-ONNX,onnx-community/LFM3-1.7B-ONNX").split(",")
+  const rounds = Number(params.get("rounds") ?? 5)
+  let settle: { resolve: () => void; reject: (e: Error) => void } | null = null
+  // What the current step waits for: a model's "ready" or a reply's "done".
+  let awaiting = ""
+  let reply = ""
+  worker.onmessage = ({ data }) => {
+    if (data.type === "token") reply += data.text
+    else if (data.type === "ready" && data.model === awaiting) settle?.resolve()
+    else if (data.type === "done" && data.id === awaiting) settle?.resolve()
+    else if (data.type === "load-error" || data.type === "error")
+      settle?.reject(new Error(data.message))
+  }
+  worker.onerror = (e) => settle?.reject(new Error(e.message || "worker error"))
+  const wait = () =>
+    new Promise<void>((resolve, reject) => {
+      settle = { resolve, reject }
+    })
+  for (let i = 0; i < rounds; i++) {
+    const model = models[i % models.length]
+    const t0 = performance.now()
+    awaiting = model
+    const loaded = wait()
+    worker.postMessage({ type: "load", model })
+    await loaded
+    const loadS = (performance.now() - t0) / 1000
+    reply = ""
+    awaiting = `switch${i}`
+    const done = wait()
+    worker.postMessage({
+      type: "generate",
+      id: `switch${i}`,
+      model,
+      chat: [{ role: "user", content: "What is the capital of France? One sentence." }],
+      tools: [],
+      thinking: false,
+      sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
+      maxTokens: 24
+    })
+    await done
+    log(
+      `SWITCH ${i + 1}/${rounds}: ${model} loaded in ${loadS.toFixed(1)} s, replied in ${((performance.now() - t0) / 1000 - loadS).toFixed(1)} s: ${JSON.stringify(reply.slice(0, 80))}`
+    )
+  }
+  worker.terminate()
+}
+
 /** wllama (llama.cpp in WebAssembly) with every layer offloaded to WebGPU. */
 async function runWllama(text: string, gpu = true) {
   const url = "/wllama/index.js"
@@ -310,6 +364,7 @@ async function main() {
   else if (run === "wllama") await runWllama(text)
   else if (run === "wllama-cpu") await runWllama(text, false)
   else if (run === "webgl") await runWebgl(text)
+  else if (run === "switch") await runSwitch()
   else log("Pass ?run=tjs, tjs-cpu, wllama or wllama-cpu.")
 }
 
