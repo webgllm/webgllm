@@ -220,10 +220,29 @@ export class Gpu {
     return shader
   }
 
+  /** Programs compiled, and the slowest ones' milliseconds by a source prefix (load profiling). */
+  compiled = { count: 0, ms: 0, slowest: [] as Array<[number, string]> }
+
   /** A fragment shader's program, compiled once per source. */
   program(source: string): Program {
     const cached = this.programs.get(source)
     if (cached) return cached
+    const started = performance.now()
+    try {
+      return this.compile(source)
+    } finally {
+      const ms = performance.now() - started
+      this.compiled.count++
+      this.compiled.ms += ms
+      // A source's first line after the header, to tell kernels apart.
+      const tag = source.split("\n").find((l) => l.startsWith("uniform")) ?? ""
+      this.compiled.slowest.push([Math.round(ms), `${tag.slice(0, 40)} ${source.length}`])
+      this.compiled.slowest.sort((a, b) => b[0] - a[0])
+      this.compiled.slowest.length = Math.min(this.compiled.slowest.length, 8)
+    }
+  }
+
+  private compile(source: string): Program {
     const gl = this.gl
     const program = gl.createProgram()
     if (!program) throw new GpuError("Couldn't create a program.")
@@ -233,6 +252,14 @@ export class Gpu {
     gl.linkProgram(program)
     // (Flagged for deletion: freed with the program.)
     gl.deleteShader(fragment)
+    const entry = { program, uniforms: new Map(), samplers: this.linked(program) }
+    this.programs.set(source, entry)
+    return entry
+  }
+
+  /** A linked program's samplers (throws if it didn't link). */
+  private linked(program: WebGLProgram): Array<string> {
+    const gl = this.gl
     if (
       !gl.getProgramParameter(program, gl.LINK_STATUS) &&
       !gl.isContextLost()
@@ -255,9 +282,7 @@ export class Gpu {
         samplers.push(info.name)
       }
     }
-    const entry = { program, uniforms: new Map(), samplers }
-    this.programs.set(source, entry)
-    return entry
+    return samplers
   }
 
   private uniform(p: Program, name: string) {

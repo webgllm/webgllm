@@ -27,6 +27,7 @@
       const out = document.getElementById("out")
       const log = (text) => {
         out.textContent += `${text}\n`
+        void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
       }
       log(navigator.userAgent)
       log(`OffscreenCanvas: ${typeof OffscreenCanvas !== "undefined"}`)
