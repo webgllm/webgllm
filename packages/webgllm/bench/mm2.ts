@@ -23,11 +23,17 @@ uvec4 packH2(vec4 a, vec4 b) {
 `
 
 type Variant = {
-  weights: "rgba4" | "bytes" | "words"
+  weights: "rgba4" | "bytes" | "words" | "unorm8"
   acts: "f16" | "h2"
   tokens: 1 | 2 | 4 | 8
   /** Weights, activations and block sums as mediump (half precision on Metal?). */
   half?: boolean
+  /** Timing only: skip the activation sums (wrong results). */
+  noSum?: boolean
+  /** Fetch each h2 activation texel once for both its halves. */
+  paired?: boolean
+  /** Scale folded into each step (no per-block sums held per token). */
+  fold?: boolean
 }
 
 function kernel(v: Variant) {
@@ -41,7 +47,49 @@ function kernel(v: Variant) {
     v.acts === "f16"
       ? `texelFetch(uA, ivec2(kb * 8 + ${j}, m0 + ${t}), 0)`
       : `h2pick(texelFetch(uA, ivec2(kb * 4 + (${j}) / 2, m0 + ${t}), 0), (${j}) & 1)`
-  if (v.weights === "rgba4") {
+  if (v.weights === "rgba4" && v.fold) {
+    // Per block: the scale times 15 up front; each step adds straight into
+    // the accumulators, so no per-token block sums are held.
+    {
+      line(`vec4 d15 = 15.0 * texelFetch(uS, ivec2(kb, g), 0);`)
+      for (let t = 0; t < T; t++) line(`float s${t} = 0.0;`)
+      for (let j = 0; j < 8; j++) {
+        line(`{`)
+        for (const r of [0, 1, 2, 3])
+          line(`  vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0);`)
+        for (let t = 0; t < T; t++) {
+          line(`  { vec4 a = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+          line(`    s${t} += dot(a, vec4(1.0));`)
+          line(`    acc${t} += d15 * vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+        }
+        line(`}`)
+      }
+      for (let t = 0; t < T; t++) line(`acc${t} -= (8.0 / 15.0) * d15 * s${t};`)
+    }
+    // Drop the shared preamble (d and the per-token block sums).
+    L.splice(0, 1 + T)
+  } else if (v.weights === "rgba4" && v.paired) {
+    // Each h2 texel jj fetched once: features 8jj..8jj+3 (lo), +4..+7 (hi).
+    for (let jj = 0; jj < 4; jj++) {
+      line(`{`)
+      for (let t = 0; t < T; t++)
+        line(`  uvec4 u${t} = texelFetch(uA, ivec2(kb * 4 + ${jj}, m0 + ${t}), 0);`)
+      for (const half of [0, 1]) {
+        const j = 2 * jj + half
+        line(`  {`)
+        for (const r of [0, 1, 2, 3])
+          line(`    vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0);`)
+        for (let t = 0; t < T; t++) {
+          line(`    { vec4 a = ${half ? "h2hi" : "h2lo"}(u${t});`)
+          line(`      s${t} += dot(a, vec4(1.0));`)
+          line(`      b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+        }
+        line(`  }`)
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * s${t});`)
+  } else if (v.weights === "rgba4") {
     // Texel (kb * 32 + r * 8 + j, g): row r, weights 4j..4j+3 (q / 15).
     for (let j = 0; j < 8; j++) {
       line(`{`)
@@ -55,6 +103,28 @@ function kernel(v: Variant) {
       line(`}`)
     }
     for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * s${t});`)
+  } else if (v.weights === "unorm8") {
+    // RGBA8 texel (kb * 16 + r * 4 + w, g), read as floats: bytes of weights
+    // 4w.. (low nibbles) and 16+4w.. (high), split with float math.
+    for (let w = 0; w < 4; w++) {
+      line(`{`)
+      for (const r of [0, 1, 2, 3]) {
+        line(`  vec4 B${r} = floor(texelFetch(uW, ivec2(kb * 16 + ${r * 4 + w}, g), 0) * 255.0 + 0.5);`)
+        line(`  vec4 H${r} = floor(B${r} * 0.0625);`)
+        line(`  vec4 L${r} = B${r} - 16.0 * H${r};`)
+      }
+      for (let t = 0; t < T; t++) {
+        line(`  { uvec4 u = texelFetch(uA, ivec2(kb * 4 + ${w >> 1}, m0 + ${t}), 0);`)
+        line(`    uvec4 u2 = texelFetch(uA, ivec2(kb * 4 + ${(w >> 1) + 2}, m0 + ${t}), 0);`)
+        line(`    vec4 x = ${w & 1 ? "h2hi" : "h2lo"}(u); vec4 y = ${w & 1 ? "h2hi" : "h2lo"}(u2);`)
+        line(`    s${t} += dot(x + y, vec4(1.0));`)
+        line(
+          `    b${t} += vec4(dot(L0, x) + dot(H0, y), dot(L1, x) + dot(H1, y), dot(L2, x) + dot(H2, y), dot(L3, x) + dot(H3, y)); }`
+        )
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++) line(`acc${t} += d * (b${t} - 8.0 * s${t});`)
   } else if (v.weights === "words") {
     // RGBA32UI texel (kb * 4 + r, g): row r's whole block, uint k holding
     // weights 8k..8k+7 (nibble i at bits 4i), split with integer shifts.
@@ -107,6 +177,10 @@ function kernel(v: Variant) {
     T === 1
       ? "o0 = acc0;"
       : Array.from({ length: T / 2 }, (_, k) => `o${k} = packH2(acc${2 * k}, acc${2 * k + 1});`).join("\n  ")
+  if (v.noSum) {
+    for (let i = 0; i < L.length; i++)
+      L[i] = L[i].replace(/s\d \+= dot\([^;]*\);/g, "")
+  }
   if (v.half) {
     for (let i = 0; i < L.length; i++)
       L[i] = L[i]
@@ -116,7 +190,7 @@ function kernel(v: Variant) {
   return `${HEADER}
 vec4 h2pick(uvec4 u, int hi) { return hi == 1 ? h2hi(u) : h2lo(u); }
 uniform ${v.acts === "f16" ? "sampler2D" : "usampler2D"} uA;
-uniform ${v.weights === "rgba4" ? "sampler2D" : "usampler2D"} uW;
+uniform ${v.weights === "rgba4" || v.weights === "unorm8" ? "sampler2D" : "usampler2D"} uW;
 uniform sampler2D uS;
 uniform int uKb;
 ${outs}
@@ -726,6 +800,7 @@ async function shapes(gpu: Gpu, batch: number) {
     const wRgba4 = gpu.texture(gl.RGBA4, blocks * 32, G)
     const wBytes = gpu.texture(gl.RGBA8UI, blocks * 16, G)
     const wWords = G <= 16384 ? gpu.texture(gl.RGBA32UI, blocks * 4, G) : null
+    const wUnorm8 = gpu.texture(gl.RGBA8, blocks * 16, G)
     const scales = gpu.texture(gl.RGBA16F, blocks, G)
     for (const M of [params.batch ?? 512]) {
       const aF16 = gpu.texture(gl.RGBA16F, K / 4, M)
@@ -740,12 +815,8 @@ async function shapes(gpu: Gpu, batch: number) {
             ]
           : [
               { weights: "rgba4", acts: "h2", tokens: 4 },
-              ...(G <= 16384
-                ? ([
-                    { weights: "words", acts: "h2", tokens: 2 },
-                    { weights: "words", acts: "h2", tokens: 4 }
-                  ] as Array<Variant>)
-                : [])
+              { weights: "rgba4", acts: "h2", tokens: 4, fold: true },
+              { weights: "rgba4", acts: "h2", tokens: 8, fold: true }
             ]
       for (const v of variants) {
         const T = v.tokens
@@ -762,7 +833,14 @@ async function shapes(gpu: Gpu, batch: number) {
             program,
             inputs: {
               uA: v.acts === "f16" ? aF16 : aH2,
-              uW: v.weights === "rgba4" ? wRgba4 : v.weights === "words" ? (wWords ?? wBytes) : wBytes,
+              uW:
+                v.weights === "rgba4"
+                  ? wRgba4
+                  : v.weights === "unorm8"
+                    ? wUnorm8
+                    : v.weights === "words"
+                      ? (wWords ?? wBytes)
+                      : wBytes,
               uS: scales
             },
             uniforms: { uKb: { int: blocks } },
@@ -781,7 +859,7 @@ async function shapes(gpu: Gpu, batch: number) {
           best = Math.min(best, (performance.now() - t0) / n)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
@@ -823,6 +901,7 @@ async function shapes(gpu: Gpu, batch: number) {
     gpu.delete(wRgba4)
     gpu.delete(wBytes)
     if (wWords) gpu.delete(wWords)
+    gpu.delete(wUnorm8)
     gpu.delete(scales)
   }
 }
