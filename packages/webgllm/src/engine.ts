@@ -1644,6 +1644,12 @@ export class Engine {
     this.position = d.pos0 + count
   }
 
+  /**
+   * Whether the last batch's final add drew the head's scaled input (a few
+   * rows, folded norms): then the head reads that, with no norm pass.
+   */
+  private headScaled = false
+
   /** The token the last pick with a guess read forward, or -1. */
   guessedToken = -1
 
@@ -1892,6 +1898,11 @@ export class Engine {
   private head(row0: number, rows = 1) {
     const b = this.buffers
     const e = this.embedding
+    if (e.rgba4 && this.headScaled) {
+      // The last add drew h2(x · final norm weights): no norm pass.
+      this.headRgba4(e, rows, row0)
+      return
+    }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) {
       this.headRgba4(e, rows)
@@ -1940,7 +1951,11 @@ export class Engine {
    * The output head through RGBA4 weights, split along K in
    * TUNING.headSplit slices (added up by one more pass).
    */
-  private headRgba4(e: GpuMatrix, rows: number) {
+  /**
+   * With `scaledRow0`, reads the last add's scaled input from that row on
+   * (see headScaled) instead of lastNormed.
+   */
+  private headRgba4(e: GpuMatrix, rows: number, scaledRow0?: number) {
     const b = this.buffers
     const split = Math.max(1, Math.min(TUNING.headSplit, e.blocks))
     const sliceRows = this.logitRows
@@ -1959,9 +1974,12 @@ export class Engine {
     }
     this.gpu.run({
       name: "head",
-      program: this.gpu.program(K.headRgba4({ zeros: !!e.zeros })),
+      program: this.gpu.program(
+        K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined })
+      ),
       inputs: {
-        uA: b.lastNormed,
+        ...(scaledRow0 !== undefined && { uR: b.residual[0] }),
+        uA: scaledRow0 !== undefined ? b.scaled[0] : b.lastNormed,
         uW: e.quants,
         uS: e.scales,
         ...(e.zeros && { uZ: e.zeros })
@@ -1974,7 +1992,15 @@ export class Engine {
         uOutW: { int: OUT_WIDTH },
         uSliceRows: { int: sliceRows },
         uKbSlice: { int: Math.ceil(e.blocks / split) },
-        uRows: { int: rows }
+        uRows: { int: rows },
+        ...(scaledRow0 !== undefined && {
+          uRowA0: { int: scaledRow0 },
+          uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+          uROff: { int: this.config.hiddenSize / 4 },
+          uParts: { int: TUNING.rmsParts },
+          uTexels: { int: this.config.hiddenSize / 4 },
+          uEps: this.config.normEps
+        })
       },
       output: target,
       rect: { x: 0, y: 0, width: OUT_WIDTH, height }
@@ -2029,6 +2055,55 @@ export class Engine {
       )
     }
     const e = this.embedding
+    // A few rows: the split matmuls apply the norm to the residual as they
+    // read it (no norm pass; see TUNING.foldNorm).
+    const foldAt = (j: number) => {
+      const l = this.layers[j]
+      return (
+        rows <= SPLIT_ROWS &&
+        TUNING.foldNorm > 0 &&
+        !probe &&
+        (l.conv?.inProj ?? l.attention?.qkvg)?.rgba4 === true &&
+        l.gateUp.rgba4
+      )
+    }
+    const prescaled = TUNING.foldNorm === 2
+    // The embedding draws layer 0's sums of squares and scaled input too.
+    const embedFolded = prescaled && e.rgba4 && foldAt(0)
+    // The last add draws the final norm's scaled input for the head.
+    this.headScaled = prescaled && e.rgba4 && foldAt(this.layers.length - 1)
+    if (embedFolded) {
+      const texels = c.hiddenSize / 4
+      const embedInputs = {
+        uIds: b.ids,
+        uW: e.quants,
+        uS: e.scales,
+        ...(e.zeros && { uZ: e.zeros }),
+        uNext: this.layers[0].operatorNorm
+      }
+      const shape = {
+        uKb: { int: e.blocks },
+        uH: { int: e.rowsPerColumn },
+        uRowTexels: { int: e.rowTexels },
+        uTexels: { int: texels },
+        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) }
+      }
+      const output = [b.residual[0], b.scaled[0]]
+      const parts: Array<["values" | "rms" | "scaled", number, number]> = [
+        ["values", 0, texels],
+        ["rms", texels, TUNING.rmsParts],
+        ["scaled", texels + K.RMS_PARTS, texels / 2]
+      ]
+      for (const [part, x, width] of parts) {
+        this.gpu.run({
+          program: this.gpu.program(K.embedFold({ zeros: !!e.zeros, part })),
+          inputs: embedInputs,
+          uniforms: { ...shape, uBase: { int: x } },
+          output,
+          rect: { x, y: 0, width, height: rows }
+        })
+      }
+    } else
     this.gpu.run({
       program: this.gpu.program(
         e.bits === 6
@@ -2092,23 +2167,10 @@ export class Engine {
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       const [h, next] = b.residual
-      // A few rows: the split matmuls apply the norm to the residual as
-      // they read it (no norm pass). The embedding has no sums of squares
-      // for that, so layer 0 normalizes first.
-      const foldAt = (j: number) => {
-        const l = this.layers[j]
-        return (
-          rows <= SPLIT_ROWS &&
-          TUNING.foldNorm > 0 &&
-          !probe &&
-          (l.conv?.inProj ?? l.attention?.qkvg)?.rgba4 === true &&
-          l.gateUp.rgba4
-        )
-      }
       const fold = foldAt(i)
-      const prescaled = TUNING.foldNorm === 2
+      // (Layer 0 folds only if the embedding drew its sums and input.)
       const opIn: MatIn =
-        fold && i > 0
+        fold && (i > 0 || (embedFolded && prescaled))
           ? { a: h, norm: prescaled ? "prescaled" : layer.operatorNorm }
           : { a: b.normed }
       if (!opIn.norm) {
@@ -2185,9 +2247,15 @@ export class Engine {
         h,
         rows,
         downSplit,
-        prescaled && i + 1 < this.layers.length && foldAt(i + 1)
-          ? this.layers[i + 1].operatorNorm
-          : undefined
+        !prescaled
+          ? undefined
+          : i + 1 < this.layers.length
+            ? foldAt(i + 1)
+              ? this.layers[i + 1].operatorNorm
+              : undefined
+            : this.headScaled
+              ? this.finalNorm
+              : undefined
       )
       await look(i, "l_out", h, c.hiddenSize)
     }

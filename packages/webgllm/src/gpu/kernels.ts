@@ -488,7 +488,15 @@ ${L.join("\n")}
  * sums over blocks [s · uKbSlice, (s + 1) · uKbSlice); HEAD_SUM adds the
  * slices when there's more than one.
  */
-function headRgba4Source(o: { zeros: boolean }) {
+function headRgba4Source(o: {
+  zeros: boolean
+  /**
+   * Read the last add's h2(x · final norm weights / PRESCALE) from row
+   * uRowA0 + r, column uAOff, and apply the row's 1 / RMS (from uR) last,
+   * instead of normalized h2 activations from row r.
+   */
+  prescaled?: boolean
+}) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -498,7 +506,11 @@ function headRgba4Source(o: { zeros: boolean }) {
       : `const vec4 z = vec4(8.0);`
   )
   for (const j of [0, 1, 2, 3]) {
-    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, r), 0);`)
+    line(
+      o.prescaled
+        ? `uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, uRowA0 + r), 0);`
+        : `uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, r), 0);`
+    )
     line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
   }
   line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
@@ -524,6 +536,7 @@ uniform int uOutW;
 uniform int uSliceRows;
 uniform int uKbSlice;
 uniform int uRows;
+${o.prescaled ? `${RMS_SCALE}\nuniform int uAOff;\nuniform int uRowA0;` : ""}
 out vec4 o;
 void main() {
   // Row (slice · uRows + r) · uSliceRows + yl: token r's slice.
@@ -545,7 +558,72 @@ void main() {
 ${L.join("\n")}
     }
   }
-  o = acc;
+  o = ${o.prescaled ? `acc * (rmsScale(uRowA0 + r) * ${PRESCALE}.0)` : "acc"};
+}`
+}
+
+/**
+ * The embedding for a few tokens with the extras an add draws (see
+ * addScaled): `part` "values" is the embedding rows, "rms" their partial
+ * sums of squares (from column uBase), "scaled" h2(x · layer 0's norm
+ * weights / PRESCALE) into output 1 (from column uBase), so layer 0's split
+ * matmuls fold its norm too. RGBA4 embeddings; outputs as the add's.
+ */
+function embedFoldSource(o: { zeros: boolean; part: "values" | "rms" | "scaled" }) {
+  const zero = o.zeros
+    ? "float(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0)[r])"
+    : "8.0"
+  const main =
+    o.part === "values"
+      ? `o = embedTexel(x, y);
+  o2 = uvec4(0u);`
+      : o.part === "rms"
+        ? `int p = x - uBase;
+  int i0 = p * uChunk;
+  int i1 = min(uTexels, i0 + uChunk);
+  vec4 s = vec4(0.0);
+  for (int i = i0; i < i1; i++) {
+    vec4 v = embedTexel(i, y);
+    s += v * v;
+  }
+  o = s;
+  o2 = uvec4(0u);`
+        : `int j = x - uBase;
+  vec4 a = embedTexel(2 * j, y) * texelFetch(uNext, ivec2(2 * j, 0), 0);
+  vec4 b = embedTexel(2 * j + 1, y) * texelFetch(uNext, ivec2(2 * j + 1, 0), 0);
+  o = vec4(0.0);
+  o2 = packH2(a * (1.0 / ${PRESCALE}.0), b * (1.0 / ${PRESCALE}.0));`
+  return `${HEADER}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform sampler2D uNext;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uBase;
+uniform int uChunk;
+uniform int uTexels;
+layout(location = 0) out vec4 o;
+layout(location = 1) out uvec4 o2;
+vec4 embedTexel(int x, int y) {
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = x * 4;
+  int kb = c >> 5;
+  int j = c & 31;
+  float d = texelFetch(uS, ivec2(col * uKb + kb, gr), 0)[r];
+  vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0) + 0.5);
+  return d * (q - ${zero});
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  ${main}
 }`
 }
 
@@ -1778,3 +1856,5 @@ export function withPairSplit(source: string, split: number) {
 
 export const attendChunk = memo(attendChunkSource)
 export const attendCombine = memo(attendCombineSource)
+
+export const embedFold = memo(embedFoldSource)
