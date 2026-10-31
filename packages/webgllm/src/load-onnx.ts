@@ -1,5 +1,6 @@
 /**
- * Loads LFM3 weights from an onnxruntime-genai style ONNX export with
+ * Loads LFM3 and LFM2/LFM2.5 weights from an onnxruntime-genai style ONNX
+ * export with
  * 4-bit MatMulNBits projections and a GatherBlockQuantized embedding,
  * such as daveycodez/LFM3-1.7B-Web's onnx/model_q4f16.onnx (+ its
  * .onnx_data file).
@@ -226,14 +227,14 @@ export async function* loadOnnx(
     const l = layers[i]
     const [n0, n1, n2, n3] = l.norms as [
       OnnxTensor,
+      OnnxTensor | null,
       OnnxTensor,
-      OnnxTensor,
-      OnnxTensor
+      OnnxTensor | null
     ]
     const operatorNorm = await floats(n0, D)
-    const postOperatorNorm = await floats(n1, D)
+    const postOperatorNorm = n1 ? await floats(n1, D) : undefined
     const ffnNorm = await floats(n2, D)
-    const postFfnNorm = await floats(n3, D)
+    const postFfnNorm = n3 ? await floats(n3, D) : undefined
     let conv: ConvWeights | undefined
     let attention: AttentionWeights | undefined
     if (l.type === "conv") {
@@ -282,12 +283,12 @@ export async function* loadOnnx(
     const value: LayerWeights = {
       type: l.type,
       operatorNorm,
-      postOperatorNorm,
       ffnNorm,
-      postFfnNorm,
       gateUp,
       down
     }
+    if (postOperatorNorm) value.postOperatorNorm = postOperatorNorm
+    if (postFfnNorm) value.postFfnNorm = postFfnNorm
     if (conv) value.conv = conv
     if (attention) value.attention = attention
     yield { kind: "layer", layer: i, value }
@@ -315,8 +316,8 @@ function tensorBytes(t: OnnxTensor): number {
 
 type LayerPlan = {
   type: LayerType
-  /** operator, post-operator, ffn, post-ffn norms. */
-  norms: Array<OnnxTensor>
+  /** operator, post-operator, ffn, post-ffn norms (the post ones: LFM3 only). */
+  norms: Array<OnnxTensor | null>
   /** conv: in_proj, out_proj; attention: q_proj, k, v, o (+ gate_proj); then mlp gate, up, down. */
   matrices: Array<NBits>
   /** conv: the kernel; attention: q_norm, k_norm. */
@@ -406,12 +407,15 @@ class OnnxModel {
   layerPlan(i: number, type: LayerType, config: ModelConfig): LayerPlan {
     const D = config.hiddenSize
     const p = `model.layers.${i}.`
+    const norm = (n: string) => this.init(`${p}${n}.weight`)
+    const optional = (n: string) =>
+      this.has(`${p}${n}.weight`) ? norm(n) : null
     const norms = [
-      "operator_layernorm",
-      "post_operator_layernorm",
-      "ffn_layernorm",
-      "post_ffn_layernorm"
-    ].map((n) => this.init(`${p}${n}.weight`))
+      norm("operator_layernorm"),
+      optional("post_operator_layernorm"),
+      norm("ffn_layernorm"),
+      optional("post_ffn_layernorm")
+    ]
     const w = (name: string) => this.nbits(`model_layers_${i}_${name}`)
     const mlp = [w("mlp_gate_proj"), w("mlp_up_proj"), w("mlp_down_proj")]
     if (type === "conv") {
@@ -454,6 +458,16 @@ class OnnxModel {
       this.init(`${p}attn.k_norm.layernorm.weight`)
     ]
     this.checkRotary(i, type, config)
+    if (q.N === qRows && !config.attentionGate) {
+      // LFM2: no output gate.
+      return {
+        type,
+        norms,
+        matrices: [q, k, v, o, ...mlp],
+        extra,
+        q: { start: 0, rows: qRows }
+      }
+    }
     if (q.N === qRows) {
       const gateWeight = w("attn_gate_proj")
       return {
@@ -481,8 +495,9 @@ class OnnxModel {
   /** A Split's part sizes, from its input or attribute. */
   private splitSizes(split: OnnxNode): Array<number> {
     const axis = split.attributes.get("axis")?.i ?? 0
-    if (axis !== -1 && axis !== 2)
-      throw new Error(`ONNX: ${split.name} doesn't split the last axis`)
+    // The channels axis: last, or 1 after a transpose to channels-first.
+    if (axis !== -1 && axis !== 2 && axis !== 1)
+      throw new Error(`ONNX: ${split.name} doesn't split the channels axis`)
     const input = split.inputs[1]
     if (input) return onnxInt64s(this.init(input))
     const attr = split.attributes.get("split")?.ints
@@ -527,9 +542,12 @@ class OnnxModel {
    * order can't matter; HF's chunk order B, x is kept).
    */
   private bcxSegments(inProj: NBits, D: number): Array<Segment> {
-    const split = this.consumersOf(this.outputOf(inProj)).find(
-      (n) => n.opType === "Split"
-    )
+    // LFM2's export transposes to channels-first before the split.
+    const out = this.outputOf(inProj)
+    const transposed = this.consumersOf(out).find((n) => n.opType === "Transpose")
+    const split = [out, ...(transposed ? transposed.outputs : [])]
+      .flatMap((name) => this.consumersOf(name))
+      .find((n) => n.opType === "Split")
     if (!split)
       throw new Error(`ONNX: ${inProj.name} is not split into B, C, x`)
     const sizes = this.splitSizes(split)
@@ -537,13 +555,17 @@ class OnnxModel {
       throw new Error(`ONNX: ${split.name} sizes [${sizes}]`)
     const conv = this.graph.nodes.find(
       (n) =>
-        n.opType.startsWith("CausalConv") &&
+        (n.opType.startsWith("CausalConv") || n.opType === "Conv") &&
         split.outputs.some((o) => this.feeds(o, n))
     )
     if (!conv) throw new Error(`ONNX: no convolution after ${split.name}`)
+    // C multiplies the convolution's output (LFM2's export slices it first).
+    const convOut = new Set([conv.outputs[0]])
+    for (const n of this.consumersOf(conv.outputs[0]))
+      if (n.opType === "Slice") convOut.add(n.outputs[0])
     const cIndex = split.outputs.findIndex((out) =>
       this.consumersOf(out).some(
-        (n) => n.opType === "Mul" && n.inputs.includes(conv.outputs[0])
+        (n) => n.opType === "Mul" && n.inputs.some((x) => convOut.has(x))
       )
     )
     if (cIndex < 0) throw new Error(`ONNX: can't find C after ${conv.name}`)
@@ -554,12 +576,24 @@ class OnnxModel {
     }))
   }
 
-  /** Whether `name` reaches `node` through at most one Mul. */
+  /**
+   * Whether `name` reaches `node` through at most one Mul, and then at most
+   * one Concat (LFM2's export prepends the past conv state).
+   */
   private feeds(name: string, node: OnnxNode): boolean {
     if (node.inputs.includes(name)) return true
     return this.consumersOf(name).some(
       (n) =>
-        n.opType === "Mul" && n.outputs.some((o) => node.inputs.includes(o))
+        n.opType === "Mul" &&
+        n.outputs.some(
+          (o) =>
+            node.inputs.includes(o) ||
+            this.consumersOf(o).some(
+              (c) =>
+                c.opType === "Concat" &&
+                c.outputs.some((x) => node.inputs.includes(x))
+            )
+        )
     )
   }
 
@@ -663,6 +697,22 @@ type HfRope = {
   rope_type?: string
 }
 
+/**
+ * Whether attention has LFM3's output gate: its own gate_proj, or q_proj
+ * rows that a Sigmoid reads after a split. LFM2 has neither.
+ */
+function hasAttentionGate(model: OnnxModel, layerTypes: Array<LayerType>) {
+  const i = layerTypes.findIndex((t) => t !== "conv")
+  if (i < 0) return false
+  if (model.has(`model_layers_${i}_attn_gate_proj_MatMul_weight_quant`))
+    return true
+  const q = model.nbits(`model_layers_${i}_attn_q_proj`)
+  const node = model
+    .consumersOf(q.quant.name)
+    .find((n) => n.opType === "MatMulNBits")
+  return !!node && model.consumersOf(node.outputs[0]).some((n) => n.opType === "Split")
+}
+
 function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
   if (typeof json !== "object" || json === null)
     throw new Error("ONNX: config must be the parsed config.json")
@@ -748,6 +798,7 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
     ropeDimsSliding: rotated(slidingRope),
     normEps: num("norm_eps", 1e-5),
     convKernel: num("conv_L_cache"),
+    attentionGate: hasAttentionGate(model, layerTypes),
     bosTokenId: tokenId("bos_token_id"),
     eosTokenId: tokenId("eos_token_id"),
     padTokenId: tokenId("pad_token_id")

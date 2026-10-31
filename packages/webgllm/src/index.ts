@@ -21,6 +21,7 @@ export type {
   WebGlModelReasoningByName,
   WebGlTextModel
 } from "./model-meta.js"
+export type { ToolFormat } from "./tool-calls.js"
 export { Engine } from "./engine.js"
 export type { EngineOptions, LayerProbe } from "./engine.js"
 export type { Sampling } from "./sampler.js"

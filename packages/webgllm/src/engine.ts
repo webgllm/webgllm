@@ -42,9 +42,10 @@ type GpuMatrix = {
 type GpuLayer = {
   type: LayerType
   operatorNorm: Texture
-  postOperatorNorm: Texture
+  /** LFM3's sandwich norms; LFM2 has none. */
+  postOperatorNorm?: Texture
   ffnNorm: Texture
-  postFfnNorm: Texture
+  postFfnNorm?: Texture
   conv?: {
     inProj: GpuMatrix
     outProj: GpuMatrix
@@ -514,9 +515,11 @@ export class Engine {
     const layer: GpuLayer = {
       type: w.type,
       operatorNorm: this.vector(w.operatorNorm),
-      postOperatorNorm: this.vector(w.postOperatorNorm),
+      ...(w.postOperatorNorm && {
+        postOperatorNorm: this.vector(w.postOperatorNorm)
+      }),
       ffnNorm: this.vector(w.ffnNorm),
-      postFfnNorm: this.vector(w.postFfnNorm),
+      ...(w.postFfnNorm && { postFfnNorm: this.vector(w.postFfnNorm) }),
       gateUp: this.matrix(w.gateUp),
       down: this.matrix(w.down)
     }
@@ -736,6 +739,23 @@ export class Engine {
   }
 
   /**
+   * Runs every kind of pass once (a prompt batch, a draft batch, a single
+   * token, both ways of sampling, a snapshot) so shaders compile, and the
+   * driver builds its pipelines, at load rather than inside the first
+   * reply's timings. Then forgets it all.
+   */
+  async warmUp() {
+    const row = await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
+    await this.candidates(row, 1, 1)
+    await this.logits(row)
+    await this.forwardHidden([0, 0], { draft: true })
+    this.accept(1)
+    await this.logits(await this.forwardHidden([0]))
+    this.snapshot()
+    this.reset()
+  }
+
+  /**
    * a · wᵀ for `rows` tokens: a few rows leave a split matmul's partial
    * sums in the partial buffer and return the number of slices (consumers
    * read them through pf, no reduce pass); more rows write the pair tensor
@@ -800,7 +820,11 @@ export class Engine {
       // Narrow matrices split K in two, stacked in the output, so there are
       // enough fragments to fill the GPU (consumers add the slices).
       const pairRows = Math.ceil(rows / 2)
-      const slices = w.groups <= TUNING.sliceGroups ? 2 : 1
+      // Two slices only where the output has the rows for both (the narrow
+      // matmuls' outputs are sized for two; LFM2.5 350M's in_proj is narrow
+      // enough to qualify, but its output isn't).
+      const slices =
+        w.groups <= TUNING.sliceGroups && out.height >= 2 * pairRows ? 2 : 1
       const width = w.groups
       this.gpu.run({
         name: "matmul",
@@ -961,7 +985,7 @@ export class Engine {
   }
 
   /**
-   * out = h + post-norm(y): the sandwich norm and the residual add, with
+   * out = h + post-norm(y) (or h + y without a norm: LFM2), with
    * out's rows' sums of squares drawn into its last columns in the same pass
    * (same output texture: no new render pass). y is a pair tensor, or a
    * split matmul's partial sums over `split` slices.
@@ -969,14 +993,16 @@ export class Engine {
   private addNormed(
     h: Texture,
     y: Texture,
-    norm: Texture,
+    norm: Texture | undefined,
     out: Texture,
     rows: number,
     split = 0
   ) {
     const { hiddenSize } = this.config
     const texels = hiddenSize / 4
-    this.rms(y, 0, rows, split)
+    // Through the sandwich norm (LFM3), y's sums of squares first.
+    const normed = !!norm
+    if (normed) this.rms(y, 0, rows, split)
     const read = (source: string) =>
       this.gpu.program(split ? this.fromSplit(source, ["uY"]) : source)
     const common = {
@@ -987,10 +1013,14 @@ export class Engine {
       uSplitIn: { int: split },
       ...this.pairIn(y)
     }
-    const inputs = { uH: h, uY: y, uR: this.buffers.rms, uNorm: norm }
+    const inputs = {
+      uH: h,
+      uY: y,
+      ...(norm && { uR: this.buffers.rms, uNorm: norm })
+    }
     this.gpu.run({
       name: "add",
-      program: read(K.ADD_NORMED),
+      program: read(K.addNormed(normed)),
       inputs,
       uniforms: common,
       output: out,
@@ -998,7 +1028,7 @@ export class Engine {
     })
     this.gpu.run({
       name: "add",
-      program: read(K.RMS_OF_ADD),
+      program: read(K.rmsOfAdd(normed)),
       inputs,
       uniforms: {
         ...common,
@@ -1075,7 +1105,9 @@ export class Engine {
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
     this.gpu.run({
       name: "heads",
-      program: read(K.headPrep({ out: "f32", rope: true, norm: true })),
+      program: read(
+        K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim })
+      ),
       inputs: { uQKVG: qkvgIn, uNorm: layer.qNorm, uRope: rope },
       uniforms: {
         uSplitIn: { int: split },
@@ -1100,7 +1132,9 @@ export class Engine {
       const offset = row0 - m0
       this.gpu.run({
         name: "heads",
-        program: read(K.headPrep({ out: "h2", rope: true, norm: true })),
+        program: read(
+          K.headPrep({ out: "h2", rope: true, norm: true, headDim: c.headDim })
+        ),
         inputs: { uQKVG: qkvgIn, uNorm: layer.kNorm, uRope: rope },
         uniforms: {
           uSplitIn: { int: split },
@@ -1117,7 +1151,7 @@ export class Engine {
       })
       this.gpu.run({
         name: "heads",
-        program: read(K.VALUES),
+        program: read(K.values(c.headDim)),
         inputs: { uQKVG: qkvgIn },
         uniforms: {
           uSplitIn: { int: split },
@@ -1157,7 +1191,7 @@ export class Engine {
       }
       this.gpu.run({
         name: "scores",
-        program: this.gpu.program(K.SCORES),
+        program: this.gpu.program(K.scores(c.headDim)),
         inputs: { uQ: b.q, uK: layer.keys },
         uniforms: {
           ...ring,
@@ -1178,7 +1212,7 @@ export class Engine {
       })
       this.gpu.run({
         name: "attend",
-        program: read(K.ATTEND),
+        program: read(K.attend(c.headDim, c.attentionGate)),
         inputs: { uS: b.scores, uV: layer.values, uQKVG: qkvgIn },
         uniforms: {
           uSplitIn: { int: split },

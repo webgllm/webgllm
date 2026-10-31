@@ -56,8 +56,13 @@ export type ModelConfig = {
   ropeDimsFull: number
   ropeDimsSliding: number
   normEps: number
-  /** Short convolution width (LFM3: 7). */
+  /** Short convolution width (LFM3: 7, LFM2: 3). */
   convKernel: number
+  /**
+   * Whether attention has LFM3's per-head sigmoid output gate (its rows
+   * follow v's in `qkvg`). LFM2 has none.
+   */
+  attentionGate: boolean
   bosTokenId: number
   eosTokenId: number
   padTokenId: number
@@ -92,7 +97,8 @@ export type ConvWeights = {
 export type AttentionWeights = {
   /**
    * q, k, v and the output gate in one matrix: rows numHeads * headDim of q,
-   * then numKvHeads * headDim of k, the same of v, then numHeads of gate.
+   * then numKvHeads * headDim of k, the same of v, then numHeads of gate
+   * (when the model has one: config.attentionGate).
    */
   qkvg: QuantMatrix
   o: QuantMatrix
@@ -103,9 +109,10 @@ export type AttentionWeights = {
 export type LayerWeights = {
   type: LayerType
   operatorNorm: Float32Array
-  postOperatorNorm: Float32Array
+  /** LFM3's sandwich norms on the operator's and the MLP's outputs; LFM2 has none. */
+  postOperatorNorm?: Float32Array
   ffnNorm: Float32Array
-  postFfnNorm: Float32Array
+  postFfnNorm?: Float32Array
   conv?: ConvWeights
   attention?: AttentionWeights
   /** w1 (gate) rows, then w3 (up) rows: 2 × intermediateSize. */

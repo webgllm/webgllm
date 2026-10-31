@@ -1,15 +1,11 @@
 /**
- * Reading LFM3's replies as they stream: thinking (`<think>…</think>`), the
- * answer, and tool calls in LFM3's format:
- *
- * `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
+ * Reading Liquid AI models' replies as they stream: thinking
+ * (`<think>…</think>`, in LFM2 and LFM3 alike) and the answer. Tool calls
+ * are read in tool-calls.ts.
  */
-
-export type ParsedToolCall = { name: string; args: Record<string, unknown> }
 
 export const THINK_OPEN = "<think>"
 export const THINK_CLOSE = "</think>"
-const TOOL_CALL = "<tool_call>"
 
 /** Length of the longest end of `text` that could be the start of `tag`. */
 function partialTag(text: string, tag: string) {
@@ -116,68 +112,4 @@ export function splitThinking(text: string) {
       .join("")
       .trim()
   }
-}
-
-/**
- * Splits a streaming answer into the text before the first tool call (shown
- * as it comes) and the tool-call markup after it (parsed at the end).
- */
-export function createToolCallSplitter() {
-  let held = ""
-  let markup: string | null = null
-  return {
-    push(text: string) {
-      if (markup !== null) {
-        markup += text
-        return ""
-      }
-      held += text
-      const at = held.indexOf(TOOL_CALL)
-      if (at >= 0) {
-        const before = held.slice(0, at)
-        markup = held.slice(at)
-        held = ""
-        return before
-      }
-      const keep = partialTag(held, TOOL_CALL)
-      const out = held.slice(0, held.length - keep)
-      held = held.slice(out.length)
-      return out
-    },
-    flush() {
-      const rest = held
-      held = ""
-      return { text: rest, markup }
-    }
-  }
-}
-
-/** A parameter's text as a value: JSON where it parses, else the text. */
-function parseValue(raw: string): unknown {
-  const s = raw.trim()
-  if (s === "") return ""
-  try {
-    return JSON.parse(s)
-  } catch {
-    return raw
-  }
-}
-
-/** Every tool call in LFM3's markup. */
-export function parseToolCalls(text: string): Array<ParsedToolCall> {
-  const calls: Array<ParsedToolCall> = []
-  for (const m of text.matchAll(/<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g)) {
-    for (const f of m[1].matchAll(
-      /<function=([^>\n]+)>([\s\S]*?)(?:<\/function>|$)/g
-    )) {
-      const args: Record<string, unknown> = {}
-      for (const p of f[2].matchAll(
-        /<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g
-      )) {
-        args[p[1].trim()] = parseValue(p[2])
-      }
-      calls.push({ name: f[1].trim(), args })
-    }
-  }
-  return calls
 }

@@ -508,6 +508,8 @@ function ggufConfig(
     convKernel: num("shortconv.l_cache"),
     bosTokenId: tokenId("bos_token_id", -1),
     eosTokenId: tokenId("eos_token_id", -1),
-    padTokenId: tokenId("padding_token_id", -1)
+    padTokenId: tokenId("padding_token_id", -1),
+    // The GGUF loader reads LFM3 (its output gate and sandwich norms).
+    attentionGate: true
   }
 }

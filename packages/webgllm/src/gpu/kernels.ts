@@ -503,43 +503,61 @@ void main() {
   o = packH2(a, b);
 }`
 
-/** f32 out = h + y · rms(y) · w: a sandwich norm's output added to the residual. */
-export const ADD_NORMED = `${HEADER}${RMS_SCALE}
+/**
+ * y as added to the residual: through a sandwich norm (LFM3: y · rms(y) · w,
+ * with y's RMS_PARTIAL sums in uR) or as it is (LFM2).
+ */
+function addedY(normed: boolean) {
+  return normed
+    ? `${RMS_SCALE}
+uniform sampler2D uNorm;
+vec4 added(int x, int m) {
+  return pf(uY, x, m) * rmsScale(m) * texelFetch(uNorm, ivec2(x, 0), 0);
+}`
+    : `
+uniform int uTexels;
+vec4 added(int x, int m) { return pf(uY, x, m); }`
+}
+
+/** f32 out = h + y, y through the sandwich norm when `normed`. */
+export function addNormed(normed: boolean) {
+  return `${HEADER}
 uniform sampler2D uH;
 uniform usampler2D uY;
-uniform sampler2D uNorm;
+${addedY(normed)}
 out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
-  float r = rmsScale(p.y);
-  o = texelFetch(uH, p, 0) + pf(uY, p.x, p.y) * r * texelFetch(uNorm, ivec2(p.x, 0), 0);
+  o = texelFetch(uH, p, 0) + added(p.x, p.y);
 }`
+}
 
 /**
  * The partial sums of squares of ADD_NORMED's output x = h + y · rms(y) · w,
  * computed from its inputs, so they can be drawn in the same pass as the
  * add itself (into the residual's last RMS_PARTS columns, from uBase).
  */
-export const RMS_OF_ADD = `${HEADER}${RMS_SCALE}
+export function rmsOfAdd(normed: boolean) {
+  return `${HEADER}
 uniform sampler2D uH;
 uniform usampler2D uY;
-uniform sampler2D uNorm;
+${addedY(normed)}
 uniform int uChunk;
 uniform int uBase;
 out vec4 o;
 void main() {
   int p = int(gl_FragCoord.x) - uBase;
   int m = int(gl_FragCoord.y);
-  float r = rmsScale(m);
   int i0 = p * uChunk;
   int i1 = min(uTexels, i0 + uChunk);
   vec4 s = vec4(0.0);
   for (int i = i0; i < i1; i++) {
-    vec4 v = texelFetch(uH, ivec2(i, m), 0) + pf(uY, i, m) * r * texelFetch(uNorm, ivec2(i, 0), 0);
+    vec4 v = texelFetch(uH, ivec2(i, m), 0) + added(i, m);
     s += v * v;
   }
   o = s;
 }`
+}
 
 /**
  * A kernel that reads matmul outputs (`names`) as pair tensors, made to
@@ -669,8 +687,12 @@ export function headPrep(o: {
   out: "f32" | "h2"
   rope: boolean
   norm: boolean
+  /** Dims per head (LFM3: 128, LFM2: 64). */
+  headDim: number
 }) {
   const texelsPerOut = o.out === "f32" ? 1 : 2
+  // f32 texels per head; the RoPE table's sines start half a head in.
+  const T = o.headDim / 4
   const prep = `
 vec4 rotated(int base, int t, int pos, float inv) {
   vec4 v = pf(uQKVG, base + t, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(t, 0), 0)" : ""};
@@ -682,7 +704,7 @@ vec4 rotated(int base, int t, int pos, float inv) {
   int f = first ? t : tp;
   vec4 p = pf(uQKVG, base + tp, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(tp, 0), 0)" : ""};
   vec4 cs = texelFetch(uRope, ivec2(f, pos), 0);
-  vec4 sn = texelFetch(uRope, ivec2(16 + f, pos), 0);
+  vec4 sn = texelFetch(uRope, ivec2(${T / 2} + f, pos), 0);
   return first ? v * cs - p * sn : v * cs + p * sn;`
       : "return v;"
   }
@@ -703,18 +725,18 @@ out ${o.out === "f32" ? "vec4" : "uvec4"} o;
 void main() {
   int x = int(gl_FragCoord.x);
   m = int(gl_FragCoord.y) - uRowOffset;
-  int head = x / ${32 / texelsPerOut};
-  int t0 = (x % ${32 / texelsPerOut}) * ${texelsPerOut};
-  int base = uBase + head * 32;
+  int head = x / ${T / texelsPerOut};
+  int t0 = (x % ${T / texelsPerOut}) * ${texelsPerOut};
+  int base = uBase + head * ${T};
   float inv = 1.0;
   ${
     o.norm
       ? `vec4 s = vec4(0.0);
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < ${T}; i++) {
     vec4 v = pf(uQKVG, base + i, m);
     s += v * v;
   }
-  inv = inversesqrt(dot(s, vec4(1.0)) / 128.0 + uEps);`
+  inv = inversesqrt(dot(s, vec4(1.0)) / ${o.headDim}.0 + uEps);`
       : ""
   }
   int pos = uPos0 + m;
@@ -734,7 +756,9 @@ void main() {
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
  * (later than the query, outside the sliding window, past uKeys) get -1e30.
  */
-export const SCORES = `${HEADER}${H2}
+export function scores(headDim: number) {
+  const U = headDim / 8
+  return `${HEADER}
 uniform sampler2D uQ;
 uniform usampler2D uK;
 uniform int uRows;
@@ -771,13 +795,13 @@ void main() {
   }
   if (!any(live)) { o = vec4(-1e30); return; }
   vec4 acc = vec4(0.0);
-  for (int u = 0; u < 16; u++) {
-    vec4 qa = texelFetch(uQ, ivec2(h * 32 + 2 * u, m), 0);
-    vec4 qb = texelFetch(uQ, ivec2(h * 32 + 2 * u + 1, m), 0);
-    uvec4 k0 = texelFetch(uK, ivec2(kh * 16 + u, row.x), 0);
-    uvec4 k1 = texelFetch(uK, ivec2(kh * 16 + u, row.y), 0);
-    uvec4 k2 = texelFetch(uK, ivec2(kh * 16 + u, row.z), 0);
-    uvec4 k3 = texelFetch(uK, ivec2(kh * 16 + u, row.w), 0);
+  for (int u = 0; u < ${U}; u++) {
+    vec4 qa = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u, m), 0);
+    vec4 qb = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u + 1, m), 0);
+    uvec4 k0 = texelFetch(uK, ivec2(kh * ${U} + u, row.x), 0);
+    uvec4 k1 = texelFetch(uK, ivec2(kh * ${U} + u, row.y), 0);
+    uvec4 k2 = texelFetch(uK, ivec2(kh * ${U} + u, row.z), 0);
+    uvec4 k3 = texelFetch(uK, ivec2(kh * ${U} + u, row.w), 0);
     acc += vec4(
       dot(qa, h2lo(k0)) + dot(qb, h2hi(k0)),
       dot(qa, h2lo(k1)) + dot(qb, h2hi(k1)),
@@ -786,13 +810,16 @@ void main() {
   }
   o = mix(vec4(-1e30), acc, vec4(live));
 }`
+}
 
 /**
  * Softmax over a query's scores, the weighted sum of values (uV: h2 cache),
  * times the head's sigmoid gate (from the q|k|v|gate projection at texel
  * uGateTexel). h2 output: 8 dims of one head per texel.
  */
-export const ATTEND = `${HEADER}${H2}
+export function attend(headDim: number, gate: boolean) {
+  const U = headDim / 8
+  return `${HEADER}
 uniform sampler2D uS;
 uniform usampler2D uV;
 uniform usampler2D uQKVG;
@@ -809,8 +836,8 @@ out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y);
-  int h = x / 16;
-  int u = x - h * 16;
+  int h = x / ${U};
+  int u = x - h * ${U};
   int kh = h / uGroup;
   int r = h * uRows + (m - uM0);
   int panel = r / uPanelRows;
@@ -832,18 +859,25 @@ void main() {
       int j = 4 * i + c;
       if (j >= uKeys) break;
       int vj = uJ0 + j;
-      uvec4 v = texelFetch(uV, ivec2(kh * 16 + u, uRing > 0 ? vj % uRing : vj), 0);
+      uvec4 v = texelFetch(uV, ivec2(kh * ${U} + u, uRing > 0 ? vj % uRing : vj), 0);
       lo += e[c] * h2lo(v);
       hi += e[c] * h2hi(v);
     }
   }
-  float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
-  float scale = 1.0 / (l * (1.0 + exp(-gate)));
+  ${
+    gate
+      ? `float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
+  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
+      : "float scale = 1.0 / l;"
+  }
   o = packH2(lo * scale, hi * scale);
 }`
+}
 
 /** Values into the h2 cache: 8 dims per texel, rows offset to the cache position. */
-export const VALUES = `${HEADER}${H2}
+export function values(headDim: number) {
+  const U = headDim / 8
+  return `${HEADER}
 uniform usampler2D uQKVG;
 uniform int uBase;
 uniform int uRowOffset;
@@ -851,10 +885,11 @@ out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y) - uRowOffset;
-  int head = x / 16;
-  int t = uBase + head * 32 + (x % 16) * 2;
+  int head = x / ${U};
+  int t = uBase + head * ${2 * U} + (x % ${U}) * 2;
   o = packH2(pf(uQKVG, t, m), pf(uQKVG, t + 1, m));
 }`
+}
 
 /** SwiGLU: silu(gate) · up, from w1|w3's f32 output (uHalf texels each). h2 output. */
 export const SWIGLU = `${HEADER}${H2}

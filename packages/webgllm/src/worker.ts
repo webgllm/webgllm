@@ -199,7 +199,8 @@ async function load(
       }
     })
     if (signal.aborted) throw new Superseded()
-    engine.reset()
+    await engine.warmUp()
+    if (signal.aborted) throw new Superseded()
     return { model, engine, tokenizer, cached: [] }
   } catch (error) {
     // A failed or superseded load frees its textures now.

@@ -24,14 +24,15 @@ import { generate, loadModel } from "./client.js"
 import { modelMeta } from "./model-meta.js"
 import type { WebGlModelReasoningByName, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings } from "./protocol.js"
-import {
-  createThinkingSplitter,
-  createToolCallSplitter,
-  parseToolCalls,
-  splitThinking
-} from "./reply.js"
+import { createThinkingSplitter, splitThinking } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
+import {
+  createToolCallSplitter,
+  formatLfm2ToolCalls,
+  parseToolCalls
+} from "./tool-calls.js"
+import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
 /** Per-call `modelOptions`: sampling over the model card's, and the most tokens to generate. */
 export type WebGlTextProviderOptions = Partial<Sampling> & {
@@ -99,13 +100,50 @@ function parseArguments(json: string): Record<string, unknown> {
 }
 
 /**
+ * An assistant turn with tool calls, written the way the model's template
+ * takes them: LFM2's template doesn't read `tool_calls`, so its calls go in
+ * the content in its own format; LFM3's template writes `tool_calls` itself.
+ */
+function assistantToolTurn(
+  content: string,
+  calls: Array<ParsedToolCall & { id: string }>,
+  format: ToolFormat
+): ChatMessage {
+  if (format === "lfm2") {
+    return { role: "assistant", content: content + formatLfm2ToolCalls(calls) }
+  }
+  return {
+    role: "assistant",
+    content,
+    tool_calls: calls.map((c) => ({
+      id: c.id,
+      type: "function",
+      function: { name: c.name, arguments: c.args }
+    }))
+  }
+}
+
+/** The current turn's thinking, for a template that reads it (LFM3's). */
+function withThinking(
+  turn: ChatMessage,
+  thinking: string,
+  format: ToolFormat
+): ChatMessage {
+  // Liquid's guide: keep the reasoning of the current tool-use turn.
+  return format === "lfm3" ? { ...turn, thinking } : turn
+}
+
+/**
  * The conversation as chat-template messages. Tool calls and results from
  * earlier turns are left out and their answers kept: small models copy the
  * shape of past calls badly and get lost in old results. The current
  * turn's calls and results stay, with its thinking (Liquid's guidance for
  * tool use), since the model answers from them.
  */
-function toChatMessages(messages: Array<ModelMessage>): Array<ChatMessage> {
+function toChatMessages(
+  messages: Array<ModelMessage>,
+  format: ToolFormat
+): Array<ChatMessage> {
   const chat: Array<ChatMessage> = []
   const currentTurn = messages.map((m) => m.role).lastIndexOf("user")
   const toolNames = new Map<string, string>()
@@ -135,17 +173,9 @@ function toChatMessages(messages: Array<ModelMessage>): Array<ChatMessage> {
       if (content) chat.push({ role: m.role, content })
       continue
     }
+    const turn = assistantToolTurn(content, calls, format)
     const thinking = m.thinking?.map((t) => t.content).join("")
-    chat.push({
-      role: "assistant",
-      content,
-      tool_calls: calls.map((c) => ({
-        id: c.id,
-        type: "function",
-        function: { name: c.name, arguments: c.args }
-      })),
-      ...(thinking && { thinking })
-    })
+    chat.push(thinking ? withThinking(turn, thinking, format) : turn)
   }
   return chat
 }
@@ -213,6 +243,11 @@ export class WebGlTextAdapter<
     super({}, model)
   }
 
+  /** How the model writes tool calls. */
+  private get toolFormat(): ToolFormat {
+    return modelMeta(this.model).toolFormat ?? "lfm3"
+  }
+
   private sampling(
     modelOptions: WebGlTextProviderOptions | undefined
   ): Sampling {
@@ -268,7 +303,7 @@ export class WebGlTextAdapter<
       .join("\n\n")
     const chat: Array<ChatMessage> = [
       ...(system ? [{ role: "system" as const, content: system }] : []),
-      ...toChatMessages(options.messages)
+      ...toChatMessages(options.messages, this.toolFormat)
     ]
 
     let reasoning: "none" | "open" | "closed" = "none"
@@ -457,7 +492,7 @@ export class WebGlTextAdapter<
       model: this.model,
       chat: [
         { role: "system", content: system },
-        ...toChatMessages(chatOptions.messages)
+        ...toChatMessages(chatOptions.messages, this.toolFormat)
       ],
       tools: [],
       thinking: enableThinking(chatOptions.reasoning, this.model),
