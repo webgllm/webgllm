@@ -135,6 +135,12 @@ export const TUNING = {
 }
 
 /**
+ * Where the output head left the logits: a texture of logitRows rows per
+ * token, or `split` K-slices of it, `stride` rows apart, to be added up.
+ */
+type HeadOut = { logits: Texture; split: number; stride: number }
+
+/**
  * A matmul's input: h2 activations, or the f32 residual and the norm to
  * apply (its weights, or "prescaled": already applied by the add).
  */
@@ -1804,7 +1810,7 @@ export class Engine {
       }
       return out
     }
-    this.head(row0, rows)
+    const head = this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
     const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as [
@@ -1817,13 +1823,15 @@ export class Engine {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
       uLogitRows: { int: this.logitRows },
+      uHeadSplit: { int: head.split },
+      uHeadStride: { int: head.stride },
       uExtra: { ivec4: extra },
       uPenaltyRow0: { int: penaltyRow0 }
     }
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_MAX),
-      inputs: { uLogits: b.logits, uMask: b.mask },
+      inputs: { uLogits: head.logits, uMask: b.mask },
       uniforms: picking,
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
@@ -1834,7 +1842,7 @@ export class Engine {
       this.gpu.run({
         name: "pick",
         program: this.gpu.program(K.CHUNK_ARGMAX),
-        inputs: { uMax: b.chunkMax, uLogits: b.logits, uMask: b.mask },
+        inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask },
         uniforms: {
           ...picking,
           uChunks: { int: total },
@@ -1864,7 +1872,7 @@ export class Engine {
       name: "pick",
       program: this.gpu.program(K.CHUNK_GATHER),
       inputs: {
-        uLogits: b.logits,
+        uLogits: head.logits,
         uMask: b.mask,
         uByRank: b.chunkByRank,
         uIds: b.ids
@@ -1907,19 +1915,15 @@ export class Engine {
    * into the logits texture, logitRows rows per token (only RGBA4 heads take
    * more than one).
    */
-  private head(row0: number, rows = 1) {
+  private head(row0: number, rows = 1, sum = true): HeadOut {
     const b = this.buffers
     const e = this.embedding
     if (e.rgba4 && this.headScaled) {
       // The last add drew h2(x · final norm weights): no norm pass.
-      this.headRgba4(e, rows, row0)
-      return
+      return this.headRgba4(e, rows, row0, sum)
     }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
-    if (e.rgba4) {
-      this.headRgba4(e, rows)
-      return
-    }
+    if (e.rgba4) return this.headRgba4(e, rows, undefined, sum)
     this.gpu.run({
       name: "head",
       program: this.gpu.program(
@@ -1949,6 +1953,7 @@ export class Engine {
       },
       output: b.logits
     })
+    return { logits: b.logits, split: 1, stride: 0 }
   }
 
   /** The scaled texture drawn with residual texture `r` (see buffers.scaled). */
@@ -1967,22 +1972,26 @@ export class Engine {
    * With `scaledRow0`, reads the last add's scaled input from that row on
    * (see headScaled) instead of lastNormed.
    */
-  private headRgba4(e: GpuMatrix, rows: number, scaledRow0?: number) {
+  private headRgba4(
+    e: GpuMatrix,
+    rows: number,
+    scaledRow0?: number,
+    sum = true
+  ): HeadOut {
     const b = this.buffers
-    const split = Math.max(1, Math.min(TUNING.headSplit, e.blocks))
+    // (At most 4: the pick passes add up to 4 slices themselves.)
+    const split = Math.max(1, Math.min(TUNING.headSplit, 4, e.blocks))
     const sliceRows = this.logitRows
     const height = split * rows * sliceRows
     let target = b.logits
     if (split > 1) {
-      const p = b.partial
-      if (p.width >= OUT_WIDTH && p.height >= height) target = p
-      else {
-        if (!this.headScratch || this.headScratch.height < height) {
-          if (this.headScratch) this.gpu.delete(this.headScratch)
-          this.headScratch = this.f32(OUT_WIDTH * 4, height)
-        }
-        target = this.headScratch
+      // Its own texture (not the partial buffer), so the pick passes that
+      // read it don't hold up the next forward's matmuls.
+      if (!this.headScratch || this.headScratch.height < height) {
+        if (this.headScratch) this.gpu.delete(this.headScratch)
+        this.headScratch = this.f32(OUT_WIDTH * 4, split * SPLIT_ROWS * sliceRows)
       }
+      target = this.headScratch
     }
     this.gpu.run({
       name: "head",
@@ -2017,7 +2026,9 @@ export class Engine {
       output: target,
       rect: { x: 0, y: 0, width: OUT_WIDTH, height }
     })
-    if (split === 1) return
+    if (split === 1) return { logits: b.logits, split: 1, stride: 0 }
+    // Readers that add the slices themselves skip the sum pass.
+    if (!sum) return { logits: target, split, stride: rows * sliceRows }
     this.gpu.run({
       name: "head",
       program: this.gpu.program(K.HEAD_SUM),
@@ -2030,6 +2041,7 @@ export class Engine {
       output: b.logits,
       rect: { x: 0, y: 0, width: OUT_WIDTH, height: rows * sliceRows }
     })
+    return { logits: b.logits, split: 1, stride: 0 }
   }
 
   /** Logits for one row of the last batch's final residual. */

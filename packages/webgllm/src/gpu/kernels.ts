@@ -1442,6 +1442,9 @@ void main() {
  */
 const PENALIZED = `
 uniform int uLogitRows;
+/* The head's K-slices to add up (1: summed already), uHeadStride rows apart. */
+uniform int uHeadSplit;
+uniform int uHeadStride;
 uniform ivec4 uExtra;
 /* The batch row that logits row 0 is (when rows are picked one at a time). */
 uniform int uPenaltyRow0;
@@ -1460,7 +1463,11 @@ float penalized(float v, uint m, int id, int r) {
 vec4 chunkTexel(int c, int t, int r) {
   int texel = c * 64 + t;
   ivec2 p = ivec2(texel % uOutW, texel / uOutW);
-  vec4 v = texelFetch(uLogits, ivec2(p.x, p.y + r * uLogitRows), 0);
+  vec4 v = vec4(0.0);
+  for (int s = 0; s < 4; s++) {
+    if (s >= uHeadSplit) break;
+    v += texelFetch(uLogits, ivec2(p.x, p.y + r * uLogitRows + s * uHeadStride), 0);
+  }
   int base = 4 * p.x;
   int id = 4 * texel;
   return vec4(
