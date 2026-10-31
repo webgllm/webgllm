@@ -32,6 +32,8 @@ export type WorkerRequest =
       sampling: Sampling
       /** Most tokens to generate; the worker's default when left out. */
       maxTokens?: number
+      /** Draft tokens by prompt lookup (speculative decoding); on by default. */
+      speculative?: boolean
     }
   | { type: "stop"; id: string }
 

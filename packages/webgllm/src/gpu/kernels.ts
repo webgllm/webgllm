@@ -45,6 +45,7 @@ vec4 pf(highp sampler2D s, int x, int m) {
   for (int k = 0; k < uSplitIn; k++) acc += texelFetch(s, ivec2(x, m * uSplitIn + k), 0);
   return acc;
 }
+
 `
 
 /** Kept for kernels that name it; the helpers are in HEADER. */
@@ -279,7 +280,9 @@ ${L.join("\n")}
 /**
  * The few-token matmul for RGBA4 weights (see `matmulPair`), split along K:
  * output row m · uSplit + s holds row group x's partial sums for token m
- * over blocks [s · uKbSlice, (s + 1) · uKbSlice). REDUCE_PAIR adds them up.
+ * over blocks [s · uKbSlice, (s + 1) · uKbSlice); pf adds them up. One
+ * token per fragment: a fragment writing several tokens' sums (several
+ * outputs) runs slower than their own fragments reading the same weights.
  */
 export function matmulSplitRgba4(o: { zeros: boolean }) {
   const L: Array<string> = []
@@ -362,20 +365,14 @@ void main() {
  */
 export const REDUCE_SWIGLU = `${HEADER}
 uniform sampler2D uP;
-uniform int uSplit;
 uniform int uHalf;
 out uvec4 o;
-vec4 total(int x, int m) {
-  vec4 acc = vec4(0.0);
-  for (int s = 0; s < uSplit; s++) acc += texelFetch(uP, ivec2(x, m * uSplit + s), 0);
-  return acc;
-}
 vec4 silu(vec4 g) { return g / (1.0 + exp(-g)); }
 void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y);
-  vec4 a = silu(total(2 * x, m)) * total(uHalf + 2 * x, m);
-  vec4 b = silu(total(2 * x + 1, m)) * total(uHalf + 2 * x + 1, m);
+  vec4 a = silu(pf(uP, 2 * x, m)) * pf(uP, uHalf + 2 * x, m);
+  vec4 b = silu(pf(uP, 2 * x + 1, m)) * pf(uP, uHalf + 2 * x + 1, m);
   o = packH2(a, b);
 }`
 
@@ -622,6 +619,41 @@ void main() {
   }
 }`
 }
+
+/**
+ * The convolution's state after each prefix of a few-token batch (for
+ * speculative decoding, which may keep only some of a batch's tokens):
+ * block p - 1 (width - 1 rows) holds convState's output for uM = p.
+ */
+export function convPrefixes(width: number) {
+  const w = width - 1
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform int uDt;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int p = y / ${w} + 1;
+  int i = y - (p - 1) * ${w};
+  int t = p - ${w} + i;
+  if (t >= 0) {
+    o = pf(uBCx, x, t) * pf(uBCx, 2 * uDt + x, t);
+  } else {
+    o = texelFetch(uState, ivec2(x, p + i), 0);
+  }
+}`
+}
+
+/** Copies rows [uOff, uOff + height) of an f32 tensor to rows [0, height). */
+export const COPY_ROWS = `${HEADER}
+uniform sampler2D uX;
+uniform int uOff;
+out vec4 o;
+void main() {
+  o = texelFetch(uX, ivec2(int(gl_FragCoord.x), int(gl_FragCoord.y) + uOff), 0);
+}`
 
 /**
  * RMS-normalized and rotated head vectors. Reads one head (32 f32 texels

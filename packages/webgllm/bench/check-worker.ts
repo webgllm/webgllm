@@ -9,6 +9,7 @@ import { httpSource } from "../src/byte-source.js"
 import { headPermutation, loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
 import { loadTokenizer } from "../src/tokenizer.js"
+import { lookupDraft } from "../src/draft.js"
 
 type Manifest = {
   files: Array<{ file: string; name?: string; shape: Array<number> }>
@@ -459,28 +460,6 @@ async function run(params: {
 }
 
 /** Without reference tensors: a chat prompt, and a greedy reply decoded. */
-/**
- * Up to `max` draft tokens for what follows `tokens`: the tokens that
- * followed the latest earlier occurrence of its last 3 (else 2, else 1).
- */
-function lookupDraft(tokens: Array<number>, max: number): Array<number> {
-  for (let n = 3; n >= 1; n--) {
-    if (tokens.length <= n) continue
-    const tail = tokens.slice(-n)
-    for (let start = tokens.length - n - 1; start >= 0; start--) {
-      let match = true
-      for (let j = 0; j < n; j++) {
-        if (tokens[start + j] !== tail[j]) {
-          match = false
-          break
-        }
-      }
-      if (match) return tokens.slice(start + n, Math.min(start + n + max, tokens.length))
-    }
-  }
-  return []
-}
-
 async function smoke(params: {
   model: string
   format?: "gguf" | "onnx"
@@ -735,6 +714,57 @@ async function smoke(params: {
   log(
     `prompt ${promptMs.toFixed(0)} ms (${((prompt.length / promptMs) * 1000).toFixed(1)} tokens/s), ${out.length} tokens in ${decodeMs.toFixed(0)} ms (${((out.length / decodeMs) * 1000).toFixed(1)} tokens/s)`
   )
+  // The same reply with speculative decoding, as the worker writes:
+  // drafts by prompt lookup checked in one batch, greedy, so the tokens
+  // must match the plain loop's exactly.
+  // The worker's policy (src/worker.ts: DRAFT_MATCH, DRAFTS).
+  for (const [minMatch, maxDrafts] of [[2, 3]]) {
+    engine.reset()
+    engine.setSeen(prompt, tokenizer.vocabSize)
+    let tok = await pick(await engine.forwardHidden(prompt))
+    const history = [...prompt]
+    const spec: Array<number> = []
+    let steps = 0
+    const t3 = performance.now()
+    const limit = params.length ? 64 : 48
+    while (spec.length < limit && tok !== tokenizer.specialTokens.eos) {
+      spec.push(tok)
+      engine.markSeen(tok)
+      history.push(tok)
+      if (spec.length >= limit) break
+      const drafts = lookupDraft(
+        history,
+        Math.min(maxDrafts, limit - spec.length - 1),
+        minMatch
+      )
+      const batch = [tok, ...drafts]
+      await engine.forwardHidden(batch, { draft: drafts.length > 0 })
+      steps++
+      let kept = 1
+      let next = -1
+      for (let i = 0; i < batch.length; i++) {
+        const choice = await pick(i)
+        if (i + 1 < batch.length && choice === batch[i + 1] && batch[i + 1] !== tokenizer.specialTokens.eos) {
+          kept++
+          spec.push(choice)
+          engine.markSeen(choice)
+          history.push(choice)
+          continue
+        }
+        next = choice
+        break
+      }
+      if (drafts.length) engine.accept(kept)
+      if (next < 0) break
+      tok = next
+    }
+    const specMs = performance.now() - t3
+    const same = spec.length === out.length && spec.every((t, i) => t === out[i])
+    const firstDiff = spec.findIndex((t, i) => t !== out[i])
+    log(
+      `SPECULATIVE match ${minMatch}+, ${maxDrafts} drafts: ${spec.length} tokens in ${steps} steps, ${specMs.toFixed(0)} ms (${((spec.length / specMs) * 1000).toFixed(1)} tokens/s); ${same ? "same tokens as plain decoding" : `DIFFERENT from plain decoding at token ${firstDiff}`}`
+    )
+  }
 }
 
 onmessage = ({ data }) => {

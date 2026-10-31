@@ -50,6 +50,8 @@ type GpuLayer = {
     outProj: GpuMatrix
     kernel: Texture
     state: [Texture, Texture]
+    /** The state after each prefix of the last few-token batch (see accept). */
+    prefixes: Texture
   }
   attention?: {
     qkvg: GpuMatrix
@@ -531,7 +533,8 @@ export class Engine {
         inProj: this.matrix(w.conv.inProj),
         outProj: this.matrix(w.conv.outProj),
         kernel: this.vector(taps, width),
-        state: [this.f32(D, width - 1), this.f32(D, width - 1)]
+        state: [this.f32(D, width - 1), this.f32(D, width - 1)],
+        prefixes: this.f32(D, (width - 1) * SPLIT_ROWS)
       }
     }
     if (w.attention) {
@@ -658,6 +661,7 @@ export class Engine {
    * returns where it is now: tokens before it are still in the cache.
    */
   rewind(position: number): number {
+    this.draft = null
     const at = Math.max(
       0,
       ...[...this.snapshots.keys()].filter((p) => p <= position)
@@ -709,6 +713,7 @@ export class Engine {
 
   /** Forgets the cache: the next forward starts a new sequence. */
   reset() {
+    this.draft = null
     this.position = 0
     for (const saved of this.snapshots.values()) this.freeSnapshot(saved)
     this.snapshots.clear()
@@ -740,6 +745,16 @@ export class Engine {
     if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows)
     this.matmul(a, w, out, rows)
     return 0
+  }
+
+  /** The last split matmul's partial sums. */
+  private partials() {
+    return this.buffers.partial
+  }
+
+  /** `source`, reading `names` from the last split matmul's partials. */
+  private fromSplit(source: string, names: Array<string>) {
+    return K.fromPartials(source, names)
   }
 
   /** How each pair tensor was last written: K-slices stacked, rows apart. */
@@ -852,7 +867,9 @@ export class Engine {
         1,
         Math.min(
           TUNING.maxSplit,
-          Math.ceil(TUNING.splitFragments / (w.groups * rows)),
+          // Slices per token: a few tokens (a token and its drafts) take
+          // as long as one, their fragments' chains of reads no longer.
+          Math.ceil(TUNING.splitFragments / w.groups),
           w.blocks / 4
         )
       )
@@ -961,7 +978,7 @@ export class Engine {
     const texels = hiddenSize / 4
     this.rms(y, 0, rows, split)
     const read = (source: string) =>
-      this.gpu.program(split ? K.fromPartials(source, ["uY"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uY"]) : source)
     const common = {
       uTexels: { int: texels },
       uEps: this.config.normEps,
@@ -999,9 +1016,9 @@ export class Engine {
     const b = this.buffers
     const dt = c.hiddenSize / 4
     const split = this.project(b.normed, layer.inProj, b.bcx, rows)
-    const bcx = split ? b.partial : b.bcx
+    const bcx = split ? this.partials() : b.bcx
     const read = (source: string) =>
-      this.gpu.program(split ? K.fromPartials(source, ["uBCx"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uBCx"]) : source)
     this.gpu.run({
       name: "conv",
       program: read(K.shortConv(c.convKernel)),
@@ -1023,6 +1040,17 @@ export class Engine {
       output: layer.state[1],
       rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
     })
+    if (this.keepPrefixes && rows > 1) {
+      // The state after each shorter prefix too, for accept().
+      this.gpu.run({
+        name: "conv",
+        program: read(K.convPrefixes(c.convKernel)),
+        inputs: { uBCx: bcx, uState: layer.state[0] },
+        uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
+        output: layer.prefixes,
+        rect: { x: 0, y: 0, width: dt, height: (c.convKernel - 1) * rows }
+      })
+    }
     layer.state.reverse()
     return this.project(b.convOut, layer.outProj, b.opOut, rows)
   }
@@ -1041,9 +1069,9 @@ export class Engine {
     const qDims = c.numHeads * c.headDim
     const kvDims = c.numKvHeads * c.headDim
     const split = this.project(b.normed, layer.qkvg, b.qkvg, rows)
-    const qkvgIn = split ? b.partial : b.qkvg
+    const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
-      this.gpu.program(split ? K.fromPartials(source, ["uQKVG"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uQKVG"]) : source)
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
     this.gpu.run({
       name: "heads",
@@ -1218,7 +1246,11 @@ export class Engine {
    * Reads tokens into the cache like `forward`, without reading logits
    * back; returns the row of the last token, for `candidates`.
    */
-  async forwardHidden(tokens: ArrayLike<number>): Promise<number> {
+  async forwardHidden(
+    tokens: ArrayLike<number>,
+    options: { draft?: boolean } = {}
+  ): Promise<number> {
+    if (options.draft) return this.forwardDraft(Array.from(tokens))
     if (this.position + tokens.length > this.contextLength) {
       throw new Error(
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
@@ -1233,6 +1265,64 @@ export class Engine {
       last = await this.forwardBatch(batch, undefined)
     }
     return last
+  }
+
+  /** Where the last draft batch started, and how many tokens it had. */
+  private draft: { pos0: number; rows: number } | null = null
+  /** Whether the batch being read keeps each prefix's conv state. */
+  private keepPrefixes = false
+
+  /**
+   * Reads a few tokens (at most SPLIT_ROWS: a token and its drafted
+   * successors, for speculative decoding) keeping what's needed to keep
+   * only a prefix of them afterwards (see accept). Returns the last row.
+   */
+  private async forwardDraft(tokens: Array<number>) {
+    if (tokens.length > SPLIT_ROWS)
+      throw new Error(`A draft batch holds ${SPLIT_ROWS} tokens at most.`)
+    if (this.position + tokens.length > this.contextLength) {
+      throw new Error(
+        `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
+      )
+    }
+    const pos0 = this.position
+    this.keepPrefixes = true
+    try {
+      const last = await this.forwardBatch(tokens, undefined)
+      this.draft = { pos0, rows: tokens.length }
+      return last
+    } finally {
+      this.keepPrefixes = false
+    }
+  }
+
+  /**
+   * Keeps the first `count` tokens of the last draft batch and forgets the
+   * rest: the cache continues after them. Keys and values past them are
+   * never read before they're written again; the convolutions' state is
+   * set back to the prefix's.
+   */
+  accept(count: number) {
+    const d = this.draft
+    if (!d) throw new Error("No draft batch to accept tokens of.")
+    this.draft = null
+    if (count < 1 || count > d.rows)
+      throw new Error(`Can't keep ${count} of a ${d.rows}-token batch.`)
+    if (count < d.rows) {
+      const rows = this.config.convKernel - 1
+      for (const layer of this.layers) {
+        if (!layer.conv) continue
+        this.gpu.run({
+          name: "conv",
+          program: this.gpu.program(K.COPY_ROWS),
+          inputs: { uX: layer.conv.prefixes },
+          uniforms: { uOff: { int: (count - 1) * rows } },
+          output: layer.conv.state[0],
+          rect: { x: 0, y: 0, width: layer.conv.state[0].width, height: rows }
+        })
+      }
+    }
+    this.position = d.pos0 + count
   }
 
   /** The penalty mask on the CPU side, mirrored to the GPU's. */
@@ -1477,7 +1567,7 @@ export class Engine {
       await look(i, "op_out", b.opOut, c.hiddenSize, "pair")
       this.addNormed(
         h,
-        opSplit ? b.partial : b.opOut,
+        opSplit ? this.partials() : b.opOut,
         layer.postOperatorNorm,
         next,
         rows,
@@ -1492,9 +1582,9 @@ export class Engine {
         this.gpu.run({
           name: "swiglu",
           program: this.gpu.program(K.REDUCE_SWIGLU),
-          inputs: { uP: b.partial },
+          inputs: { uP: this.partials() },
           uniforms: {
-            uSplit: { int: slices },
+            uSplitIn: { int: slices },
             uHalf: { int: c.intermediateSize / 4 }
           },
           output: b.act,
@@ -1518,7 +1608,7 @@ export class Engine {
       await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
       this.addNormed(
         next,
-        downSplit ? b.partial : b.ffnOut,
+        downSplit ? this.partials() : b.ffnOut,
         layer.postFfnNorm,
         h,
         rows,

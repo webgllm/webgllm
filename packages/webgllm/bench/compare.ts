@@ -137,6 +137,77 @@ async function runTjs(text: string, cpu = false) {
   )
 }
 
+/**
+ * This package's WebGL 2 engine, through its worker as the app runs it
+ * (with speculative decoding unless ?speculative=0), on the same prompt.
+ */
+async function runWebgl(text: string) {
+  const worker = new Worker("/bundle/src/worker.js", { type: "module" })
+  const model = params.get("model") ?? "onnx-community/LFM3-1.7B-ONNX"
+  const speculative = params.get("speculative") !== "0"
+  let lastPct = -10
+  let ready: () => void = () => undefined
+  let failed: (e: Error) => void = () => undefined
+  const pending = new Map<
+    string,
+    { resolve: (s: Record<string, number | null>) => void; reject: (e: Error) => void }
+  >()
+  let reply = ""
+  worker.onmessage = ({ data }) => {
+    if (data.type === "progress") {
+      const pct = Math.floor(data.progress * 100)
+      if (pct >= lastPct + 10) {
+        lastPct = pct
+        log(`loading ${pct}% (${data.cached ? "from storage" : "downloading"})`)
+      }
+    } else if (data.type === "ready") ready()
+    else if (data.type === "load-error") failed(new Error(data.message))
+    else if (data.type === "token") reply += data.text
+    else if (data.type === "done") pending.get(data.id)?.resolve(data.stats)
+    else if (data.type === "error") pending.get(data.id)?.reject(new Error(data.message))
+  }
+  const t0 = performance.now()
+  await new Promise<void>((resolve, reject) => {
+    ready = resolve
+    failed = reject
+    worker.postMessage({ type: "load", model })
+  })
+  log(`WebGL loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
+  let n = 0
+  const generate = (content: string, maxTokens: number) =>
+    new Promise<Record<string, number | null>>((resolve, reject) => {
+      const id = `run${n++}`
+      pending.set(id, { resolve, reject })
+      reply = ""
+      worker.postMessage({
+        type: "generate",
+        id,
+        model,
+        chat: [{ role: "user", content }],
+        tools: [],
+        thinking: false,
+        sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
+        maxTokens,
+        speculative
+      })
+    })
+  await generate("Hi", 4)
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const input = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
+    const promptTps = (input / (s.promptMs ?? 1)) * 1000
+    const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
+    log(
+      `WebGL run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
+    )
+    if (i === 0) log(`reply: ${JSON.stringify(reply.slice(0, 200))}`)
+    runs.push({ promptTps, decodeTps, ttftMs: s.firstTokenMs ?? 0 })
+  }
+  summarize(`WebGL${speculative ? " (speculative)" : ""}, ${model}`, runs)
+  worker.terminate()
+}
+
 /** wllama (llama.cpp in WebAssembly) with every layer offloaded to WebGPU. */
 async function runWllama(text: string, gpu = true) {
   const url = "/wllama/index.js"
@@ -215,6 +286,7 @@ async function main() {
   else if (run === "tjs-cpu") await runTjs(text, true)
   else if (run === "wllama") await runWllama(text)
   else if (run === "wllama-cpu") await runWllama(text, false)
+  else if (run === "webgl") await runWebgl(text)
   else log("Pass ?run=tjs, tjs-cpu, wllama or wllama-cpu.")
 }
 

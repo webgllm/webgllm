@@ -12,7 +12,8 @@ import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { createSampler } from "./sampler.js"
+import { lookupDraft } from "./draft.js"
+import { createSampler, draw, verify } from "./sampler.js"
 import { download, storedFile } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
@@ -34,6 +35,16 @@ let loading: {
   promise: Promise<Loaded>
   abort: AbortController
 } | null = null
+
+/**
+ * Drafted tokens checked with each written one (speculative decoding by
+ * prompt lookup; see draft.ts). A batch of a token and its drafts is read
+ * as fast as one token, and the tokens kept are distributed exactly as
+ * without drafts.
+ */
+const DRAFTS = 3
+/** Drafts follow an earlier occurrence of at least this many last tokens. */
+const DRAFT_MATCH = 2
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -326,18 +337,21 @@ async function generate(request: GenerateRequest) {
   )
   if (onGpu) engine.setSeen(prompt, vocab)
   else sampler.see(prompt)
-  const next = async () => {
+  // The distribution of the token after `r`, a row of the last batch, as
+  // token ids and probabilities.
+  const distribution = async (r: number) => {
     if (onGpu) {
       const { ids, logits } = await engine.candidates(
-        row,
+        r,
         sampling.top_k,
         sampling.repetition_penalty
       )
-      return ids[sampler.sample(logits)]
+      const d = sampler.distribution(logits)
+      return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }
     }
-    const logits = await engine.logits(row)
+    const logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
-    return sampler.sample(logits)
+    return sampler.distribution(logits)
   }
 
   // When the template opens the thinking itself (LFM3 with thinking on ends
@@ -347,23 +361,63 @@ async function generate(request: GenerateRequest) {
     post({ type: "token", id, text: THINK_OPEN })
   }
 
-  let token = await next()
+  let token = draw(await distribution(row))
   stats.promptMs = performance.now() - promptStart
   const firstTokenAt = performance.now()
   stats.firstTokenMs = firstTokenAt - requested
   const decoder = tokenizer.createStreamDecoder({ skipSpecialTokens: false })
   const eos = tokenizer.specialTokens.eos
-  while (!stopped.has(id)) {
+  // Prompt and reply so far, where drafts are looked up.
+  const history = prompt.slice()
+  // Writes out a token of the reply; false once the reply is over.
+  const emit = (t: number) => {
     stats.outputTokens++
-    if (token === eos) break
-    if (onGpu) engine.markSeen(token)
-    else sampler.see([token])
-    const text = decoder.push(token)
+    if (t === eos) return false
+    if (onGpu) engine.markSeen(t)
+    else sampler.see([t])
+    history.push(t)
+    const text = decoder.push(t)
     if (text) post({ type: "token", id, text })
-    if (stats.outputTokens >= maxTokens) break
-    row = await engine.forwardHidden([token])
-    model.cached.push(token)
-    token = await next()
+    return stats.outputTokens < maxTokens
+  }
+  let going = emit(token)
+  while (going && !stopped.has(id)) {
+    // The token and its drafts in one batch: drafts the reply can still
+    // hold (one more token is drawn after them) and the cache too.
+    const drafts = lookupDraft(
+      history,
+      Math.min(
+        request.speculative === false ? 0 : DRAFTS,
+        maxTokens - stats.outputTokens - 1,
+        engine.contextLength - engine.position - 1
+      ),
+      DRAFT_MATCH
+    )
+    const batch = [token, ...drafts]
+    row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
+    // Row i's distribution checks draft i + 1; the first draft it rejects
+    // is replaced by a token drawn from what's left, and the rest dropped.
+    let kept = 1
+    let next = -1
+    for (let i = 0; i < batch.length && going; i++) {
+      const d = await distribution(i)
+      if (i + 1 === batch.length) {
+        next = draw(d)
+        break
+      }
+      const check = verify(d, batch[i + 1])
+      if (!check.kept) {
+        next = check.token
+        break
+      }
+      kept++
+      going = emit(batch[i + 1]) && !stopped.has(id)
+    }
+    if (drafts.length) engine.accept(kept)
+    model.cached.push(...batch.slice(0, kept))
+    if (!going || next < 0) break
+    token = next
+    going = emit(token)
   }
   const rest = decoder.flush()
   if (rest) post({ type: "token", id, text: rest })
