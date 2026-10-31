@@ -110,8 +110,10 @@ export const TUNING = {
   rmsParts: 64,
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
-  /** Their K-slices: about this many K values each (twice for over 8192 rows). */
+  /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
+  /** ...and at most this many (readers add them up). */
+  quadMaxSplit: 4,
   /** K-slices of the RGBA4 output head (more than 1 adds a pass to sum them). */
   headSplit: 4,
   /**
@@ -168,7 +170,13 @@ const OUT_WIDTH = 1024
 /** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
 const MAX_SNAPSHOTS = 8
 /** Queries per attention slice: the scores buffer holds this many per head. */
+/**
+ * Queries per attention slice (see attend): more is fewer passes and more
+ * fragments per pass, for a bigger scores buffer (64: ~33 MB at an 8192
+ * context), so it's 64 only for desktop-size batches.
+ */
 const SCORE_ROWS = 32
+const SCORE_ROWS_LARGE = 64
 /** Logits per chunk when picking candidates on the GPU. */
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
@@ -345,12 +353,13 @@ export class Engine {
       scores: this.gpu.texture(
         GL.RGBA32F,
         scoreTexels,
-        c.numHeads * Math.min(M, SCORE_ROWS)
+        c.numHeads *
+          Math.min(M, this.batchSize >= 256 ? SCORE_ROWS_LARGE : SCORE_ROWS)
       ),
       attnOut: this.h2(qDims, M),
       gateUp: this.pair(2 * I, M),
       act: this.h2(I, M),
-      ffnOut: this.pair(D, this.quadMatmuls ? 4 * M : 2 * M),
+      ffnOut: this.pair(D, 2 * M),
       lastNormed: this.h2(D, SPLIT_ROWS),
       /** Logits: logitRows rows per token, for up to SPLIT_ROWS tokens. */
       logits: this.gpu.texture(
@@ -906,7 +915,10 @@ export class Engine {
       const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
       // The most slices the output holds at a full batch: the same for
       // every batch, so the warm-up compiles the programs prompts use.
-      const most = Math.floor(out.height / Math.ceil(this.capacity / 4))
+      const most = Math.min(
+        TUNING.quadMaxSplit,
+        Math.floor(out.height / Math.ceil(this.capacity / 4))
+      )
       const kbSlice = Math.ceil(
         w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
       )

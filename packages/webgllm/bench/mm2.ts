@@ -25,7 +25,7 @@ uvec4 packH2(vec4 a, vec4 b) {
 type Variant = {
   weights: "rgba4" | "bytes"
   acts: "f16" | "h2"
-  tokens: 1 | 2 | 4
+  tokens: 1 | 2 | 4 | 8
   /** Weights, activations and block sums as mediump (half precision on Metal?). */
   half?: boolean
 }
@@ -80,13 +80,11 @@ function kernel(v: Variant) {
       ? "out vec4 o0;"
       : T === 2
         ? "out uvec4 o0;"
-        : "layout(location = 0) out uvec4 o0;\nlayout(location = 1) out uvec4 o1;"
+        : Array.from({ length: T / 2 }, (_, k) => `layout(location = ${k}) out uvec4 o${k};`).join("\n")
   const writes =
     T === 1
       ? "o0 = acc0;"
-      : T === 2
-        ? "o0 = packH2(acc0, acc1);"
-        : "o0 = packH2(acc0, acc1);\n  o1 = packH2(acc2, acc3);"
+      : Array.from({ length: T / 2 }, (_, k) => `o${k} = packH2(acc${2 * k}, acc${2 * k + 1});`).join("\n  ")
   if (v.half) {
     for (let i = 0; i < L.length; i++)
       L[i] = L[i]
@@ -718,7 +716,8 @@ async function shapes(gpu: Gpu, batch: number) {
               { weights: "rgba4", acts: "f16", tokens: 1 }
             ]
           : [
-              { weights: "rgba4", acts: "h2", tokens: 4 }
+              { weights: "rgba4", acts: "h2", tokens: 4 },
+              { weights: "rgba4", acts: "h2", tokens: 8 }
             ]
       for (const v of variants) {
         const T = v.tokens
