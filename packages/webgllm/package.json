@@ -1,0 +1,63 @@
+{
+  "name": "@tanstack-ai-browser/webgl",
+  "version": "0.0.0",
+  "description": "TanStack AI adapter for LFM3 running in the browser on WebGL 2, for devices without WebGPU",
+  "license": "MIT",
+  "author": "daveycodez",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daveycodez/tanstack-ai-browser.git",
+    "directory": "packages/webgl"
+  },
+  "homepage": "https://github.com/daveycodez/tanstack-ai-browser/tree/main/packages/webgl#readme",
+  "bugs": "https://github.com/daveycodez/tanstack-ai-browser/issues",
+  "keywords": [
+    "tanstack-ai",
+    "tanstack",
+    "ai",
+    "llm",
+    "webgl",
+    "webgl2",
+    "lfm3",
+    "gguf",
+    "onnx",
+    "browser",
+    "local-ai"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "@tanstack-ai-browser/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "!**/*.tsbuildinfo"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "nx": {
+    "name": "webgl"
+  },
+  "peerDependencies": {
+    "@tanstack/ai": "^1.0.0"
+  },
+  "dependencies": {
+    "@huggingface/jinja": "0.5.10",
+    "@huggingface/tokenizers": "0.2.0"
+  },
+  "devDependencies": {
+    "@tanstack/ai": "1.0.0",
+    "esbuild": "0.28.2"
+  }
+}

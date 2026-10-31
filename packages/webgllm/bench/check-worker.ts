@@ -1,0 +1,596 @@
+/**
+ * Correctness check, in a worker: runs the engine over the reference
+ * prompt and compares every layer's output and the logits with llama.cpp's
+ * (served from /ref/, see bench/README.md).
+ */
+import { Engine } from "../src/engine.js"
+import type { LayerProbe } from "../src/engine.js"
+import { httpSource } from "../src/byte-source.js"
+import { headPermutation, loadGguf } from "../src/load-gguf.js"
+import { loadOnnx } from "../src/load-onnx.js"
+import { loadTokenizer } from "../src/tokenizer.js"
+
+type Manifest = {
+  files: Array<{ file: string; name?: string; shape: Array<number> }>
+}
+
+const log = (text: string) => postMessage({ type: "log", text })
+
+/** Where the ONNX build's files are served: /onnx-web/ or /onnx-community/. */
+let onnxDir = "/onnx-web"
+
+/** Where the reference tensors are: /ref/ (llama.cpp, GGUF) or /ref-onnx/ (onnxruntime). */
+let refBase = "/ref/"
+
+/** The model's weights: the GGUF from /models/, or the ONNX build from /onnx-web/. */
+async function modelPieces(params: {
+  model: string
+  format?: "gguf" | "onnx"
+}) {
+  if (params.format !== "onnx")
+    return loadGguf(await httpSource(`/models/${params.model}`))
+  const config = (await (
+    await fetch(`${onnxDir}/config.json`)
+  ).json()) as Record<string, unknown>
+  return loadOnnx({
+    config,
+    graph: await httpSource(`${onnxDir}/onnx/model_q4f16.onnx`),
+    data: await httpSource(`${onnxDir}/onnx/model_q4f16.onnx_data`)
+  })
+}
+
+/** Rows [from, from + rows) of a float32 [n][dims] reference file. */
+async function refRows(file: string, dims: number, from: number, rows: number) {
+  const res = await fetch(`${refBase}${file}`, {
+    headers: {
+      Range: `bytes=${from * dims * 4}-${(from + rows) * dims * 4 - 1}`
+    }
+  })
+  if (!res.ok) throw new Error(`/ref/${file}: ${res.status}`)
+  return new Float32Array(await res.arrayBuffer())
+}
+
+/** How far `got` is from `want`: relative RMS error, max abs difference, cosine. */
+function compare(got: Float32Array, want: Float32Array) {
+  let dd = 0
+  let ww = 0
+  let gw = 0
+  let gg = 0
+  let max = 0
+  let worst = 0
+  for (let i = 0; i < want.length; i++) {
+    const d = got[i] - want[i]
+    dd += d * d
+    ww += want[i] * want[i]
+    gg += got[i] * got[i]
+    gw += got[i] * want[i]
+    if (Math.abs(d) > max || Number.isNaN(d)) {
+      max = Math.abs(d)
+      worst = i
+    }
+  }
+  return {
+    rel: Math.sqrt(dd / ww),
+    max,
+    worst,
+    cos: gw / Math.sqrt(gg * ww)
+  }
+}
+
+const fmt = (r: ReturnType<typeof compare>) =>
+  `rel ${r.rel.toExponential(2)}  cos ${r.cos.toFixed(6)}  max ${r.max.toExponential(2)} @${r.worst}`
+
+function softmax(logits: Float32Array) {
+  let mx = -Infinity
+  for (const v of logits) mx = Math.max(mx, v)
+  let sum = 0
+  const p = new Float64Array(logits.length)
+  for (let i = 0; i < logits.length; i++) {
+    p[i] = Math.exp(logits[i] - mx)
+    sum += p[i]
+  }
+  for (let i = 0; i < p.length; i++) p[i] /= sum
+  return p
+}
+
+function argmax(a: ArrayLike<number>) {
+  let best = 0
+  for (let i = 1; i < a.length; i++) if (a[i] > a[best]) best = i
+  return best
+}
+
+/** Logit comparison: KL(ref || ours), top-1 agreement, top-5 overlap. */
+function compareLogits(got: Float32Array, want: Float32Array) {
+  const p = softmax(want)
+  const q = softmax(got)
+  let kl = 0
+  for (let i = 0; i < p.length; i++)
+    if (p[i] > 0) kl += p[i] * Math.log(p[i] / Math.max(q[i], 1e-30))
+  const top = (a: ArrayLike<number>) =>
+    Array.from(a, (v, i) => [v, i] as const)
+      .sort((x, y) => y[0] - x[0])
+      .slice(0, 5)
+      .map(([, i]) => i)
+  const tw = top(want)
+  const tg = top(got)
+  return {
+    kl,
+    top1: tw[0] === tg[0],
+    top5: tg.filter((i) => tw.includes(i)).length,
+    ...compare(got, want)
+  }
+}
+
+async function run(params: {
+  model: string
+  format?: "gguf" | "onnx"
+  batch: number
+  precision: "highp" | "mediump"
+  layers: boolean
+}) {
+  refBase = params.format === "onnx" ? "/ref-onnx/" : "/ref/"
+  const manifest = (await (
+    await fetch(`${refBase}manifest.json`)
+  ).json()) as Manifest
+  const tokensFile = (await (await fetch(`${refBase}tokens.json`)).json()) as {
+    token_ids?: Array<number>
+    tokens?: Array<number>
+    greedy_continuation?: Array<number> | { token_ids?: Array<number> }
+  }
+  const tokens = tokensFile.token_ids ?? tokensFile.tokens ?? []
+  const files = new Set(manifest.files.map((f) => f.file))
+  log(`${tokens.length} reference tokens, ${files.size} reference files`)
+
+  const canvas = new OffscreenCanvas(1, 1)
+  const engine = new Engine(canvas, {
+    batchSize: params.batch,
+    matmulPrecision: params.precision
+  })
+  log(
+    `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
+  )
+  const t0 = performance.now()
+  await engine.load(await modelPieces(params))
+  log(
+    `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
+  )
+
+  const D = engine.config.hiddenSize
+  const V = engine.config.vocabSize
+  const worstByLayer = new Map<string, number>()
+  const c = engine.config
+  const qDims = c.numHeads * c.headDim
+  const kvDims = c.numKvHeads * c.headDim
+  const qPerm = headPermutation(c.numHeads, c.headDim, c.ropeDimsFull)
+  const kPerm = headPermutation(c.numKvHeads, c.headDim, c.ropeDimsFull)
+  /** Reference rows put in our layout: q/k dims reordered in full-attention layers. */
+  const reorder = (
+    want: Float32Array,
+    dims: number,
+    perm: Int32Array | null
+  ) => {
+    if (!perm) return want
+    const out = new Float32Array(want.length)
+    for (let r = 0; r < want.length / dims; r++) {
+      for (let i = 0; i < dims; i++)
+        out[r * dims + i] = want[r * dims + perm[i]]
+    }
+    return out
+  }
+  const check = async (
+    key: string,
+    got: Float32Array,
+    file: string,
+    dims: number,
+    offset: number,
+    rows: number,
+    perm: Int32Array | null = null,
+    scale = 1
+  ) => {
+    if (!files.has(file)) return
+    const want = reorder(await refRows(file, dims, offset, rows), dims, perm)
+    const g = scale === 1 ? got : got.map((v) => v * scale)
+    const r = compare(g, want)
+    worstByLayer.set(key, Math.max(worstByLayer.get(key) ?? 0, r.rel))
+    log(`  ${key.padEnd(20)} tokens ${offset}..${offset + rows - 1}  ${fmt(r)}`)
+  }
+  /** Columns [from, from + width) of a rows × dims tensor. */
+  const columns = (
+    data: Float32Array,
+    rows: number,
+    dims: number,
+    from: number,
+    width: number
+  ) => {
+    const out = new Float32Array(rows * width)
+    for (let r = 0; r < rows; r++)
+      out.set(
+        data.subarray(r * dims + from, r * dims + from + width),
+        r * width
+      )
+    return out
+  }
+  // Our probe names → the reference's files.
+  const probe: LayerProbe | undefined = params.layers
+    ? async (layer, name, read) => {
+        const type = c.layerTypes[layer]
+        const full = type === "full_attention"
+        const simple: Record<string, string> = {
+          operator_norm: "operator_norm",
+          in_proj: "conv_in_proj",
+          conv: "conv_gated",
+          op_out: type === "conv" ? "conv_out_proj" : "attn_out_proj",
+          after_op: "resid_mid",
+          ffn_out: "ffn_out",
+          l_out: "l_out",
+          attn_out: "attn_gated"
+        }
+        const wanted = [...Object.keys(simple), "qkvg", "q"].includes(name)
+        if (!wanted) return
+        const file = (n: string) => `${n}-${layer}.bin`
+        const any =
+          name === "qkvg"
+            ? files.has(file("q_proj"))
+            : name === "q"
+              ? files.has(file("q_rope"))
+              : files.has(file(simple[name]))
+        if (!any) return
+        const t = await read()
+        const rows = t.rows
+        const data = t.data.subarray(0, rows * t.dims)
+        if (name === "qkvg") {
+          await check(
+            `q_proj-${layer}`,
+            columns(data, rows, t.dims, 0, qDims),
+            file("q_proj"),
+            qDims,
+            t.offset,
+            rows,
+            full ? qPerm : null
+          )
+          await check(
+            `k_proj-${layer}`,
+            columns(data, rows, t.dims, qDims, kvDims),
+            file("k_proj"),
+            kvDims,
+            t.offset,
+            rows,
+            full ? kPerm : null
+          )
+          await check(
+            `v_proj-${layer}`,
+            columns(data, rows, t.dims, qDims + kvDims, kvDims),
+            file("v_proj"),
+            kvDims,
+            t.offset,
+            rows
+          )
+          // The reference's gate is after its sigmoid.
+          const gate = columns(
+            data,
+            rows,
+            t.dims,
+            qDims + 2 * kvDims,
+            c.numHeads
+          ).map((v) => 1 / (1 + Math.exp(-v)))
+          await check(
+            `attn_gate-${layer}`,
+            gate,
+            file("attn_gate"),
+            c.numHeads,
+            t.offset,
+            rows
+          )
+        } else if (name === "q") {
+          await check(
+            `q_rope-${layer}`,
+            data,
+            file("q_rope"),
+            qDims,
+            t.offset,
+            rows,
+            full ? qPerm : null,
+            Math.sqrt(c.headDim)
+          )
+        } else {
+          await check(
+            `${simple[name]}-${layer}`,
+            data,
+            file(simple[name]),
+            t.dims,
+            t.offset,
+            rows
+          )
+        }
+      }
+    : undefined
+
+  // The prompt in batches, with logits checked at a few rows of each batch.
+  engine.reset()
+  let agree = 0
+  let checked = 0
+  let klSum = 0
+  const forwardStart = performance.now()
+  for (let start = 0; start < tokens.length; start += params.batch) {
+    const batch = tokens.slice(start, start + params.batch)
+    await engine.forward(batch, probe)
+    for (const row of [0, Math.floor(batch.length / 2), batch.length - 1]) {
+      const got = await engine.logits(row)
+      const want = await refRows("logits.bin", V, start + row, 1)
+      const r = compareLogits(got, want)
+      checked++
+      if (r.top1) agree++
+      klSum += r.kl
+      log(
+        `logits @${start + row}: KL ${r.kl.toExponential(2)}  top1 ${r.top1 ? "same" : "DIFFERENT"}  top5 ${r.top5}/5  ${fmt(r)}`
+      )
+    }
+  }
+  log(
+    `forward ${((performance.now() - forwardStart) / 1000).toFixed(2)} s (with checks), ${engine.gpu.draws} draws`
+  )
+
+  // Writing: the reference's greedy continuation fed one token at a time,
+  // each step's logits against llama.cpp's single-token decodes.
+  const cont = tokensFile.greedy_continuation
+  const continuation = Array.isArray(cont) ? cont : (cont?.token_ids ?? [])
+  if (files.has("gen_logits.bin") && continuation.length) {
+    let genAgree = 0
+    let genKl = 0
+    let ours = argmax(
+      await engine.logits(
+        tokens.length -
+          1 -
+          Math.floor((tokens.length - 1) / params.batch) * params.batch
+      )
+    )
+    let sameAsRef = ours === continuation[0]
+    // gen_logits row i: after feeding continuation token i. Each step also
+    // checks the GPU's candidate pick (top 50 chunks, a 1.1 penalty on the
+    // tokens so far) against the same pick from the full logits.
+    let pickAgree = 0
+    const seen = new Set<number>(tokens)
+    engine.setSeen(tokens, V)
+    for (let i = 0; i < continuation.length; i++) {
+      const got = await engine.forward([continuation[i]])
+      seen.add(continuation[i])
+      engine.markSeen(continuation[i])
+      const picked = await engine.candidates(0, 50, 1.1)
+      const penalized = got.slice()
+      for (const t of seen)
+        penalized[t] =
+          penalized[t] < 0 ? penalized[t] * 1.1 : penalized[t] / 1.1
+      const order = Array.from(penalized, (v, j) => [v, j] as const)
+        .sort((a, b) => b[0] - a[0])
+        .slice(0, 50)
+      const pickedSet = new Map(
+        Array.from(picked.ids, (id, j) => [id, picked.logits[j]] as const)
+      )
+      const exact = order.every(
+        ([v, j]) =>
+          pickedSet.has(j) &&
+          Math.abs((pickedSet.get(j) ?? 0) - v) <
+            1e-4 * Math.max(1, Math.abs(v))
+      )
+      if (exact) pickAgree++
+      else log(`candidate pick differs at step ${i}`)
+      const want = await refRows("gen_logits.bin", V, i, 1)
+      const r = compareLogits(got, want)
+      if (r.top1) genAgree++
+      genKl += r.kl
+      ours = argmax(got)
+      if (i + 1 < continuation.length && ours !== continuation[i + 1])
+        sameAsRef = false
+      if (i < 4 || !r.top1)
+        log(
+          `decode step ${i + 1}: KL ${r.kl.toExponential(2)}  top1 ${r.top1 ? "same" : "DIFFERENT"}  top5 ${r.top5}/5  ${fmt(r)}`
+        )
+    }
+    const steps = continuation.length
+    log(
+      `DECODE SUMMARY: top-1 agreement ${genAgree}/${steps}, mean KL ${(genKl / steps).toExponential(2)}, greedy path ${sameAsRef ? "identical" : "diverges"} over ${continuation.length} tokens`
+    )
+    log(
+      `CANDIDATES: GPU top-50 pick with penalty matches the full logits at ${pickAgree}/${steps} steps`
+    )
+  }
+  log(
+    `SUMMARY: top-1 agreement ${agree}/${checked}, mean KL ${(klSum / checked).toExponential(2)}`
+  )
+  if (worstByLayer.size) {
+    const worst = [...worstByLayer.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+    log(
+      `worst tensors: ${worst.map(([k, v]) => `${k} ${v.toExponential(2)}`).join(", ")}`
+    )
+  }
+
+  // Speed: the whole prompt again from an empty cache, no checks.
+  engine.reset()
+  await engine.gpu.finish()
+  const t1 = performance.now()
+  const logits = await engine.forward(tokens)
+  const ms = performance.now() - t1
+  log(
+    `SPEED: ${tokens.length} tokens in ${ms.toFixed(0)} ms = ${((tokens.length / ms) * 1000).toFixed(1)} tokens/s (batch ${params.batch}), next token ${argmax(logits)}`
+  )
+  void D
+}
+
+/** Without reference tensors: a chat prompt, and a greedy reply decoded. */
+async function smoke(params: {
+  model: string
+  format?: "gguf" | "onnx"
+  /** The ONNX build's directory on the server (default onnx-web). */
+  onnx?: string
+  batch: number
+  precision: "highp" | "mediump"
+  question?: string
+  /** Pad the question to about this many prompt tokens, to time prompt reading. */
+  length?: number
+  skip?: Array<string>
+}) {
+  if (params.onnx) onnxDir = `/${params.onnx}`
+  const dir = params.format === "onnx" ? onnxDir : "/hf"
+  const [tokenizerJson, tokenizerConfig, chatTemplate] = await Promise.all([
+    fetch(`${dir}/tokenizer.json`).then((r) => r.json() as Promise<object>),
+    fetch(`${dir}/tokenizer_config.json`).then(
+      (r) => r.json() as Promise<Record<string, unknown>>
+    ),
+    fetch(`${dir}/chat_template.jinja`).then((r) =>
+      r.ok ? r.text() : undefined
+    )
+  ])
+  const tokenizer = loadTokenizer({
+    tokenizerJson,
+    tokenizerConfig,
+    chatTemplate
+  })
+  const canvas = new OffscreenCanvas(1, 1)
+  const engine = new Engine(canvas, {
+    batchSize: params.batch,
+    matmulPrecision: params.precision
+  })
+  log(
+    `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
+  )
+  const t0 = performance.now()
+  await engine.load(await modelPieces(params))
+  // Profile: the prompt with each kind of pass left out in turn.
+  if (params.skip) {
+    const tokens = Array.from(
+      { length: params.length ?? 512 },
+      (_, i) => 1000 + (i % 5000)
+    )
+    engine.reset()
+    await engine.forward(tokens.slice(0, 8))
+    const time = async (label: string, skip: Array<string>) => {
+      engine.gpu.skip = new Set(skip)
+      engine.reset()
+      await engine.gpu.finish()
+      const t = performance.now()
+      await engine.forward(tokens)
+      const ms = performance.now() - t
+      log(`PROFILE ${label.padEnd(16)} ${ms.toFixed(0)} ms`)
+      return ms
+    }
+    const all = await time("everything", [])
+    for (const name of params.skip) {
+      const ms = await time(`without ${name}`, [name])
+      log(
+        `  ${name}: ${(all - ms).toFixed(0)} ms (${(((all - ms) / all) * 100).toFixed(0)}%)`
+      )
+    }
+    await time("everything again", [])
+    // Writing: single-token steps, each with its logits read back.
+    const step = async (
+      label: string,
+      skip: Array<string>,
+      readLogits = true
+    ) => {
+      engine.gpu.skip = new Set(skip)
+      engine.reset()
+      await engine.forward(tokens.slice(0, 64))
+      const draws = engine.gpu.draws
+      const t = performance.now()
+      for (let i = 0; i < 16; i++) {
+        if (readLogits) await engine.forward([tokens[i]])
+        else {
+          await engine.forwardNoLogits([tokens[i]])
+          await engine.gpu.finish()
+        }
+      }
+      const ms = (performance.now() - t) / 16
+      log(
+        `DECODE ${label.padEnd(22)} ${ms.toFixed(1)} ms/token, ${((engine.gpu.draws - draws) / 16).toFixed(0)} draws/token`
+      )
+      return ms
+    }
+    const full = await step("everything", [])
+    await step("no logits readback", [], false)
+    for (const name of params.skip) {
+      const ms = await step(`without ${name}`, [name])
+      log(`  ${name}: ${(full - ms).toFixed(1)} ms`)
+    }
+    engine.gpu.skip = new Set()
+    const t = performance.now()
+    for (let i = 0; i < 16; i++) await engine.logits(0)
+    log(
+      `DECODE output head + readback alone: ${((performance.now() - t) / 16).toFixed(1)} ms`
+    )
+    const t2 = performance.now()
+    for (let i = 0; i < 16; i++) await engine.gpu.finish()
+    log(
+      `DECODE empty sync alone: ${((performance.now() - t2) / 16).toFixed(1)} ms`
+    )
+    return
+  }
+  log(
+    `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
+  )
+  let question =
+    params.question ?? "What is the capital of France? Answer in one sentence."
+  const filler =
+    "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+  const chat = () => [{ role: "user" as const, content: question }]
+  const encode = () =>
+    tokenizer.encodeChat(chat(), {
+      addGenerationPrompt: true,
+      enableThinking: false
+    })
+  if (params.length) {
+    let pad = ""
+    while (
+      tokenizer.encodeChat([{ role: "user", content: pad + question }], {
+        addGenerationPrompt: true
+      }).length < params.length
+    )
+      pad += filler
+    question = `${pad}\n\n${question}`
+  }
+  const prompt = encode()
+  log(`prompt: ${prompt.length} tokens`)
+  // Warm up: compile every shader on a short prompt first.
+  engine.reset()
+  await engine.forward(prompt.slice(0, 8))
+  await engine.forward(prompt.slice(8, 9))
+  engine.reset()
+  // As the worker does it: candidates picked on the GPU (top 50, penalty
+  // 1.1), the likeliest drawn (greedy, for a repeatable reply).
+  const pick = async (row: number) => {
+    const { ids, logits } = await engine.candidates(row, 50, 1.1)
+    return ids[argmax(logits)]
+  }
+  const t1 = performance.now()
+  engine.setSeen(prompt, tokenizer.vocabSize)
+  let token = await pick(await engine.forwardHidden(prompt))
+  const promptMs = performance.now() - t1
+  const out: Array<number> = []
+  const t2 = performance.now()
+  for (let i = 0; i < (params.length ? 64 : 48); i++) {
+    if (token === tokenizer.specialTokens.eos) break
+    out.push(token)
+    engine.markSeen(token)
+    token = await pick(await engine.forwardHidden([token]))
+  }
+  const decodeMs = performance.now() - t2
+  log(`REPLY: ${JSON.stringify(tokenizer.decode(out))}`)
+  log(
+    `prompt ${promptMs.toFixed(0)} ms (${((prompt.length / promptMs) * 1000).toFixed(1)} tokens/s), ${out.length} tokens in ${decodeMs.toFixed(0)} ms (${((out.length / decodeMs) * 1000).toFixed(1)} tokens/s)`
+  )
+}
+
+onmessage = ({ data }) => {
+  ;(data.smoke ? smoke(data) : run(data)).then(
+    () => postMessage({ type: "done" }),
+    (error: unknown) =>
+      postMessage({
+        type: "error",
+        message:
+          error instanceof Error
+            ? `${error.message}\n${error.stack}`
+            : String(error)
+      })
+  )
+}
