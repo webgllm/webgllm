@@ -24,7 +24,11 @@ import {
   type OnnxTensor
 } from "./onnx.js"
 import { ReadPlan } from "./read-plan.js"
-import { newQuantMatrix, packMatMulNBits } from "./repack.js"
+import {
+  newQuantMatrix,
+  packMatMulNBits,
+  packMatMulNBitsScales
+} from "./repack.js"
 import type {
   AttentionWeights,
   ByteSource,
@@ -193,23 +197,32 @@ export async function* loadOnnx(
         N += s.rows
       }
     }
-    const m = newQuantMatrix(
-      N,
-      K,
-      4,
-      parts.some((p) => p.w.zp)
-    )
+    if (N % 4 !== 0) throw new Error(`ONNX: ${N} rows isn't a multiple of 4`)
     const rowBlocks = K / 32
     const rowZp = Math.ceil(rowBlocks / 2)
+    // The quants stay as MatMulNBits stores them (rows copied into place):
+    // the engine rearranges them on the GPU (QuantMatrix.raw).
+    const withZeros = parts.some((p) => p.w.zp)
+    const m: QuantMatrix = {
+      N,
+      K,
+      bits: 4,
+      quants: new Uint32Array(0),
+      scales: new Uint16Array(N * rowBlocks),
+      zeros: withZeros ? new Uint8Array(N * rowBlocks).fill(8) : null,
+      raw: new Uint8Array(N * rowBlocks * 16)
+    }
+    const raw = m.raw as Uint8Array
     for (const { w, segments } of parts) {
       const quant = await plan.take(w.quant.name)
       const scales = await plan.take(w.scales.name)
       const zp = w.zp ? await plan.take(w.zp.name) : null
       for (const { start, rows, to } of segments) {
-        packMatMulNBits(
+        const row = rowBlocks * 16
+        raw.set(quant.subarray(start * row, (start + rows) * row), to * row)
+        packMatMulNBitsScales(
           m,
           to,
-          quant.subarray(start * rowBlocks * 16),
           scales.subarray(start * rowBlocks * 2),
           zp ? zp.subarray(start * rowZp) : null,
           rows

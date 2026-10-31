@@ -13,6 +13,11 @@
  *   row group g is in column g / H at row g % H.
  */
 
+/*
+ * RGBA4 weight texels hold 4 consecutive weights with the first in the low
+ * nibble (A) and the last in the high one (R): as MatMulNBits stores them,
+ * so its bytes upload as they are. Kernels read them as .wzyx.
+ */
 const HEADER = `#version 300 es
 precision highp float;
 precision highp int;
@@ -90,9 +95,9 @@ const PRESCALE = 32
  */
 function memo<A extends Array<unknown>>(
   build: (...args: A) => string
-): (...args: A) => string {
+): ((...args: A) => string) & { source: string } {
   const cache = new Map<string, string>()
-  return (...args: A) => {
+  const made = (...args: A) => {
     const key = JSON.stringify(args)
     let source = cache.get(key)
     if (source === undefined) {
@@ -101,6 +106,8 @@ function memo<A extends Array<unknown>>(
     }
     return source
   }
+  // (The generator's own text, for the engine's code fingerprint.)
+  return Object.assign(made, { source: build.toString() })
 }
 
 export type MatmulOptions = {
@@ -298,7 +305,7 @@ function matmulPairSource(o: { zeros: boolean }) {
   for (let j = 0; j < 8; j++) {
     line(`{`)
     for (const r of [0, 1, 2, 3])
-      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx;`)
     const half = j & 1 ? "h2hi" : "h2lo"
     for (const t of [0, 1]) {
       line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
@@ -364,7 +371,7 @@ function matmulQuadSource(o: { zeros: boolean }) {
   for (let j = 0; j < 8; j++) {
     line(`{`)
     for (const r of [0, 1, 2, 3])
-      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx;`)
     const half = j & 1 ? "h2hi" : "h2lo"
     for (const t of [0, 1, 2, 3]) {
       line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
@@ -439,7 +446,7 @@ void main() {
   int gr = g - col * uH;
   int kb = kq / 8;
   int j = kq - kb * 8;
-  vec4 w = texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0);
+  vec4 w = texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0).wzyx;
   float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
   float z = ${o.zeros ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))" : "8.0"};
   o = (15.0 * w - z) * d;
@@ -655,7 +662,7 @@ function matmulSplitRgba4Source(o: {
     for (const r of [0, 1, 2, 3]) {
       const terms = Array.from(
         { length: 8 },
-        (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0), A${j})`
+        (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
       )
       line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
     }
@@ -739,7 +746,7 @@ function headRgba4Source(o: {
   for (const r of [0, 1, 2, 3]) {
     const terms = Array.from(
       { length: 8 },
-      (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0), A${j})`
+      (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
     )
     line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
   }
@@ -838,7 +845,7 @@ vec4 embedTexel(int x, int y) {
   int kb = c >> 5;
   int j = c & 31;
   float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
-  vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0) + 0.5);
+  vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0).wzyx + 0.5);
   return d * (q - ${zero});
 }
 void main() {
@@ -909,7 +916,7 @@ function embedSource(o: {
   let fetch: string
   if (o.rgba4) {
     // Texel kb · 32 + r · 8 + j / 4: row r's weights 32kb + j .. + 3, as q / 15.
-    fetch = `vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0) + 0.5);
+    fetch = `vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0).wzyx + 0.5);
   o = d * (q - ${zero});`
   } else if (o.bits === 4 && o.bytes) {
     fetch = `int word = j < 16 ? j >> 2 : (j - 16) >> 2;

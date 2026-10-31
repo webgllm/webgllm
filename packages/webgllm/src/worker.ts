@@ -11,11 +11,12 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
+import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { lookupDraft } from "./draft.js"
 import { createSampler, draw, verify } from "./sampler.js"
-import { download, storedFile } from "./storage.js"
+import { download, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -28,6 +29,8 @@ type Loaded = {
   tokenizer: Tokenizer
   /** Token ids in the engine's cache, in order. */
   cached: Array<number>
+  /** Milliseconds each phase of the load took. */
+  timings?: Record<string, number>
 }
 
 let current: Loaded | null = null
@@ -155,10 +158,19 @@ async function load(
   // the worker, where the engine runs.)
   if (typeof OffscreenCanvas === "undefined")
     throw new GpuError("This browser has no OffscreenCanvas in workers.")
+  const t0 = performance.now()
+  const timings: Record<string, number> = {}
+  let mark = t0
+  const lap = (name: string) => {
+    const now = performance.now()
+    timings[name] = Math.round(now - mark)
+    mark = now
+  }
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     batchSize: PROMPT_BATCH,
     ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
   })
+  lap("context")
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -174,6 +186,7 @@ async function load(
       templateFile,
       weightFiles
     } = await fetchFiles(model, signal)
+    lap("files")
     post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
@@ -183,6 +196,16 @@ async function load(
       >,
       ...(templateFile && { chatTemplate: await templateFile.text() })
     })
+    // What an earlier load measured on this GPU with this model and code.
+    const noteKey = [
+      engine.gpu.limits.renderer,
+      navigator.userAgent,
+      model,
+      plain ? "plain" : "mrt",
+      Engine.fingerprint
+    ].join("|")
+    const note = (await readGpuNotes())[noteKey]
+    if (note) engine.preferLayout = note.layout
     const pieces =
       meta.files.kind === "gguf"
         ? loadGguf(blobSource(weightFiles[0]))
@@ -215,11 +238,27 @@ async function load(
       }
     })
     if (signal.aborted) throw new Superseded()
+    lap("weights")
+    timings.weightsReading = Math.round(engine.loadMs.reading)
+    timings.weightsUploading = Math.round(engine.loadMs.uploading)
+    timings.toRgba4 = Math.round(engine.loadMs.convert)
+    timings.repackOnnx = Math.round(repackTime.ms)
+    repackTime.ms = 0
+    if (engine.layoutChoice?.ms) timings.layoutProbe = Math.round(engine.layoutChoice.ms)
     await engine.warmUp()
+    lap("warmUp")
     if (signal.aborted) throw new Superseded()
     // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
-    const error = await engine.selfCheck()
+    // A pass is remembered (same GPU, browser, model and code).
+    const error =
+      note && note.selfCheck <= SELF_CHECK_MAX
+        ? note.selfCheck
+        : await engine.selfCheck()
+    lap("selfCheck")
+    if (!note && engine.layoutChoice && error <= SELF_CHECK_MAX)
+      void writeGpuNote(noteKey, { layout: engine.layoutChoice.layout, selfCheck: error })
+    timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
       if (plain) {
@@ -230,7 +269,7 @@ async function load(
       release(engine)
       return await load(model, signal, true)
     }
-    return { model, engine, tokenizer, cached: [] }
+    return { model, engine, tokenizer, cached: [], timings }
   } catch (error) {
     // A failed or superseded load frees its textures now.
     release(engine)
@@ -263,7 +302,7 @@ function startLoad(model: string): Promise<Loaded> {
       }
       loading = null
       current = loaded
-      post({ type: "ready", model })
+      post({ type: "ready", model, timings: loaded.timings })
     },
     (error: unknown) => {
       if (loading !== entry) return

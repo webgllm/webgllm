@@ -85,6 +85,12 @@ export type QuantMatrix = {
   scales: Uint16Array
   /** 4-bit only: one zero point (0..15) per row and block; null means 8. */
   zeros: Uint8Array | null
+  /**
+   * 4-bit only, instead of `quants` (then empty): the rows as onnxruntime's
+   * MatMulNBits stores them ([N][K / 32][16], element 2i of a block in byte
+   * i's low nibble), for the engine to rearrange on the GPU.
+   */
+  raw?: Uint8Array
 }
 
 export type ConvWeights = {

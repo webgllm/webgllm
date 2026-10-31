@@ -183,8 +183,10 @@ async function runWebgl(text: string) {
         lastPct = pct
         log(`loading ${pct}% (${data.cached ? "from storage" : "downloading"})`)
       }
-    } else if (data.type === "ready") ready()
-    else if (data.type === "load-error") failed(new Error(data.message))
+    } else if (data.type === "ready") {
+      if (data.timings) log(`LOAD PHASES (ms): ${JSON.stringify(data.timings)}`)
+      ready()
+    } else if (data.type === "load-error") failed(new Error(data.message))
     else if (data.type === "token") reply += data.text
     else if (data.type === "done") pending.get(data.id)?.resolve(data.stats)
     else if (data.type === "error") pending.get(data.id)?.reject(new Error(data.message))

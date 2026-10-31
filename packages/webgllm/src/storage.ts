@@ -45,6 +45,43 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
   }
 }
 
+/**
+ * What a load learned about this GPU and model that the next load needn't
+ * measure again (see worker.ts), keyed by GPU, browser, model and engine
+ * code. Best effort: no storage means measuring each time.
+ */
+export type GpuNote = { layout: "rgba4" | "bytes"; selfCheck: number }
+
+const NOTES = "gpu-notes.json"
+
+export async function readGpuNotes(): Promise<Record<string, GpuNote>> {
+  try {
+    const file = await (await (await dir()).getFileHandle(NOTES)).getFile()
+    return JSON.parse(await file.text()) as Record<string, GpuNote>
+  } catch {
+    return {}
+  }
+}
+
+export async function writeGpuNote(key: string, note: GpuNote) {
+  try {
+    const notes = await readGpuNotes()
+    notes[key] = note
+    const handle = await (await dir()).getFileHandle(NOTES, { create: true })
+    const access = await openAccess(handle)
+    try {
+      const bytes = new TextEncoder().encode(JSON.stringify(notes))
+      access.truncate(0)
+      access.write(bytes, { at: 0 })
+      access.flush()
+    } finally {
+      access.close()
+    }
+  } catch {
+    // Remembering is optional.
+  }
+}
+
 /** Waits `ms`, or rejects when `signal` aborts. */
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {

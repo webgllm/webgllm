@@ -114,6 +114,87 @@ export function packQ8_0(
  * [rows][K / 32] fp16 bytes; `zp` [rows][ceil(K / 64)] packed two blocks
  * per byte, low nibble first (null: 8).
  */
+/**
+ * MatMulNBits rows (see QuantMatrix.raw) as `quants` in this module's
+ * layout: what packMatMulNBits does to the quants, for a matrix whose
+ * quants were left raw.
+ */
+export function quantsFromRaw(raw: Uint8Array, N: number, K: number) {
+  const blocks = K / 32
+  const quants = new Uint32Array(N * blocks * 4)
+  const q = new Uint8Array(quants.buffer)
+  for (let n = 0; n < N; n++) {
+    let p = n * blocks * 16
+    let qi = ((n >> 2) * blocks * 4 + (n & 3)) * 16
+    for (let b = 0; b < blocks; b++, p += 16, qi += 64) {
+      for (let k = 0; k < 8; k++) {
+        const lo = raw[p + k]
+        const hi = raw[p + 8 + k]
+        q[qi + 2 * k] = (lo & 0x0f) | ((hi & 0x0f) << 4)
+        q[qi + 2 * k + 1] = (lo >> 4) | (hi & 0xf0)
+      }
+    }
+  }
+  return quants
+}
+
+/**
+ * Rows [n0, n0 + rows) (multiples of 4) of MatMulNBits rows as RGBA4 texels
+ * in the engine's layout (row group by row group: block, then row, then 8
+ * texels of 4 weights, the first in the low nibble): each row's 16-byte
+ * block is already those 8 texels, so it's moved into place, not repacked.
+ */
+export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number) {
+  const blocks = K / 32
+  const src = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2)
+  const out = new Uint32Array(rows * blocks * 4)
+  for (let i = 0; i < rows; i++) {
+    let s = (n0 + i) * blocks * 4
+    let o = ((i >> 2) * blocks * 4 + (i & 3)) * 4
+    for (let b = 0; b < blocks; b++, s += 4, o += 16) {
+      out[o] = src[s]
+      out[o + 1] = src[s + 1]
+      out[o + 2] = src[s + 2]
+      out[o + 3] = src[s + 3]
+    }
+  }
+  return new Uint16Array(out.buffer)
+}
+
+/**
+ * packMatMulNBits' scales and zero points only, for a matrix whose quants
+ * stay raw (QuantMatrix.raw).
+ */
+export function packMatMulNBitsScales(
+  m: QuantMatrix,
+  row0: number,
+  scaleBytes: Uint8Array,
+  zp: Uint8Array | null,
+  rows: number
+): void {
+  const blocks = m.K / 32
+  const zpStride = Math.ceil(blocks / 2)
+  if (scaleBytes.length < rows * blocks * 2)
+    throw new Error("MatMulNBits scales are too short")
+  if (zp && zp.length < rows * zpStride)
+    throw new Error("MatMulNBits zero points are too short")
+  const scales = m.scales
+  const zeros = m.zeros
+  for (let i = 0; i < rows; i++) {
+    const n = row0 + i
+    let sp = i * blocks * 2
+    const zr = i * zpStride
+    let si = (n >> 2) * blocks * 4 + (n & 3)
+    for (let b = 0; b < blocks; b++, sp += 2, si += 4) {
+      scales[si] = scaleBytes[sp] | (scaleBytes[sp + 1] << 8)
+      if (zp && zeros) zeros[si] = (zp[zr + (b >> 1)] >> ((b & 1) << 2)) & 15
+    }
+  }
+}
+
+/** Milliseconds spent in packMatMulNBits (load profiling). */
+export const repackTime = { ms: 0 }
+
 export function packMatMulNBits(
   m: QuantMatrix,
   row0: number,
@@ -136,6 +217,7 @@ export function packMatMulNBits(
     throw new Error("zero points given for a matrix without them")
   if (zp && zp.length < rows * zpStride)
     throw new Error("MatMulNBits zero points are too short")
+  const started = performance.now()
   const q = quantBytes(m)
   const scales = m.scales
   const zeros = m.zeros
@@ -160,6 +242,7 @@ export function packMatMulNBits(
       if (zp && zeros) zeros[si] = (zp[zr + (b >> 1)] >> ((b & 1) << 2)) & 15
     }
   }
+  repackTime.ms += performance.now() - started
 }
 
 /** Running error of the Q6_K → 8-bit conversion. */

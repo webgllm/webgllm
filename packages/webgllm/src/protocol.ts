@@ -53,7 +53,12 @@ export type WorkerResponse =
       loadedBytes?: number
       totalBytes?: number
     }
-  | { type: "ready"; model: string }
+  | {
+      type: "ready"
+      model: string
+      /** Milliseconds each phase of the load took (a fresh load only). */
+      timings?: Record<string, number>
+    }
   | { type: "load-error"; model: string; message: string }
   | { type: "token"; id: string; text: string }
   | { type: "done"; id: string; stats: RunTimings }

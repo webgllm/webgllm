@@ -7,6 +7,7 @@ import { attentionError } from "./attention-check.js"
 import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
+import { quantsFromRaw, rawRgba4 } from "./repack.js"
 import type {
   LayerType,
   LayerWeights,
@@ -88,11 +89,12 @@ type GpuLayer = {
  */
 function toRgba4(words: Uint32Array) {
   const out = new Uint16Array(words.length * 2)
+  // The first weight in the low nibble (kernels read .wzyx; see kernels.ts).
   const four = (x: number) =>
-    ((x & 15) << 12) |
-    (((x >>> 8) & 15) << 8) |
-    (((x >>> 16) & 15) << 4) |
-    ((x >>> 24) & 15)
+    (x & 15) |
+    (((x >>> 8) & 15) << 4) |
+    (((x >>> 16) & 15) << 8) |
+    (((x >>> 24) & 15) << 12)
   for (let row = 0; row < words.length; row += 4) {
     const o = row * 2
     for (let w = 0; w < 4; w++) {
@@ -383,7 +385,11 @@ export class Engine {
     pieces: AsyncIterable<WeightPiece>,
     onProgress?: (piece: WeightPiece) => void
   ) {
+    let mark = performance.now()
+    this.loadMs = { reading: 0, uploading: 0, convert: 0 }
     for await (const piece of pieces) {
+      const got = performance.now()
+      this.loadMs.reading += got - mark
       if (piece.kind === "config") this.configure(piece.config)
       else if (piece.kind === "embedding") {
         // Whole, or in chunks of rows: allocated with the first.
@@ -408,6 +414,8 @@ export class Engine {
       onProgress?.(piece)
       if (this.gpu.isLost)
         throw new GpuError("The GPU context was lost while loading.")
+      mark = performance.now()
+      this.loadMs.uploading += mark - got
     }
     if (
       !this.embedding ||
@@ -765,6 +773,36 @@ export class Engine {
   }
 
   /** A quantized matrix as textures, filled with `m`. */
+  /**
+   * A hash of the engine's GPU code (every kernel and the engine itself):
+   * what the worker keys a GPU's remembered self-check and weight layout
+   * by, so any change to the code checks again.
+   */
+  static readonly fingerprint: string = (() => {
+    const text =
+      Object.entries(K)
+        .map(([name, v]) =>
+          name +
+          (typeof v === "function"
+            ? ((v as { source?: string }).source ?? v.toString())
+            : String(v))
+        )
+        .join("\n") + Engine.toString()
+    // FNV-1a.
+    let h = 0x811c9dc5
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i)
+      h = Math.imul(h, 0x01000193)
+    }
+    return (h >>> 0).toString(16)
+  })()
+  /** The weight layout to use without timing (a remembered choice; see chooseLayout). */
+  preferLayout: "rgba4" | "bytes" | null = null
+  /**
+   * The last load's milliseconds waiting on the weight pieces (reading and
+   * repacking them) and turning them into textures.
+   */
+  loadMs = { reading: 0, uploading: 0, convert: 0 }
   /** 4-bit layer weights in RGBA4 (else byte texels): see chooseLayout. */
   private rgba4Layers = true
   /** The layout chooseLayout picked and its timings (ms per writing matmul). */
@@ -772,6 +810,8 @@ export class Engine {
     layout: "rgba4" | "bytes"
     rgba4Ms: number
     bytesMs: number
+    /** How long choosing took. */
+    ms?: number
   } | null = null
 
   /**
@@ -783,8 +823,11 @@ export class Engine {
    * writing matmul on each in turn, best of a few rounds.
    */
   private async chooseLayout(m: QuantMatrix) {
-    if (m.bits !== 4 || TUNING.layerRgba4 >= 0) {
-      this.rgba4Layers = TUNING.layerRgba4 !== 0
+    if (m.bits !== 4 || TUNING.layerRgba4 >= 0 || this.preferLayout) {
+      this.rgba4Layers =
+        TUNING.layerRgba4 >= 0
+          ? TUNING.layerRgba4 !== 0
+          : this.preferLayout !== "bytes"
       this.layoutChoice = {
         layout: this.rgba4Layers ? "rgba4" : "bytes",
         rgba4Ms: NaN,
@@ -792,8 +835,9 @@ export class Engine {
       }
       return
     }
+    const started = performance.now()
     let seed = 1
-    const quants = new Uint32Array(m.quants.length)
+    const quants = new Uint32Array(m.N * (m.K / 32) * 4)
     for (let i = 0; i < quants.length; i++) {
       seed = (seed * 1664525 + 1013904223) >>> 0
       quants[i] = seed
@@ -844,7 +888,8 @@ export class Engine {
     this.layoutChoice = {
       layout: this.rgba4Layers ? "rgba4" : "bytes",
       rgba4Ms: best[0],
-      bytesMs: best[1]
+      bytesMs: best[1],
+      ms: performance.now() - started
     }
   }
 
@@ -972,6 +1017,10 @@ export class Engine {
 
   /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
   private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
+    // Raw MatMulNBits rows go into RGBA4 as they are (16-byte runs moved
+    // into place; see rawRgba4); other layouts get the rows repacked.
+    if (m.raw && !gm.rgba4)
+      m = { ...m, quants: quantsFromRaw(m.raw, m.N, m.K), raw: undefined }
     const { blocks, rowTexels, rowsPerColumn } = gm
     const g0 = row0 / 4
     const groups = m.N / 4
@@ -984,13 +1033,18 @@ export class Engine {
       const local = g - g0
       const quants = m.quants.subarray(local * words, (local + run) * words)
       if (gm.rgba4) {
+        const t = performance.now()
+        const pixels = m.raw
+          ? rawRgba4(m.raw, m.K, local * 4, run * 4)
+          : toRgba4(quants)
+        this.loadMs.convert += performance.now() - t
         this.gpu.write(
           gm.quants,
           { x: column * rowTexels, y, width: rowTexels, height: run },
           {
             format: GL.RGBA,
             type: GL.UNSIGNED_SHORT_4_4_4_4,
-            pixels: toRgba4(quants)
+            pixels
           }
         )
       } else
