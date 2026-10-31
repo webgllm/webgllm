@@ -958,11 +958,14 @@ async function smoke(params: {
     const run = async (texels: number) => {
       const saved = TUNING.scoreTexels
       TUNING.scoreTexels = texels
-      engine.reset()
-      const out: Array<Float32Array> = [await engine.forward(prompt)]
-      for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
-      TUNING.scoreTexels = saved
-      return out
+      try {
+        engine.reset()
+        const out: Array<Float32Array> = [await engine.forward(prompt)]
+        for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+        return out
+      } finally {
+        TUNING.scoreTexels = saved
+      }
     }
     const whole = await run(TUNING.scoreTexels)
     const segmented = await run(128)

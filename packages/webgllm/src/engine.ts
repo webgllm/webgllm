@@ -137,6 +137,15 @@ export const TUNING = {
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
    */
   foldNorm: 2,
+  /**
+   * The worker's speculative decoding (see worker.ts): drafts follow an
+   * earlier occurrence of at least draftMatch last tokens; they're used
+   * while recent batches kept draftMinKept drafts on average; with
+   * guessDrafts, a draft batch also guesses the token after its last row.
+   */
+  draftMatch: 2,
+  draftMinKept: 0.75,
+  guessDrafts: 0,
   /** 1: few-row conv blocks draw their output and new state in one pass. */
   fuseConv: 1,
   /**
@@ -545,28 +554,37 @@ export class Engine {
       positions > block
         ? Math.ceil(positions / block) * block
         : 2 ** Math.ceil(Math.log2(positions))
-    for (const layer of this.layers) {
-      const a = layer.attention
-      if (!a || a.ring) continue
-      const kv = this.kvTexture(positions)
-      this.gpu.run({
-        name: "grow",
-        program: this.gpu.program(K.COPY_POSITIONS),
-        inputs: { uX: a.kv },
-        uniforms: {
-          uPos0: { int: 0 },
-          uRow0: { int: 0 },
-          uMod: { int: a.kv.height }
-        },
-        output: kv,
-        rect: { x: 0, y: 0, width: a.kv.width, height: a.kv.height }
-      })
-      this.gpu.delete(a.kv)
-      a.kv = kv
-    }
-    if (this.gpu.outOfMemory()) {
+    try {
+      for (const layer of this.layers) {
+        const a = layer.attention
+        if (!a || a.ring) continue
+        const kv = this.kvTexture(positions)
+        try {
+          this.gpu.run({
+            name: "grow",
+            program: this.gpu.program(K.COPY_POSITIONS),
+            inputs: { uX: a.kv },
+            uniforms: {
+              uPos0: { int: 0 },
+              uRow0: { int: 0 },
+              uMod: { int: a.kv.height }
+            },
+            output: kv,
+            rect: { x: 0, y: 0, width: a.kv.width, height: a.kv.height }
+          })
+        } catch (error) {
+          this.gpu.delete(kv)
+          throw error
+        }
+        this.gpu.delete(a.kv)
+        a.kv = kv
+      }
+      if (this.gpu.outOfMemory()) throw new GpuError("Out of memory.")
+    } catch (error) {
+      // Some layers may hold a cache that didn't copy: start over.
+      if (!this.gpu.isLost) this.reset()
       throw new GpuError(
-        `The GPU ran out of memory growing the cache to ${positions} tokens. Start a new session to keep going.`
+        `The GPU couldn't grow the cache to ${positions} tokens (${error instanceof Error ? error.message : String(error)}). Start a new session to keep going.`
       )
     }
     this.kvPositions = positions
@@ -591,12 +609,15 @@ export class Engine {
    * (see attendChunk) within the GPU's render targets.
    */
   private headGroup() {
+    if (this.group) return this.group
     const c = this.config
     const group = c.numHeads / c.numKvHeads
     let G = Math.min(group, Math.floor(this.gpu.limits.maxDrawBuffers / 3))
-    while (group % G) G--
+    while (G > 1 && (group % G || !this.gpu.canRender(GL.RGBA32F, 3 * G))) G--
+    this.group = G
     return G
   }
+  private group = 0
 
   /**
    * Chunked attention's partial results, for `rows` (query, chunk) pairs
@@ -1646,10 +1667,12 @@ export class Engine {
       )
       // Chunks per segment: up to ATTEND_CHUNKS of at least
       // attendChunkTexels texels (fewer where segments are many).
+      // (Segments are parallel work already: with many, fewer chunks each,
+      // so a slice keeps more queries.)
       const perSegment = Math.max(
         1,
         Math.min(
-          ATTEND_CHUNKS,
+          Math.max(2, Math.ceil(ATTEND_CHUNKS / segmentsMax)),
           Math.floor(this.gpu.limits.maxTextureSize / segmentsMax)
         )
       )
@@ -1829,6 +1852,11 @@ export class Engine {
 
   /** Reads tokens into the cache without computing logits (for timing). */
   async forwardNoLogits(tokens: ArrayLike<number>) {
+    if (this.position + tokens.length > this.contextLength) {
+      throw new Error(
+        `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
+      )
+    }
     await this.forwardBatch(Array.from(tokens), undefined)
   }
 
@@ -2248,7 +2276,10 @@ export class Engine {
       // read it don't hold up the next forward's matmuls.
       if (!this.headScratch || this.headScratch.height < height) {
         if (this.headScratch) this.gpu.delete(this.headScratch)
-        this.headScratch = this.f32(OUT_WIDTH * 4, split * SPLIT_ROWS * sliceRows)
+        this.headScratch = this.f32(
+          OUT_WIDTH * 4,
+          Math.max(height, split * SPLIT_ROWS * sliceRows)
+        )
       }
       target = this.headScratch
     }

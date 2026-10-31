@@ -14,7 +14,11 @@ const log = (text: string) => {
   void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
 }
 
-const QUESTION = "Describe the river scene above in a short paragraph."
+/** ?q=quote asks for a reply that copies the prompt (where drafts help). */
+const QUESTION =
+  params.get("q") === "quote"
+    ? "Copy the first three sentences above word for word, then describe the scene in a short paragraph."
+    : "Describe the river scene above in a short paragraph."
 const FILLER =
   "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
 

@@ -307,6 +307,29 @@ export class Gpu {
     )
   }
 
+  /**
+   * Whether the GPU can draw into `count` textures of this format at once
+   * (some cap the bits a pixel writes: 512 on Apple's mobile GPUs through
+   * ANGLE, so 6 RGBA32F targets fail there).
+   */
+  canRender(internal: number, count: number) {
+    const gl = this.gl
+    if (count > this.limits.maxDrawBuffers) return false
+    if (count > (gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) as number)) return false
+    const textures = Array.from({ length: count }, () => this.texture(internal, 1, 1))
+    const fb = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    textures.forEach((t, i) =>
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t.tex, 0)
+    )
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    this.boundFb = null
+    gl.deleteFramebuffer(fb)
+    textures.forEach((t) => this.delete(t))
+    return ok
+  }
+
   /** Whether the GPU has run out of memory (a texture it couldn't make). */
   outOfMemory() {
     const gl = this.gl

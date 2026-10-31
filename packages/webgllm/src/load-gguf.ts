@@ -498,7 +498,7 @@ function ggufConfig(
     vocabSize: embedding.dims[1],
     layerTypes,
     slidingWindow: num("attention.sliding_window", 0),
-    contextLength: num("context_length"),
+    contextLength: num("context_length", 8192),
     ropeThetaFull: f32Decimal(num("rope.freq_base")),
     ropeThetaSliding: f32Decimal(
       num("rope.freq_base_swa", num("rope.freq_base"))

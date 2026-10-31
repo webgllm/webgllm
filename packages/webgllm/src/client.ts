@@ -3,6 +3,7 @@
  * off the main thread on an OffscreenCanvas. One worker, one model in it at
  * a time: loading another frees the previous one.
  */
+import { MIN_TEXTURE_SIZE } from "./limits.js"
 import type { WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import type { Sampling } from "./sampler.js"
@@ -133,11 +134,6 @@ function keepDownloads() {
   navigator.storage?.persist?.().catch(() => undefined)
 }
 
-/**
- * Textures the engine needs, in texels per side: LFM3's split matmuls'
- * partial sums are 3,840 wide. (The cache wraps past a texture's height.)
- */
-const MIN_TEXTURE_SIZE = 4096
 
 /**
  * Whether this browser can run the engine: WebGL 2 with float render

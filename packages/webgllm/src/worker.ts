@@ -6,6 +6,7 @@
  */
 import { blobSource } from "./byte-source.js"
 import { Engine, MAX_CHUNKS, TUNING } from "./engine.js"
+import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
@@ -43,8 +44,6 @@ let loading: {
  * without drafts.
  */
 const DRAFTS = 3
-/** Drafts follow an earlier occurrence of at least this many last tokens. */
-const DRAFT_MATCH = 2
 /**
  * Guessing (see Engine.forwardGuess) stops while fewer than this share of
  * the last GUESS_WINDOW guesses were the token drawn: a wrong guess holds
@@ -53,12 +52,17 @@ const DRAFT_MATCH = 2
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
 /**
- * Drafts are used while recent draft batches kept at least this many
- * drafts on average (over the last DRAFT_WINDOW): otherwise guessing,
- * which a draft batch gives up, does more.
+ * Drafts are used while recent draft batches kept at least
+ * TUNING.draftMinKept drafts on average (over the last DRAFT_WINDOW):
+ * otherwise guessing, which a draft batch gives up, does more. (Drafts
+ * follow an earlier occurrence of TUNING.draftMatch last tokens.)
  */
-const DRAFT_MIN_KEPT = 0.75
 const DRAFT_WINDOW = 8
+/**
+ * Tokens after which drafting tries again though recent batches kept too
+ * few: a reply may start quoting (code, a tool's result) halfway through.
+ */
+const DRAFT_RETRY = 32
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -160,6 +164,13 @@ async function load(
     batchSize: promptBatch()
   })
   try {
+    // Before a gigabyte downloads: the weight textures' width.
+    const { maxTextureSize } = engine.gpu.limits
+    if (maxTextureSize < MIN_TEXTURE_SIZE) {
+      throw new GpuError(
+        `This GPU's textures go up to ${maxTextureSize} texels; the model needs ${MIN_TEXTURE_SIZE}.`
+      )
+    }
     const {
       cached,
       tokenizerFile,
@@ -357,13 +368,16 @@ async function generate(request: GenerateRequest) {
       guesses.filter(Boolean).length >= GUESS_MIN_HITS * guesses.length)
   // The token guessed with the last distribution, or -1.
   let guessed = -1
-  // Drafts kept per recent draft batch (see DRAFT_MIN_KEPT).
+  // Drafts kept per recent draft batch (see DRAFT_WINDOW).
   const draftsKept: Array<number> = []
+  // Tokens written since the last draft batch.
+  let sinceDrafts = 0
   const drafting = () =>
     request.speculative !== false &&
     (draftsKept.length < DRAFT_WINDOW / 2 ||
+      sinceDrafts >= DRAFT_RETRY ||
       draftsKept.reduce((a, b) => a + b, 0) >=
-        DRAFT_MIN_KEPT * draftsKept.length)
+        TUNING.draftMinKept * draftsKept.length)
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
@@ -446,9 +460,10 @@ async function generate(request: GenerateRequest) {
         const more =
           stats.outputTokens < maxTokens - 1 &&
           engine.position < engine.contextLength - 1 &&
-          (!drafting() || lookupDraft(history, 1, DRAFT_MATCH).length === 0)
+          (!drafting() || lookupDraft(history, 1, TUNING.draftMatch).length === 0)
         token = draw(await distribution(0, more && guessing()))
         going = emit(token)
+        sinceDrafts++
         continue
       }
       engine.dropGuess()
@@ -462,7 +477,7 @@ async function generate(request: GenerateRequest) {
         maxTokens - stats.outputTokens - 1,
         engine.contextLength - engine.position - 1
       ),
-      DRAFT_MATCH
+      TUNING.draftMatch
     )
     const batch = [token, ...drafts]
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
@@ -471,7 +486,7 @@ async function generate(request: GenerateRequest) {
     // Guess the token after the last row (good if every draft is kept).
     const guessLast =
       guessing() &&
-      drafts.length === 0 &&
+      (drafts.length === 0 || TUNING.guessDrafts > 0) &&
       stats.outputTokens + drafts.length < maxTokens - 1 &&
       engine.position < engine.contextLength - 1
     const all = onGpu
@@ -501,7 +516,8 @@ async function generate(request: GenerateRequest) {
       engine.accept(kept)
       draftsKept.push(kept - 1)
       if (draftsKept.length > DRAFT_WINDOW) draftsKept.shift()
-    }
+      sinceDrafts = 0
+    } else sinceDrafts += kept
     model.cached.push(...batch.slice(0, kept))
     if (!going || next < 0) break
     token = next
@@ -536,8 +552,17 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
       .then(() => generate(data))
       .catch((error: unknown) => {
         // A lost GPU context can't be used again: the next generation
-        // loads the model afresh.
+        // loads the model afresh. Otherwise the cache may hold part of a
+        // batch (or a failed growth): forget it.
         if (current?.engine.gpu.isLost) current = null
+        else if (current) {
+          current.cached.length = 0
+          try {
+            current.engine.reset()
+          } catch {
+            current = null
+          }
+        }
         post({ type: "error", id: data.id, message: errorMessage(error) })
       })
       .finally(() => stopped.delete(data.id))
