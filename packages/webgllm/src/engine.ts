@@ -18,7 +18,9 @@ import type {
 type GpuMatrix = {
   N: number
   K: number
-  bits: 4 | 8
+  bits: 4 | 6 | 8
+  /** Quants in byte textures rather than RGBA32UI. */
+  bytes: boolean
   blocks: number
   /** Row groups (N / 4). */
   groups: number
@@ -50,12 +52,22 @@ type GpuLayer = {
     kNorm: Texture
     keys: Texture
     values: Texture
+    /**
+     * Rows in the cache when it's a ring (sliding-window layers: the window
+     * plus a batch, position p at row p % ring); 0 for a full cache.
+     */
+    ring: number
   }
   gateUp: GpuMatrix
   down: GpuMatrix
 }
 
 export type EngineOptions = {
+  /**
+   * Sliding-window layers keep only their window (plus a batch) of keys and
+   * values, in a ring: ~75 MB less for LFM3. On by default.
+   */
+  ringCache?: boolean
   /** Pass kinds not to draw, for profiling (outputs are wrong). */
   skip?: Array<string>
   /** Tokens the cache holds, prompt and reply together. */
@@ -82,6 +94,10 @@ export type LayerProbe = (
 ) => void | Promise<void>
 
 const OUT_WIDTH = 1024
+/** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
+const MAX_SNAPSHOTS = 8
+/** Queries per attention slice: the scores buffer holds this many per head. */
+const SCORE_ROWS = 32
 /** Logits per chunk when picking candidates on the GPU. */
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
@@ -102,6 +118,7 @@ export class Engine {
   readonly batchSize: number
   private precision: "highp" | "mediump"
   private bytes: boolean
+  private ringCache: boolean
   private layers: Array<GpuLayer> = []
   private embedding!: GpuMatrix
   private finalNorm!: Texture
@@ -120,6 +137,7 @@ export class Engine {
     this.batchSize = options.batchSize ?? 128
     this.precision = options.matmulPrecision ?? "highp"
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
+    this.ringCache = options.ringCache ?? true
     for (const name of options.skip ?? []) this.gpu.skip.add(name)
   }
 
@@ -130,9 +148,18 @@ export class Engine {
   ) {
     for await (const piece of pieces) {
       if (piece.kind === "config") this.configure(piece.config)
-      else if (piece.kind === "embedding")
-        this.embedding = this.matrix(piece.value)
-      else if (piece.kind === "finalNorm")
+      else if (piece.kind === "embedding") {
+        // Whole, or in chunks of rows: allocated with the first.
+        const { value, row0 = 0, totalRows = value.N } = piece
+        if (row0 === 0)
+          this.embedding = this.allocateMatrix(
+            totalRows,
+            value.K,
+            value.bits,
+            !!value.zeros
+          )
+        this.writeMatrix(this.embedding, value, row0)
+      } else if (piece.kind === "finalNorm")
         this.finalNorm = this.vector(piece.value)
       else this.layers[piece.layer] = this.layer(piece.value)
       onProgress?.(piece)
@@ -207,7 +234,11 @@ export class Engine {
       convOut: this.h2(D, M),
       qkvg: this.f32(qkvg, M),
       q: this.f32(c.numHeads * c.headDim, M),
-      scores: this.gpu.texture(GL.RGBA32F, scoreTexels, c.numHeads * M),
+      scores: this.gpu.texture(
+        GL.RGBA32F,
+        scoreTexels,
+        c.numHeads * Math.min(M, SCORE_ROWS)
+      ),
       attnOut: this.h2(c.numHeads * c.headDim, M),
       gateUp: this.f32(2 * c.intermediateSize, M),
       act: this.h2(c.intermediateSize, M),
@@ -231,7 +262,6 @@ export class Engine {
         1
       ),
       candidates: this.gpu.texture(GL.RGBA32F, CHUNK / 4 + 1, MAX_CHUNKS),
-      debug: this.f32(Math.max(2 * c.intermediateSize, qkvg), M),
       /** Split matmuls' partial sums: widest output × (rows × slices). */
       partial: this.gpu.texture(
         GL.RGBA32F,
@@ -249,89 +279,130 @@ export class Engine {
     })
   }
 
-  /** A quantized matrix as textures, in columns if it has more row groups than fit. */
+  /** A quantized matrix as textures, filled with `m`. */
   private matrix(m: QuantMatrix): GpuMatrix {
+    const gm = this.allocateMatrix(m.N, m.K, m.bits, !!m.zeros)
+    this.writeMatrix(gm, m, 0)
+    return gm
+  }
+
+  /**
+   * Textures for an N × K matrix, in columns if it has more row groups than
+   * a texture is tall.
+   */
+  private allocateMatrix(
+    N: number,
+    K: number,
+    bits: 4 | 6 | 8,
+    withZeros: boolean
+  ): GpuMatrix {
     const max = this.gpu.limits.maxTextureSize
-    const blocks = m.K / 32
-    const groups = m.N / 4
-    // A block row is 16 bytes (4-bit) or 32 (8-bit): 1 or 2 RGBA32UI texels,
-    // or 4 or 8 byte texels.
-    const texelsPerBlockRow = (m.bits === 4 ? 1 : 2) * (this.bytes ? 4 : 1)
-    const rowTexels = blocks * 4 * texelsPerBlockRow
-    const quantFormat = !this.bytes
-      ? GL.RGBA32UI
-      : m.bits === 4
-        ? GL.RGBA8UI
-        : GL.RGBA8I
+    // A block row: 4-bit 16 bytes, 8-bit 32, as RGBA32UI texels (1, 2) or
+    // byte texels (4, 8); a Q6_K super-block row, 208 bytes: 52 byte texels
+    // (always bytes: its kernels split them with float math, faster than
+    // integer shifts on mobile GPUs).
+    const blocks = K / (bits === 6 ? 256 : 32)
+    const groups = N / 4
     const columns = Math.ceil(groups / max)
+    // Byte texels are 4× as wide: words where a row group wouldn't fit.
+    const byteTexels = bits === 6 ? 52 : bits === 4 ? 4 : 8
+    const bytes =
+      bits === 6 || (this.bytes && columns * blocks * 4 * byteTexels <= max)
+    const texelsPerBlockRow = bytes ? byteTexels : byteTexels / 4
+    const rowTexels = blocks * 4 * texelsPerBlockRow
+    const quantFormat = !bytes
+      ? GL.RGBA32UI
+      : bits === 8
+        ? GL.RGBA8I
+        : GL.RGBA8UI
     const rowsPerColumn = Math.ceil(groups / columns)
-    if (columns * rowTexels > max)
+    if (columns * rowTexels > max) {
       throw new GpuError(
-        `A ${m.N}×${m.K} matrix doesn't fit in this GPU's textures.`
+        `A ${N}×${K} matrix doesn't fit in this GPU's textures.`
       )
-    const quants = this.gpu.texture(
-      quantFormat,
-      columns * rowTexels,
-      rowsPerColumn
-    )
-    const scales = this.gpu.texture(GL.RGBA16F, columns * blocks, rowsPerColumn)
-    const zeros = m.zeros
-      ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
-      : null
-    for (let c = 0; c < columns; c++) {
-      const g0 = c * rowsPerColumn
-      const rows = Math.min(rowsPerColumn, groups - g0)
-      const qWords = (rowTexels * 4) / (this.bytes ? 4 : 1)
-      const words = m.quants.subarray(g0 * qWords, (g0 + rows) * qWords)
-      this.gpu.write(
-        quants,
-        { x: c * rowTexels, y: 0, width: rowTexels, height: rows },
-        {
-          format: GL.RGBA_INTEGER,
-          type: !this.bytes
-            ? GL.UNSIGNED_INT
-            : m.bits === 4
-              ? GL.UNSIGNED_BYTE
-              : GL.BYTE,
-          pixels: !this.bytes
-            ? words
-            : m.bits === 4
-              ? new Uint8Array(words.buffer, words.byteOffset, words.byteLength)
-              : new Int8Array(words.buffer, words.byteOffset, words.byteLength)
-        }
-      )
-      this.gpu.write(
-        scales,
-        { x: c * blocks, y: 0, width: blocks, height: rows },
-        {
-          format: GL.RGBA,
-          type: GL.HALF_FLOAT,
-          pixels: m.scales.subarray(g0 * blocks * 4, (g0 + rows) * blocks * 4)
-        }
-      )
-      if (zeros && m.zeros) {
-        this.gpu.write(
-          zeros,
-          { x: c * blocks, y: 0, width: blocks, height: rows },
-          {
-            format: GL.RGBA_INTEGER,
-            type: GL.UNSIGNED_BYTE,
-            pixels: m.zeros.subarray(g0 * blocks * 4, (g0 + rows) * blocks * 4)
-          }
-        )
-      }
     }
     return {
-      N: m.N,
-      K: m.K,
-      bits: m.bits,
+      N,
+      K,
+      bits,
+      bytes,
       blocks,
       groups,
       rowsPerColumn,
       rowTexels,
-      quants,
-      scales,
-      zeros
+      quants: this.gpu.texture(quantFormat, columns * rowTexels, rowsPerColumn),
+      scales: this.gpu.texture(GL.RGBA16F, columns * blocks, rowsPerColumn),
+      zeros: withZeros
+        ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
+        : null
+    }
+  }
+
+  /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
+  private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
+    const { blocks, rowTexels, rowsPerColumn } = gm
+    const g0 = row0 / 4
+    const groups = m.N / 4
+    // Words of one row group: its quant texels' bytes over 4.
+    const words = m.quants.length / groups
+    for (let g = g0; g < g0 + groups;) {
+      const column = Math.floor(g / rowsPerColumn)
+      const y = g - column * rowsPerColumn
+      const run = Math.min(g0 + groups - g, rowsPerColumn - y)
+      const local = g - g0
+      const quants = m.quants.subarray(local * words, (local + run) * words)
+      this.gpu.write(
+        gm.quants,
+        { x: column * rowTexels, y, width: rowTexels, height: run },
+        {
+          format: GL.RGBA_INTEGER,
+          type: !gm.bytes
+            ? GL.UNSIGNED_INT
+            : m.bits === 8
+              ? GL.BYTE
+              : GL.UNSIGNED_BYTE,
+          pixels: !gm.bytes
+            ? quants
+            : m.bits !== 8
+              ? new Uint8Array(
+                  quants.buffer,
+                  quants.byteOffset,
+                  quants.byteLength
+                )
+              : new Int8Array(
+                  quants.buffer,
+                  quants.byteOffset,
+                  quants.byteLength
+                )
+        }
+      )
+      this.gpu.write(
+        gm.scales,
+        { x: column * blocks, y, width: blocks, height: run },
+        {
+          format: GL.RGBA,
+          type: GL.HALF_FLOAT,
+          pixels: m.scales.subarray(
+            local * blocks * 4,
+            (local + run) * blocks * 4
+          )
+        }
+      )
+      if (gm.zeros && m.zeros) {
+        this.gpu.write(
+          gm.zeros,
+          { x: column * blocks, y, width: blocks, height: run },
+          {
+            format: GL.RGBA_INTEGER,
+            type: GL.UNSIGNED_BYTE,
+            pixels: m.zeros.subarray(
+              local * blocks * 4,
+              (local + run) * blocks * 4
+            )
+          }
+        )
+      }
+      g += run
     }
   }
 
@@ -364,41 +435,121 @@ export class Engine {
     }
     if (w.attention) {
       const kvDims = c.numKvHeads * c.headDim
+      // A sliding-window layer only ever reads its window back: it keeps the
+      // window plus one batch (written before the batch's queries read).
+      const window = c.slidingWindow + this.batchSize
+      const ring =
+        this.ringCache &&
+        w.type === "sliding_attention" &&
+        window < this.contextLength
+          ? window
+          : 0
+      const rows = ring || this.contextLength
       layer.attention = {
         qkvg: this.matrix(w.attention.qkvg),
         o: this.matrix(w.attention.o),
         qNorm: this.vector(w.attention.qNorm),
         kNorm: this.vector(w.attention.kNorm),
-        keys: this.h2(kvDims, this.contextLength),
-        values: this.h2(kvDims, this.contextLength)
+        keys: this.h2(kvDims, rows),
+        values: this.h2(kvDims, rows),
+        ring
       }
     }
     return layer
   }
 
-  /** Convolution states saved at cache positions, to resume from later. */
-  private snapshots = new Map<number, Array<Texture>>()
+  /**
+   * What a later prompt needs to resume at a cache position: the
+   * convolutions' state, and the sliding-window layers' last window of keys
+   * and values (their ring may have moved on since). Full-attention layers
+   * keep every position, so they need nothing saved.
+   */
+  private snapshots = new Map<
+    number,
+    { conv: Array<Texture>; windows: Array<[Texture, Texture]> }
+  >()
+
+  private freeSnapshot(saved: {
+    conv: Array<Texture>
+    windows: Array<[Texture, Texture]>
+  }) {
+    saved.conv.forEach((t) => this.gpu.delete(t))
+    saved.windows.forEach(([k, v]) => {
+      this.gpu.delete(k)
+      this.gpu.delete(v)
+    })
+  }
 
   /**
-   * Saves the convolutions' state at the current position, so a later
-   * prompt that shares the tokens so far can resume here: the attention
-   * cache can be rewound to any position, the convolutions' state can't.
+   * Copies cache positions [from, to) between a ring of `fromRows` rows and
+   * one of `toRows` (position p at row p % rows), in runs that don't wrap
+   * in the target.
+   */
+  private copyPositions(
+    source: Texture,
+    fromRows: number,
+    target: Texture,
+    toRows: number,
+    from: number,
+    to: number
+  ) {
+    for (let a = from; a < to;) {
+      const row0 = a % toRows
+      const run = Math.min(to - a, toRows - row0)
+      this.gpu.run({
+        program: this.gpu.program(K.COPY_POSITIONS),
+        inputs: { uX: source },
+        uniforms: {
+          uPos0: { int: a },
+          uRow0: { int: row0 },
+          uMod: { int: fromRows }
+        },
+        output: target,
+        rect: { x: 0, y: row0, width: target.width, height: run }
+      })
+      a += run
+    }
+  }
+
+  /**
+   * Saves what's needed to resume at the current position (see
+   * `snapshots`), so a later prompt that shares the tokens so far reads only
+   * what's new. Keeps the latest MAX_SNAPSHOTS.
    */
   snapshot() {
-    if (this.snapshots.has(this.position)) return
-    const saved: Array<Texture> = []
-    for (const layer of this.layers) {
-      if (!layer.conv) continue
-      const state = layer.conv.state[0]
-      const copy = this.gpu.texture(GL.RGBA32F, state.width, state.height)
-      this.gpu.run({
-        program: this.gpu.program(K.COPY),
-        inputs: { uX: state },
-        output: copy
-      })
-      saved.push(copy)
+    const at = this.position
+    if (this.snapshots.has(at)) return
+    const W = this.config.slidingWindow
+    const saved = {
+      conv: [] as Array<Texture>,
+      windows: [] as Array<[Texture, Texture]>
     }
-    this.snapshots.set(this.position, saved)
+    for (const layer of this.layers) {
+      if (layer.conv) {
+        const state = layer.conv.state[0]
+        const copy = this.gpu.texture(GL.RGBA32F, state.width, state.height)
+        this.gpu.run({
+          program: this.gpu.program(K.COPY),
+          inputs: { uX: state },
+          output: copy
+        })
+        saved.conv.push(copy)
+      }
+      const a = layer.attention
+      if (a?.ring) {
+        const keys = this.gpu.texture(GL.RGBA32UI, a.keys.width, W)
+        const values = this.gpu.texture(GL.RGBA32UI, a.values.width, W)
+        this.copyPositions(a.keys, a.ring, keys, W, Math.max(0, at - W), at)
+        this.copyPositions(a.values, a.ring, values, W, Math.max(0, at - W), at)
+        saved.windows.push([keys, values])
+      }
+    }
+    this.snapshots.set(at, saved)
+    for (const [p, old] of this.snapshots) {
+      if (this.snapshots.size <= MAX_SNAPSHOTS) break
+      this.freeSnapshot(old)
+      this.snapshots.delete(p)
+    }
   }
 
   /**
@@ -412,7 +563,7 @@ export class Engine {
     )
     for (const [p, saved] of this.snapshots) {
       if (p <= at) continue
-      saved.forEach((t) => this.gpu.delete(t))
+      this.freeSnapshot(saved)
       this.snapshots.delete(p)
     }
     const saved = this.snapshots.get(at)
@@ -420,24 +571,45 @@ export class Engine {
       this.reset()
       return 0
     }
-    let i = 0
+    const W = this.config.slidingWindow
+    let c = 0
+    let w = 0
     for (const layer of this.layers) {
-      if (!layer.conv) continue
-      this.gpu.run({
-        program: this.gpu.program(K.COPY),
-        inputs: { uX: saved[i++] },
-        output: layer.conv.state[0]
-      })
+      if (layer.conv) {
+        this.gpu.run({
+          program: this.gpu.program(K.COPY),
+          inputs: { uX: saved.conv[c++] },
+          output: layer.conv.state[0]
+        })
+      }
+      const a = layer.attention
+      if (a?.ring) {
+        const [keys, values] = saved.windows[w++]
+        this.copyPositions(keys, W, a.keys, a.ring, Math.max(0, at - W), at)
+        this.copyPositions(values, W, a.values, a.ring, Math.max(0, at - W), at)
+      }
     }
     this.position = at
     return at
   }
 
+  private debug: Texture | null = null
+
+  /** A scratch tensor for probes, made the first time one asks. */
+  private debugTexture() {
+    const c = this.config
+    const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
+    this.debug ??= this.f32(
+      Math.max(2 * c.intermediateSize, qkvg),
+      this.batchSize
+    )
+    return this.debug
+  }
+
   /** Forgets the cache: the next forward starts a new sequence. */
   reset() {
     this.position = 0
-    for (const saved of this.snapshots.values())
-      saved.forEach((t) => this.gpu.delete(t))
+    for (const saved of this.snapshots.values()) this.freeSnapshot(saved)
     this.snapshots.clear()
     const zero = new Float32Array(
       this.config.hiddenSize * (this.config.convKernel - 1)
@@ -458,6 +630,9 @@ export class Engine {
   }
 
   private matmul(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
+    const bits = w.bits
+    if (bits === 6)
+      throw new GpuError("Q6_K weights are only read as the output head.")
     // A few rows: split K so the GPU has enough fragments to keep busy.
     const split =
       rows <= SPLIT_ROWS
@@ -477,11 +652,11 @@ export class Engine {
         name: "matmul",
         program: this.gpu.program(
           K.matmul({
-            bits: w.bits,
+            bits,
             zeros: !!w.zeros,
             wrap: false,
             precision: this.precision,
-            bytes: this.bytes,
+            bytes: w.bytes,
             split: true
           })
         ),
@@ -514,11 +689,11 @@ export class Engine {
     }
     const program = this.gpu.program(
       K.matmul({
-        bits: w.bits,
+        bits,
         zeros: !!w.zeros,
         wrap: false,
         precision: this.precision,
-        bytes: this.bytes
+        bytes: w.bytes
       })
     )
     this.gpu.run({
@@ -677,72 +852,92 @@ export class Engine {
       output: b.q,
       rect: { x: 0, y: 0, width: qDims / 4, height: rows }
     })
-    // Keys and values into the cache at positions pos0...
-    this.gpu.run({
-      name: "heads",
-      program: this.gpu.program(
-        K.headPrep({ out: "h2", rope: true, norm: true })
-      ),
-      inputs: { uQKVG: b.qkvg, uNorm: layer.kNorm, uRope: rope },
-      uniforms: {
-        uBase: { int: qDims / 4 },
-        uPairTexels: { int: pairTexels },
-        uPos0: { int: pos0 },
-        uRowOffset: { int: pos0 },
-        uEps: c.normEps,
-        uScale: 1
-      },
-      output: layer.keys,
-      rect: { x: 0, y: pos0, width: kvDims / 8, height: rows }
-    })
-    this.gpu.run({
-      name: "heads",
-      program: this.gpu.program(K.VALUES),
-      inputs: { uQKVG: b.qkvg },
-      uniforms: {
-        uBase: { int: (qDims + kvDims) / 4 },
-        uRowOffset: { int: pos0 }
-      },
-      output: layer.values,
-      rect: { x: 0, y: pos0, width: kvDims / 8, height: rows }
-    })
-    const j0 = sliding ? Math.max(0, pos0 - c.slidingWindow + 1) : 0
-    const keys = pos0 + rows - j0
+    // Keys and values into the cache at positions pos0..., in up to two
+    // runs of rows where a ring cache wraps around.
+    const length = layer.ring || this.contextLength
+    for (let m0 = 0; m0 < rows;) {
+      const row0 = (pos0 + m0) % length
+      const run = Math.min(rows - m0, length - row0)
+      // A fragment at row y reads token m = y - offset.
+      const offset = row0 - m0
+      this.gpu.run({
+        name: "heads",
+        program: this.gpu.program(
+          K.headPrep({ out: "h2", rope: true, norm: true })
+        ),
+        inputs: { uQKVG: b.qkvg, uNorm: layer.kNorm, uRope: rope },
+        uniforms: {
+          uBase: { int: qDims / 4 },
+          uPairTexels: { int: pairTexels },
+          uPos0: { int: pos0 },
+          uRowOffset: { int: offset },
+          uEps: c.normEps,
+          uScale: 1
+        },
+        output: layer.keys,
+        rect: { x: 0, y: row0, width: kvDims / 8, height: run }
+      })
+      this.gpu.run({
+        name: "heads",
+        program: this.gpu.program(K.VALUES),
+        inputs: { uQKVG: b.qkvg },
+        uniforms: {
+          uBase: { int: (qDims + kvDims) / 4 },
+          uRowOffset: { int: offset }
+        },
+        output: layer.values,
+        rect: { x: 0, y: row0, width: kvDims / 8, height: run }
+      })
+      m0 += run
+    }
+    // Queries in slices of SCORE_ROWS, so the scores buffer stays small:
+    // each slice sees keys up to its last query (and, in sliding layers,
+    // from its first query's window on).
     const group = c.numHeads / c.numKvHeads
-    this.gpu.run({
-      name: "scores",
-      program: this.gpu.program(K.SCORES),
-      inputs: { uQ: b.q, uK: layer.keys },
-      uniforms: {
-        uM: { int: rows },
-        uJ0: { int: j0 },
-        uKeys: { int: keys },
-        uPos0: { int: pos0 },
-        uWindow: { int: sliding ? c.slidingWindow : 0 },
-        uGroup: { int: group }
-      },
-      output: b.scores,
-      rect: {
-        x: 0,
-        y: 0,
-        width: Math.ceil(keys / 4),
-        height: c.numHeads * rows
+    for (let m0 = 0; m0 < rows; m0 += SCORE_ROWS) {
+      const slice = Math.min(SCORE_ROWS, rows - m0)
+      const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
+      const keys = pos0 + m0 + slice - j0
+      const ring = {
+        uRows: { int: slice },
+        uM0: { int: m0 },
+        uRing: { int: layer.ring }
       }
-    })
-    this.gpu.run({
-      name: "attend",
-      program: this.gpu.program(K.ATTEND),
-      inputs: { uS: b.scores, uV: layer.values, uQKVG: b.qkvg },
-      uniforms: {
-        uM: { int: rows },
-        uJ0: { int: j0 },
-        uKeys: { int: keys },
-        uGroup: { int: group },
-        uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
-      },
-      output: b.attnOut,
-      rect: { x: 0, y: 0, width: qDims / 8, height: rows }
-    })
+      this.gpu.run({
+        name: "scores",
+        program: this.gpu.program(K.SCORES),
+        inputs: { uQ: b.q, uK: layer.keys },
+        uniforms: {
+          ...ring,
+          uJ0: { int: j0 },
+          uKeys: { int: keys },
+          uPos0: { int: pos0 },
+          uWindow: { int: sliding ? c.slidingWindow : 0 },
+          uGroup: { int: group }
+        },
+        output: b.scores,
+        rect: {
+          x: 0,
+          y: 0,
+          width: Math.ceil(keys / 4),
+          height: c.numHeads * slice
+        }
+      })
+      this.gpu.run({
+        name: "attend",
+        program: this.gpu.program(K.ATTEND),
+        inputs: { uS: b.scores, uV: layer.values, uQKVG: b.qkvg },
+        uniforms: {
+          ...ring,
+          uJ0: { int: j0 },
+          uKeys: { int: keys },
+          uGroup: { int: group },
+          uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
+        },
+        output: b.attnOut,
+        rect: { x: 0, y: m0, width: qDims / 8, height: slice }
+      })
+    }
     this.matmul(b.attnOut, layer.o, b.opOut, rows)
   }
 
@@ -910,13 +1105,15 @@ export class Engine {
     this.gpu.run({
       name: "head",
       program: this.gpu.program(
-        K.matmul({
-          bits: e.bits,
-          zeros: !!e.zeros,
-          wrap: true,
-          precision: this.precision,
-          bytes: this.bytes
-        })
+        e.bits === 6
+          ? K.MATMUL_Q6_K_HEAD
+          : K.matmul({
+              bits: e.bits,
+              zeros: !!e.zeros,
+              wrap: true,
+              precision: this.precision,
+              bytes: e.bytes
+            })
       ),
       inputs: {
         uA: b.lastNormed,
@@ -965,7 +1162,9 @@ export class Engine {
     const e = this.embedding
     this.gpu.run({
       program: this.gpu.program(
-        K.embed({ bits: e.bits, zeros: !!e.zeros, bytes: this.bytes })
+        e.bits === 6
+          ? K.EMBED_Q6_K
+          : K.embed({ bits: e.bits, zeros: !!e.zeros, bytes: e.bytes })
       ),
       inputs: {
         uIds: b.ids,
@@ -995,10 +1194,10 @@ export class Engine {
           this.gpu.run({
             program: this.gpu.program(K.H2_TO_F32),
             inputs: { uX: tex },
-            output: b.debug,
+            output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
           })
-          src = b.debug
+          src = this.debugTexture()
         }
         const data = await this.gpu.read(src, {
           x: 0,

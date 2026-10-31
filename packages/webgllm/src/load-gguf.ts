@@ -3,8 +3,9 @@
  * such as Liquid AI's LFM3-1.7B-QAD-Q4_0.gguf.
  *
  * - Q4_0 matrices keep their blocks as they are (same nibble order); Q8_0
- *   stays 8-bit. The Q6_K embedding is dequantized and requantized to 8
- *   bits (scale = max|w| / 127 per block of 32).
+ *   stays 8-bit. A Q6_K embedding (Liquid AI's) is kept as it is, for the
+ *   shader to read natively; a float one is quantized to 8 bits. The
+ *   embedding comes in chunks of rows.
  * - Full-attention layers: llama.cpp keeps HF's head layout, where partial
  *   RoPE rotates dims j and j + headDim / 2 for j < ropeDimsFull / 2 (the
  *   other frequencies are zero; GGUF's rope_freqs.weight marks them with
@@ -28,6 +29,7 @@ import {
   newQuantMatrix,
   packQ4_0,
   packQ8_0,
+  packQ6_K,
   quantizeQ8,
   type RequantStats
 } from "./repack.js"
@@ -47,7 +49,7 @@ export type LoadGgufOptions = {
   header?: GgufHeader
   /** Embedding rows converted per step (default 512). */
   embeddingChunkRows?: number
-  /** Filled with the error of requantizing a Q6_K (or float) embedding to 8 bits. */
+  /** Filled with the error of requantizing a float embedding to 8 bits. */
   requantStats?: RequantStats
 }
 
@@ -263,22 +265,26 @@ export async function* loadGguf(
 
   yield { kind: "finalNorm", value: await norm("output_norm.weight") }
 
-  const bits = embedding.type === GgmlType.Q4_0 ? 4 : 8
-  const m = newQuantMatrix(vocab, D, bits, false)
-  const floats =
-    bits === 8 && embedding.type !== GgmlType.Q8_0
-      ? new Float32Array(chunkRows * D)
-      : undefined
+  // The embedding (also the output head) in chunks of rows, so it's never
+  // all in JavaScript memory at once: Q6_K as it is (the shader reads it
+  // natively), Q4_0 and Q8_0 repacked, floats quantized to 8 bits.
+  const q6 = embedding.type === GgmlType.Q6_K
+  const native =
+    embedding.type === GgmlType.Q4_0 || embedding.type === GgmlType.Q8_0
+  const bits = q6 ? 6 : embedding.type === GgmlType.Q4_0 ? 4 : 8
+  const floats = q6 || native ? undefined : new Float32Array(chunkRows * D)
   for (let r = 0; r < vocab; r += chunkRows) {
     const rows = Math.min(chunkRows, vocab - r)
     const bytes = await plan.take(`token_embd.weight@${r}`)
-    if (floats) {
+    const m = newQuantMatrix(rows, D, bits, false)
+    if (q6) packQ6_K(m, 0, bytes, rows)
+    else if (floats) {
       const values = floats.subarray(0, rows * D)
       rowsToFloats(embedding, bytes, rows, values)
-      quantizeQ8(m, r, values, rows, options.requantStats)
-    } else packRows(m, r, embedding, bytes, rows)
+      quantizeQ8(m, 0, values, rows, options.requantStats)
+    } else packRows(m, 0, embedding, bytes, rows)
+    yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
-  yield { kind: "embedding", value: m }
 }
 
 /** The bits a tensor gets in a QuantMatrix. */

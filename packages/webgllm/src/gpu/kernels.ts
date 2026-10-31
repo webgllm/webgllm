@@ -426,15 +426,19 @@ void main() {
 }
 
 /**
- * Attention scores, 4 keys per texel: row h * uM + m holds query m of head
- * h against keys uJ0 + 4x .. + 3. Queries are pre-scaled f32 (uQ), keys h2
+ * Attention scores, 4 keys per texel, for the uRows queries from uM0: row
+ * h * uRows + (m - uM0) holds query m of head h against keys uJ0 + 4x ..
+ * + 3. With uRing > 0 the cache is a ring of that many rows (position j at
+ * row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
  * (later than the query, outside the sliding window, past uKeys) get -1e30.
  */
 export const SCORES = `${HEADER}${H2}
 uniform sampler2D uQ;
 uniform usampler2D uK;
-uniform int uM;
+uniform int uRows;
+uniform int uM0;
+uniform int uRing;
 uniform int uJ0;
 uniform int uKeys;
 uniform int uPos0;
@@ -444,8 +448,8 @@ out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
-  int h = y / uM;
-  int m = y - h * uM;
+  int h = y / uRows;
+  int m = uM0 + (y - h * uRows);
   int kh = h / uGroup;
   int qpos = uPos0 + m;
   vec4 s = vec4(-1e30);
@@ -454,7 +458,7 @@ void main() {
     if (j - uJ0 >= uKeys || j > qpos || (uWindow > 0 && qpos - j >= uWindow)) continue;
     float acc = 0.0;
     for (int u = 0; u < 16; u++) {
-      uvec4 k = texelFetch(uK, ivec2(kh * 16 + u, j), 0);
+      uvec4 k = texelFetch(uK, ivec2(kh * 16 + u, uRing > 0 ? j % uRing : j), 0);
       acc += dot(texelFetch(uQ, ivec2(h * 32 + 2 * u, m), 0), h2lo(k));
       acc += dot(texelFetch(uQ, ivec2(h * 32 + 2 * u + 1, m), 0), h2hi(k));
     }
@@ -472,7 +476,9 @@ export const ATTEND = `${HEADER}${H2}
 uniform sampler2D uS;
 uniform usampler2D uV;
 uniform sampler2D uQKVG;
-uniform int uM;
+uniform int uRows;
+uniform int uM0;
+uniform int uRing;
 uniform int uJ0;
 uniform int uKeys;
 uniform int uGroup;
@@ -484,7 +490,7 @@ void main() {
   int h = x / 16;
   int u = x - h * 16;
   int kh = h / uGroup;
-  int row = h * uM + m;
+  int row = h * uRows + (m - uM0);
   int texels = (uKeys + 3) / 4;
   float mx = -1e30;
   for (int i = 0; i < texels; i++) {
@@ -500,7 +506,8 @@ void main() {
     for (int c = 0; c < 4; c++) {
       int j = 4 * i + c;
       if (j >= uKeys) break;
-      uvec4 v = texelFetch(uV, ivec2(kh * 16 + u, uJ0 + j), 0);
+      int vj = uJ0 + j;
+      uvec4 v = texelFetch(uV, ivec2(kh * 16 + u, uRing > 0 ? vj % uRing : vj), 0);
       lo += e[c] * h2lo(v);
       hi += e[c] * h2hi(v);
     }
@@ -690,4 +697,157 @@ void main() {
     if (int(texelFetch(uRank, ivec2(i, 0), 0).x) == r) c = i;
   }
   o = t < 64 ? chunkTexel(c, t) : vec4(float(c), 0.0, 0.0, 0.0);
+}`
+
+/**
+ * Copies cache rows (h2) between caches of different lengths: target row y
+ * holds position uPos0 + (y - uRow0), read from row position % uMod of uX.
+ */
+export const COPY_POSITIONS = `${HEADER}
+uniform usampler2D uX;
+uniform int uPos0;
+uniform int uRow0;
+uniform int uMod;
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int pos = uPos0 + (p.y - uRow0);
+  o = texelFetch(uX, ivec2(p.x, pos % uMod), 0);
+}`
+
+/*
+ * ggml Q6_K, read natively (see weights.ts for the layout), from a byte
+ * texture: a row's super-block of 256 weights is 52 RGBA8UI texels, ql
+ * (texels 0..31), qh (32..47) and the int8 scales (48..51), with its fp16 d
+ * in the scales texture. In half n of a super-block, for l = 0..31, as
+ * dequantize_row_q6_K:
+ *   y[128n + l]      = d · sc[8n + l/16 + 0] · ((ql[64n + l] & 15      | (qh[32n + l] >> 0 & 3) << 4) - 32)
+ *   y[128n + l + 32] = d · sc[8n + l/16 + 2] · ((ql[64n + l + 32] & 15 | (qh[32n + l] >> 2 & 3) << 4) - 32)
+ *   y[128n + l + 64] = d · sc[8n + l/16 + 4] · ((ql[64n + l] >> 4      | (qh[32n + l] >> 4 & 3) << 4) - 32)
+ *   y[128n + l + 96] = d · sc[8n + l/16 + 6] · ((ql[64n + l + 32] >> 4 | (qh[32n + l] >> 6 & 3) << 4) - 32)
+ * Texel w of a half covers l = 4w..4w+3: ql texels 16n + w and 16n + 8 + w,
+ * qh texel 32 + 8n + w. The bits come apart with float math (exact on
+ * integers up to 255), which mobile GPUs run faster than integer shifts.
+ */
+const Q6_K_UNPACK = `
+// Low nibbles (lo) and high nibbles (hi) of 4 bytes.
+void nibbles(vec4 B, out vec4 lo, out vec4 hi) { hi = floor(B * 0.0625); lo = B - 16.0 * hi; }
+// The four 2-bit fields of 4 bytes, lowest first.
+void pairs(vec4 B, out vec4 h0, out vec4 h1, out vec4 h2, out vec4 h3) {
+  vec4 t1 = floor(B * 0.25);
+  h0 = B - 4.0 * t1;
+  vec4 t2 = floor(t1 * 0.25);
+  h1 = t1 - 4.0 * t2;
+  h3 = floor(t2 * 0.25);
+  h2 = t2 - 4.0 * h3;
+}
+// An int8 scale from its byte.
+float sc8(float b) { return b < 128.0 ? b : b - 256.0; }`
+
+/** The output head from a Q6_K embedding: `matmul` with `wrap`, for 6-bit weights. */
+export const MATMUL_Q6_K_HEAD = (() => {
+  const C = "xyzw"
+  const body: Array<string> = []
+  const line = (s: string) => body.push(`      ${s}`)
+  for (const r of [0, 1, 2, 3]) {
+    line(`{`)
+    line(`  int t0 = wx + (sb * 4 + ${r}) * 52;`)
+    for (let i = 0; i < 4; i++)
+      line(`  vec4 S${i} = vec4(texelFetch(uW, ivec2(t0 + ${48 + i}, gr), 0));`)
+    line(`  float sum = 0.0;`)
+    for (const n of [0, 1]) {
+      for (let w = 0; w < 8; w++) {
+        line(`  {`)
+        line(`    vec4 a0, a1, b0, b1, h0, h1, h2, h3;`)
+        line(
+          `    nibbles(vec4(texelFetch(uW, ivec2(t0 + ${16 * n + w}, gr), 0)), a0, a1);`
+        )
+        line(
+          `    nibbles(vec4(texelFetch(uW, ivec2(t0 + ${16 * n + 8 + w}, gr), 0)), b0, b1);`
+        )
+        line(
+          `    pairs(vec4(texelFetch(uW, ivec2(t0 + ${32 + 8 * n + w}, gr), 0)), h0, h1, h2, h3);`
+        )
+        const groups = [
+          "a0 + 16.0 * h0",
+          "b0 + 16.0 * h1",
+          "a1 + 16.0 * h2",
+          "b1 + 16.0 * h3"
+        ]
+        for (const [g, q] of groups.entries()) {
+          const k = 8 * n + (w >> 2) + 2 * g
+          const texel = 16 * n + 4 * g + (w >> 1)
+          const half = w & 1 ? "h2hi" : "h2lo"
+          line(
+            `    sum += sc8(S${k >> 2}.${C[k & 3]}) * dot(${q} - 32.0, ${half}(texelFetch(uA, ivec2(sb * 32 + ${texel}, m), 0)));`
+          )
+        }
+        line(`  }`)
+      }
+    }
+    line(`  acc.${C[r]} += d.${C[r]} * sum;`)
+    line(`}`)
+  }
+  return `${HEADER}${H2}${Q6_K_UNPACK}
+uniform usampler2D uA;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uRow;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int g = y * uOutW + x;
+  int m = uRow;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc = vec4(0.0);
+  for (int sb = 0; sb < uKb; sb++) {
+    vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);
+${body.join("\n")}
+  }
+  o = acc;
+}`
+})()
+
+/** Embedding rows for token ids from a Q6_K embedding: `embed`, for 6-bit weights. */
+export const EMBED_Q6_K = `${HEADER}${Q6_K_UNPACK}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int sb = c >> 8;
+  int n = (c >> 7) & 1;
+  int grp = (c >> 5) & 3;
+  int w = (c & 31) >> 2;
+  int t0 = col * uRowTexels + (sb * 4 + r) * 52;
+  vec4 lo, hi, h0, h1, h2, h3;
+  nibbles(vec4(texelFetch(uW, ivec2(t0 + 16 * n + w + (grp & 1) * 8, gr), 0)), lo, hi);
+  pairs(vec4(texelFetch(uW, ivec2(t0 + 32 + 8 * n + w, gr), 0)), h0, h1, h2, h3);
+  vec4 low = grp < 2 ? lo : hi;
+  vec4 high = grp == 0 ? h0 : grp == 1 ? h1 : grp == 2 ? h2 : h3;
+  int k = 8 * n + (w >> 2) + 2 * grp;
+  float sc = sc8(float(texelFetch(uW, ivec2(t0 + 48 + (k >> 2), gr), 0)[k & 3]));
+  float d = texelFetch(uS, ivec2(col * uKb + sb, gr), 0)[r];
+  o = (d * sc) * (low + 16.0 * high - 32.0);
 }`

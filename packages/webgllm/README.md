@@ -55,11 +55,23 @@ Both builds were checked tensor by tensor against a reference:
 
 `chat()` runs tools and the agent loop; each model call is one generation in the worker. The worker downloads the files to the Origin Private File System (resuming a dropped download), then streams the weights from there into textures, one layer at a time.
 
-- **Loaders:** `loadGguf` and `loadOnnx` read either format into the same weights (`weights.ts`): 4-bit blocks of 32 in llama.cpp's Q4_0 order, zero points where the ONNX build has them, the GGUF's Q6_K embedding as 8-bit blocks. Only tensors are read from the ONNX graph; its ops aren't run.
+- **Loaders:** `loadGguf` and `loadOnnx` read either format into the same weights (`weights.ts`): 4-bit blocks of 32 in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is kept as it is and read natively in the shader, so its weights are exactly llama.cpp's. The embedding goes to the GPU in chunks of rows, so it's never all in JavaScript memory. Only tensors are read from the ONNX graph; its ops aren't run.
 - **Kernels:** fragment shaders, one output texel per fragment (`gpu/kernels.ts`). Matmuls read weights from byte textures and activations as packed halves, eight per texel. A one-token matmul splits its rows' blocks across fragments, so the GPU has enough work. Every op of LFM3's graph is a pass: RMSNorm, the gated short convolution with its state, QK-norm and RoPE, attention over a half-precision KV cache (sliding-window layers see their last 256 tokens), the sigmoid output gate, SwiGLU, and the sandwich norms.
 - **Prompts** are read 128 tokens at a time; big passes are split into bands of rows, under mobile GPUs' watchdogs.
 - **Sampling:** with top-k (LFM3's 50), the GPU applies the repetition penalty and picks the 50 chunks of 256 logits with the largest logits, which hold the top 50 tokens for sure, so writing a token reads back ~50 KB rather than every logit. Readbacks go through a pixel buffer and a fence.
-- **Cache reuse:** a follow-up reads only what's new. The attention cache rewinds to any position; the convolutions' state is saved after each prompt batch and reply, to resume from.
-- **Context:** 8,192 tokens.
+- **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state and the sliding-window layers' last window are saved after each prompt batch and reply (the latest 8), to resume from.
+- **Context:** 8,192 tokens. Sliding-window layers keep only their window plus a batch, in a ring.
+
+### Memory
+
+GPU textures, with the 8,192-token cache, and the most JavaScript memory a load takes (it streams the weights, a layer or a chunk of the embedding at a time):
+
+| Model                           | GPU textures | Peak JavaScript memory while loading |
+| ------------------------------- | ------------ | ------------------------------------ |
+| `daveycodez/LFM3-1.7B-Web`      | 1,014 MiB    | ~110 MiB                             |
+| `onnx-community/LFM3-1.7B-ONNX` | 1,105 MiB    | ~110 MiB                             |
+| `LiquidAI/LFM3-1.7B-GGUF`       | 1,143 MiB    | ~110 MiB                             |
+
+That's for iPhone Safari's ~2 GB limit on a page, which the tokenizer and the page itself also count against.
 
 **Status:** early (0.x); the API may change. See the [repository README](https://github.com/daveycodez/tanstack-ai-browser#readme).

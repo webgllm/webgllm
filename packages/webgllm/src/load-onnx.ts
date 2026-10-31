@@ -295,15 +295,16 @@ export async function* loadOnnx(
 
   yield { kind: "finalNorm", value: await floats(finalNorm, D) }
 
-  const m = newQuantMatrix(emb.N, D, 4, emb.zp !== null)
+  // In chunks of rows, so the embedding is never all in JavaScript memory.
   for (let r = 0; r < emb.N; r += chunkRows) {
     const rows = Math.min(chunkRows, emb.N - r)
     const quant = await plan.take(`quant@${r}`)
     const scales = await plan.take(`scales@${r}`)
     const zp = emb.zp ? await plan.take(`zp@${r}`) : null
-    packMatMulNBits(m, r, quant, scales, zp, rows)
+    const m = newQuantMatrix(rows, D, 4, emb.zp !== null)
+    packMatMulNBits(m, 0, quant, scales, zp, rows)
+    yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
   }
-  yield { kind: "embedding", value: m }
 }
 
 function tensorBytes(t: OnnxTensor): number {

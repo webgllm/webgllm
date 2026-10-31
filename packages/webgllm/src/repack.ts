@@ -8,21 +8,25 @@
 import { halfTable, toHalf } from "./half.js"
 import type { QuantMatrix } from "./weights.js"
 
+/** Words per row per block: 32 weights of 4 or 8 bits, or a 256-weight Q6_K super-block. */
+const WORDS_PER_BLOCK = { 4: 4, 6: 52, 8: 8 } as const
+
 export function newQuantMatrix(
   N: number,
   K: number,
-  bits: 4 | 8,
+  bits: 4 | 6 | 8,
   withZeros: boolean
 ): QuantMatrix {
   if (N % 4 !== 0) throw new Error(`matrix rows (${N}) must be a multiple of 4`)
-  if (K % 32 !== 0)
-    throw new Error(`matrix columns (${K}) must be a multiple of 32`)
-  const blocks = K / 32
+  const blockSize = bits === 6 ? 256 : 32
+  if (K % blockSize !== 0)
+    throw new Error(`matrix columns (${K}) must be a multiple of ${blockSize}`)
+  const blocks = K / blockSize
   return {
     N,
     K,
     bits,
-    quants: new Uint32Array(N * blocks * (bits === 4 ? 4 : 8)),
+    quants: new Uint32Array(N * blocks * WORDS_PER_BLOCK[bits]),
     scales: new Uint16Array(N * blocks),
     zeros: withZeros ? new Uint8Array(N * blocks).fill(8) : null
   }
@@ -36,7 +40,12 @@ function quantBytes(m: QuantMatrix): Uint8Array {
   )
 }
 
-function check(m: QuantMatrix, row0: number, rows: number, bits: 4 | 8): void {
+function check(
+  m: QuantMatrix,
+  row0: number,
+  rows: number,
+  bits: 4 | 6 | 8
+): void {
   if (m.bits !== bits) throw new Error(`expected a ${bits}-bit matrix`)
   if (row0 < 0 || row0 + rows > m.N)
     throw new RangeError(`rows ${row0}..${row0 + rows} are outside the matrix`)
@@ -272,5 +281,32 @@ export function quantizeQ8(
     stats.sumSquaredError += sse
     stats.sumSquared += ss
     stats.maxError = maxError
+  }
+}
+
+/**
+ * ggml Q6_K rows (super-blocks of 210 bytes: ql[128], qh[64], int8
+ * scales[16], fp16 d) into a 6-bit QuantMatrix, bytes as they are: the
+ * shader dequantizes them as dequantize_row_q6_K does.
+ */
+export function packQ6_K(
+  m: QuantMatrix,
+  row0: number,
+  src: Uint8Array,
+  rows: number
+): void {
+  check(m, row0, rows, 6)
+  const superBlocks = m.K / 256
+  const bytes = quantBytes(m)
+  for (let i = 0; i < rows; i++) {
+    const n = row0 + i
+    const g = n >> 2
+    const r = n & 3
+    for (let s = 0; s < superBlocks; s++) {
+      const from = (i * superBlocks + s) * 210
+      const at = (g * superBlocks + s) * 4 + r
+      bytes.set(src.subarray(from, from + 208), at * 208)
+      m.scales[at] = src[from + 208] | (src[from + 209] << 8)
+    }
   }
 }

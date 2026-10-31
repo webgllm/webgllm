@@ -19,6 +19,15 @@
  *
  * A weight is scale * (q - zero): 4-bit q in 0..15 with `zeros` (null means
  * 8 everywhere, as Q4_0), 8-bit q in -128..127 with zero 0.
+ *
+ * 6-bit matrices are ggml's Q6_K blocks as they are, for an embedding a
+ * GGUF stores that way (it's also the output head): super-blocks of 256
+ * weights along K. A row's super-block is 52 words, ql (32 words: low
+ * nibbles), qh (16: high 2 bits) and the 16 int8 sub-block scales (4), as
+ * in the file; its fp16 d goes in `scales`. `quants` index, in words:
+ * ((g * superBlocks + s) * 4 + r) * 52 + w; `scales`: (g * superBlocks + s)
+ * * 4 + r. A weight is d * scale[sub-block] * (q - 32), as
+ * dequantize_row_q6_K.
  */
 
 export type LayerType = "conv" | "full_attention" | "sliding_attention"
@@ -57,12 +66,12 @@ export type ModelConfig = {
 export type QuantMatrix = {
   /** Output rows; a multiple of 4. */
   N: number
-  /** Inputs per row; a multiple of 32. */
+  /** Inputs per row; a multiple of 32 (256 for 6-bit). */
   K: number
-  bits: 4 | 8
+  bits: 4 | 6 | 8
   /** See the module comment for the layout. */
   quants: Uint32Array
-  /** IEEE half bits, one per row and block. */
+  /** IEEE half bits, one per row and block (super-block for 6-bit). */
   scales: Uint16Array
   /** 4-bit only: one zero point (0..15) per row and block; null means 8. */
   zeros: Uint8Array | null
@@ -122,7 +131,11 @@ export type ModelWeights = {
  */
 export type WeightPiece =
   | { kind: "config"; config: ModelConfig }
-  | { kind: "embedding"; value: QuantMatrix }
+  /**
+   * The embedding, whole or in chunks of rows: `value` holds rows [row0,
+   * row0 + value.N) of a totalRows-row matrix (row0 a multiple of 4).
+   */
+  | { kind: "embedding"; value: QuantMatrix; row0?: number; totalRows?: number }
   | { kind: "finalNorm"; value: Float32Array }
   | { kind: "layer"; layer: number; value: LayerWeights }
 

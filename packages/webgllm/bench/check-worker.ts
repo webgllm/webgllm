@@ -124,6 +124,7 @@ function compareLogits(got: Float32Array, want: Float32Array) {
 async function run(params: {
   model: string
   format?: "gguf" | "onnx"
+  ring?: boolean
   batch: number
   precision: "highp" | "mediump"
   layers: boolean
@@ -144,7 +145,8 @@ async function run(params: {
   const canvas = new OffscreenCanvas(1, 1)
   const engine = new Engine(canvas, {
     batchSize: params.batch,
-    matmulPrecision: params.precision
+    matmulPrecision: params.precision,
+    ringCache: (params as { ring?: boolean }).ring !== false
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
@@ -314,6 +316,7 @@ async function run(params: {
   for (let start = 0; start < tokens.length; start += params.batch) {
     const batch = tokens.slice(start, start + params.batch)
     await engine.forward(batch, probe)
+    engine.snapshot()
     for (const row of [0, Math.floor(batch.length / 2), batch.length - 1]) {
       const got = await engine.logits(row)
       const want = await refRows("logits.bin", V, start + row, 1)
@@ -392,6 +395,18 @@ async function run(params: {
     )
     log(
       `CANDIDATES: GPU top-50 pick with penalty matches the full logits at ${pickAgree}/${steps} steps`
+    )
+    // Rewind: back to the last snapshot inside the prompt (the decode steps
+    // above have since moved the sliding layers' rings on), read the rest of
+    // the prompt again, and check the last position's logits.
+    const back = engine.rewind(tokens.length - 1)
+    const again = await engine.forward(tokens.slice(back))
+    const r = compareLogits(
+      again,
+      await refRows("logits.bin", V, tokens.length - 1, 1)
+    )
+    log(
+      `REWIND to ${back}, ${tokens.length - back} tokens read again: KL ${r.kl.toExponential(2)}  top1 ${r.top1 ? "same" : "DIFFERENT"}  top5 ${r.top5}/5`
     )
   }
   log(
