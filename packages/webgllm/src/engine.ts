@@ -136,7 +136,14 @@ export const TUNING = {
    * Few-token matmuls apply the RMS norm as they read, with no norm pass:
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
    */
-  foldNorm: 2
+  foldNorm: 2,
+  /**
+   * Prompt batches run at most paceAhead chunks of this many layers ahead
+   * of the GPU (0: unpaced), so the browser's GPU process never holds
+   * seconds of work and pages keep drawing (see Gpu.pace).
+   */
+  paceLayers: 4,
+  paceAhead: 2
 }
 
 /**
@@ -2395,6 +2402,13 @@ export class Engine {
 
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
+      if (
+        rows > SPLIT_ROWS &&
+        TUNING.paceLayers > 0 &&
+        i > 0 &&
+        i % TUNING.paceLayers === 0
+      )
+        await this.gpu.pace(TUNING.paceAhead)
       const [h, next] = b.residual
       const fold = foldAt(i)
       // (Layer 0 folds only if the embedding drew its sums and input.)

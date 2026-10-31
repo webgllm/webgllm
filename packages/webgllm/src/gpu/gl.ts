@@ -438,6 +438,29 @@ export class Gpu {
     return this.readStart(texture, rect)()
   }
 
+  /** Fences after paced chunks of passes, oldest first (see pace). */
+  private paced: Array<WebGLSync> = []
+
+  /**
+   * Ends a chunk of passes, and waits (without blocking) until at most
+   * `ahead` chunks are queued on the GPU. Without it, a long prompt queues
+   * seconds of work at once, and the browser's GPU process (which draws
+   * every page, and the browser itself) stalls until the queue drains.
+   */
+  async pace(ahead: number) {
+    const gl = this.gl
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
+    gl.flush()
+    if (sync) this.paced.push(sync)
+    while (this.paced.length > ahead && !this.isLost) {
+      const oldest = this.paced[0]
+      if (gl.getSyncParameter(oldest, gl.SYNC_STATUS) === gl.SIGNALED) {
+        gl.deleteSync(oldest)
+        this.paced.shift()
+      } else await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+  }
+
   /** Flushes issued passes to the GPU, so it starts on them. */
   flush() {
     this.gl.flush()

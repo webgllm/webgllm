@@ -25,7 +25,11 @@
       // ?model=…gguf&batch=128&precision=highp&layers=1
       const params = new URLSearchParams(location.search)
       const out = document.getElementById("out")
+      // ?jank=1: each line stamped with seconds since load, and at the end
+      // every frame gap over 50 ms with when it was.
+      const stamp = params.get("jank") === "1"
       const log = (text) => {
+        if (stamp) text = `[${(performance.now() / 1000).toFixed(2)}] ${text}`
         out.textContent += `${text}\n`
         void fetch("/log", { method: "POST", body: text }).catch(
           () => undefined
@@ -35,10 +39,51 @@
       const worker = new Worker("/bundle/bench/check-worker.js", {
         type: "module"
       })
+      // Frame gaps on this page over the window the worker reports (prompt
+      // runs, in absolute time): a stand-in for how much the GPU work
+      // starves the compositor.
+      const frames = []
+      const frame = (t) => {
+        frames.push(performance.timeOrigin + t)
+        if (frames.length > 20000) frames.splice(0, 10000)
+        requestAnimationFrame(frame)
+      }
+      requestAnimationFrame(frame)
       worker.onmessage = ({ data }) => {
+        if (data.type === "jank") {
+          const report = () => {
+            // Every frame in the window, and one either side of it.
+            const i0 = Math.max(0, frames.findIndex((f) => f >= data.from) - 1)
+            let i1 = frames.findIndex((f) => f > data.to)
+            if (i1 < 0) i1 = frames.length - 1
+            const inside = frames.slice(i0, i1 + 1)
+            const gaps = []
+            for (let i = 1; i < inside.length; i++) gaps.push(inside[i] - inside[i - 1])
+            const sorted = [...gaps].sort((a, b) => a - b)
+            const over = (ms) => gaps.filter((g) => g > ms).length
+            log(
+              `JANK over ${(data.to - data.from).toFixed(0)} ms: ${gaps.length} frames, median ${sorted[Math.floor(sorted.length / 2)]?.toFixed(1)} ms, worst ${sorted[sorted.length - 1]?.toFixed(1)} ms, over 34 ms: ${over(34)}, over 100 ms: ${over(100)}`
+            )
+          }
+          // (Frames up to a second after the window, once they've come.)
+          setTimeout(report, 1200)
+          return
+        }
         if (data.type === "log") log(data.text)
         else if (data.type === "error") log(`ERROR: ${data.message}\nALL DONE`)
-        else if (data.type === "done") log("ALL DONE")
+        else if (data.type === "done") {
+          if (stamp) {
+            const t0 = performance.timeOrigin
+            const freezes = []
+            for (let i = 1; i < frames.length; i++) {
+              const gap = frames[i] - frames[i - 1]
+              if (gap > 50)
+                freezes.push(`${((frames[i - 1] - t0) / 1000).toFixed(2)}s +${gap.toFixed(0)}ms`)
+            }
+            log(`FREEZES: ${freezes.join(", ") || "none"}`)
+          }
+          log("ALL DONE")
+        }
       }
       worker.onerror = (e) => log(`worker error: ${e.message}\nALL DONE`)
       worker.postMessage({

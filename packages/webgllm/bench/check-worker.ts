@@ -830,6 +830,7 @@ async function smoke(params: {
   const times: Array<number> = []
   const gpuTimes: Array<number> = []
   let token = 0
+  const jankFrom = performance.timeOrigin + performance.now()
   for (let run = 0; run < 3; run++) {
     engine.reset()
     await engine.gpu.finish()
@@ -848,6 +849,11 @@ async function smoke(params: {
       gl.deleteQuery(query)
     }
   }
+  postMessage({
+    type: "jank",
+    from: jankFrom,
+    to: performance.timeOrigin + performance.now()
+  })
   // A/B: ?ab=knob:a,b runs the prompt alternating TUNING[knob] = a and b,
   // 5 times each, and compares the medians (drift on a shared machine
   // cancels out).
