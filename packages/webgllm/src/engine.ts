@@ -114,6 +114,11 @@ export const TUNING = {
    * another pass, so many fragments share the work (0: never).
    */
   attendChunkTexels: 64,
+  /**
+   * For a few rows (writing), chunk only past this many score texels: the
+   * extra combine pass costs more than one long loop until then.
+   */
+  attendChunkTexelsDecode: 256,
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
@@ -862,12 +867,15 @@ export class Engine {
       // Chunked attention (long key ranges) too, forced on for a short
       // batch and a token.
       const saved = TUNING.attendChunkTexels
+      const savedDecode = TUNING.attendChunkTexelsDecode
       TUNING.attendChunkTexels = 1
+      TUNING.attendChunkTexelsDecode = 1
       try {
         await this.forwardHidden(new Array(12).fill(0))
         await this.logits(await this.forwardHidden([0]))
       } finally {
         TUNING.attendChunkTexels = saved
+        TUNING.attendChunkTexelsDecode = savedDecode
         this.reset()
       }
     }
@@ -1442,10 +1450,14 @@ export class Engine {
         Math.ceil(kt / ATTEND_CHUNKS)
       )
       const chunks = Math.ceil(kt / chunkTexels)
+      const chunkPast =
+        rows <= SPLIT_ROWS
+          ? Math.max(TUNING.attendChunkTexelsDecode, 2 * TUNING.attendChunkTexels)
+          : 2 * TUNING.attendChunkTexels
       if (
         chunkBufs &&
         TUNING.attendChunkTexels > 0 &&
-        kt > 2 * TUNING.attendChunkTexels &&
+        kt > chunkPast &&
         slice * chunks <= chunkBufs[0].height
       ) {
         // Long key ranges: chunks of keys in parallel, then combined.
