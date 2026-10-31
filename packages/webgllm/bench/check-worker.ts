@@ -4,6 +4,7 @@
  * (served from /ref/, see bench/README.md).
  */
 import { Engine, TUNING } from "../src/engine.js"
+import * as K from "../src/gpu/kernels.js"
 import type { LayerProbe } from "../src/engine.js"
 import { httpSource } from "../src/byte-source.js"
 import { headPermutation, loadGguf } from "../src/load-gguf.js"
@@ -563,11 +564,73 @@ async function smoke(params: {
     }
     const full = await step("everything", [])
     {
+      // Each decode matmul alone: 64 passes back to back (no readback).
+      type Internals = {
+        buffers: { normed: unknown; partial: unknown; rms: unknown; residual: Array<unknown> }
+        layers: Array<{
+          conv?: { inProj: unknown; outProj: unknown }
+          attention?: { qkvg: unknown; o: unknown }
+          gateUp: unknown
+          down: unknown
+        }>
+        splitPartials(a: unknown, w: unknown, rows: number): number
+        rms(x: unknown, row0: number, rows: number, split?: number): void
+      }
+      const e = engine as unknown as Internals
+      const convLayer = e.layers.find((l) => l.conv)
+      const attnLayer = e.layers.find((l) => l.attention)
+      const mats: Array<[string, unknown]> = [
+        ["in_proj", convLayer?.conv?.inProj],
+        ["out_proj", convLayer?.conv?.outProj],
+        ["qkvg", attnLayer?.attention?.qkvg],
+        ["o", attnLayer?.attention?.o],
+        ["gate_up", e.layers[0].gateUp],
+        ["down", e.layers[0].down]
+      ]
+      const per = async (run: () => void) => {
+        run()
+        await engine.gpu.finish()
+        let best = Infinity
+        for (let round = 0; round < 3; round++) {
+          const t = performance.now()
+          for (let i = 0; i < 64; i++) run()
+          await engine.gpu.finish()
+          best = Math.min(best, ((performance.now() - t) / 64) * 1000)
+        }
+        return best
+      }
+      // Each timed pass alternates with a 1-texel copy into another texture,
+      // so every pass is its own render pass (repeated draws into one
+      // target let the GPU skip all but the last: hidden surface removal).
+      const scratch = engine.gpu.texture(WebGL2RenderingContext.RGBA32F, 1, 1)
+      const copy = () =>
+        engine.gpu.run({
+          program: engine.gpu.program(K.COPY),
+          inputs: { uX: e.buffers.residual[0] as typeof scratch },
+          output: scratch,
+          rect: { x: 0, y: 0, width: 1, height: 1 }
+        })
+      const floor = await per(() => {
+        e.rms(e.buffers.residual[0], 0, 1)
+        copy()
+      })
+      const parts: Array<string> = [`2 tiny passes ${floor.toFixed(0)}`]
+      for (const [name, w] of mats) {
+        if (!w) continue
+        const t = await per(() => {
+          e.splitPartials(e.buffers.normed, w, 1)
+          copy()
+        })
+        parts.push(`${name} +${(t - floor / 2).toFixed(0)}`)
+      }
+      log(`MATMUL µs (each with its own pass): ${parts.join(", ")}`)
+    }
+    {
       // Fragment work per kind of pass: each drawn twice (same target, no
       // new render pass), GPU time added. Best of 3 rounds of 16 tokens.
       const gpuTime = async () => {
         let best = Infinity
-        for (let round = 0; round < 3; round++) {
+        for (let round = 0; round < 5; round++) {
           await engine.gpu.finish()
           const t = performance.now()
           for (let i = 0; i < 16; i++) await engine.forwardNoLogits([tokens[i]])
@@ -576,11 +639,12 @@ async function smoke(params: {
         }
         return best
       }
+      engine.gpu.repeatTimes = 4
       const base = await gpuTime()
       const parts: Array<string> = []
       for (const name of ["matmul", "rms", "add", "swiglu", "heads", "conv", "scores", "attend"]) {
         engine.gpu.repeat = new Set([name])
-        parts.push(`${name} ${(await gpuTime() - base).toFixed(2)}`)
+        parts.push(`${name} ${((await gpuTime() - base) / 3).toFixed(2)}`)
       }
       engine.gpu.repeat = new Set()
       log(`WORK (ms per token, fragments only; base ${base.toFixed(2)}): ${parts.join(", ")}`)

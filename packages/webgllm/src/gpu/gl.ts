@@ -52,7 +52,7 @@ export type Texture = {
   bytes: number
 }
 
-type Program = {
+export type Program = {
   program: WebGLProgram
   uniforms: Map<string, WebGLUniformLocation | null>
   samplers: Array<string>
@@ -125,6 +125,8 @@ export class Gpu {
    * for timing what their fragments cost beyond the pass itself.
    */
   repeat = new Set<string>()
+  /** How many times `repeat` passes are drawn. */
+  repeatTimes = 2
   /** Fragments per draw before a pass is split into bands (GPU watchdog). */
   maxFragmentsPerDraw = 1 << 22
 
@@ -396,7 +398,7 @@ export class Gpu {
       1,
       Math.floor(this.maxFragmentsPerDraw / rect.width)
     )
-    const times = pass.name && this.repeat.has(pass.name) ? 2 : 1
+    const times = pass.name && this.repeat.has(pass.name) ? this.repeatTimes : 1
     for (let n = 0; n < times; n++) {
       for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
         const height = Math.min(rowsPerBand, rect.y + rect.height - y)
