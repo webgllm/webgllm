@@ -1253,7 +1253,9 @@ export class Engine {
           uKbSlice: { int: kbSlice }
         },
         output: [out, partner],
-        rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices }
+        rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
+        // (Per block: 4 rows' weights and 4 tokens' activations.)
+        work: kbSlice * 40
       })
       this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
       return
@@ -1280,7 +1282,8 @@ export class Engine {
           uKbSlice: { int: Math.ceil(w.blocks / slices) }
         },
         output: out,
-        rect: { x: 0, y: 0, width, height: pairRows * slices }
+        rect: { x: 0, y: 0, width, height: pairRows * slices },
+        work: Math.ceil(w.blocks / slices) * 24
       })
       this.slicing.set(out.id, { split: slices, stride: pairRows })
       return
@@ -1301,7 +1304,8 @@ export class Engine {
       inputs: weights,
       uniforms: shape,
       output: out,
-      rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
+      rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
+      work: w.blocks * 24
     })
   }
 
@@ -1824,7 +1828,8 @@ export class Engine {
             y: 0,
             width: Math.ceil((n * total) / panelRows) * Math.min(kt, segTexels),
             height: Math.min(panelRows, n * total)
-          }
+          },
+          work: (c.headDim / 8) * (4 + 2 * G)
         })
       const chunks = chunksOf(chunkTexels)
       const chunkPast =
@@ -1873,7 +1878,8 @@ export class Engine {
               y: chunk0 * slice,
               width: qDims / 8 / G,
               height: slice * n * segChunks
-            }
+            },
+            work: chunkTexels * (2 * G + 8)
           })
           chunk0 += n * segChunks
           if (paced) await this.charge(attentionWork(gKeys))
@@ -1894,7 +1900,8 @@ export class Engine {
             uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
           },
           output: b.attnOut,
-          rect: { x: 0, y: m0, width: qDims / 8, height: slice }
+          rect: { x: 0, y: m0, width: qDims / 8, height: slice },
+          work: chunk0 * 3 * G + 2
         })
         m0 += slice
         continue
@@ -1916,7 +1923,8 @@ export class Engine {
           uVOff: { int: kvDims / 8 }
         },
         output: b.attnOut,
-        rect: { x: 0, y: m0, width: qDims / 8, height: slice }
+        rect: { x: 0, y: m0, width: qDims / 8, height: slice },
+        work: Math.ceil(keys / 4) * 10
       })
       m0 += slice
     }

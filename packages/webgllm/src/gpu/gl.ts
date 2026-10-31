@@ -84,6 +84,11 @@ export type Pass = {
   output: Texture | Array<Texture>
   /** The rectangle to draw, in texels; the whole output by default. */
   rect?: { x: number; y: number; width: number; height: number }
+  /**
+   * About how many texels a fragment reads (1 by default): draws are split
+   * by fragments times this, so a heavy pass never runs long in one draw.
+   */
+  work?: number
 }
 
 const VERTEX_SHADER = `#version 300 es
@@ -136,6 +141,12 @@ export class Gpu {
   repeatTimes = 2
   /** Fragments per draw before a pass is split into bands (GPU watchdog). */
   maxFragmentsPerDraw = 1 << 22
+  /**
+   * Texel reads (fragments × Pass.work) per draw before a pass is split:
+   * tens of milliseconds on a slow integrated GPU, far inside a watchdog
+   * (Windows resets a GPU after 2 s).
+   */
+  maxReadsPerDraw = 1 << 28
 
   constructor(canvas: OffscreenCanvas | HTMLCanvasElement) {
     canvas.addEventListener("webglcontextlost", (event) => {
@@ -513,10 +524,15 @@ export class Gpu {
       height: outputs[0].height
     }
     // Bands of rows, each its own draw, so no single draw runs long enough
-    // to trip the GPU watchdog.
+    // to trip the GPU watchdog: by fragments, and by the reads they make.
     const rowsPerBand = Math.max(
       1,
-      Math.floor(this.maxFragmentsPerDraw / rect.width)
+      Math.floor(
+        Math.min(
+          this.maxFragmentsPerDraw,
+          this.maxReadsPerDraw / Math.max(1, pass.work ?? 1)
+        ) / rect.width
+      )
     )
     const times = pass.name && this.repeat.has(pass.name) ? this.repeatTimes : 1
     for (let n = 0; n < times; n++) {
@@ -699,9 +715,19 @@ export class Gpu {
       if (status === gl.WAIT_FAILED)
         throw new GpuError("Waiting on the GPU failed.")
       if (status !== gl.TIMEOUT_EXPIRED) return
-      // Spin on messages at first; back off to timers on long waits.
+      // Spin on messages at first; back off to timers on long waits. With
+      // timers throttled (a hidden page: a 1 ms wait can take a second),
+      // block on a pixel of the last pass instead, as pace does.
       if (spins < 2000) await this.yieldOnce()
-      else await new Promise((resolve) => setTimeout(resolve, 1))
+      else if (performance.now() < this.throttledUntil) {
+        this.readBack()
+        return
+      } else {
+        const t = performance.now()
+        await new Promise((resolve) => setTimeout(resolve, 1))
+        if (performance.now() - t > 50)
+          this.throttledUntil = performance.now() + 2000
+      }
     }
   }
 

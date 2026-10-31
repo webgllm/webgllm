@@ -45,9 +45,48 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
   }
 }
 
+/** Waits `ms`, or rejects when `signal` aborts. */
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer)
+        reject(signal.reason)
+      },
+      { once: true }
+    )
+  })
+
+/**
+ * The file's sync access handle. One file has one at a time: a download
+ * of it that was just superseded may hold it until its fetch notices, so
+ * a few tries.
+ */
+async function openAccess(
+  handle: FileSystemFileHandle,
+  signal?: AbortSignal
+): Promise<SyncAccessHandle> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return (await (
+        handle as FileSystemFileHandle & {
+          createSyncAccessHandle: () => Promise<SyncAccessHandle>
+        }
+      ).createSyncAccessHandle()) as SyncAccessHandle
+    } catch (error) {
+      if (signal?.aborted || attempt >= 10) throw error
+      await sleep(250 * (attempt + 1), signal)
+    }
+  }
+}
+
 /**
  * Downloads `file` to disk unless it's there, reporting bytes as they come,
- * and returns it.
+ * and returns it. Survives dropped connections (resuming with a range
+ * request) and a closed access handle (browsers close them, iOS Safari
+ * for a page it suspends): a new handle, from the bytes on disk.
  */
 export async function download(
   file: ModelFile,
@@ -58,13 +97,23 @@ export async function download(
   if (done) return done
   const folder = await dir()
   const handle = await folder.getFileHandle(diskName(file), { create: true })
-  const access = (await (
-    handle as FileSystemFileHandle & {
-      createSyncAccessHandle: () => Promise<SyncAccessHandle>
+  let access = await openAccess(handle, signal)
+  /** The bytes on disk, through a new handle if the browser closed this one. */
+  const size = async () => {
+    try {
+      return access.getSize()
+    } catch {
+      try {
+        access.close()
+      } catch {
+        // Already closed.
+      }
+      access = await openAccess(handle, signal)
+      return access.getSize()
     }
-  ).createSyncAccessHandle()) as SyncAccessHandle
+  }
   try {
-    let loaded = access.getSize()
+    let loaded = await size()
     if (file.bytes !== undefined && loaded > file.bytes) {
       access.truncate(0)
       loaded = 0
@@ -103,19 +152,23 @@ export async function download(
         break
       } catch (error) {
         if (signal?.aborted || attempt + 1 >= ATTEMPTS) throw error
-        await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt))
-        loaded = access.getSize()
+        await sleep(1000 * 2 ** attempt, signal)
+        loaded = await size()
       }
     }
-    if (file.bytes !== undefined && access.getSize() !== file.bytes) {
-      const size = access.getSize()
+    const final = await size()
+    if (file.bytes !== undefined && final !== file.bytes) {
       access.truncate(0)
       throw new Error(
-        `${file.path} downloaded as ${size} bytes, expected ${file.bytes}.`
+        `${file.path} downloaded as ${final} bytes, expected ${file.bytes}.`
       )
     }
   } finally {
-    access.close()
+    try {
+      access.close()
+    } catch {
+      // Already closed.
+    }
   }
   await folder.getFileHandle(marker(file), { create: true })
   return handle.getFile()

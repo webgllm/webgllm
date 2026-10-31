@@ -157,7 +157,10 @@ async function load(
 ): Promise<Loaded> {
   const meta = modelMeta(model)
   // The GPU first: a browser or GPU that can't run the model says so before
-  // a gigabyte downloads.
+  // a gigabyte downloads. (The page's hasWebGl2 checks the page; this is
+  // the worker, where the engine runs.)
+  if (typeof OffscreenCanvas === "undefined")
+    throw new GpuError("This browser has no OffscreenCanvas in workers.")
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     batchSize: PROMPT_BATCH,
     ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
