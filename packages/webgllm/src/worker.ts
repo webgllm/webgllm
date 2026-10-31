@@ -249,6 +249,7 @@ async function load(
     lap("warmUp")
     timings.programs = engine.gpu.compiled.count
     timings.compileMs = Math.round(engine.gpu.compiled.ms)
+    for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
     // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).

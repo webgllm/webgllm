@@ -1355,14 +1355,26 @@ export class Engine {
    * driver builds its pipelines, at load rather than inside the first
    * reply's timings. Then forgets it all.
    */
+  /** Programs each warm-up step compiled (load profiling). */
+  warmCounts: Record<string, number> = {}
   async warmUp() {
+    let seen = this.gpu.compiled.count
+    const step = (name: string) => {
+      this.warmCounts[name] = this.gpu.compiled.count - seen
+      seen = this.gpu.compiled.count
+    }
     const row = await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
+    step("batch9")
     await this.candidates(row, 1, 1, true)
+    step("pick")
     this.dropGuess()
     await this.logits(row)
+    step("logits")
     await this.forwardHidden([0, 0], { draft: true })
+    step("draft")
     this.accept(1)
     await this.logits(await this.forwardHidden([0]))
+    step("token")
     this.snapshot()
     this.reset()
     if (TUNING.attendChunkTexels > 0) {
@@ -1375,6 +1387,7 @@ export class Engine {
       try {
         await this.forwardHidden(new Array(12).fill(0))
         await this.logits(await this.forwardHidden([0]))
+        step("chunked")
       } finally {
         TUNING.attendChunkTexels = saved
         TUNING.attendChunkTexelsDecode = savedDecode
