@@ -23,7 +23,39 @@ type Format = { name: string; internal: number; format: number; type: number; by
  * "strip": fragment (s, y) reads row y; "rows": fragment (y, s), so
  * neighbours in x read neighbouring rows, as the engine's matmuls do.
  */
-type Mode = "strip" | "rows"
+type Mode = "strip" | "rows" | "slab64" | "slab128"
+
+/**
+ * "slab": the pass's fragments are a WIN × WIN window; at step c of band b
+ * fragment (x, y) reads texel (x + WIN·c, y + WIN·b), so each step the
+ * whole window reads one contiguous WIN × WIN block, as a copy would.
+ */
+function slabKernel(f: Format, unroll: number, win: number) {
+  const sampler = f.float ? "sampler2D" : "usampler2D"
+  const acc = f.float ? "vec4" : "uvec4"
+  const reads = Array.from(
+    { length: unroll },
+    (_, k) => `    acc += texelFetch(uW, ivec2(x + ${win} * (c + ${k}), yb), 0);`
+  ).join("\n")
+  return `${HEADER}
+uniform ${sampler} uW;
+uniform sampler2D uPrev;
+uniform int uRun;
+uniform int uQ;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  ${acc} acc = ${acc}(0);
+  for (int i = 0; i < uRun; i += ${unroll}) {
+    int band = i / uQ;
+    int c = i - band * uQ;
+    int yb = y + ${win} * band;
+${reads}
+  }
+  o = vec4(acc) + texelFetch(uPrev, ivec2(0, 0), 0) * 1e-30;
+}`
+}
 
 function kernel(f: Format, unroll: number, mode: Mode) {
   const sampler = f.float ? "sampler2D" : "usampler2D"
@@ -87,19 +119,27 @@ async function main() {
       words[i] = seed
     }
     const w = gpu.texture(f.internal, width, rows, { format: f.format, type: f.type, pixels })
-    const cases: Array<[Mode, number]> = [["strip", 512], ["rows", 32], ["rows", 128], ["rows", 512]]
+    const cases: Array<[Mode, number]> = [
+      ["rows", 128],
+      ["rows", 512],
+      ["slab64", (width * rows) / 4096],
+      ["slab128", (width * rows) / 16384]
+    ]
     for (const [mode, run] of cases) {
       for (const unroll of [8]) {
-        const program = gpu.program(kernel(f, unroll, mode))
+        const win = mode === "slab64" ? 64 : mode === "slab128" ? 128 : 0
+        if (win && (rows % win || width % win)) continue
+        const program = gpu.program(win ? slabKernel(f, unroll, win) : kernel(f, unroll, mode))
         const draw = (i: number) =>
           gpu.run({
             name: "bw",
             program,
-            inputs: { uW: w, uPrev: outs[mode][(i + 1) % 2] },
-            uniforms: { uRun: { int: run } },
-            output: outs[mode][i % 2],
-            rect:
-              mode === "rows"
+            inputs: { uW: w, uPrev: outs[win ? "strip" : mode as "strip" | "rows"][(i + 1) % 2] },
+            uniforms: { uRun: { int: run }, uQ: { int: width / Math.max(win, 1) } },
+            output: outs[win ? "strip" : mode as "strip" | "rows"][i % 2],
+            rect: win
+              ? { x: 0, y: 0, width: win, height: win }
+              : mode === "rows"
                 ? { x: 0, y: 0, width: rows, height: width / run }
                 : { x: 0, y: 0, width: width / run, height: rows }
           })

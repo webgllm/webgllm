@@ -45,3 +45,11 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 ## Weight texels (Oct 31)
 
 4-bit layer weights now live in byte texels (RGBA8, normalized), not RGBA4: half the fetches per block, which a fetch-bound GPU (PowerVR) turns into writing speed (LFM3 12.8 → 16.6 tok/s, 350M +17%). Apple GPUs split RGBA4's nibbles for free in the texture unit and pay for the byte split in ALU; scales and zero points share one texel and the split takes a floor and two dots per texel, leaving the M3 2–4% and an iPhone 16 Pro Max 15–40% behind RGBA4. So the engine times both at load (Engine.chooseLayout: the first layer's gate|up shape, random weights, the writing matmul on each) and keeps the faster: bytes on the Pixel (0.405 vs 0.496 ms), RGBA4 on the iPhone (0.276 vs 0.306) and the M3. TUNING.layerRgba4 forces one.
+
+## Apple writing experiments (350M, M3 Ultra and iPhone 16 Pro Max, Oct 31)
+
+- What a pass costs (`mm2.html?batch=0` on the iPhone): every change of render target costs ~21 µs, even for a 1-pixel draw into a 1×1 texture, and scissor or invalidate hints don't change it; more draws into the same target cost ~1.2 µs each. A step that reads the last step's output needs its own render pass, so this is a floor per dependent step.
+- A 350M writing step on the iPhone (`check.html?…&onnx=lfm25-350m&skip=attend`): 148 passes, 6.5 ms of GPU time. About 3 ms of that is the per-pass floor and ~2.3 ms is streaming the ~140 MB of 4-bit layer weights; most single matmuls take the same ~46 µs (iPhone) or ~0.13 ms (M3, Chromium) whatever their shape (`mm2.html?batch=1&only=350M`). Flushing every layer or only at the readback: no difference.
+- Slab reads (`bandwidth.html`, each step of all fragments reading one contiguous block, like a blit): no faster on the iPhone (RGBA8 53 vs 49 GB/s, RGBA4 slower) and far slower on the M3. What does matter on Apple is fragments per pass: 4k fragments stream ~35 GB/s on the iPhone, 16k ~44, 64k+ ~49.
+- One or two weight rows per fragment (4× or 2× the fragments, each streaming a quarter or half of a row group; `rowKernel` in mm2.ts): slower than four rows on both (each fragment still fetches every activation), e.g. the 350M down 0.067 vs 0.053 ms on the iPhone.
+- The 350M's zero points aren't all 8 (73% differ), so the kernels without zero points don't apply to it.

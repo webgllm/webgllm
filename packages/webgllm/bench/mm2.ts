@@ -232,6 +232,47 @@ ${L.join("\n")}
 }
 
 /**
+ * RGBA4 weights, one token, K in `split` slices, and R (1 or 2) of a row
+ * group's 4 rows per fragment: 4 / R times the fragments of `kernel`, each
+ * streaming R / 4 of the weights (the activations are fetched by each).
+ * Output R32F / RG32F, 4G / R wide.
+ */
+function rowKernel(R: 1 | 2) {
+  const per = 4 / R
+  const L: Array<string> = []
+  for (let j = 0; j < 8; j++) {
+    L.push(`    { vec4 a = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, 0), 0));`)
+    L.push(`      s += dot(a, vec4(1.0));`)
+    for (let r = 0; r < R; r++)
+      L.push(`      b${R === 1 ? "" : "." + "xy"[r]} += dot(texelFetch(uW, ivec2(kb * 32 + (r0 + ${r}) * 8 + ${j}, g), 0), a);`)
+    L.push(`    }`)
+  }
+  const T = R === 1 ? "float" : "vec2"
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKbS;
+out ${T} o0;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int g = x / ${per};
+  int r0 = (x - g * ${per}) * ${R};
+  int kb0 = int(gl_FragCoord.y) * uKbS;
+  ${T} acc = ${T}(0.0);
+  for (int kb = kb0; kb < kb0 + uKbS; kb++) {
+    vec4 d4 = texelFetch(uS, ivec2(kb, g), 0);
+    ${T} d = ${R === 1 ? "d4[r0]" : "r0 == 0 ? d4.xy : d4.zw"};
+    ${T} b = ${T}(0.0);
+    float s = 0.0;
+${L.join("\n")}
+    acc += d * (15.0 * b - 8.0 * s);
+  }
+  o0 = acc;
+}`
+}
+
+/**
  * RGBA4 weights, h2 activations, R rows (R / 4 row groups) × T tokens per
  * fragment; output k (MRT) is row group k / (T / 2), tokens 2·(k % (T/2))
  * and +1 as a pair texel. `sameActs`: every fragment reads token rows 0..T-1
@@ -1150,6 +1191,36 @@ void main() { o = ${read}; }`)
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
+      if (M === 1)
+        for (const R of [1, 2] as const)
+          for (const split of [4, 8]) {
+            const width = (G * 4) / R
+            if (width > gpu.limits.maxTextureSize) continue
+            const outs = [0, 1].map(() => gpu.texture(R === 1 ? gl.R32F : 0x8230, width, split))
+            const program = gpu.program(rowKernel(R))
+            const run = (i: number) =>
+              gpu.run({
+                name: "mm",
+                program,
+                inputs: { uA: aH2, uW: wRgba4, uS: scales },
+                uniforms: { uKbS: { int: Math.ceil(blocks / split) } },
+                output: outs[i % 2]
+              })
+            run(0)
+            run(1)
+            await gpu.finish()
+            let best = Infinity
+            for (let round = 0; round < 3; round++) {
+              const t0 = performance.now()
+              for (let i = 0; i < 50; i++) run(i)
+              await gpu.finish()
+              best = Math.min(best, (performance.now() - t0) / 50)
+            }
+            log(
+              `MM2 ${label} ${N}x${K} M=1 w=rgba4 rows ${R} split ${split}: ${best.toFixed(3)} ms, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+            )
+            for (const t of outs) gpu.delete(t)
+          }
       for (const [rows, T, label2, opts] of [
         [4, 4, "", {}],
         [4, 4, " fold", { fold: true }],
