@@ -23,7 +23,7 @@ uvec4 packH2(vec4 a, vec4 b) {
 `
 
 type Variant = {
-  weights: "rgba4" | "bytes"
+  weights: "rgba4" | "bytes" | "words"
   acts: "f16" | "h2"
   tokens: 1 | 2 | 4 | 8
   /** Weights, activations and block sums as mediump (half precision on Metal?). */
@@ -55,6 +55,28 @@ function kernel(v: Variant) {
       line(`}`)
     }
     for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * s${t});`)
+  } else if (v.weights === "words") {
+    // RGBA32UI texel (kb * 4 + r, g): row r's whole block, uint k holding
+    // weights 8k..8k+7 (nibble i at bits 4i), split with integer shifts.
+    for (const r of [0, 1, 2, 3])
+      line(`uvec4 W${r} = texelFetch(uW, ivec2(kb * 4 + ${r}, g), 0);`)
+    for (let k = 0; k < 4; k++) {
+      line(`{`)
+      for (const r of [0, 1, 2, 3]) {
+        line(`  vec4 L${r} = vec4((uvec4(W${r}[${k}]) >> uvec4(0u, 4u, 8u, 12u)) & 15u);`)
+        line(`  vec4 H${r} = vec4((uvec4(W${r}[${k}]) >> uvec4(16u, 20u, 24u, 28u)) & 15u);`)
+      }
+      for (let t = 0; t < T; t++) {
+        line(`  { uvec4 u = texelFetch(uA, ivec2(kb * 4 + ${k}, m0 + ${t}), 0);`)
+        line(`    vec4 x = h2lo(u); vec4 y = h2hi(u);`)
+        line(`    s${t} += dot(x + y, vec4(1.0));`)
+        line(
+          `    b${t} += vec4(dot(L0, x) + dot(H0, y), dot(L1, x) + dot(H1, y), dot(L2, x) + dot(H2, y), dot(L3, x) + dot(H3, y)); }`
+        )
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++) line(`acc${t} += d * (b${t} - 8.0 * s${t});`)
   } else {
     // Byte texel (kb * 16 + r * 4 + w, g): weights 4w.. (lo), 16+4w.. (hi).
     for (let w = 0; w < 4; w++) {
@@ -703,6 +725,7 @@ async function shapes(gpu: Gpu, batch: number) {
     const G = N / 4
     const wRgba4 = gpu.texture(gl.RGBA4, blocks * 32, G)
     const wBytes = gpu.texture(gl.RGBA8UI, blocks * 16, G)
+    const wWords = G <= 16384 ? gpu.texture(gl.RGBA32UI, blocks * 4, G) : null
     const scales = gpu.texture(gl.RGBA16F, blocks, G)
     for (const M of [params.batch ?? 512]) {
       const aF16 = gpu.texture(gl.RGBA16F, K / 4, M)
@@ -717,7 +740,12 @@ async function shapes(gpu: Gpu, batch: number) {
             ]
           : [
               { weights: "rgba4", acts: "h2", tokens: 4 },
-              { weights: "rgba4", acts: "h2", tokens: 8 }
+              ...(G <= 16384
+                ? ([
+                    { weights: "words", acts: "h2", tokens: 2 },
+                    { weights: "words", acts: "h2", tokens: 4 }
+                  ] as Array<Variant>)
+                : [])
             ]
       for (const v of variants) {
         const T = v.tokens
@@ -734,7 +762,7 @@ async function shapes(gpu: Gpu, batch: number) {
             program,
             inputs: {
               uA: v.acts === "f16" ? aF16 : aH2,
-              uW: v.weights === "rgba4" ? wRgba4 : wBytes,
+              uW: v.weights === "rgba4" ? wRgba4 : v.weights === "words" ? (wWords ?? wBytes) : wBytes,
               uS: scales
             },
             uniforms: { uKb: { int: blocks } },
@@ -794,6 +822,7 @@ async function shapes(gpu: Gpu, batch: number) {
     }
     gpu.delete(wRgba4)
     gpu.delete(wBytes)
+    if (wWords) gpu.delete(wWords)
     gpu.delete(scales)
   }
 }
