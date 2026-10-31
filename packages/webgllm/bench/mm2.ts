@@ -687,16 +687,20 @@ async function shapes(gpu: Gpu, batch: number) {
     for (const x of [w, sc, a, ...outs]) gpu.delete(x)
   }
   for (const [label, N, K] of [
-    ["gate+up", 15360, 2048],
+    ["gate+up as 2 K-slices", 30720, 1024],
+    ["gate+up as 4 K-slices", 61440, 512],
     ["in_proj", 6144, 2048],
+    ["in_proj as 2 K-slices", 12288, 1024],
+    ["in_proj as 4 K-slices", 24576, 512],
     ["qkvg", 3088, 2048],
-    ["out_proj/o", 2048, 2048],
+    ["qkvg as 2 K-slices", 6176, 1024],
+    ["qkvg as 4 K-slices", 12352, 512],
     ["o as 2 K-slices", 4096, 1024],
     ["o as 4 K-slices", 8192, 512],
-    ["down", 2048, 7680],
     ["down as 2 K-slices", 4096, 3840],
-    ["down as 4 K-slices", 8192, 1920]
-  ] as const) {
+    ["down as 4 K-slices", 8192, 1920],
+    ["down as 8 K-slices", 16384, 960]
+] as const) {
     const blocks = K / 32
     const G = N / 4
     const wRgba4 = gpu.texture(gl.RGBA4, blocks * 32, G)
@@ -714,10 +718,7 @@ async function shapes(gpu: Gpu, batch: number) {
               { weights: "rgba4", acts: "f16", tokens: 1 }
             ]
           : [
-              { weights: "rgba4", acts: "h2", tokens: 2 },
-              { weights: "bytes", acts: "h2", tokens: 2 },
-              { weights: "rgba4", acts: "h2", tokens: 4 },
-              { weights: "bytes", acts: "h2", tokens: 4 }
+              { weights: "rgba4", acts: "h2", tokens: 4 }
             ]
       for (const v of variants) {
         const T = v.tokens

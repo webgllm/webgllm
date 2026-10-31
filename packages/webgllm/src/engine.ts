@@ -108,6 +108,10 @@ export const TUNING = {
   maxSplit: 16,
   /** Pixels per row summing its squares (at most K.RMS_PARTS). */
   rmsParts: 64,
+  /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
+  quad: 1,
+  /** Their K-slices: about this many K values each (twice for over 8192 rows). */
+  quadSliceK: 512,
   /** K-slices of the RGBA4 output head (more than 1 adds a pass to sum them). */
   headSplit: 4,
   /**
@@ -124,6 +128,12 @@ export const TUNING = {
 type MatIn = { a: Texture; norm?: Texture | "prescaled" }
 
 export type EngineOptions = {
+  /**
+   * Four tokens per fragment in prompt matmuls (a quarter fewer weight
+   * reads per multiply; ~40 MB more at a 512-token batch). Default: for
+   * batches of 256 or more.
+   */
+  quadMatmuls?: boolean
   /**
    * Sliding-window layers keep only their window (plus a batch) of keys and
    * values, in a ring: ~75 MB less for LFM3. On by default.
@@ -181,6 +191,9 @@ export class Engine {
   private ringCache: boolean
   private layers: Array<GpuLayer> = []
   private embedding!: GpuMatrix
+  private readonly quadMatmuls: boolean
+  /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
+  private quads = new Map<number, Texture>()
   private finalNorm!: Texture
   private ropeFull!: Texture
   private ropeSliding!: Texture
@@ -199,6 +212,7 @@ export class Engine {
     this.precision = options.matmulPrecision ?? "highp"
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
+    this.quadMatmuls = options.quadMatmuls ?? this.batchSize >= 256
     for (const name of options.skip ?? []) this.gpu.skip.add(name)
   }
 
@@ -241,6 +255,11 @@ export class Engine {
   private configure(config: ModelConfig) {
     this.config = config
     this.buffers = this.allocate()
+    if (this.quadMatmuls) {
+      const b = this.buffers
+      for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut])
+        this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
+    }
     this.ropeFull = this.ropeTable(config.ropeThetaFull, config.ropeDimsFull)
     this.ropeSliding = this.ropeTable(
       config.ropeThetaSliding,
@@ -318,7 +337,8 @@ export class Engine {
       rms: this.gpu.texture(GL.RGBA32F, K.RMS_PARTS, M),
       normed: this.h2(D, M),
       opOut: this.pair(D, 2 * M),
-      bcx: this.pair(3 * D, M),
+      // (Room for more K-slices of 4-token matmuls: see matmulQuad.)
+      bcx: this.pair(3 * D, this.quadMatmuls ? 2 * M : M),
       convOut: this.h2(D, M),
       qkvg: this.pair(qkvg, 2 * M),
       q: this.f32(c.numHeads * c.headDim, M),
@@ -330,7 +350,7 @@ export class Engine {
       attnOut: this.h2(qDims, M),
       gateUp: this.pair(2 * I, M),
       act: this.h2(I, M),
-      ffnOut: this.pair(D, 2 * M),
+      ffnOut: this.pair(D, this.quadMatmuls ? 4 * M : 2 * M),
       lastNormed: this.h2(D, SPLIT_ROWS),
       /** Logits: logitRows rows per token, for up to SPLIT_ROWS tokens. */
       logits: this.gpu.texture(
@@ -818,7 +838,29 @@ export class Engine {
   }
 
   /** How each pair tensor was last written: K-slices stacked, rows apart. */
-  private slicing = new Map<number, { split: number; stride: number }>()
+  private slicing = new Map<
+    number,
+    { split: number; stride: number; quad?: boolean }
+  >()
+
+  /** Pair tensor t's second texture if a 4-token matmul wrote it last. */
+  private quadOf(t: Texture) {
+    return this.slicing.get(t.id)?.quad ? this.quads.get(t.id) : undefined
+  }
+
+  /** The second texture of pair tensor t as input `name`_B, if it has one. */
+  private quadInputs(name: string, t: Texture): Record<string, Texture> {
+    const partner = this.quadOf(t)
+    return partner ? { [`${name}_B`]: partner } : {}
+  }
+
+  /** `source` reading pair tensor input `name` (t) as it was written. */
+  private readPair(source: string, name: string, t: Texture) {
+    if (!this.quadOf(t)) return source
+    // The slice count as a constant: the reads unroll.
+    const split = this.slicing.get(t.id)?.split ?? 1
+    return K.withPairSplit(K.fromQuad(source, [name]), split)
+  }
 
   /** The uniforms pf needs to read pair tensor t (its K-slices). */
   private pairIn(t: Texture) {
@@ -854,6 +896,34 @@ export class Engine {
         rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
       })
       this.slicing.set(out.id, { split: 1, stride: 0 })
+      return
+    }
+    const partner = this.quads.get(out.id)
+    if (w.rgba4 && partner && TUNING.quad > 0) {
+      // Four tokens per fragment, into two textures; K in slices of about
+      // quadSliceK values (twice that for wide matrices), stacked in rows.
+      const quadRows = Math.ceil(rows / 4)
+      const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
+      // The most slices the output holds at a full batch: the same for
+      // every batch, so the warm-up compiles the programs prompts use.
+      const most = Math.floor(out.height / Math.ceil(this.capacity / 4))
+      const kbSlice = Math.ceil(
+        w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
+      )
+      const slices = Math.ceil(w.blocks / kbSlice)
+      this.gpu.run({
+        name: "matmul",
+        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
+        inputs: weights,
+        uniforms: {
+          ...shape,
+          uSliceRows: { int: quadRows },
+          uKbSlice: { int: kbSlice }
+        },
+        output: [out, partner],
+        rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices }
+      })
+      this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
       return
     }
     if (w.rgba4) {
@@ -999,9 +1069,11 @@ export class Engine {
       program: this.gpu.program(
         split > 0
           ? K.withSplit(K.rmsPartial("split"), split)
-          : K.rmsPartial(split < 0 ? "f32" : "pair")
+          : split < 0
+            ? K.rmsPartial("f32")
+            : this.readPair(K.rmsPartial("pair"), "uX", x)
       ),
-      inputs: { uX: x },
+      inputs: { uX: x, ...(split === 0 && this.quadInputs("uX", x)) },
       uniforms: {
         uTexels: { int: texels },
         uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
@@ -1065,7 +1137,11 @@ export class Engine {
     const normed = !!norm
     if (normed) this.rms(y, 0, rows, split)
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uY"], split) : source)
+      this.gpu.program(
+        split
+          ? this.fromSplit(source, ["uY"], split)
+          : this.readPair(source, "uY", y)
+      )
     const common = {
       uTexels: { int: texels },
       uEps: this.config.normEps,
@@ -1077,6 +1153,7 @@ export class Engine {
     const inputs = {
       uH: h,
       uY: y,
+      ...(!split && this.quadInputs("uY", y)),
       ...(norm && { uR: this.buffers.rms, uNorm: norm })
     }
     // With `next`, a second output: h2(x · next's weights), drawn in the
@@ -1128,11 +1205,16 @@ export class Engine {
     const split = this.project(input.a, layer.inProj, b.bcx, rows, input.norm)
     const bcx = split ? this.partials() : b.bcx
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uBCx"], split) : source)
+      this.gpu.program(
+        split
+          ? this.fromSplit(source, ["uBCx"], split)
+          : this.readPair(source, "uBCx", bcx)
+      )
+    const bcxIn = { uBCx: bcx, ...(!split && this.quadInputs("uBCx", bcx)) }
     this.gpu.run({
       name: "conv",
       program: read(K.shortConv(c.convKernel)),
-      inputs: { uBCx: bcx, uState: layer.state[0], uConv: layer.kernel },
+      inputs: { ...bcxIn, uState: layer.state[0], uConv: layer.kernel },
       uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
       output: b.convOut,
       rect: { x: 0, y: 0, width: c.hiddenSize / 8, height: rows }
@@ -1140,7 +1222,7 @@ export class Engine {
     this.gpu.run({
       name: "conv",
       program: read(K.convState(c.convKernel)),
-      inputs: { uBCx: bcx, uState: layer.state[0] },
+      inputs: { ...bcxIn, uState: layer.state[0] },
       uniforms: {
         uDt: { int: dt },
         uM: { int: rows },
@@ -1155,7 +1237,7 @@ export class Engine {
       this.gpu.run({
         name: "conv",
         program: read(K.convPrefixes(c.convKernel)),
-        inputs: { uBCx: bcx, uState: layer.state[0] },
+        inputs: { ...bcxIn, uState: layer.state[0] },
         uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
         output: layer.prefixes,
         rect: { x: 0, y: 0, width: dt, height: (c.convKernel - 1) * rows }
@@ -1182,14 +1264,22 @@ export class Engine {
     const split = this.project(input.a, layer.qkvg, b.qkvg, rows, input.norm)
     const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uQKVG"], split) : source)
+      this.gpu.program(
+        split
+          ? this.fromSplit(source, ["uQKVG"], split)
+          : this.readPair(source, "uQKVG", qkvgIn)
+      )
+    const qkvgInputs = {
+      uQKVG: qkvgIn,
+      ...(!split && this.quadInputs("uQKVG", qkvgIn))
+    }
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
     this.gpu.run({
       name: "heads",
       program: read(
         K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim })
       ),
-      inputs: { uQKVG: qkvgIn, uNorm: layer.qNorm, uRope: rope },
+      inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
       uniforms: {
         uSplitIn: { int: split },
         ...this.pairIn(qkvgIn),
@@ -1216,7 +1306,7 @@ export class Engine {
         program: read(
           K.headPrep({ out: "h2", rope: true, norm: true, headDim: c.headDim })
         ),
-        inputs: { uQKVG: qkvgIn, uNorm: layer.kNorm, uRope: rope },
+        inputs: { ...qkvgInputs, uNorm: layer.kNorm, uRope: rope },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
@@ -1234,7 +1324,7 @@ export class Engine {
       this.gpu.run({
         name: "heads",
         program: read(K.values(c.headDim)),
-        inputs: { uQKVG: qkvgIn },
+        inputs: qkvgInputs,
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
@@ -1296,7 +1386,7 @@ export class Engine {
       this.gpu.run({
         name: "attend",
         program: read(K.attend(c.headDim, c.attentionGate)),
-        inputs: { uS: b.scores, uV: layer.kv, uQKVG: qkvgIn },
+        inputs: { uS: b.scores, uV: layer.kv, ...qkvgInputs },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
@@ -1849,10 +1939,12 @@ export class Engine {
         if (h2) {
           this.gpu.run({
             program: this.gpu.program(
-              h2 === "pair" ? K.PAIR_TO_F32 : K.H2_TO_F32
+              h2 === "pair"
+                ? this.readPair(K.PAIR_TO_F32, "uX", tex)
+                : K.H2_TO_F32
             ),
             uniforms: this.pairIn(tex),
-            inputs: { uX: tex },
+            inputs: { uX: tex, ...(h2 === "pair" && this.quadInputs("uX", tex)) },
             output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
           })
@@ -1946,8 +2038,8 @@ export class Engine {
         this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
         this.gpu.run({
           name: "swiglu",
-          program: this.gpu.program(K.SWIGLU),
-          inputs: { uGU: b.gateUp },
+          program: this.gpu.program(this.readPair(K.SWIGLU, "uGU", b.gateUp)),
+          inputs: { uGU: b.gateUp, ...this.quadInputs("uGU", b.gateUp) },
           uniforms: {
             uHalf: { int: c.intermediateSize / 4 },
             ...this.pairIn(b.gateUp)

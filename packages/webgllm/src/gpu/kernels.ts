@@ -38,6 +38,21 @@ vec4 pf(highp usampler2D s, int x, int m) {
   }
   return acc;
 }
+/*
+ * The same from a 4-token matmul's two outputs (see matmulQuad): tokens
+ * 4q, 4q + 1 in a, 4q + 2, 4q + 3 in b, row q (plus its K-slices).
+ */
+vec4 pfq(highp usampler2D a, highp usampler2D b, int x, int m) {
+  vec4 acc = vec4(0.0);
+  int row = m >> 2;
+  bool second = ((m >> 1) & 1) == 1;
+  for (int k = 0; k < max(uPairSplit, 1); k++) {
+    ivec2 p = ivec2(x, row + k * uSliceStride);
+    uvec4 u = second ? texelFetch(b, p, 0) : texelFetch(a, p, 0);
+    acc += (m & 1) == 0 ? h2lo(u) : h2hi(u);
+  }
+  return acc;
+}
 /* The same from a split matmul's uSplitIn partial sums (row m · uSplitIn + s). */
 uniform int uSplitIn;
 vec4 pf(highp sampler2D s, int x, int m) {
@@ -298,6 +313,73 @@ void main() {
 ${L.join("\n")}
   }
   o = packH2(acc0, acc1);
+}`
+}
+
+/**
+ * The prompt matmul for RGBA4 weights with four tokens per fragment (see
+ * matmulPair): twice the multiplies per weight read. Tokens 4q, 4q + 1 go
+ * to output 0 and 4q + 2, 4q + 3 to output 1, as pair texels, at row
+ * s · uSliceRows + q for K-slice s (pfq reads them).
+ */
+function matmulQuadSource(o: { zeros: boolean }) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+  line(
+    o.zeros
+      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+      : `const vec4 z = vec4(8.0);`
+  )
+  line(
+    `vec4 b0 = vec4(0.0); vec4 b1 = vec4(0.0); vec4 b2 = vec4(0.0); vec4 b3 = vec4(0.0);`
+  )
+  line(`float s0 = 0.0; float s1 = 0.0; float s2 = 0.0; float s3 = 0.0;`)
+  for (let j = 0; j < 8; j++) {
+    line(`{`)
+    for (const r of [0, 1, 2, 3])
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
+    const half = j & 1 ? "h2hi" : "h2lo"
+    for (const t of [0, 1, 2, 3]) {
+      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`    s${t} += dot(a, vec4(1.0));`)
+      line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+    }
+    line(`}`)
+  }
+  for (const t of [0, 1, 2, 3]) line(`acc${t} += d * (15.0 * b${t} - z * s${t});`)
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uSliceRows;
+uniform int uKbSlice;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out uvec4 o1;
+void main() {
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 4 * (y - slice * uSliceRows);
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  vec4 acc2 = vec4(0.0);
+  vec4 acc3 = vec4(0.0);
+  for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+  }
+  o0 = packH2(acc0, acc1);
+  o1 = packH2(acc2, acc3);
 }`
 }
 
@@ -1485,6 +1567,59 @@ export function withSplit(source: string, split: number) {
     out = source.replace(
       "uniform int uSplitIn;",
       `const int uSplitIn = ${split};`
+    )
+    bySource.set(split, out)
+  }
+  return out
+}
+
+export const matmulQuad = memo(matmulQuadSource)
+
+const quadCache = new Map<string, Map<string, string>>()
+/**
+ * A kernel that reads pair tensors `names` with pf, made to read a 4-token
+ * matmul's two outputs instead: each name gets a second sampler, name_B.
+ */
+export function fromQuad(source: string, names: Array<string>) {
+  let bySource = quadCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    quadCache.set(source, bySource)
+  }
+  const key = names.join(",")
+  let out = bySource.get(key)
+  if (out === undefined) {
+    out = source
+    for (const name of names) {
+      out = out
+        .replace(
+          `uniform usampler2D ${name};`,
+          `uniform usampler2D ${name};\nuniform usampler2D ${name}_B;`
+        )
+        .split(`pf(${name},`)
+        .join(`pfq(${name}, ${name}_B,`)
+    }
+    bySource.set(key, out)
+  }
+  return out
+}
+
+const pairSplitCache = new Map<string, Map<number, string>>()
+/**
+ * `source` with the pair tensor's K-slice count fixed at `split` (a
+ * constant, not a uniform), so pf / pfq's loop unrolls.
+ */
+export function withPairSplit(source: string, split: number) {
+  let bySource = pairSplitCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    pairSplitCache.set(source, bySource)
+  }
+  let out = bySource.get(split)
+  if (out === undefined) {
+    out = source.replace(
+      "uniform int uPairSplit;",
+      `const int uPairSplit = ${split};`
     )
     bySource.set(split, out)
   }
