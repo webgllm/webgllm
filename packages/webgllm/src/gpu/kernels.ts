@@ -1451,41 +1451,59 @@ export const CHUNK_GATHER = `${HEADER}
 uniform sampler2D uLogits;
 uniform usampler2D uMask;
 uniform sampler2D uByRank;
+uniform usampler2D uIds;
 uniform int uOutW;
 uniform float uPenalty;
 uniform int uCount;
 ${PENALIZED}
 out vec4 o;
 void main() {
-  // Row row · uCount + k: row's chunk ranked k.
+  // Row row · uCount + k: row's chunk ranked k; then its index (texel 64)
+  // and the ids texture's first id (texel 65: CHUNK_ARGMAX's guess).
   int t = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
   int row = y / uCount;
   int k = y - row * uCount;
   int c = int(texelFetch(uByRank, ivec2(k, row), 0).x);
-  o = t < 64 ? chunkTexel(c, t, row) : vec4(float(c), 0.0, 0.0, 0.0);
+  o = t < 64
+    ? chunkTexel(c, t, row)
+    : t == 64
+      ? vec4(float(c), 0.0, 0.0, 0.0)
+      : vec4(float(texelFetch(uIds, ivec2(0, 0), 0).x), 0.0, 0.0, 0.0);
 }`
 
 /**
- * The likeliest token (penalized), as a token id into the ids texture:
- * the first largest logit of the top-ranked chunk (CHUNK_GATHER's row 0),
- * as the CPU's pick from the same candidates would be.
+ * The likeliest token (penalized) of row uRow, as a token id into the ids
+ * texture, straight from the chunk maxima: the first chunk with the largest
+ * (as CHUNK_RANK ranks them), then its first largest logit. Needs only
+ * CHUNK_MAX, so the next forward needn't wait for the rest of the pick.
  */
-export const CANDIDATE_ARGMAX = `${HEADER}
-uniform sampler2D uCand;
-uniform int uCandRow;
+export const CHUNK_ARGMAX = `${HEADER}
+uniform sampler2D uMax;
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform int uOutW;
+uniform int uChunks;
+uniform int uRow;
+uniform float uPenalty;
+${PENALIZED}
 out uvec4 o;
 void main() {
-  float best = -3e38;
+  int best = 0;
+  float top = texelFetch(uMax, ivec2(0, uRow), 0).x;
+  for (int i = 1; i < uChunks; i++) {
+    float v = texelFetch(uMax, ivec2(i, uRow), 0).x;
+    if (v > top) { top = v; best = i; }
+  }
+  float b = -3e38;
   int at = 0;
   for (int t = 0; t < 64; t++) {
-    vec4 v = texelFetch(uCand, ivec2(t, uCandRow), 0);
+    vec4 v = chunkTexel(best, t, uRow);
     for (int c = 0; c < 4; c++) {
-      if (v[c] > best) { best = v[c]; at = 4 * t + c; }
+      if (v[c] > b) { b = v[c]; at = 4 * t + c; }
     }
   }
-  int chunk = int(texelFetch(uCand, ivec2(64, uCandRow), 0).x + 0.5);
-  o = uvec4(uint(chunk * 256 + at), 0u, 0u, 0u);
+  o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
 }`
 
 /**

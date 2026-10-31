@@ -382,13 +382,7 @@ async function generate(request: GenerateRequest) {
         sampling.repetition_penalty,
         guess
       )
-      if (guess && engine.guessing) {
-        // The GPU's pick: the first largest of the same logits.
-        let best = 0
-        for (let i = 1; i < logits.length; i++)
-          if (logits[i] > logits[best]) best = i
-        guessed = ids[best]
-      }
+      if (guess && engine.guessing) guessed = engine.guessedToken
       const d = sampler.distribution(logits)
       return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }
     }
@@ -411,13 +405,7 @@ async function generate(request: GenerateRequest) {
       drafts,
       guess
     )
-    if (guess && engine.guessing) {
-      const { ids, logits } = picked[rows - 1]
-      let best = 0
-      for (let i = 1; i < logits.length; i++)
-        if (logits[i] > logits[best]) best = i
-      guessed = ids[best]
-    }
+    if (guess && engine.guessing) guessed = engine.guessedToken
     return picked.map(({ ids, logits }) => {
       const d = sampler.distribution(logits)
       return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }

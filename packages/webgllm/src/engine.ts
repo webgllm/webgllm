@@ -186,7 +186,7 @@ const MAX_SNAPSHOTS = 8
  * context), so it's 64 only for desktop-size batches.
  */
 const SCORE_ROWS = 32
-const SCORE_ROWS_LARGE = 64
+const SCORE_ROWS_LARGE = 128
 /** Most key chunks per query in chunked attention (see attendChunk). */
 const ATTEND_CHUNKS = 16
 /** Logits per chunk when picking candidates on the GPU. */
@@ -426,9 +426,10 @@ export class Engine {
       ),
       /** Pixel (r, row): the chunk ranked r. */
       chunkByRank: this.gpu.texture(GL.RGBA32F, MAX_CHUNKS, SPLIT_ROWS),
+      /** Per chunk: its logits, its index, and the guessed token (row 0). */
       candidates: this.gpu.texture(
         GL.RGBA32F,
-        CHUNK / 4 + 1,
+        CHUNK / 4 + 2,
         MAX_CHUNKS * SPLIT_ROWS
       ),
       /** Split matmuls' partial sums: widest output × (rows × slices). */
@@ -1643,6 +1644,9 @@ export class Engine {
     this.position = d.pos0 + count
   }
 
+  /** The token the last pick with a guess read forward, or -1. */
+  guessedToken = -1
+
   /** Where a guessed token was read (see `forwardGuess`), while it's pending. */
   private guessAt: number | null = null
 
@@ -1652,7 +1656,7 @@ export class Engine {
   }
 
   /**
-   * Reads the token in the ids texture (CANDIDATE_ARGMAX's pick) as one
+   * Reads the token in the ids texture (CHUNK_ARGMAX's pick) as one
    * more token, without the CPU: it runs while the candidates are read back
    * and a token drawn from them. If that's the token, keepGuess, and the
    * GPU never waited; if not, dropGuess forgets it.
@@ -1806,6 +1810,22 @@ export class Engine {
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
     })
+    if (guess) {
+      // The last row's likeliest token as the next forward's input, from
+      // the chunk maxima: the forward waits on this, not on the gather.
+      this.gpu.run({
+        name: "pick",
+        program: this.gpu.program(K.CHUNK_ARGMAX),
+        inputs: { uMax: b.chunkMax, uLogits: b.logits, uMask: b.mask },
+        uniforms: {
+          ...picking,
+          uChunks: { int: total },
+          uRow: { int: rows - 1 }
+        },
+        output: b.ids,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+    }
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_RANK),
@@ -1825,23 +1845,17 @@ export class Engine {
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_GATHER),
-      inputs: { uLogits: b.logits, uMask: b.mask, uByRank: b.chunkByRank },
+      inputs: {
+        uLogits: b.logits,
+        uMask: b.mask,
+        uByRank: b.chunkByRank,
+        uIds: b.ids
+      },
       uniforms: { ...picking, uCount: { int: count } },
       output: b.candidates,
-      rect: { x: 0, y: 0, width: CHUNK / 4 + 1, height: count * rows }
+      rect: { x: 0, y: 0, width: CHUNK / 4 + 2, height: count * rows }
     })
-    const texels = CHUNK / 4 + 1
-    if (guess) {
-      // The last row's likeliest token as the next forward's input.
-      this.gpu.run({
-        name: "pick",
-        program: this.gpu.program(K.CANDIDATE_ARGMAX),
-        inputs: { uCand: b.candidates },
-        uniforms: { uCandRow: { int: (rows - 1) * count } },
-        output: b.ids,
-        rect: { x: 0, y: 0, width: 1, height: 1 }
-      })
-    }
+    const texels = CHUNK / 4 + 2
     const pending = this.gpu.readStart(b.candidates, {
       x: 0,
       y: 0,
@@ -1851,6 +1865,8 @@ export class Engine {
     // Read it forward while the candidates go back to the CPU (see guess).
     if (guess) await this.forwardGuess()
     const data = await pending()
+    // The token the GPU guessed (and read forward), as it picked it.
+    this.guessedToken = guess ? Math.round(data[(CHUNK / 4 + 1) * 4]) : -1
     const out = []
     for (let r = 0; r < rows; r++) {
       const ids = new Int32Array(count * CHUNK)
