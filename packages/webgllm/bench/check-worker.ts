@@ -340,10 +340,31 @@ async function run(params: {
   let checked = 0
   let klSum = 0
   const forwardStart = performance.now()
+  // Every position scored too, against the fp32 reference where there is
+  // one and the main reference (as the Transformers.js quality page does).
+  const hasFp32 = files.has("logits_fp32.bin")
+  const all = { fp32: { kl: 0, top1: 0 }, main: { kl: 0, top1: 0 } }
+  const checkedFp32 = { kl: 0, top1: 0, n: 0 }
   for (let start = 0; start < tokens.length; start += params.batch) {
     const batch = tokens.slice(start, start + params.batch)
     await engine.forward(batch, probe)
     engine.snapshot()
+    const mid = [0, Math.floor(batch.length / 2), batch.length - 1]
+    for (let row = 0; row < batch.length; row++) {
+      const got = await engine.logits(row)
+      const main = compareLogits(got, await refRows("logits.bin", V, start + row, 1))
+      all.main.kl += main.kl
+      if (main.top1) all.main.top1++
+      if (!hasFp32) continue
+      const f = compareLogits(got, await refRows("logits_fp32.bin", V, start + row, 1))
+      all.fp32.kl += f.kl
+      if (f.top1) all.fp32.top1++
+      if (mid.includes(row)) {
+        checkedFp32.kl += f.kl
+        if (f.top1) checkedFp32.top1++
+        checkedFp32.n++
+      }
+    }
     for (const row of [0, Math.floor(batch.length / 2), batch.length - 1]) {
       const got = await engine.logits(row)
       const want = await refRows("logits.bin", V, start + row, 1)
@@ -379,6 +400,8 @@ async function run(params: {
     // checks the GPU's candidate pick (top 50 chunks, a 1.1 penalty on the
     // tokens so far) against the same pick from the full logits.
     let pickAgree = 0
+    let genFp32Kl = 0
+    let genFp32Top1 = 0
     const seen = new Set<number>(tokens)
     engine.setSeen(tokens, V)
     for (let i = 0; i < continuation.length; i++) {
@@ -406,6 +429,11 @@ async function run(params: {
       else log(`candidate pick differs at step ${i}`)
       const want = await refRows("gen_logits.bin", V, i, 1)
       const r = compareLogits(got, want)
+      if (files.has("gen_logits_fp32.bin")) {
+        const f = compareLogits(got, await refRows("gen_logits_fp32.bin", V, i, 1))
+        genFp32Kl += f.kl
+        if (f.top1) genFp32Top1++
+      }
       if (r.top1) genAgree++
       genKl += r.kl
       ours = argmax(got)
@@ -422,6 +450,15 @@ async function run(params: {
     )
     log(
       `CANDIDATES: GPU top-50 pick with penalty matches the full logits at ${pickAgree}/${steps} steps`
+    )
+    const n = tokens.length
+    if (hasFp32) {
+      log(
+        `QUALITY WebGL vs fp32 reference: prompt (all ${n}) mean KL ${(all.fp32.kl / n).toExponential(2)}, top-1 ${all.fp32.top1}/${n}; checked ${checkedFp32.n} mean KL ${(checkedFp32.kl / checkedFp32.n).toExponential(2)}, top-1 ${checkedFp32.top1}/${checkedFp32.n}; writing (decode path) mean KL ${(genFp32Kl / steps).toExponential(2)}, top-1 ${genFp32Top1}/${steps}`
+      )
+    }
+    log(
+      `QUALITY WebGL vs main reference: prompt (all ${n}) mean KL ${(all.main.kl / n).toExponential(2)}, top-1 ${all.main.top1}/${n}; writing mean KL ${(genKl / steps).toExponential(2)}, top-1 ${genAgree}/${steps}`
     )
     // Rewind: back to the last snapshot inside the prompt (the decode steps
     // above have since moved the sliding layers' rings on), read the rest of
