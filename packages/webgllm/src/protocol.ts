@@ -34,6 +34,11 @@ export type WorkerRequest =
       maxTokens?: number
       /** Draft tokens by prompt lookup (speculative decoding); on by default. */
       speculative?: boolean
+      /**
+       * Read the likeliest next token forward while each token is drawn
+       * (lossless); on by default.
+       */
+      pipeline?: boolean
     }
   | { type: "stop"; id: string }
 

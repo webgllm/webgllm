@@ -113,6 +113,11 @@ export class Gpu {
   bytes = 0
   /** Draw calls issued, for profiling. */
   draws = 0
+  /** Render passes started (each change of output texture), for profiling. */
+  passes = 0
+  /** When set, collects the name of each pass that starts a render pass. */
+  trace: Array<string> | null = null
+  private boundFb: WebGLFramebuffer | null = null
   /** Pass names not to draw: for timing what the rest costs (results are wrong). */
   skip = new Set<string>()
   /** Fragments per draw before a pass is split into bands (GPU watchdog). */
@@ -367,7 +372,13 @@ export class Gpu {
         gl.uniform3f(loc, value[0], value[1], value[2])
       else gl.uniform4f(loc, value[0], value[1], value[2], value[3])
     }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer(pass.output))
+    const fb = this.framebuffer(pass.output)
+    if (fb !== this.boundFb) {
+      this.passes++
+      this.trace?.push(`${pass.name ?? ""}(${program.samplers.join(",")})`)
+      this.boundFb = fb
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
     const rect = pass.rect ?? {
       x: 0,
       y: 0,
@@ -392,7 +403,7 @@ export class Gpu {
    * Reads a rectangle of an RGBA32F texture back without stalling the GPU:
    * into a pixel buffer, then waits on a fence before copying it out.
    */
-  async read(
+  read(
     texture: Texture,
     rect: { x: number; y: number; width: number; height: number } = {
       x: 0,
@@ -401,26 +412,67 @@ export class Gpu {
       height: texture.height
     }
   ): Promise<Float32Array> {
+    return this.readStart(texture, rect)()
+  }
+
+  /** Flushes issued passes to the GPU, so it starts on them. */
+  flush() {
+    this.gl.flush()
+  }
+
+  /**
+   * Issues a read like `read`'s, and returns a function that waits for it:
+   * passes issued in between run after the read on the GPU, without the
+   * read waiting for them.
+   */
+  readStart(
+    texture: Texture,
+    rect: { x: number; y: number; width: number; height: number } = {
+      x: 0,
+      y: 0,
+      width: texture.width,
+      height: texture.height
+    }
+  ): () => Promise<Float32Array> {
     const gl = this.gl
     const out = new Float32Array(rect.width * rect.height * 4)
     const buffer = gl.createBuffer()
     if (!buffer) throw new GpuError("Couldn't create a pixel buffer.")
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer(texture))
+    this.boundFb = this.framebuffer(texture)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.boundFb)
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
     gl.bufferData(gl.PIXEL_PACK_BUFFER, out.byteLength, gl.STREAM_READ)
     gl.readPixels(rect.x, rect.y, rect.width, rect.height, gl.RGBA, gl.FLOAT, 0)
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
-    try {
-      await this.wait(sync)
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
-      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
-    } finally {
-      if (sync) gl.deleteSync(sync)
-      gl.deleteBuffer(buffer)
+    return async () => {
+      try {
+        await this.wait(sync)
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
+      } finally {
+        if (sync) gl.deleteSync(sync)
+        gl.deleteBuffer(buffer)
+      }
+      return out
     }
+  }
+
+  /**
+   * Reads a rectangle of an RGBA32F texture back, blocking until the GPU
+   * gets there: no fence polling, so less latency (fine in a worker).
+   */
+  readNow(
+    texture: Texture,
+    rect = { x: 0, y: 0, width: texture.width, height: texture.height }
+  ): Float32Array {
+    const gl = this.gl
+    const out = new Float32Array(rect.width * rect.height * 4)
+    this.boundFb = this.framebuffer(texture)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.boundFb)
+    gl.readPixels(rect.x, rect.y, rect.width, rect.height, gl.RGBA, gl.FLOAT, out)
     return out
   }
 

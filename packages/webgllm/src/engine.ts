@@ -107,8 +107,15 @@ export const TUNING = {
   /** ...into at most this many slices (the partial buffer holds 32). */
   maxSplit: 16,
   /** Pixels per row summing its squares (at most K.RMS_PARTS). */
-  rmsParts: 64
+  rmsParts: 64,
+  /** K-slices of the RGBA4 output head (more than 1 adds a pass to sum them). */
+  headSplit: 4,
+  /** 1: few-token matmuls apply the RMS norm as they read (no norm pass). */
+  foldNorm: 0
 }
+
+/** A matmul's input: h2 activations, or the f32 residual and the norm to apply. */
+type MatIn = { a: Texture; norm?: Texture }
 
 export type EngineOptions = {
   /**
@@ -204,7 +211,8 @@ export class Engine {
             totalRows,
             value.K,
             value.bits,
-            !!value.zeros
+            !!value.zeros,
+            value.bits === 4
           )
         this.writeMatrix(this.embedding, value, row0)
       } else if (piece.kind === "finalNorm")
@@ -324,6 +332,8 @@ export class Engine {
         Math.ceil(c.vocabSize / CHUNK),
         1
       ),
+      /** Pixel r: the chunk ranked r. */
+      chunkByRank: this.gpu.texture(GL.RGBA32F, MAX_CHUNKS, 1),
       candidates: this.gpu.texture(GL.RGBA32F, CHUNK / 4 + 1, MAX_CHUNKS),
       /** Split matmuls' partial sums: widest output × (rows × slices). */
       partial: this.gpu.texture(
@@ -665,6 +675,7 @@ export class Engine {
    */
   rewind(position: number): number {
     this.draft = null
+    this.guessAt = null
     const at = Math.max(
       0,
       ...[...this.snapshots.keys()].filter((p) => p <= position)
@@ -717,6 +728,7 @@ export class Engine {
   /** Forgets the cache: the next forward starts a new sequence. */
   reset() {
     this.draft = null
+    this.guessAt = null
     this.position = 0
     for (const saved of this.snapshots.values()) this.freeSnapshot(saved)
     this.snapshots.clear()
@@ -746,7 +758,8 @@ export class Engine {
    */
   async warmUp() {
     const row = await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
-    await this.candidates(row, 1, 1)
+    await this.candidates(row, 1, 1, true)
+    this.dropGuess()
     await this.logits(row)
     await this.forwardHidden([0, 0], { draft: true })
     this.accept(1)
@@ -761,8 +774,15 @@ export class Engine {
    * read them through pf, no reduce pass); more rows write the pair tensor
    * `out` and return 0.
    */
-  private project(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
-    if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows)
+  private project(
+    a: Texture,
+    w: GpuMatrix,
+    out: Texture,
+    rows: number,
+    norm?: Texture
+  ) {
+    if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows, norm)
+    if (norm) throw new Error("Only split matmuls fold the norm in.")
     this.matmul(a, w, out, rows)
     return 0
   }
@@ -870,7 +890,14 @@ export class Engine {
    * keep busy: partial sums into the partial buffer (row m · slices + s).
    * Returns the number of slices.
    */
-  private splitPartials(a: Texture, w: GpuMatrix, rows: number) {
+  private splitPartials(
+    a: Texture,
+    w: GpuMatrix,
+    rows: number,
+    norm?: Texture
+  ) {
+    if (norm && !w.rgba4)
+      throw new Error("Only RGBA4 matmuls fold the norm in.")
     const bits = w.bits
     if (bits === 6)
       throw new GpuError("Q6_K weights are only read as the output head.")
@@ -903,7 +930,7 @@ export class Engine {
         name: "matmul",
         program: this.gpu.program(
           w.rgba4
-            ? K.matmulSplitRgba4({ zeros: !!w.zeros })
+            ? K.matmulSplitRgba4({ zeros: !!w.zeros, normed: !!norm })
             : K.matmul({
                 bits,
                 zeros: !!w.zeros,
@@ -913,11 +940,17 @@ export class Engine {
                 split: true
               })
         ),
-        inputs: weights,
+        inputs: norm ? { ...weights, uNorm: norm, uR: a } : weights,
         uniforms: {
           ...shape,
           uSplit: { int: slices },
-          uKbSlice: { int: kbSlice }
+          uKbSlice: { int: kbSlice },
+          ...(norm && {
+            uROff: { int: this.config.hiddenSize / 4 },
+            uParts: { int: TUNING.rmsParts },
+            uTexels: { int: this.config.hiddenSize / 4 },
+            uEps: this.config.normEps
+          })
         },
         output: this.buffers.partial,
         rect: { x: 0, y: 0, width: w.groups, height: rows * slices }
@@ -1041,11 +1074,15 @@ export class Engine {
   }
 
   /** The conv block; returns out_proj's split (see `project`). */
-  private convolve(layer: NonNullable<GpuLayer["conv"]>, rows: number) {
+  private convolve(
+    layer: NonNullable<GpuLayer["conv"]>,
+    rows: number,
+    input: MatIn
+  ) {
     const c = this.config
     const b = this.buffers
     const dt = c.hiddenSize / 4
-    const split = this.project(b.normed, layer.inProj, b.bcx, rows)
+    const split = this.project(input.a, layer.inProj, b.bcx, rows, input.norm)
     const bcx = split ? this.partials() : b.bcx
     const read = (source: string) =>
       this.gpu.program(split ? this.fromSplit(source, ["uBCx"]) : source)
@@ -1089,7 +1126,8 @@ export class Engine {
     layer: NonNullable<GpuLayer["attention"]>,
     type: LayerType,
     rows: number,
-    pos0: number
+    pos0: number,
+    input: MatIn
   ) {
     const c = this.config
     const b = this.buffers
@@ -1098,7 +1136,7 @@ export class Engine {
     const pairTexels = (sliding ? c.ropeDimsSliding : c.ropeDimsFull) / 8
     const qDims = c.numHeads * c.headDim
     const kvDims = c.numKvHeads * c.headDim
-    const split = this.project(b.normed, layer.qkvg, b.qkvg, rows)
+    const split = this.project(input.a, layer.qkvg, b.qkvg, rows, input.norm)
     const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
       this.gpu.program(split ? this.fromSplit(source, ["uQKVG"]) : source)
@@ -1359,6 +1397,46 @@ export class Engine {
     this.position = d.pos0 + count
   }
 
+  /** Where a guessed token was read (see `forwardGuess`), while it's pending. */
+  private guessAt: number | null = null
+
+  /** Whether a guessed token's forward is pending (keepGuess or dropGuess). */
+  get guessing() {
+    return this.guessAt !== null
+  }
+
+  /**
+   * Reads the token in the ids texture (CANDIDATE_ARGMAX's pick) as one
+   * more token, without the CPU: it runs while the candidates are read back
+   * and a token drawn from them. If that's the token, keepGuess, and the
+   * GPU never waited; if not, dropGuess forgets it.
+   */
+  private async forwardGuess() {
+    if (this.position + 1 > this.contextLength) return
+    this.draft = null
+    const at = this.position
+    await this.forwardBatch([0], undefined, true)
+    this.guessAt = at
+    this.gpu.flush()
+  }
+
+  /** The guessed token was the one drawn: it stays in the cache. */
+  keepGuess() {
+    this.guessAt = null
+  }
+
+  /**
+   * The guessed token wasn't the one drawn: back to before it. Its keys and
+   * values are written over by the next token; the convolutions' state
+   * before it is still in their other state texture.
+   */
+  dropGuess() {
+    if (this.guessAt === null) return
+    for (const layer of this.layers) layer.conv?.state.reverse()
+    this.position = this.guessAt
+    this.guessAt = null
+  }
+
   /** The penalty mask on the CPU side, mirrored to the GPU's. */
   private maskData: Uint8Array | null = null
 
@@ -1410,7 +1488,8 @@ export class Engine {
   async candidates(
     row: number,
     chunks: number,
-    penalty: number
+    penalty: number,
+    guess = false
   ): Promise<{ ids: Int32Array; logits: Float32Array }> {
     const c = this.config
     const b = this.buffers
@@ -1435,23 +1514,43 @@ export class Engine {
     })
     this.gpu.run({
       name: "pick",
+      program: this.gpu.program(K.CHUNK_BY_RANK),
+      inputs: { uRank: b.chunkRank },
+      uniforms: { uChunks: { int: total } },
+      output: b.chunkByRank,
+      rect: { x: 0, y: 0, width: count, height: 1 }
+    })
+    this.gpu.run({
+      name: "pick",
       program: this.gpu.program(K.CHUNK_GATHER),
-      inputs: { uLogits: b.logits, uMask: b.mask, uRank: b.chunkRank },
+      inputs: { uLogits: b.logits, uMask: b.mask, uByRank: b.chunkByRank },
       uniforms: {
         uOutW: { int: OUT_WIDTH },
-        uChunks: { int: total },
         uPenalty: penalty
       },
       output: b.candidates,
       rect: { x: 0, y: 0, width: CHUNK / 4 + 1, height: count }
     })
     const texels = CHUNK / 4 + 1
-    const data = await this.gpu.read(b.candidates, {
+    if (guess) {
+      // The likeliest token as the next forward's input, on the GPU.
+      this.gpu.run({
+        name: "pick",
+        program: this.gpu.program(K.CANDIDATE_ARGMAX),
+        inputs: { uCand: b.candidates },
+        output: b.ids,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+    }
+    const pending = this.gpu.readStart(b.candidates, {
       x: 0,
       y: 0,
       width: texels,
       height: count
     })
+    // Read it forward while the candidates go back to the CPU (see guess).
+    if (guess) await this.forwardGuess()
+    const data = await pending()
     const ids = new Int32Array(count * CHUNK)
     const logits = new Float32Array(count * CHUNK)
     for (let r = 0; r < count; r++) {
@@ -1469,6 +1568,10 @@ export class Engine {
     const b = this.buffers
     const e = this.embedding
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, 1, row)
+    if (e.rgba4) {
+      this.headRgba4(e)
+      return
+    }
     this.gpu.run({
       name: "head",
       program: this.gpu.program(
@@ -1500,6 +1603,63 @@ export class Engine {
     })
   }
 
+  private headScratch: Texture | null = null
+
+  /**
+   * The output head through RGBA4 weights, split along K in
+   * TUNING.headSplit slices (added up by one more pass).
+   */
+  private headRgba4(e: GpuMatrix) {
+    const b = this.buffers
+    const split = Math.max(1, Math.min(TUNING.headSplit, e.blocks))
+    const sliceRows = Math.ceil(e.groups / OUT_WIDTH)
+    let target = b.logits
+    if (split > 1) {
+      const p = b.partial
+      if (p.width >= OUT_WIDTH && p.height >= split * sliceRows) target = p
+      else {
+        if (
+          !this.headScratch ||
+          this.headScratch.height < split * sliceRows
+        ) {
+          if (this.headScratch) this.gpu.delete(this.headScratch)
+          this.headScratch = this.f32(OUT_WIDTH * 4, split * sliceRows)
+        }
+        target = this.headScratch
+      }
+    }
+    this.gpu.run({
+      name: "head",
+      program: this.gpu.program(K.headRgba4({ zeros: !!e.zeros })),
+      inputs: {
+        uA: b.lastNormed,
+        uW: e.quants,
+        uS: e.scales,
+        ...(e.zeros && { uZ: e.zeros })
+      },
+      uniforms: {
+        uKb: { int: e.blocks },
+        uH: { int: e.rowsPerColumn },
+        uRowTexels: { int: e.rowTexels },
+        uG: { int: e.groups },
+        uOutW: { int: OUT_WIDTH },
+        uSliceRows: { int: sliceRows },
+        uKbSlice: { int: Math.ceil(e.blocks / split) }
+      },
+      output: target,
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * sliceRows }
+    })
+    if (split === 1) return
+    this.gpu.run({
+      name: "head",
+      program: this.gpu.program(K.HEAD_SUM),
+      inputs: { uP: target },
+      uniforms: { uSplit: { int: split }, uSliceRows: { int: sliceRows } },
+      output: b.logits,
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: sliceRows }
+    })
+  }
+
   /** Logits for one row of the last batch's final residual. */
   async logits(row: number): Promise<Float32Array> {
     const c = this.config
@@ -1511,27 +1671,35 @@ export class Engine {
 
   private async forwardBatch(
     batch: Array<number>,
-    probe: LayerProbe | undefined
+    probe: LayerProbe | undefined,
+    idsOnGpu = false
   ) {
     const c = this.config
     const b = this.buffers
     const rows = batch.length
     const pos0 = this.position
-    this.gpu.write(
-      b.ids,
-      { x: 0, y: 0, width: 1, height: rows },
-      {
-        format: GL.RED_INTEGER,
-        type: GL.UNSIGNED_INT,
-        pixels: new Uint32Array(batch)
-      }
-    )
+    if (!idsOnGpu) {
+      this.gpu.write(
+        b.ids,
+        { x: 0, y: 0, width: 1, height: rows },
+        {
+          format: GL.RED_INTEGER,
+          type: GL.UNSIGNED_INT,
+          pixels: new Uint32Array(batch)
+        }
+      )
+    }
     const e = this.embedding
     this.gpu.run({
       program: this.gpu.program(
         e.bits === 6
           ? K.EMBED_Q6_K
-          : K.embed({ bits: e.bits, zeros: !!e.zeros, bytes: e.bytes })
+          : K.embed({
+              bits: e.bits,
+              zeros: !!e.zeros,
+              bytes: e.bytes,
+              rgba4: e.rgba4
+            })
       ),
       inputs: {
         uIds: b.ids,
@@ -1583,15 +1751,28 @@ export class Engine {
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       const [h, next] = b.residual
-      this.normToH2(h, layer.operatorNorm, b.normed, rows, -1, i > 0)
-      await look(i, "operator_norm", b.normed, c.hiddenSize, true)
+      // A few rows: the split matmuls apply the norm to the residual as
+      // they read it (no norm pass). The embedding has no sums of squares
+      // for that, so layer 0 normalizes first.
+      const fold =
+        rows <= SPLIT_ROWS &&
+        TUNING.foldNorm > 0 &&
+        !probe &&
+        (layer.conv?.inProj ?? layer.attention?.qkvg)?.rgba4 === true &&
+        layer.gateUp.rgba4
+      const opIn: MatIn =
+        fold && i > 0 ? { a: h, norm: layer.operatorNorm } : { a: b.normed }
+      if (!opIn.norm) {
+        this.normToH2(h, layer.operatorNorm, b.normed, rows, -1, i > 0)
+        await look(i, "operator_norm", b.normed, c.hiddenSize, true)
+      }
       let opSplit = 0
       if (layer.conv) {
-        opSplit = this.convolve(layer.conv, rows)
+        opSplit = this.convolve(layer.conv, rows, opIn)
         await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
       } else if (layer.attention) {
-        opSplit = this.attend(layer.attention, layer.type, rows, pos0)
+        opSplit = this.attend(layer.attention, layer.type, rows, pos0, opIn)
         const qkvgDims =
           (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
         await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
@@ -1608,11 +1789,13 @@ export class Engine {
         opSplit
       )
       await look(i, "after_op", next, c.hiddenSize)
-      this.normToH2(next, layer.ffnNorm, b.normed, rows)
+      if (!fold) this.normToH2(next, layer.ffnNorm, b.normed, rows)
       if (rows <= SPLIT_ROWS) {
         // A few rows: the split matmul's slices are summed and through
         // SwiGLU in one pass.
-        const slices = this.splitPartials(b.normed, layer.gateUp, rows)
+        const slices = fold
+          ? this.splitPartials(next, layer.gateUp, rows, layer.ffnNorm)
+          : this.splitPartials(b.normed, layer.gateUp, rows)
         this.gpu.run({
           name: "swiglu",
           program: this.gpu.program(K.REDUCE_SWIGLU),

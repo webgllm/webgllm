@@ -41,8 +41,12 @@ vec4 pf(highp usampler2D s, int x, int m) {
 /* The same from a split matmul's uSplitIn partial sums (row m · uSplitIn + s). */
 uniform int uSplitIn;
 vec4 pf(highp sampler2D s, int x, int m) {
+  // A constant bound, so the loop unrolls and the reads go out together.
   vec4 acc = vec4(0.0);
-  for (int k = 0; k < uSplitIn; k++) acc += texelFetch(s, ivec2(x, m * uSplitIn + k), 0);
+  for (int k = 0; k < 16; k++) {
+    if (k >= uSplitIn) break;
+    acc += texelFetch(s, ivec2(x, m * uSplitIn + k), 0);
+  }
   return acc;
 }
 
@@ -284,7 +288,7 @@ ${L.join("\n")}
  * token per fragment: a fragment writing several tokens' sums (several
  * outputs) runs slower than their own fragments reading the same weights.
  */
-export function matmulSplitRgba4(o: { zeros: boolean }) {
+export function matmulSplitRgba4(o: { zeros: boolean; normed?: boolean }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -293,6 +297,14 @@ export function matmulSplitRgba4(o: { zeros: boolean }) {
       ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
       : `const vec4 z = vec4(8.0);`
   )
+  if (o.normed) {
+    // x · norm weights from the f32 residual; the row's 1 / RMS is applied
+    // to the sums at the end (it's the same for the whole row).
+    for (let j = 0; j < 8; j++)
+      line(
+        `vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
+      )
+  } else
   for (const j of [0, 1, 2, 3]) {
     line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
     line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
@@ -307,8 +319,7 @@ export function matmulSplitRgba4(o: { zeros: boolean }) {
     line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
   }
   line(`acc += d * (15.0 * b - z * sa);`)
-  return `${HEADER}
-uniform usampler2D uA;
+  return `${HEADER}${o.normed ? `${RMS_SCALE}\nuniform sampler2D uA;\nuniform sampler2D uNorm;` : "uniform usampler2D uA;"}
 uniform sampler2D uW;
 uniform sampler2D uS;
 ${o.zeros ? "uniform usampler2D uZ;" : ""}
@@ -333,9 +344,86 @@ void main() {
   for (int kb = kb0; kb < kb1; kb++) {
 ${L.join("\n")}
   }
+  o = ${o.normed ? "acc * rmsScale(m)" : "acc"};
+}`
+}
+
+/**
+ * The output head for RGBA4 weights (see `matmulPair`): one token (row 0
+ * of uA), output spread over uOutW-wide rows (the vocabulary is wider than
+ * a texture). Texel (x, s · uSliceRows + y) holds row group y · uOutW + x's
+ * sums over blocks [s · uKbSlice, (s + 1) · uKbSlice); HEAD_SUM adds the
+ * slices when there's more than one.
+ */
+export function headRgba4(o: { zeros: boolean }) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+  line(
+    o.zeros
+      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+      : `const vec4 z = vec4(8.0);`
+  )
+  for (const j of [0, 1, 2, 3]) {
+    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, 0), 0);`)
+    line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+  }
+  line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
+  line(`vec4 b = vec4(0.0);`)
+  for (const r of [0, 1, 2, 3]) {
+    const terms = Array.from(
+      { length: 8 },
+      (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0), A${j})`
+    )
+    line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
+  }
+  line(`acc += d * (15.0 * b - z * sa);`)
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uSliceRows;
+uniform int uKbSlice;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int g = (y - slice * uSliceRows) * uOutW + x;
+  vec4 acc = vec4(0.0);
+  if (g < uG) {
+    int kb0 = slice * uKbSlice;
+    int kb1 = min(uKb, kb0 + uKbSlice);
+    int col = g / uH;
+    int gr = g - col * uH;
+    int wx = col * uRowTexels;
+    int sx = col * uKb;
+    for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+    }
+  }
   o = acc;
 }`
 }
+
+/** The output head's slices (see `headRgba4`) added up: texel (x, y). */
+export const HEAD_SUM = `${HEADER}
+uniform sampler2D uP;
+uniform int uSplit;
+uniform int uSliceRows;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 acc = vec4(0.0);
+  for (int s = 0; s < uSplit; s++) acc += texelFetch(uP, ivec2(p.x, p.y + s * uSliceRows), 0);
+  o = acc;
+}`
 
 /**
  * Sums a split matmul's slices into a pair tensor: texel (x, y) holds
@@ -389,12 +477,21 @@ void main() {
  * Embedding rows for token ids (uIds: R32UI, one id per row) from the
  * quantized embedding: f32 output, 4 features per texel.
  */
-export function embed(o: { bits: 4 | 8; zeros: boolean; bytes: boolean }) {
+export function embed(o: {
+  bits: 4 | 8
+  zeros: boolean
+  bytes: boolean
+  rgba4?: boolean
+}) {
   const zero = o.zeros
     ? "float(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0)[r])"
     : "8.0"
   let fetch: string
-  if (o.bits === 4 && o.bytes) {
+  if (o.rgba4) {
+    // Texel kb · 32 + r · 8 + j / 4: row r's weights 32kb + j .. + 3, as q / 15.
+    fetch = `vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0) + 0.5);
+  o = d * (q - ${zero});`
+  } else if (o.bits === 4 && o.bytes) {
     fetch = `int word = j < 16 ? j >> 2 : (j - 16) >> 2;
   vec4 B = vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + word, gr), 0));
   vec4 hi = floor(B * 0.0625);
@@ -416,7 +513,7 @@ export function embed(o: { bits: 4 | 8; zeros: boolean; bytes: boolean }) {
   }
   return `${HEADER}
 uniform usampler2D uIds;
-uniform ${o.bytes && o.bits === 8 ? "isampler2D" : "usampler2D"} uW;
+uniform ${o.rgba4 ? "sampler2D" : o.bytes && o.bits === 8 ? "isampler2D" : "usampler2D"} uW;
 uniform sampler2D uS;
 ${o.zeros ? "uniform usampler2D uZ;" : ""}
 uniform int uKb;
@@ -465,9 +562,13 @@ void main() {
   int i0 = p * uChunk;
   int i1 = min(uTexels, i0 + uChunk);
   vec4 s = vec4(0.0);
-  for (int i = i0; i < i1; i++) {
-    vec4 v = ${pair ? "pf(uX, i, m)" : "texelFetch(uX, ivec2(i, m), 0)"};
-    s += v * v;
+  // Unrolled 4 at a time, so the reads go out together.
+  for (int i = i0; i < i1; i += 4) {
+    for (int k = 0; k < 4; k++) {
+      if (i + k >= i1) break;
+      vec4 v = ${pair ? "pf(uX, i + k, m)" : "texelFetch(uX, ivec2(i + k, m), 0)"};
+      s += v * v;
+    }
   }
   o = s;
 }`
@@ -481,8 +582,13 @@ uniform int uTexels;
 uniform int uParts;
 uniform float uEps;
 float rmsScale(int m) {
+  // A constant bound (RMS_PARTS), so the loop unrolls and the reads go out
+  // together.
   vec4 s = vec4(0.0);
-  for (int p = 0; p < uParts; p++) s += texelFetch(uR, ivec2(uROff + p, m), 0);
+  for (int p = 0; p < 64; p++) {
+    if (p >= uParts) break;
+    s += texelFetch(uR, ivec2(uROff + p, m), 0);
+  }
   return inversesqrt(dot(s, vec4(1.0)) / float(uTexels * 4) + uEps);
 }
 `
@@ -511,12 +617,14 @@ function addedY(normed: boolean) {
   return normed
     ? `${RMS_SCALE}
 uniform sampler2D uNorm;
-vec4 added(int x, int m) {
-  return pf(uY, x, m) * rmsScale(m) * texelFetch(uNorm, ivec2(x, 0), 0);
+float rowScale(int m) { return rmsScale(m); }
+vec4 added(int x, int m, float rs) {
+  return pf(uY, x, m) * rs * texelFetch(uNorm, ivec2(x, 0), 0);
 }`
     : `
 uniform int uTexels;
-vec4 added(int x, int m) { return pf(uY, x, m); }`
+float rowScale(int m) { return 1.0; }
+vec4 added(int x, int m, float rs) { return pf(uY, x, m); }`
 }
 
 /** f32 out = h + y, y through the sandwich norm when `normed`. */
@@ -528,7 +636,7 @@ ${addedY(normed)}
 out vec4 o;
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
-  o = texelFetch(uH, p, 0) + added(p.x, p.y);
+  o = texelFetch(uH, p, 0) + added(p.x, p.y, rowScale(p.y));
 }`
 }
 
@@ -550,9 +658,10 @@ void main() {
   int m = int(gl_FragCoord.y);
   int i0 = p * uChunk;
   int i1 = min(uTexels, i0 + uChunk);
+  float rs = rowScale(m);
   vec4 s = vec4(0.0);
   for (int i = i0; i < i1; i++) {
-    vec4 v = texelFetch(uH, ivec2(i, m), 0) + added(i, m);
+    vec4 v = texelFetch(uH, ivec2(i, m), 0) + added(i, m, rs);
     s += v * v;
   }
   o = s;
@@ -981,27 +1090,58 @@ void main() {
   o = vec4(float(rank), 0.0, 0.0, 0.0);
 }`
 
+/** Pixel r: the index of the chunk ranked r (CHUNK_RANK inverted). */
+export const CHUNK_BY_RANK = `${HEADER}
+uniform sampler2D uRank;
+uniform int uChunks;
+out vec4 o;
+void main() {
+  int r = int(gl_FragCoord.x);
+  int c = 0;
+  for (int i = 0; i < uChunks; i++) {
+    if (int(texelFetch(uRank, ivec2(i, 0), 0).x) == r) c = i;
+  }
+  o = vec4(float(c), 0.0, 0.0, 0.0);
+}`
+
 /**
- * Row r: the logits of the chunk ranked r, 64 texels, then its index in
- * texel 64.
+ * Row r: the logits of the chunk ranked r (from CHUNK_BY_RANK), 64
+ * texels, then its index in texel 64.
  */
 export const CHUNK_GATHER = `${HEADER}
 uniform sampler2D uLogits;
 uniform usampler2D uMask;
-uniform sampler2D uRank;
+uniform sampler2D uByRank;
 uniform int uOutW;
-uniform int uChunks;
 uniform float uPenalty;
 ${PENALIZED}
 out vec4 o;
 void main() {
   int t = int(gl_FragCoord.x);
   int r = int(gl_FragCoord.y);
-  int c = 0;
-  for (int i = 0; i < uChunks; i++) {
-    if (int(texelFetch(uRank, ivec2(i, 0), 0).x) == r) c = i;
-  }
+  int c = int(texelFetch(uByRank, ivec2(r, 0), 0).x);
   o = t < 64 ? chunkTexel(c, t) : vec4(float(c), 0.0, 0.0, 0.0);
+}`
+
+/**
+ * The likeliest token (penalized), as a token id into the ids texture:
+ * the first largest logit of the top-ranked chunk (CHUNK_GATHER's row 0),
+ * as the CPU's pick from the same candidates would be.
+ */
+export const CANDIDATE_ARGMAX = `${HEADER}
+uniform sampler2D uCand;
+out uvec4 o;
+void main() {
+  float best = -3e38;
+  int at = 0;
+  for (int t = 0; t < 64; t++) {
+    vec4 v = texelFetch(uCand, ivec2(t, 0), 0);
+    for (int c = 0; c < 4; c++) {
+      if (v[c] > best) { best = v[c]; at = 4 * t + c; }
+    }
+  }
+  int chunk = int(texelFetch(uCand, ivec2(64, 0), 0).x + 0.5);
+  o = uvec4(uint(chunk * 256 + at), 0u, 0u, 0u);
 }`
 
 /**

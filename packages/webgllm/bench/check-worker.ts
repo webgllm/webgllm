@@ -547,12 +547,35 @@ async function smoke(params: {
         }
       }
       const ms = (performance.now() - t) / 16
+      // GPU throughput: queued, one wait (best of 3 rounds of 16).
+      let gpuMs = Infinity
+      for (let round = 0; round < 3; round++) {
+        await engine.gpu.finish()
+        const tg = performance.now()
+        for (let i = 0; i < 16; i++) await engine.forwardNoLogits([tokens[i]])
+        await engine.gpu.finish()
+        gpuMs = Math.min(gpuMs, (performance.now() - tg) / 16)
+      }
       log(
-        `DECODE ${label.padEnd(22)} ${ms.toFixed(1)} ms/token, ${((engine.gpu.draws - draws) / 16).toFixed(0)} draws/token`
+        `DECODE ${label.padEnd(22)} ${ms.toFixed(1)} ms/token, GPU ${gpuMs.toFixed(2)} ms/token, ${((engine.gpu.draws - draws) / 16).toFixed(0)} draws/token`
       )
-      return ms
+      return gpuMs
     }
     const full = await step("everything", [])
+    {
+      // Which passes a writing step starts render passes for.
+      const trace: Array<string> = []
+      engine.gpu.trace = trace
+      const before = engine.gpu.passes
+      await engine.forward([tokens[0]])
+      engine.gpu.trace = null
+      const counts = new Map<string, number>()
+      for (const name of trace) counts.set(name, (counts.get(name) ?? 0) + 1)
+      log(
+        `PASSES per writing step: ${engine.gpu.passes - before}; ` +
+          [...counts].sort((a, b) => b[1] - a[1]).map(([n, c]) => `${n} ${c}`).join(", ")
+      )
+    }
     await step("no logits readback", [], false)
     for (const name of params.skip) {
       const ms = await step(`without ${name}`, [name])
@@ -564,10 +587,56 @@ async function smoke(params: {
     log(
       `DECODE output head + readback alone: ${((performance.now() - t) / 16).toFixed(1)} ms`
     )
+    {
+      const head = (engine as unknown as { head(row: number): void }).head.bind(engine)
+      for (const split of [1, 2, 4, 8, 1]) {
+        TUNING.headSplit = split
+        head(0)
+        await engine.gpu.finish()
+        const th = performance.now()
+        for (let i = 0; i < 64; i++) head(0)
+        await engine.gpu.finish()
+        log(`HEAD split ${split}: ${((performance.now() - th) / 64).toFixed(2)} ms per head`)
+      }
+      TUNING.headSplit = 1
+    }
+    const tc = performance.now()
+    for (let i = 0; i < 16; i++) await engine.candidates(0, 50, 1.05)
+    log(
+      `DECODE head + top-50 pick + readback alone: ${((performance.now() - tc) / 16).toFixed(1)} ms`
+    )
+    {
+      engine.gpu.skip = new Set(["pick"])
+      await engine.gpu.finish()
+      const th = performance.now()
+      for (let i = 0; i < 16; i++) {
+        await engine.candidates(0, 50, 1.05)
+      }
+      log(
+        `DECODE head only (pick skipped) + readback: ${((performance.now() - th) / 16).toFixed(1)} ms`
+      )
+      engine.gpu.skip = new Set()
+    }
     const t2 = performance.now()
     for (let i = 0; i < 16; i++) await engine.gpu.finish()
     log(
       `DECODE empty sync alone: ${((performance.now() - t2) / 16).toFixed(1)} ms`
+    )
+    const probe = engine.gpu.texture(WebGL2RenderingContext.RGBA32F, 1, 1)
+    const t3 = performance.now()
+    for (let i = 0; i < 16; i++) engine.gpu.readNow(probe)
+    log(
+      `DECODE blocking 1-pixel read alone: ${((performance.now() - t3) / 16).toFixed(2)} ms`
+    )
+    const residual = (engine as unknown as { buffers: { residual: Array<typeof probe> } }).buffers.residual[0]
+    const t4 = performance.now()
+    for (let i = 0; i < 16; i++) {
+      await engine.forwardNoLogits([tokens[i]])
+      engine.gpu.readNow(residual, { x: 0, y: 0, width: 1, height: 1 })
+    }
+    await engine.gpu.finish()
+    log(
+      `DECODE step + blocking read: ${((performance.now() - t4) / 16).toFixed(1)} ms/token`
     )
     return
   }
@@ -677,6 +746,28 @@ async function smoke(params: {
     log(
       `AB DECODE ${knob}=${a}: ${med(perToken[a]).toFixed(2)} ms/token (${perToken[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(perToken[b]).toFixed(2)} ms/token (${perToken[b].map((t) => t.toFixed(1)).join(" ")})`
     )
+    // GPU throughput: 16 single-token forwards queued with no readback in
+    // between, one wait at the end (CPU timing noise mostly drops out).
+    const gpuTok: Record<string, Array<number>> = { [a]: [], [b]: [] }
+    for (let i = 0; i < 12; i++) {
+      const v = i % 2 === 0 ? a : b
+      ;(TUNING as Record<string, number>)[knob] = v
+      await engine.gpu.finish()
+      const t = performance.now()
+      for (let s2 = 0; s2 < 16; s2++) await engine.forwardNoLogits([next])
+      await engine.gpu.finish()
+      gpuTok[v].push((performance.now() - t) / 16)
+    }
+    ;(TUNING as Record<string, number>)[knob] = original
+    log(
+      `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
+    )
+  }
+  if (params.ab || params.abDecode) {
+    // The A/B runs left the cache elsewhere: read the prompt again.
+    engine.reset()
+    engine.setSeen(prompt, tokenizer.vocabSize)
+    token = await pick(await engine.forwardHidden(prompt))
   }
   const promptMs = [...times].sort((x, y) => x - y)[1]
   log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms; GPU ${gpuTimes.map((t) => t.toFixed(0)).join(", ")} ms`)
@@ -690,6 +781,26 @@ async function smoke(params: {
   }
   const decodeMs = performance.now() - t2
   log(`REPLY: ${JSON.stringify(tokenizer.decode(out))}`)
+  {
+    // Determinism: junk tokens, a reset, and the same reply again.
+    for (let i = 0; i < 200; i++) await engine.forwardNoLogits([1000 + i])
+    const again: Array<number> = []
+    engine.reset()
+    engine.setSeen(prompt, tokenizer.vocabSize)
+    let t = await pick(await engine.forwardHidden(prompt))
+    for (let i = 0; i < out.length; i++) {
+      if (t === tokenizer.specialTokens.eos) break
+      again.push(t)
+      engine.markSeen(t)
+      t = await pick(await engine.forwardHidden([t]))
+    }
+    const same = again.length === out.length && again.every((x, i) => x === out[i])
+    log(
+      same
+        ? "RESET CHECK: same reply after junk and a reset"
+        : `RESET CHECK: DIFFERENT after junk and a reset: ${JSON.stringify(tokenizer.decode(again))}`
+    )
+  }
   // How speculative decoding with prompt lookup would fare on this reply:
   // at each step, draft up to 3 tokens by matching the history's last
   // 3, 2 or 1 tokens earlier in the history, and count how many of the

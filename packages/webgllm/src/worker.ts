@@ -45,6 +45,13 @@ let loading: {
 const DRAFTS = 3
 /** Drafts follow an earlier occurrence of at least this many last tokens. */
 const DRAFT_MATCH = 2
+/**
+ * Guessing (see Engine.forwardGuess) stops while fewer than this share of
+ * the last GUESS_WINDOW guesses were the token drawn: a wrong guess holds
+ * the GPU up for the next token.
+ */
+const GUESS_MIN_HITS = 0.6
+const GUESS_WINDOW = 16
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -338,15 +345,34 @@ async function generate(request: GenerateRequest) {
   )
   if (onGpu) engine.setSeen(prompt, vocab)
   else sampler.see(prompt)
+  // The likeliest token is read forward while each token is drawn (see
+  // Engine.forwardGuess), while that's usually the token drawn.
+  const guesses: Array<boolean> = []
+  const guessing = () =>
+    onGpu &&
+    request.pipeline !== false &&
+    (guesses.length < GUESS_WINDOW / 2 ||
+      guesses.filter(Boolean).length >= GUESS_MIN_HITS * guesses.length)
+  // The token guessed with the last distribution, or -1.
+  let guessed = -1
   // The distribution of the token after `r`, a row of the last batch, as
-  // token ids and probabilities.
-  const distribution = async (r: number) => {
+  // token ids and probabilities; with `guess`, the likeliest token is read
+  // forward meanwhile.
+  const distribution = async (r: number, guess = false) => {
     if (onGpu) {
       const { ids, logits } = await engine.candidates(
         r,
         sampling.top_k,
-        sampling.repetition_penalty
+        sampling.repetition_penalty,
+        guess
       )
+      if (guess && engine.guessing) {
+        // The GPU's pick: the first largest of the same logits.
+        let best = 0
+        for (let i = 1; i < logits.length; i++)
+          if (logits[i] > logits[best]) best = i
+        guessed = ids[best]
+      }
       const d = sampler.distribution(logits)
       return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }
     }
@@ -362,7 +388,7 @@ async function generate(request: GenerateRequest) {
     post({ type: "token", id, text: THINK_OPEN })
   }
 
-  let token = draw(await distribution(row))
+  let token = draw(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
   const firstTokenAt = performance.now()
   stats.firstTokenMs = firstTokenAt - requested
@@ -383,6 +409,23 @@ async function generate(request: GenerateRequest) {
   }
   let going = emit(token)
   while (going && !stopped.has(id)) {
+    if (engine.guessing) {
+      const hit = guessed === token
+      guesses.push(hit)
+      if (guesses.length > GUESS_WINDOW) guesses.shift()
+      if (hit) {
+        // Already read: draw the next token (and guess the one after).
+        engine.keepGuess()
+        model.cached.push(token)
+        const more =
+          stats.outputTokens < maxTokens - 1 &&
+          engine.position < engine.contextLength - 1
+        token = draw(await distribution(0, more && guessing()))
+        going = emit(token)
+        continue
+      }
+      engine.dropGuess()
+    }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
     const drafts = lookupDraft(
@@ -401,8 +444,15 @@ async function generate(request: GenerateRequest) {
     let kept = 1
     let next = -1
     for (let i = 0; i < batch.length && going; i++) {
-      const d = await distribution(i)
-      if (i + 1 === batch.length) {
+      const last = i + 1 === batch.length
+      const d = await distribution(
+        i,
+        last &&
+          guessing() &&
+          stats.outputTokens < maxTokens - 1 &&
+          engine.position < engine.contextLength - 1
+      )
+      if (last) {
         next = draw(d)
         break
       }
@@ -414,12 +464,16 @@ async function generate(request: GenerateRequest) {
       kept++
       going = emit(batch[i + 1]) && !stopped.has(id)
     }
-    if (drafts.length) engine.accept(kept)
+    // A guess is only made after the last row, all drafts kept: nothing to
+    // take back then (and the guess has moved the cache on).
+    if (drafts.length && !engine.guessing) engine.accept(kept)
     model.cached.push(...batch.slice(0, kept))
     if (!going || next < 0) break
     token = next
     going = emit(token)
   }
+  // A guess still pending is for a token that wasn't drawn.
+  engine.dropGuess()
   const rest = decoder.flush()
   if (rest) post({ type: "token", id, text: rest })
   engine.snapshot()
