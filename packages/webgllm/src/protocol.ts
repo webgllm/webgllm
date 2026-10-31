@@ -41,6 +41,8 @@ export type WorkerRequest =
       pipeline?: boolean
     }
   | { type: "stop"; id: string }
+  /** The page's navigator.maxTouchPoints (a worker can't read it). */
+  | { type: "device"; touchPoints: number }
   /** For benchmarks: engine tuning knobs (see TUNING in engine.ts). */
   | { type: "tune"; values: Record<string, number> }
 

@@ -67,8 +67,13 @@ vec4 pf(highp sampler2D s, int x, int m) {
 
 `
 
-/** Kept for kernels that name it; the helpers are in HEADER. */
-const H2 = ""
+
+/**
+ * The add's h2(x · next norm weights) is stored divided by this (and the
+ * matmul that reads it multiplies back), so large residuals don't overflow
+ * halves.
+ */
+const PRESCALE = 32
 
 /**
  * A kernel builder that returns the same string for the same options: a
@@ -110,8 +115,8 @@ export type MatmulOptions = {
   /**
    * Split K across fragments (for a few rows, where N / 4 fragments would
    * leave the GPU idle): output row m * uSplit + s holds slice s's partial
-   * sums, over blocks [s * uKbSlice, (s + 1) * uKbSlice); REDUCE_PAIR adds
-   * them up.
+   * sums, over blocks [s * uKbSlice, (s + 1) * uKbSlice); consumers add
+   * them up (pf's sampler2D overload).
    */
   split?: boolean
   /**
@@ -220,7 +225,7 @@ function matmulSource(o: MatmulOptions) {
   int kb0 = 0;
   int kb1 = uKb;`
   const weights = o.bytes && o.bits === 8 ? "isampler2D" : "usampler2D"
-  return `${HEADER}${H2}
+  return `${HEADER}
 uniform usampler2D uA;
 uniform ${weights} uW;
 uniform sampler2D uS;
@@ -466,7 +471,13 @@ void main() {
   for (int kb = kb0; kb < kb1; kb++) {
 ${L.join("\n")}
   }
-  o = ${o.normed ? "acc * rmsScale(m)" : "acc"};
+  o = ${
+    o.normed === "prescaled"
+      ? `acc * (rmsScale(m) * ${PRESCALE}.0)`
+      : o.normed
+        ? "acc * rmsScale(m)"
+        : "acc"
+  };
 }`
 }
 
@@ -554,27 +565,6 @@ void main() {
   for (int s = 0; s < uSplit; s++)
     acc += texelFetch(uP, ivec2(p.x, p.y + s * uRows * uSliceRows), 0);
   o = acc;
-}`
-
-/**
- * Sums a split matmul's slices into a pair tensor: texel (x, y) holds
- * tokens 2y and 2y + 1 (zero past uRows), each Σ_s partial(x, m · uSplit + s).
- */
-export const REDUCE_PAIR = `${HEADER}
-uniform sampler2D uP;
-uniform int uSplit;
-uniform int uRows;
-out uvec4 o;
-vec4 total(int x, int m) {
-  vec4 acc = vec4(0.0);
-  if (m >= uRows) return acc;
-  for (int s = 0; s < uSplit; s++) acc += texelFetch(uP, ivec2(x, m * uSplit + s), 0);
-  return acc;
-}
-void main() {
-  int x = int(gl_FragCoord.x);
-  int y = int(gl_FragCoord.y);
-  o = packH2(total(x, 2 * y), total(x, 2 * y + 1));
 }`
 
 /**
@@ -725,7 +715,7 @@ float rmsScale(int m) {
 `
 
 /** h2 out = x · rms(x) · w, from f32 x, its RMS_PARTIAL sums and f32 weights. */
-export const NORM_TO_H2 = `${HEADER}${H2}${RMS_SCALE}
+export const NORM_TO_H2 = `${HEADER}${RMS_SCALE}
 uniform sampler2D uX;
 uniform sampler2D uNorm;
 uniform int uRowIn;
@@ -802,7 +792,9 @@ void main() {
   vec4 a = (texelFetch(uH, ivec2(2 * j, m), 0) + added(2 * j, m, rs)) * texelFetch(uNext, ivec2(2 * j, 0), 0);
   vec4 b = (texelFetch(uH, ivec2(2 * j + 1, m), 0) + added(2 * j + 1, m, rs)) * texelFetch(uNext, ivec2(2 * j + 1, 0), 0);
   o = vec4(0.0);
-  o2 = packH2(a, b);
+  // Scaled down by PRESCALE (the matmul scales back up), so a large
+  // residual stays inside half precision's range.
+  o2 = packH2(a * (1.0 / ${PRESCALE}.0), b * (1.0 / ${PRESCALE}.0));
 }`
 }
 
@@ -871,7 +863,7 @@ function shortConvSource(width: number) {
   }`
     )
     .join("\n")
-  return `${HEADER}${H2}
+  return `${HEADER}
 uniform usampler2D uBCx;
 uniform sampler2D uState;
 uniform sampler2D uConv;
@@ -985,7 +977,7 @@ vec4 rotated(int base, int t, int pos, float inv) {
       : "return v;"
   }
 }`
-  return `${HEADER}${H2}
+  return `${HEADER}
 uniform usampler2D uQKVG;
 uniform sampler2D uNorm;
 uniform sampler2D uRope;
@@ -1333,7 +1325,7 @@ void main() {
 }
 
 /** SwiGLU: silu(gate) · up, from w1|w3's f32 output (uHalf texels each). h2 output. */
-export const SWIGLU = `${HEADER}${H2}
+export const SWIGLU = `${HEADER}
 uniform usampler2D uGU;
 uniform int uHalf;
 out uvec4 o;
@@ -1347,7 +1339,7 @@ void main() {
 }`
 
 /** Copies an f32 tensor (for debugging reads of h2 tensors: h2 → f32). */
-export const H2_TO_F32 = `${HEADER}${H2}
+export const H2_TO_F32 = `${HEADER}
 uniform usampler2D uX;
 out vec4 o;
 void main() {
@@ -1373,6 +1365,8 @@ void main() {
 const PENALIZED = `
 uniform int uLogitRows;
 uniform ivec4 uExtra;
+/* The batch row that logits row 0 is (when rows are picked one at a time). */
+uniform int uPenaltyRow0;
 /*
  * Token id's logit with the repetition penalty for row r of a batch: the
  * mask's seen tokens, and the batch's drafts before row r (uExtra: draft i
@@ -1392,10 +1386,10 @@ vec4 chunkTexel(int c, int t, int r) {
   int base = 4 * p.x;
   int id = 4 * texel;
   return vec4(
-    penalized(v.x, texelFetch(uMask, ivec2(base, p.y), 0).x, id, r),
-    penalized(v.y, texelFetch(uMask, ivec2(base + 1, p.y), 0).x, id + 1, r),
-    penalized(v.z, texelFetch(uMask, ivec2(base + 2, p.y), 0).x, id + 2, r),
-    penalized(v.w, texelFetch(uMask, ivec2(base + 3, p.y), 0).x, id + 3, r));
+    penalized(v.x, texelFetch(uMask, ivec2(base, p.y), 0).x, id, r + uPenaltyRow0),
+    penalized(v.y, texelFetch(uMask, ivec2(base + 1, p.y), 0).x, id + 1, r + uPenaltyRow0),
+    penalized(v.z, texelFetch(uMask, ivec2(base + 2, p.y), 0).x, id + 2, r + uPenaltyRow0),
+    penalized(v.w, texelFetch(uMask, ivec2(base + 3, p.y), 0).x, id + 3, r + uPenaltyRow0));
 }`
 
 /** Each 256-logit chunk's largest (penalized) logit: x = chunk index, y = row. */
@@ -1592,7 +1586,7 @@ export const MATMUL_Q6_K_HEAD = (() => {
     }
   }
   line(`acc += d * s;`)
-  return `${HEADER}${H2}${Q6_K_UNPACK}
+  return `${HEADER}${Q6_K_UNPACK}
 uniform usampler2D uA;
 uniform usampler2D uW;
 uniform sampler2D uS;

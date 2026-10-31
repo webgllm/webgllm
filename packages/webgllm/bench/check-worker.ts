@@ -164,6 +164,7 @@ async function run(params: {
   // Shared textures are counted once, under all their names.
   const byId = new Map<number, { names: Array<string>; bytes: number }>()
   for (const [name, value] of Object.entries(buffers)) {
+    if (!value) continue
     for (const t of (Array.isArray(value) ? value : [value]) as Array<{
       id: number
       bytes: number
@@ -730,6 +731,7 @@ async function smoke(params: {
     )
     {
       const head = (engine as unknown as { head(row: number): void }).head.bind(engine)
+      const savedHeadSplit = TUNING.headSplit
       for (const split of [1, 2, 4, 8, 1]) {
         TUNING.headSplit = split
         head(0)
@@ -739,7 +741,7 @@ async function smoke(params: {
         await engine.gpu.finish()
         log(`HEAD split ${split}: ${((performance.now() - th) / 64).toFixed(2)} ms per head`)
       }
-      TUNING.headSplit = 1
+      TUNING.headSplit = savedHeadSplit
     }
     const tc = performance.now()
     for (let i = 0; i < 16; i++) await engine.candidates(0, 50, 1.05)

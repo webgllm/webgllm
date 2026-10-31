@@ -38,6 +38,16 @@ import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 export type WebGlTextProviderOptions = Partial<Sampling> & {
   /** Most tokens to generate: 4,096 by default. */
   max_new_tokens?: number
+  /**
+   * Draft tokens by prompt lookup and check them in one batch (speculative
+   * decoding; the tokens are the same as without). On by default.
+   */
+  speculative?: boolean
+  /**
+   * Read the likeliest next token forward while each token is drawn (the
+   * tokens are the same as without). On by default.
+   */
+  pipeline?: boolean
 }
 
 /** Timings of one model call, in milliseconds, in `RUN_FINISHED`'s `usage.providerUsageDetails`. */
@@ -395,6 +405,8 @@ export class WebGlTextAdapter<
       thinking: enableThinking(options.reasoning, model),
       sampling: this.sampling(options.modelOptions),
       maxTokens: options.modelOptions?.max_new_tokens,
+      speculative: options.modelOptions?.speculative,
+      pipeline: options.modelOptions?.pipeline,
       signal
     })
     let next = await stream.next()
@@ -498,6 +510,8 @@ export class WebGlTextAdapter<
       thinking: enableThinking(chatOptions.reasoning, this.model),
       sampling: this.sampling(chatOptions.modelOptions),
       maxTokens: chatOptions.modelOptions?.max_new_tokens,
+      speculative: chatOptions.modelOptions?.speculative,
+      pipeline: chatOptions.modelOptions?.pipeline,
       signal: chatOptions.abortController?.signal
     })
     let raw = ""

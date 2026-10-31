@@ -69,15 +69,17 @@ const MIN_REPLY_TOKENS = 32
 const release = (engine: Engine) =>
   engine.gpu.gl.getExtension("WEBGL_lose_context")?.loseContext()
 
+/** The page's touch points (sent by the client: a worker can't read them). */
+let touchPoints = 0
+
 /**
- * Prompt tokens per forward batch. The prompt matmuls compute two tokens
- * per fragment, so a big GPU needs big batches to stay busy; phones and
- * tablets keep small ones, for memory (iOS caps a page's GPU memory). iPads
- * report a Mac's user agent: touch points give them away.
+ * Prompt tokens per forward batch (the engine scales it up for smaller
+ * models). A big GPU needs big batches to stay busy; phones and tablets
+ * keep small ones, for memory (iOS caps a page's GPU memory). iPads report
+ * a Mac's user agent: touch points give them away.
  */
 const promptBatch = () =>
-  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) ||
-  navigator.maxTouchPoints > 1
+  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) || touchPoints > 1
     ? 128
     : 512
 
@@ -540,7 +542,9 @@ async function generate(request: GenerateRequest) {
 let queue: Promise<void> = Promise.resolve()
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type === "tune") {
+  if (data.type === "device") {
+    touchPoints = data.touchPoints
+  } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
     void startLoad(data.model).catch(() => undefined)

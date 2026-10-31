@@ -13,58 +13,106 @@ export type ToolFormat = "lfm2" | "lfm3"
 /** Where a tool call starts, in either format. */
 const MARKERS = ["<|tool_call_start|>", "<tool_call>"]
 
-/** A Python-style or JSON value: "x", 'x', 1.5, True, None, [1, 2]… */
+/** A JSON number exactly (so "02134" or "0x1F" stay strings). */
+const NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/
+
+/** A Python string literal's text: its escapes decoded, quotes unescaped. */
+function stringText(raw: string) {
+  const inner = raw.slice(1, -1)
+  let out = ""
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i]
+    if (c !== "\\" || i + 1 === inner.length) {
+      out += c
+      continue
+    }
+    const next = inner[++i]
+    if (next === "n") out += "\n"
+    else if (next === "t") out += "\t"
+    else if (next === "r") out += "\r"
+    else if (next === "u" && /^[0-9a-fA-F]{4}$/.test(inner.slice(i + 1, i + 5))) {
+      out += String.fromCharCode(parseInt(inner.slice(i + 1, i + 5), 16))
+      i += 4
+    } else out += next
+  }
+  return out
+}
+
+/**
+ * A Python literal list or dict as JSON: single-quoted strings double-quoted,
+ * True / False / None as true / false / null (outside strings).
+ */
+function pythonToJson(text: string) {
+  let out = ""
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (c === '"' || c === "'") {
+      const end = stringEnd(text, i, INNER_END)
+      if (end < 0) return text
+      out += JSON.stringify(stringText(text.slice(i, end + 1)))
+      i = end
+      continue
+    }
+    const word = /^(True|False|None)\b/.exec(text.slice(i))
+    if (word && !/[\w.]/.test(text[i - 1] ?? "")) {
+      out += word[1] === "True" ? "true" : word[1] === "False" ? "false" : "null"
+      i += word[1].length - 1
+      continue
+    }
+    out += c
+  }
+  return out
+}
+
+/** A bare Python value: a number, True, None, a list… or else the text. */
 function parseValue(raw: string): unknown {
   const s = raw.trim()
-  if (/^(["']).*\1$/s.test(s)) {
-    try {
-      return JSON.parse(s[0] === "'" ? `"${s.slice(1, -1)}"` : s)
-    } catch {
-      return s.slice(1, -1)
-    }
-  }
   if (s === "True" || s === "true") return true
   if (s === "False" || s === "false") return false
   if (s === "None" || s === "null") return null
-  if (s !== "" && !Number.isNaN(Number(s))) return Number(s)
+  if (NUMBER.test(s)) return Number(s)
+  if (s.startsWith("[") || s.startsWith("{")) {
+    try {
+      return JSON.parse(pythonToJson(s))
+    } catch {
+      return s
+    }
+  }
+  return s
+}
+
+/** An LFM3 XML parameter's value: JSON if it parses, else the text as it is. */
+function parseXmlValue(raw: string): unknown {
   try {
-    return JSON.parse(s)
+    return JSON.parse(raw)
   } catch {
-    return s
+    return raw
   }
 }
 
-/** After a value: the next argument (`, name=`), or the end of the call. */
+/** After an argument's value: the next argument (`, name=`), or the call's end. */
 const VALUE_END = /^\s*(?:,\s*[A-Za-z_]\w*\s*=|,?\s*\)|$)/
+/** After a string inside a list or dict: a separator or the bracket's end. */
+const INNER_END = /^\s*[,\]}:]/
 
 /**
  * Where the string starting at `body[start]` ends (the index of its closing
  * quote). The model doesn't escape quotes inside its strings ('JWST's
- * findings'), so a quote only closes the string when the argument ends
- * after it; otherwise it's part of the text.
+ * findings'), so a quote only closes the string when what follows can come
+ * after one (`after`: an argument's end, or a list or dict separator);
+ * otherwise it's part of the text.
  */
-function stringEnd(body: string, start: number) {
+function stringEnd(body: string, start: number, after = VALUE_END) {
   const quote = body[start]
   let last = -1
   for (let i = start + 1; i < body.length; i++) {
     if (body[i] === "\\") i++
     else if (body[i] === quote) {
-      if (VALUE_END.test(body.slice(i + 1))) return i
+      if (after.test(body.slice(i + 1))) return i
       last = i
     }
   }
   return last
-}
-
-/** A Python string literal's text, `\'` and `\"` included. */
-function stringText(raw: string) {
-  const inner = raw.slice(1, -1)
-  try {
-    const escaped = inner.replace(/\\'/g, "'").replace(/(^|[^\\])"/g, '$1\\"')
-    return JSON.parse(`"${escaped}"`) as string
-  } catch {
-    return inner
-  }
 }
 
 /** Where a `[…]` or `{…}` starting at `body[start]` ends, strings skipped. */
@@ -73,7 +121,7 @@ function bracketEnd(body: string, start: number) {
   for (let i = start; i < body.length; i++) {
     const c = body[i]
     if (c === '"' || c === "'") {
-      const end = stringEnd(body, i)
+      const end = stringEnd(body, i, INNER_END)
       if (end < 0) return -1
       i = end
     } else if (c === "[" || c === "{") depth++
@@ -132,7 +180,7 @@ function parseXmlish(body: string) {
     for (const p of f[2].matchAll(
       /<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g
     )) {
-      args[p[1].trim()] = parseValue(p[2])
+      args[p[1].trim()] = parseXmlValue(p[2])
     }
     calls.push({ name: f[1].trim(), args })
   }

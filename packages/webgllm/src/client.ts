@@ -94,6 +94,12 @@ function post(message: WorkerRequest) {
     worker.onmessage = handleMessage
     worker.onerror = (event) =>
       failWorker(event.message || "The model's worker stopped.")
+    // Workers can't see touch points; iPads (Mac user agent) need them to
+    // get phone-size batches.
+    worker.postMessage({
+      type: "device",
+      touchPoints: navigator.maxTouchPoints || 0
+    })
   }
   worker.postMessage(message)
 }
@@ -186,6 +192,10 @@ export async function* generate(request: {
   thinking?: boolean
   sampling: Sampling
   maxTokens?: number
+  /** Speculative decoding by prompt lookup (default on). */
+  speculative?: boolean
+  /** Reading the likeliest next token ahead (default on). */
+  pipeline?: boolean
   signal?: AbortSignal
 }): AsyncGenerator<string, GenerationEnd> {
   const { id, signal } = request
@@ -216,7 +226,11 @@ export async function* generate(request: {
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),
     sampling: request.sampling,
-    ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens })
+    ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
+    ...(request.speculative !== undefined && {
+      speculative: request.speculative
+    }),
+    ...(request.pipeline !== undefined && { pipeline: request.pipeline })
   })
   try {
     while (!finished || queue.length > 0) {

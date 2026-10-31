@@ -180,7 +180,6 @@ export type LayerProbe = (
 const OUT_WIDTH = 1024
 /** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
 const MAX_SNAPSHOTS = 8
-/** Queries per attention slice: the scores buffer holds this many per head. */
 /**
  * Queries per attention slice (see attend): more is fewer passes and more
  * fragments per pass, for a bigger scores buffer (64: ~33 MB at an 8192
@@ -297,10 +296,10 @@ export class Engine {
         this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
     }
     this.ropeFull = this.ropeTable(config.ropeThetaFull, config.ropeDimsFull)
-    this.ropeSliding = this.ropeTable(
-      config.ropeThetaSliding,
-      config.ropeDimsSliding
-    )
+    // (Only models with sliding-window layers read the second table.)
+    this.ropeSliding = config.layerTypes.includes("sliding_attention")
+      ? this.ropeTable(config.ropeThetaSliding, config.ropeDimsSliding)
+      : this.ropeFull
   }
 
   /**
@@ -357,8 +356,7 @@ export class Engine {
       // The hidden state, and its rows' partial sums of squares in the last
       // RMS_PARTS columns (drawn with the add that writes it).
       residual: [0, 1].map(() =>
-        // The residual, its rows' sums of squares, and room for the
-        // scaled texture's columns (written alongside, unused here).
+        // (Room for the scaled texture's columns: written alongside.)
         this.gpu.texture(GL.RGBA32F, D / 4 + K.RMS_PARTS + D / 8, M)
       ) as [Texture, Texture],
       /**
@@ -728,6 +726,8 @@ export class Engine {
    * what's new. Keeps the latest MAX_SNAPSHOTS.
    */
   snapshot() {
+    if (this.guessAt !== null)
+      throw new Error("Snapshot while a guessed token is pending.")
     const at = this.position
     if (this.snapshots.has(at)) return
     const W = this.config.slidingWindow
@@ -857,6 +857,19 @@ export class Engine {
     await this.logits(await this.forwardHidden([0]))
     this.snapshot()
     this.reset()
+    if (this.buffers.attnChunks && TUNING.attendChunkTexels > 0) {
+      // Chunked attention (long key ranges) too, forced on for a short
+      // batch and a token.
+      const saved = TUNING.attendChunkTexels
+      TUNING.attendChunkTexels = 1
+      try {
+        await this.forwardHidden(new Array(12).fill(0))
+        await this.logits(await this.forwardHidden([0]))
+      } finally {
+        TUNING.attendChunkTexels = saved
+        this.reset()
+      }
+    }
   }
 
   /**
@@ -936,19 +949,6 @@ export class Engine {
       uRowTexels: { int: w.rowTexels },
       uG: { int: w.groups }
     }
-    if (rows <= SPLIT_ROWS) {
-      const slices = this.splitPartials(a, w, rows)
-      this.gpu.run({
-        name: "matmul",
-        program: this.gpu.program(K.REDUCE_PAIR),
-        inputs: { uP: this.buffers.partial },
-        uniforms: { uSplit: { int: slices }, uRows: { int: rows } },
-        output: out,
-        rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
-      })
-      this.slicing.set(out.id, { split: 1, stride: 0 })
-      return
-    }
     const partner = this.quads.get(out.id)
     if (w.rgba4 && partner && TUNING.quad > 0) {
       // Four tokens per fragment, into two textures; K in slices of about
@@ -1011,16 +1011,14 @@ export class Engine {
     this.gpu.run({
       name: "matmul",
       program: this.gpu.program(
-        w.rgba4
-          ? K.matmulPair({ zeros: !!w.zeros })
-          : K.matmul({
-              bits,
-              zeros: !!w.zeros,
-              wrap: false,
-              precision: this.precision,
-              bytes: w.bytes,
-              pair: true
-            })
+        K.matmul({
+          bits,
+          zeros: !!w.zeros,
+          wrap: false,
+          precision: this.precision,
+          bytes: w.bytes,
+          pair: true
+        })
       ),
       inputs: weights,
       uniforms: shape,
@@ -1565,6 +1563,10 @@ export class Engine {
     options: { draft?: boolean } = {}
   ): Promise<number> {
     if (options.draft) return this.forwardDraft(Array.from(tokens))
+    if (this.guessAt !== null)
+      throw new Error("Forward while a guessed token is pending.")
+    // A plain forward ends any draft batch: nothing left to accept.
+    this.draft = null
     if (this.position + tokens.length > this.contextLength) {
       throw new Error(
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
@@ -1756,12 +1758,14 @@ export class Engine {
     chunks: number,
     penalty: number,
     drafts: Array<number>,
-    guess = false
+    guess = false,
+    penaltyRow0 = 0
   ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
     if (rows > 1 && !this.embedding.rgba4) {
-      // The other output heads take one row at a time.
+      // The other output heads take one row at a time (each still
+      // penalizing the drafts before its row).
       const out = []
       for (let r = 0; r < rows; r++) {
         out.push(
@@ -1770,8 +1774,9 @@ export class Engine {
             1,
             chunks,
             penalty,
-            [],
-            guess && r === rows - 1
+            drafts,
+            guess && r === rows - 1,
+            penaltyRow0 + r
           ))
         )
       }
@@ -1790,7 +1795,8 @@ export class Engine {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
       uLogitRows: { int: this.logitRows },
-      uExtra: { ivec4: extra }
+      uExtra: { ivec4: extra },
+      uPenaltyRow0: { int: penaltyRow0 }
     }
     this.gpu.run({
       name: "pick",
