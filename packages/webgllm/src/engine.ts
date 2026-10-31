@@ -160,8 +160,11 @@ export const TUNING = {
   packZeros: 1,
   /** 1: 4-bit byte weights in RGBA8 (normalized) textures (set before the model loads). */
   unormBytes: 1,
-  /** 1: 4-bit layer weights in RGBA4 textures; 0: byte textures (set before the model loads). */
-  layerRgba4: 0,
+  /**
+   * 4-bit layer weights in RGBA4 textures (1) or byte textures (0); -1:
+   * whichever this GPU writes faster (timed at load; see chooseLayout).
+   */
+  layerRgba4: -1,
   /** 1: the pick's argmax from the chunk maxima's positions, its loops with constant bounds. */
   fastPick: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
@@ -396,7 +399,12 @@ export class Engine {
         this.writeMatrix(this.embedding, value, row0)
       } else if (piece.kind === "finalNorm")
         this.finalNorm = this.vector(piece.value)
-      else this.layers[piece.layer] = this.layer(piece.value)
+      else {
+        // The weight layout this GPU writes fastest, once, before the
+        // first layer's textures (see chooseLayout).
+        if (!this.layoutChoice) await this.chooseLayout(piece.value.gateUp)
+        this.layers[piece.layer] = this.layer(piece.value)
+      }
       onProgress?.(piece)
       if (this.gpu.isLost)
         throw new GpuError("The GPU context was lost while loading.")
@@ -757,13 +765,96 @@ export class Engine {
   }
 
   /** A quantized matrix as textures, filled with `m`. */
+  /** 4-bit layer weights in RGBA4 (else byte texels): see chooseLayout. */
+  private rgba4Layers = true
+  /** The layout chooseLayout picked and its timings (ms per writing matmul). */
+  layoutChoice: {
+    layout: "rgba4" | "bytes"
+    rgba4Ms: number
+    bytesMs: number
+  } | null = null
+
+  /**
+   * Picks how 4-bit layer weights are stored by timing both layouts on this
+   * GPU: RGBA4 has the texture unit split the nibbles (free where weight
+   * fetches are cheap, as on Apple GPUs), byte texels take half the
+   * fetches and split them in the shader (faster where fetches are the
+   * limit, as on PowerVR). A random matrix of `m`'s shape in each, the
+   * writing matmul on each in turn, best of a few rounds.
+   */
+  private async chooseLayout(m: QuantMatrix) {
+    if (m.bits !== 4 || TUNING.layerRgba4 >= 0) {
+      this.rgba4Layers = TUNING.layerRgba4 !== 0
+      this.layoutChoice = {
+        layout: this.rgba4Layers ? "rgba4" : "bytes",
+        rgba4Ms: NaN,
+        bytesMs: NaN
+      }
+      return
+    }
+    let seed = 1
+    const quants = new Uint32Array(m.quants.length)
+    for (let i = 0; i < quants.length; i++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0
+      quants[i] = seed
+    }
+    const fake: QuantMatrix = {
+      N: m.N,
+      K: m.K,
+      bits: 4,
+      quants,
+      // Small scales (half 2^-7) and zero points 0 .. 15.
+      scales: new Uint16Array(m.scales.length).fill(0x2000),
+      zeros: m.zeros
+        ? Uint8Array.from({ length: m.zeros.length }, (_, i) => quants[i] & 15)
+        : null
+    }
+    const made = [true, false].map((rgba4) => {
+      const gm = this.allocateMatrix(m.N, m.K, 4, !!fake.zeros, rgba4)
+      this.writeMatrix(gm, fake, 0)
+      return gm
+    })
+    // Each matmul's output gets a texel read, so no GPU skips one.
+    const scratch = this.gpu.texture(GL.RGBA32F, 1, 1)
+    const step = (gm: GpuMatrix) => {
+      this.splitPartials(this.buffers.normed, gm, 1)
+      this.gpu.run({
+        program: this.gpu.program(K.COPY),
+        inputs: { uX: this.buffers.partial },
+        output: scratch,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+    }
+    for (const gm of made) step(gm)
+    await this.gpu.finish()
+    const best = [Infinity, Infinity]
+    for (let round = 0; round < 3; round++) {
+      for (const i of round % 2 ? [1, 0] : [0, 1]) {
+        const t = performance.now()
+        for (let n = 0; n < 16; n++) step(made[i])
+        await this.gpu.finish()
+        best[i] = Math.min(best[i], (performance.now() - t) / 16)
+      }
+    }
+    for (const gm of made)
+      for (const t of [gm.quants, gm.scales, gm.zeros]) if (t) this.gpu.delete(t)
+    this.gpu.delete(scratch)
+    // Bytes only if clearly faster (timing noise shouldn't flip it).
+    this.rgba4Layers = !(best[1] < best[0] * 0.95)
+    this.layoutChoice = {
+      layout: this.rgba4Layers ? "rgba4" : "bytes",
+      rgba4Ms: best[0],
+      bytesMs: best[1]
+    }
+  }
+
   private matrix(m: QuantMatrix): GpuMatrix {
     const gm = this.allocateMatrix(
       m.N,
       m.K,
       m.bits,
       !!m.zeros,
-      m.bits === 4 && TUNING.layerRgba4 > 0
+      m.bits === 4 && this.rgba4Layers
     )
     this.writeMatrix(gm, m, 0)
     return gm

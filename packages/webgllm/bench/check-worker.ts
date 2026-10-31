@@ -157,6 +157,13 @@ async function run(params: {
   )
   const t0 = performance.now()
   await engine.load(await modelPieces(params))
+  {
+    const c = engine.layoutChoice
+    if (c)
+      log(
+        `LAYOUT ${c.layout} (writing matmul: RGBA4 ${c.rgba4Ms.toFixed(3)} ms, bytes ${c.bytesMs.toFixed(3)} ms)`
+      )
+  }
   log(
     `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
   )
@@ -631,6 +638,13 @@ async function smoke(params: {
   )
   const t0 = performance.now()
   await engine.load(await modelPieces(params))
+  {
+    const c = engine.layoutChoice
+    if (c)
+      log(
+        `LAYOUT ${c.layout} (writing matmul: RGBA4 ${c.rgba4Ms.toFixed(3)} ms, bytes ${c.bytesMs.toFixed(3)} ms)`
+      )
+  }
   // Profile: the prompt with each kind of pass left out in turn.
   if (params.skip) {
     log(
