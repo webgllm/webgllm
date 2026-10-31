@@ -897,6 +897,31 @@ async function smoke(params: {
       `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
   }
+  if (prompt.length > 1000) {
+    // Chunked attention (long key ranges) against the one-pass kernel: the
+    // same prompt and 16 writing steps, logits compared step by step.
+    const run = async (chunkTexels: number) => {
+      const saved = TUNING.attendChunkTexels
+      TUNING.attendChunkTexels = chunkTexels
+      engine.reset()
+      const out: Array<Float32Array> = [await engine.forward(prompt)]
+      for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+      TUNING.attendChunkTexels = saved
+      return out
+    }
+    const plain = await run(0)
+    const chunked = await run(64)
+    let worst = 0
+    let same = 0
+    for (let i = 0; i < plain.length; i++) {
+      const r = compareLogits(chunked[i], plain[i])
+      worst = Math.max(worst, r.kl)
+      if (r.top1) same++
+    }
+    log(
+      `CHUNK CHECK: chunked vs one-pass attention over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${plain.length}`
+    )
+  }
   if (params.ab || params.abDecode) {
     // The A/B runs left the cache elsewhere: read the prompt again.
     engine.reset()
