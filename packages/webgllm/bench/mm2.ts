@@ -166,6 +166,55 @@ ${L.join("\n")}
 }
 
 /**
+ * gate|up fused with SwiGLU: each fragment computes gate rows 4g.. and up
+ * rows 4g.. (row group g + uHalfG) for 2 tokens, 8 rows sharing each
+ * activation fetch, and writes silu(gate) · up: 8 halves.
+ */
+function swigluKernel() {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 dg = texelFetch(uS, ivec2(kb, g), 0);`)
+  line(`vec4 du = texelFetch(uS, ivec2(kb, g + uHalfG), 0);`)
+  line(`vec4 bg0 = vec4(0.0); vec4 bg1 = vec4(0.0); vec4 bu0 = vec4(0.0); vec4 bu1 = vec4(0.0); float s0 = 0.0; float s1 = 0.0;`)
+  for (let j = 0; j < 8; j++) {
+    line(`{`)
+    for (const r of [0, 1, 2, 3]) {
+      line(`  vec4 g${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0);`)
+      line(`  vec4 u${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g + uHalfG), 0);`)
+    }
+    const half = j & 1 ? "h2hi" : "h2lo"
+    for (const t of [0, 1]) {
+      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`    s${t} += dot(a, vec4(1.0));`)
+      line(`    bg${t} += vec4(dot(g0, a), dot(g1, a), dot(g2, a), dot(g3, a));`)
+      line(`    bu${t} += vec4(dot(u0, a), dot(u1, a), dot(u2, a), dot(u3, a)); }`)
+    }
+    line(`}`)
+  }
+  for (const t of [0, 1]) {
+    line(`ag${t} += dg * (15.0 * bg${t} - 8.0 * s${t});`)
+    line(`au${t} += du * (15.0 * bu${t} - 8.0 * s${t});`)
+  }
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uHalfG;
+out uvec4 o;
+vec4 silu(vec4 x) { return x / (1.0 + exp(-x)); }
+void main() {
+  int g = int(gl_FragCoord.x);
+  int m0 = int(gl_FragCoord.y) * 2;
+  vec4 ag0 = vec4(0.0); vec4 ag1 = vec4(0.0); vec4 au0 = vec4(0.0); vec4 au1 = vec4(0.0);
+  for (int kb = 0; kb < uKb; kb++) {
+${L.join("\n")}
+  }
+  o = packH2(silu(ag0) * au0, silu(ag1) * au1);
+}`
+}
+
+/**
  * The same matmul in a vertex shader, captured with transform feedback:
  * vertex i = y · G + g computes rows 4g..4g+3 of tokens T·y..T·y+T-1 into
  * T vec4 varyings, with no per-pixel output budget. RGBA4 weights, h2
@@ -301,6 +350,7 @@ async function main(params: { batch?: number }) {
   const gpu = new Gpu(new OffscreenCanvas(1, 1))
   const gl = gpu.gl
   log(`GPU: ${gpu.limits.renderer}`)
+  if (params.batch) return shapes(gpu, params.batch)
   // Bare pass cost: tiny passes alternating between two outputs (each a new
   // framebuffer, as in a forward), and the same into one output.
   {
@@ -352,6 +402,231 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
       bestBig = Math.min(bestBig, (performance.now() - t0) / 300)
     }
     log(`PASS 1 pixel into 4096x512 f32, chained: ${(bestBig * 1000).toFixed(1)} µs per pass`)
+    // Same output texture every pass (an atlas: each pass draws its own
+    // 1-pixel spot), reading textures that aren't attached: no framebuffer
+    // switch between passes.
+    {
+      const atlas = gpu.texture(gl.RGBA32F, 64, 64)
+      const runSame = (i: number) =>
+        gpu.run({
+          name: "x",
+          program: tiny,
+          inputs: { uX: t[i % 3] },
+          output: atlas,
+          rect: { x: i % 64, y: (i >> 6) % 64, width: 1, height: 1 }
+        })
+      for (let i = 0; i < 50; i++) runSame(i)
+      await gpu.finish()
+      let best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 1000; i++) runSame(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 1000)
+      }
+      log(`PASS same output texture, new spot each pass: ${(best * 1000).toFixed(1)} µs per pass`)
+      // And alternating between two programs into the same texture.
+      const tiny2 = gpu.program(`${HEADER}
+uniform sampler2D uX;
+out vec4 o;
+void main() { o = texelFetch(uX, ivec2(0), 0) * 2.0; }`)
+      const runTwo = (i: number) =>
+        gpu.run({
+          name: "x",
+          program: i & 1 ? tiny : tiny2,
+          inputs: { uX: t[i % 3] },
+          output: atlas,
+          rect: { x: i % 64, y: (i >> 6) % 64, width: 1, height: 1 }
+        })
+      best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 1000; i++) runTwo(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 1000)
+      }
+      log(`PASS same output texture, two programs alternating: ${(best * 1000).toFixed(1)} µs per pass`)
+      gpu.delete(atlas)
+    }
+    // Output switches every pass but nothing reads what was just written.
+    {
+      const src = gpu.texture(gl.RGBA32F, 64, 64)
+      const outs = [0, 1].map(() => gpu.texture(gl.RGBA32F, 64, 64))
+      const runAlt = (i: number) =>
+        gpu.run({
+          name: "x",
+          program: tiny,
+          inputs: { uX: src },
+          output: outs[i % 2],
+          rect: { x: 0, y: 0, width: 1, height: 1 }
+        })
+      let best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 1000; i++) runAlt(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 1000)
+      }
+      log(`PASS output switches, no reads of fresh output: ${(best * 1000).toFixed(1)} µs per pass`)
+      // One pass per FBO but two draws in it: A→B then (same FBO B) a draw
+      // reading C, to see if extra draws in a pass are cheap.
+      gpu.delete(src)
+      for (const o of outs) gpu.delete(o)
+    }
+    // One framebuffer, two attachments, the draw target chosen per draw with
+    // drawBuffers (raw GL: the Gpu class binds one framebuffer per output set).
+    {
+      const src = gpu.texture(gl.RGBA32F, 64, 64)
+      const a0 = gpu.texture(gl.RGBA32F, 64, 64)
+      const a1 = gpu.texture(gl.RGBA32F, 64, 64)
+      const fb = gl.createFramebuffer()
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, a0.tex, 0)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, a1.tex, 0)
+      const one = gpu.program(`${HEADER}
+uniform sampler2D uX;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() { vec4 v = texelFetch(uX, ivec2(0), 0) + 1.0; o0 = v; o1 = v; }`)
+      gl.useProgram(one.program)
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, src.tex)
+      gl.uniform1i(gl.getUniformLocation(one.program, "uX"), 0)
+      const targets = [
+        [gl.COLOR_ATTACHMENT0, gl.NONE],
+        [gl.NONE, gl.COLOR_ATTACHMENT1]
+      ]
+      const draw = (i: number) => {
+        gl.drawBuffers(targets[i % 2])
+        gl.viewport(i % 64, 0, 1, 1)
+        gl.drawArrays(gl.TRIANGLES, 0, 3)
+      }
+      for (let i = 0; i < 50; i++) draw(i)
+      await gpu.finish()
+      let best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 1000; i++) draw(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 1000)
+      }
+      log(`PASS one framebuffer, drawBuffers switching between 2 targets: ${(best * 1000).toFixed(1)} µs per draw`)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.deleteFramebuffer(fb)
+      for (const x of [src, a0, a1]) gpu.delete(x)
+    }
+    // Additive blending: 16 instances summed into one RGBA32F output in a
+    // single draw (a split-K matmul without its reduce pass), chained.
+    {
+      const blendOk = !!gl.getExtension("EXT_float_blend")
+      log(`EXT_float_blend: ${blendOk ? "yes" : "no"}`)
+      const vs = gl.createShader(gl.VERTEX_SHADER)!
+      gl.shaderSource(vs, `#version 300 es
+flat out int vSlice;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  vSlice = gl_InstanceID;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`)
+      gl.compileShader(vs)
+      const fs = gl.createShader(gl.FRAGMENT_SHADER)!
+      gl.shaderSource(fs, `${HEADER}
+flat in int vSlice;
+uniform sampler2D uX;
+out vec4 o;
+void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
+      gl.compileShader(fs)
+      if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) log(`fs: ${gl.getShaderInfoLog(fs)}`)
+      const prog = gl.createProgram()!
+      gl.attachShader(prog, vs)
+      gl.attachShader(prog, fs)
+      gl.linkProgram(prog)
+      const outs = [0, 1, 2].map(() => gpu.texture(gl.RGBA32F, 64, 64))
+      const fbs = outs.map((o) => {
+        const fb = gl.createFramebuffer()!
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, o.tex, 0)
+        return fb
+      })
+      gl.useProgram(prog)
+      const loc = gl.getUniformLocation(prog, "uX")
+      let zeroDraw = false
+      const step = (i: number) => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbs[(i + 1) % 3])
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, outs[i % 3].tex)
+        gl.uniform1i(loc, 0)
+        gl.viewport(0, 0, 4, 1)
+        if (zeroDraw) {
+          // Zero the output with a draw (blend factors ZERO, ZERO), then sum.
+          gl.enable(gl.BLEND)
+          gl.blendFunc(gl.ZERO, gl.ZERO)
+          gl.drawArrays(gl.TRIANGLES, 0, 3)
+          gl.blendFunc(gl.ONE, gl.ONE)
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, 16)
+          gl.disable(gl.BLEND)
+        } else {
+          gl.enable(gl.SCISSOR_TEST)
+          gl.scissor(0, 0, 4, 1)
+          gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0])
+          gl.disable(gl.SCISSOR_TEST)
+          gl.enable(gl.BLEND)
+          gl.blendFunc(gl.ONE, gl.ONE)
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, 16)
+          gl.disable(gl.BLEND)
+        }
+      }
+      for (let i = 0; i < 30; i++) step(i)
+      await gpu.finish()
+      let best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 300; i++) step(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 300)
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbs[1])
+      const px = new Float32Array(4)
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px)
+      log(`BLEND clear + 16 blended instances, chained: ${(best * 1000).toFixed(1)} µs per step, sum ${px[0]} (expect 120)`)
+      zeroDraw = true
+      for (let i = 0; i < 30; i++) step(i)
+      await gpu.finish()
+      best = Infinity
+      for (let round = 0; round < 3; round++) {
+        const t0 = performance.now()
+        for (let i = 0; i < 300; i++) step(i)
+        await gpu.finish()
+        best = Math.min(best, (performance.now() - t0) / 300)
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbs[1])
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px)
+      log(`BLEND zeroing draw + 16 blended instances, chained: ${(best * 1000).toFixed(1)} µs per step, sum ${px[0]} (expect 120)`)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      for (const fb of fbs) gl.deleteFramebuffer(fb)
+      for (const o of outs) gpu.delete(o)
+    }
+    // Timer queries: GPU time of 200 chained passes.
+    const tq = gl.getExtension("EXT_disjoint_timer_query_webgl2") as {
+      TIME_ELAPSED_EXT: number
+    } | null
+    log(`timer query extension: ${tq ? "yes" : "no"}`)
+    if (tq) {
+      const q = gl.createQuery()!
+      gl.beginQuery(tq.TIME_ELAPSED_EXT, q)
+      const t0 = performance.now()
+      for (let i = 0; i < 200; i++)
+        gpu.run({ name: "x", program: tiny, inputs: { uX: t[i % 3] }, output: t[(i + 1) % 3], rect: { x: 0, y: 0, width: 1, height: 1 } })
+      gl.endQuery(tq.TIME_ELAPSED_EXT)
+      await gpu.finish()
+      const wall = performance.now() - t0
+      for (let i = 0; i < 200; i++) {
+        if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) break
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number
+      log(`TIMER 200 chained passes: GPU ${(ns / 1e3 / 200).toFixed(1)} µs per pass, wall ${((wall * 1000) / 200).toFixed(1)} µs per pass`)
+    }
     // CPU side alone: issue 1000 passes without waiting.
     const t1 = performance.now()
     for (let i = 0; i < 1000; i++)
@@ -363,10 +638,56 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
     for (const x of t) gpu.delete(x)
   }
   if (params.batch === 0) return
+}
+
+async function shapes(gpu: Gpu, batch: number) {
+  const gl = gpu.gl
+  const params = { batch }
+  {
+    // gate|up 15360 × 2048 fused with SwiGLU: 3840 fragments wide.
+    const N = 15360
+    const K = 2048
+    const M = batch
+    const blocks = K / 32
+    const G = N / 4
+    const w = gpu.texture(gl.RGBA4, blocks * 32, G)
+    const sc = gpu.texture(gl.RGBA16F, blocks, G)
+    const a = gpu.texture(gl.RGBA32UI, K / 8, M)
+    const outs = [0, 1].map(() => gpu.texture(gl.RGBA32UI, G / 2, M / 2))
+    const program = gpu.program(swigluKernel())
+    const run = (i: number) =>
+      gpu.run({
+        name: "mm",
+        program,
+        inputs: { uA: a, uW: w, uS: sc },
+        uniforms: { uKb: { int: blocks }, uHalfG: { int: G / 2 } },
+        output: outs[i % 2]
+      })
+    run(0)
+    run(1)
+    await gpu.finish()
+    let best = Infinity
+    for (let round = 0; round < 3; round++) {
+      const t0 = performance.now()
+      for (let i = 0; i < 10; i++) run(i)
+      await gpu.finish()
+      best = Math.min(best, (performance.now() - t0) / 10)
+    }
+    log(
+      `MM2 gate+up fused with SwiGLU ${N}x${K} M=${M}: ${best.toFixed(3)} ms, ${((2 * N * K * M) / best / 1e6).toFixed(0)} GFLOP/s`
+    )
+    for (const x of [w, sc, a, ...outs]) gpu.delete(x)
+  }
   for (const [label, N, K] of [
     ["gate+up", 15360, 2048],
     ["in_proj", 6144, 2048],
-    ["down", 2048, 7680]
+    ["qkvg", 3088, 2048],
+    ["out_proj/o", 2048, 2048],
+    ["o as 2 K-slices", 4096, 1024],
+    ["o as 4 K-slices", 8192, 512],
+    ["down", 2048, 7680],
+    ["down as 2 K-slices", 4096, 3840],
+    ["down as 4 K-slices", 8192, 1920]
   ] as const) {
     const blocks = K / 32
     const G = N / 4
@@ -385,7 +706,6 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
               { weights: "rgba4", acts: "f16", tokens: 1 }
             ]
           : [
-              { weights: "bytes", acts: "h2", tokens: 1 },
               { weights: "rgba4", acts: "h2", tokens: 2 }
             ]
       for (const v of variants) {
@@ -426,11 +746,7 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
-      for (const [rows, T] of [
-        [8, 1],
-        [4, 2],
-        [2, 4]
-      ]) {
+      for (const [rows, T] of [] as Array<[number, number]>) {
         // 2 rows: half a row group per fragment, so fragments cover N / 2.
         const width = (N / rows)
         const outs = [0, 1].map(() => gpu.texture(gl.RGBA32UI, width, M / T))

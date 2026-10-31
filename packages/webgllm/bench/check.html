@@ -50,6 +50,7 @@
         precision: params.get("precision") ?? "highp",
         layers: params.get("layers") !== "0",
         smoke: params.get("smoke") === "1",
+        ab: params.get("ab") ?? undefined,
         texels: params.get("texels") ?? undefined,
         question: params.get("q") ?? undefined,
         length: params.get("len") ? Number(params.get("len")) : undefined,

@@ -46,11 +46,15 @@ const release = (engine: Engine) =>
 
 /**
  * Prompt tokens per forward batch. The prompt matmuls compute two tokens
- * per fragment, so a big GPU needs big batches to stay busy; phones keep
- * small ones, for memory (~45 MB less).
+ * per fragment, so a big GPU needs big batches to stay busy; phones and
+ * tablets keep small ones, for memory (iOS caps a page's GPU memory). iPads
+ * report a Mac's user agent: touch points give them away.
  */
 const promptBatch = () =>
-  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) ? 128 : 512
+  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) ||
+  navigator.maxTouchPoints > 1
+    ? 128
+    : 512
 
 class Superseded extends Error {
   constructor() {
@@ -285,8 +289,10 @@ async function generate(request: GenerateRequest) {
   // batch so a later prompt can resume from there.
   const promptStart = performance.now()
   let row = 0
-  for (let i = start; i < prompt.length; i += engine.batchSize) {
-    const batch = prompt.slice(i, i + engine.batchSize)
+  let i = start
+  for (const size of engine.batchSizes(prompt.length - start)) {
+    const batch = prompt.slice(i, i + size)
+    i += size
     row = await engine.forwardHidden(batch)
     model.cached.push(...batch)
     engine.snapshot()

@@ -3,7 +3,7 @@
  * prompt and compares every layer's output and the logits with llama.cpp's
  * (served from /ref/, see bench/README.md).
  */
-import { Engine } from "../src/engine.js"
+import { Engine, TUNING } from "../src/engine.js"
 import type { LayerProbe } from "../src/engine.js"
 import { httpSource } from "../src/byte-source.js"
 import { headPermutation, loadGguf } from "../src/load-gguf.js"
@@ -155,6 +155,31 @@ async function run(params: {
   await engine.load(await modelPieces(params))
   log(
     `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
+  )
+  // The per-batch buffers, largest first.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const buffers = (engine as any).buffers as Record<string, unknown>
+  // Shared textures are counted once, under all their names.
+  const byId = new Map<number, { names: Array<string>; bytes: number }>()
+  for (const [name, value] of Object.entries(buffers)) {
+    for (const t of (Array.isArray(value) ? value : [value]) as Array<{
+      id: number
+      bytes: number
+    }>) {
+      const entry = byId.get(t.id) ?? { names: [], bytes: t.bytes }
+      if (!entry.names.includes(name)) entry.names.push(name)
+      byId.set(t.id, entry)
+    }
+  }
+  const merged = new Map<string, number>()
+  for (const { names, bytes } of byId.values()) {
+    const key = names.join("/")
+    merged.set(key, (merged.get(key) ?? 0) + bytes)
+  }
+  const sizes = [...merged.entries()]
+  sizes.sort((x, y) => y[1] - x[1])
+  log(
+    `buffers: ${sizes.map(([n, b]) => `${n} ${(b / 2 ** 20).toFixed(1)}`).join(", ")} MiB; total ${(sizes.reduce((s2, [, b]) => s2 + b, 0) / 2 ** 20).toFixed(0)} MiB`
   )
 
   const D = engine.config.hiddenSize
@@ -446,6 +471,7 @@ async function smoke(params: {
   length?: number
   skip?: Array<string>
   texels?: "bytes" | "words"
+  ab?: string
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -579,19 +605,58 @@ async function smoke(params: {
     const { ids, logits } = await engine.candidates(row, 50, 1.1)
     return ids[argmax(logits)]
   }
-  // The prompt three times (median), each from an empty cache.
+  // The prompt three times (median), each from an empty cache, with the
+  // GPU's own time from a timer query where there is one.
+  const gl = engine.gpu.gl
+  const tq = gl.getExtension("EXT_disjoint_timer_query_webgl2") as {
+    TIME_ELAPSED_EXT: number
+  } | null
   const times: Array<number> = []
+  const gpuTimes: Array<number> = []
   let token = 0
   for (let run = 0; run < 3; run++) {
     engine.reset()
     await engine.gpu.finish()
+    const query = tq ? gl.createQuery() : null
+    if (tq && query) gl.beginQuery(tq.TIME_ELAPSED_EXT, query)
     const t1 = performance.now()
     engine.setSeen(prompt, tokenizer.vocabSize)
-    token = await pick(await engine.forwardHidden(prompt))
+    const row = await engine.forwardHidden(prompt)
+    if (tq && query) gl.endQuery(tq.TIME_ELAPSED_EXT)
+    token = await pick(row)
     times.push(performance.now() - t1)
+    if (tq && query) {
+      while (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE))
+        await new Promise((r) => setTimeout(r, 2))
+      gpuTimes.push((gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6)
+      gl.deleteQuery(query)
+    }
+  }
+  // A/B: ?ab=knob:a,b runs the prompt alternating TUNING[knob] = a and b,
+  // 5 times each, and compares the medians (drift on a shared machine
+  // cancels out).
+  if (params.ab) {
+    const [knob, values] = params.ab.split(":")
+    const [a, b] = values.split(",").map(Number)
+    const runs: Record<string, Array<number>> = { [a]: [], [b]: [] }
+    const original = (TUNING as Record<string, number>)[knob]
+    for (let i = 0; i < 10; i++) {
+      const v = i % 2 === 0 ? a : b
+      ;(TUNING as Record<string, number>)[knob] = v
+      engine.reset()
+      await engine.gpu.finish()
+      const t = performance.now()
+      await pick(await engine.forwardHidden(prompt))
+      runs[v].push(performance.now() - t)
+    }
+    ;(TUNING as Record<string, number>)[knob] = original
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[2]
+    log(
+      `AB ${knob}=${a}: ${med(runs[a]).toFixed(1)} ms (${runs[a].map((t) => t.toFixed(0)).join(" ")}); ${knob}=${b}: ${med(runs[b]).toFixed(1)} ms (${runs[b].map((t) => t.toFixed(0)).join(" ")})`
+    )
   }
   const promptMs = [...times].sort((x, y) => x - y)[1]
-  log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms`)
+  log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms; GPU ${gpuTimes.map((t) => t.toFixed(0)).join(", ")} ms`)
   const out: Array<number> = []
   const t2 = performance.now()
   for (let i = 0; i < (params.length ? 64 : 48); i++) {

@@ -26,9 +26,24 @@ uvec4 packH2(vec4 a, vec4 b) {
   return uvec4(packHalf2x16(a.xy), packHalf2x16(a.zw), packHalf2x16(b.xy), packHalf2x16(b.zw));
 }
 /* Texel x (features 4x..4x+3) of token m in a pair tensor. */
+uniform int uPairSplit;
+uniform int uSliceStride;
 vec4 pf(highp usampler2D s, int x, int m) {
-  uvec4 u = texelFetch(s, ivec2(x, m >> 1), 0);
-  return (m & 1) == 0 ? h2lo(u) : h2hi(u);
+  // A K-split prompt matmul stacks its uPairSplit slices, uSliceStride
+  // rows apart.
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < max(uPairSplit, 1); k++) {
+    uvec4 u = texelFetch(s, ivec2(x, (m >> 1) + k * uSliceStride), 0);
+    acc += (m & 1) == 0 ? h2lo(u) : h2hi(u);
+  }
+  return acc;
+}
+/* The same from a split matmul's uSplitIn partial sums (row m · uSplitIn + s). */
+uniform int uSplitIn;
+vec4 pf(highp sampler2D s, int x, int m) {
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < uSplitIn; k++) acc += texelFetch(s, ivec2(x, m * uSplitIn + k), 0);
+  return acc;
 }
 `
 
@@ -236,17 +251,25 @@ ${o.zeros ? "uniform usampler2D uZ;" : ""}
 uniform int uKb;
 uniform int uH;
 uniform int uRowTexels;
+uniform int uSliceRows;
+uniform int uKbSlice;
 out uvec4 o;
 void main() {
+  // K split into slices stacked in the output: slice s's partial sums for
+  // pair row py are at row s · uSliceRows + py (pf adds them up).
   int g = int(gl_FragCoord.x);
-  int m0 = int(gl_FragCoord.y) * 2;
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 2 * (y - slice * uSliceRows);
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);
   int col = g / uH;
   int gr = g - col * uH;
   int wx = col * uRowTexels;
   int sx = col * uKb;
   vec4 acc0 = vec4(0.0);
   vec4 acc1 = vec4(0.0);
-  for (int kb = 0; kb < uKb; kb++) {
+  for (int kb = kb0; kb < kb1; kb++) {
 ${L.join("\n")}
   }
   o = packH2(acc0, acc1);
@@ -428,9 +451,14 @@ export const RMS_PARTS = 16
  * of row m. The norms add up the RMS_PARTS partials, so no pixel walks a
  * whole row.
  */
-export function rmsPartial(pair: boolean) {
+/**
+ * `kind`: x is f32, a pair tensor, or a split matmul's partial sums
+ * (read through pf).
+ */
+export function rmsPartial(kind: "f32" | "pair" | "split") {
+  const pair = kind !== "f32"
   return `${HEADER}
-uniform ${pair ? "usampler2D" : "sampler2D"} uX;
+uniform ${kind === "pair" ? "usampler2D" : "sampler2D"} uX;
 uniform int uTexels;
 uniform int uChunk;
 out vec4 o;
@@ -451,11 +479,12 @@ void main() {
 /** 1 / RMS of row m from its RMS_PARTIAL sums (uTexels: the row's texels). */
 const RMS_SCALE = `
 uniform sampler2D uR;
+uniform int uROff;
 uniform int uTexels;
 uniform float uEps;
 float rmsScale(int m) {
   vec4 s = vec4(0.0);
-  for (int p = 0; p < ${RMS_PARTS}; p++) s += texelFetch(uR, ivec2(p, m), 0);
+  for (int p = 0; p < ${RMS_PARTS}; p++) s += texelFetch(uR, ivec2(uROff + p, m), 0);
   return inversesqrt(dot(s, vec4(1.0)) / float(uTexels * 4) + uEps);
 }
 `
@@ -487,6 +516,43 @@ void main() {
   float r = rmsScale(p.y);
   o = texelFetch(uH, p, 0) + pf(uY, p.x, p.y) * r * texelFetch(uNorm, ivec2(p.x, 0), 0);
 }`
+
+/**
+ * The partial sums of squares of ADD_NORMED's output x = h + y · rms(y) · w,
+ * computed from its inputs, so they can be drawn in the same pass as the
+ * add itself (into the residual's last RMS_PARTS columns, from uBase).
+ */
+export const RMS_OF_ADD = `${HEADER}${RMS_SCALE}
+uniform sampler2D uH;
+uniform usampler2D uY;
+uniform sampler2D uNorm;
+uniform int uChunk;
+uniform int uBase;
+out vec4 o;
+void main() {
+  int p = int(gl_FragCoord.x) - uBase;
+  int m = int(gl_FragCoord.y);
+  float r = rmsScale(m);
+  int i0 = p * uChunk;
+  int i1 = min(uTexels, i0 + uChunk);
+  vec4 s = vec4(0.0);
+  for (int i = i0; i < i1; i++) {
+    vec4 v = texelFetch(uH, ivec2(i, m), 0) + pf(uY, i, m) * r * texelFetch(uNorm, ivec2(i, 0), 0);
+    s += v * v;
+  }
+  o = s;
+}`
+
+/**
+ * A kernel that reads matmul outputs (`names`) as pair tensors, made to
+ * read a split matmul's partial sums instead (pf's other overload).
+ */
+export function fromPartials(source: string, names: Array<string>) {
+  let out = source
+  for (const name of names)
+    out = out.replace(`uniform usampler2D ${name};`, `uniform sampler2D ${name};`)
+  return out
+}
 
 /**
  * The short convolution: from in_proj's output (f32 B | C | x, uD/4 texels
@@ -661,19 +727,31 @@ void main() {
   int m = uM0 + (y - h * uRows);
   int kh = h / uGroup;
   int qpos = uPos0 + m;
-  vec4 s = vec4(-1e30);
+  // The 4 keys' rows (masked ones read row 0 and are dropped below), and
+  // each query texel read once for all 4.
+  ivec4 j = uJ0 + 4 * x + ivec4(0, 1, 2, 3);
+  bvec4 live = bvec4(true);
+  ivec4 row = j;
   for (int c = 0; c < 4; c++) {
-    int j = uJ0 + 4 * x + c;
-    if (j - uJ0 >= uKeys || j > qpos || (uWindow > 0 && qpos - j >= uWindow)) continue;
-    float acc = 0.0;
-    for (int u = 0; u < 16; u++) {
-      uvec4 k = texelFetch(uK, ivec2(kh * 16 + u, uRing > 0 ? j % uRing : j), 0);
-      acc += dot(texelFetch(uQ, ivec2(h * 32 + 2 * u, m), 0), h2lo(k));
-      acc += dot(texelFetch(uQ, ivec2(h * 32 + 2 * u + 1, m), 0), h2hi(k));
-    }
-    s[c] = acc;
+    live[c] = !(j[c] - uJ0 >= uKeys || j[c] > qpos || (uWindow > 0 && qpos - j[c] >= uWindow));
+    row[c] = live[c] ? (uRing > 0 ? j[c] % uRing : j[c]) : 0;
   }
-  o = s;
+  if (!any(live)) { o = vec4(-1e30); return; }
+  vec4 acc = vec4(0.0);
+  for (int u = 0; u < 16; u++) {
+    vec4 qa = texelFetch(uQ, ivec2(h * 32 + 2 * u, m), 0);
+    vec4 qb = texelFetch(uQ, ivec2(h * 32 + 2 * u + 1, m), 0);
+    uvec4 k0 = texelFetch(uK, ivec2(kh * 16 + u, row.x), 0);
+    uvec4 k1 = texelFetch(uK, ivec2(kh * 16 + u, row.y), 0);
+    uvec4 k2 = texelFetch(uK, ivec2(kh * 16 + u, row.z), 0);
+    uvec4 k3 = texelFetch(uK, ivec2(kh * 16 + u, row.w), 0);
+    acc += vec4(
+      dot(qa, h2lo(k0)) + dot(qb, h2hi(k0)),
+      dot(qa, h2lo(k1)) + dot(qb, h2hi(k1)),
+      dot(qa, h2lo(k2)) + dot(qb, h2hi(k2)),
+      dot(qa, h2lo(k3)) + dot(qb, h2hi(k3)));
+  }
+  o = mix(vec4(-1e30), acc, vec4(live));
 }`
 
 /**

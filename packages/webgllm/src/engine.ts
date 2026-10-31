@@ -92,6 +92,15 @@ function toRgba4(words: Uint32Array) {
   return out
 }
 
+/**
+ * Knobs for A/B timing on the bench page (bench/check.html?ab=...); the
+ * defaults are what the engine uses.
+ */
+export const TUNING = {
+  /** Prompt matmuls with at most this many row groups split K in two. */
+  sliceGroups: 1024
+}
+
 export type EngineOptions = {
   /**
    * Sliding-window layers keep only their window (plus a batch) of keys and
@@ -144,6 +153,11 @@ export class Engine {
   config!: ModelConfig
   readonly contextLength: number
   readonly batchSize: number
+  /**
+   * Rows the batch buffers hold: a batch, plus room for a short tail of the
+   * prompt to join the last batch rather than cost a pass of its own.
+   */
+  readonly capacity: number
   private precision: "highp" | "mediump"
   private bytes: boolean
   private ringCache: boolean
@@ -163,6 +177,7 @@ export class Engine {
     this.gpu = new Gpu(canvas)
     this.contextLength = options.contextLength ?? 8192
     this.batchSize = options.batchSize ?? 128
+    this.capacity = this.batchSize + this.batchSize / 8
     this.precision = options.matmulPrecision ?? "highp"
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
@@ -253,29 +268,39 @@ export class Engine {
 
   private allocate() {
     const c = this.config
-    const M = this.batchSize
+    const M = this.capacity
     const D = c.hiddenSize
     const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
     const scoreTexels = Math.ceil(this.contextLength / 4)
+    const qDims = c.numHeads * c.headDim
+    const I = c.intermediateSize
+    // Each tensor has its own texture: sharing one between tensors that are
+    // never alive at once saves ~25 MB at 512 rows, but a pass that writes a
+    // texture the pass before read must wait for it, and prompts read ~12%
+    // slower. The narrow matmuls' outputs are K-split, two slices tall.
     return {
       ids: this.gpu.texture(GL.R32UI, 1, M),
-      residual: [this.f32(D, M), this.f32(D, M)] as [Texture, Texture],
+      // The hidden state, and its rows' partial sums of squares in the last
+      // RMS_PARTS columns (drawn with the add that writes it).
+      residual: [0, 1].map(() =>
+        this.gpu.texture(GL.RGBA32F, D / 4 + K.RMS_PARTS, M)
+      ) as [Texture, Texture],
       rms: this.gpu.texture(GL.RGBA32F, K.RMS_PARTS, M),
       normed: this.h2(D, M),
-      opOut: this.pair(D, M),
+      opOut: this.pair(D, 2 * M),
       bcx: this.pair(3 * D, M),
       convOut: this.h2(D, M),
-      qkvg: this.pair(qkvg, M),
+      qkvg: this.pair(qkvg, 2 * M),
       q: this.f32(c.numHeads * c.headDim, M),
       scores: this.gpu.texture(
         GL.RGBA32F,
         scoreTexels,
         c.numHeads * Math.min(M, SCORE_ROWS)
       ),
-      attnOut: this.h2(c.numHeads * c.headDim, M),
-      gateUp: this.pair(2 * c.intermediateSize, M),
-      act: this.h2(c.intermediateSize, M),
-      ffnOut: this.pair(D, M),
+      attnOut: this.h2(qDims, M),
+      gateUp: this.pair(2 * I, M),
+      act: this.h2(I, M),
+      ffnOut: this.pair(D, 2 * M),
       lastNormed: this.h2(D, 1),
       logits: this.gpu.texture(
         GL.RGBA32F,
@@ -511,7 +536,7 @@ export class Engine {
       const kvDims = c.numKvHeads * c.headDim
       // A sliding-window layer only ever reads its window back: it keeps the
       // window plus one batch (written before the batch's queries read).
-      const window = c.slidingWindow + this.batchSize
+      const window = c.slidingWindow + this.capacity
       const ring =
         this.ringCache &&
         w.type === "sliding_attention" &&
@@ -675,7 +700,7 @@ export class Engine {
     const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
     this.debug ??= this.f32(
       Math.max(2 * c.intermediateSize, qkvg),
-      this.batchSize
+      this.capacity
     )
     return this.debug
   }
@@ -701,6 +726,27 @@ export class Engine {
         )
       }
     }
+  }
+
+  /**
+   * a · wᵀ for `rows` tokens: a few rows leave a split matmul's partial
+   * sums in the partial buffer and return the number of slices (consumers
+   * read them through pf, no reduce pass); more rows write the pair tensor
+   * `out` and return 0.
+   */
+  private project(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
+    if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows)
+    this.matmul(a, w, out, rows)
+    return 0
+  }
+
+  /** How each pair tensor was last written: K-slices stacked, rows apart. */
+  private slicing = new Map<number, { split: number; stride: number }>()
+
+  /** The uniforms pf needs to read pair tensor t (its K-slices). */
+  private pairIn(t: Texture) {
+    const p = this.slicing.get(t.id) ?? { split: 1, stride: 0 }
+    return { uPairSplit: { int: p.split }, uSliceStride: { int: p.stride } }
   }
 
   /** out (a pair tensor) = a · wᵀ for `rows` tokens of h2 activations. */
@@ -730,8 +776,33 @@ export class Engine {
         output: out,
         rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
       })
+      this.slicing.set(out.id, { split: 1, stride: 0 })
       return
     }
+    if (w.rgba4) {
+      // Narrow matrices split K in two, stacked in the output, so there are
+      // enough fragments to fill the GPU (consumers add the slices).
+      const pairRows = Math.ceil(rows / 2)
+      const slices = w.groups <= TUNING.sliceGroups ? 2 : 1
+      const width = w.groups
+      this.gpu.run({
+        name: "matmul",
+        program: this.gpu.program(
+          K.matmulPair({ zeros: !!w.zeros })
+        ),
+        inputs: weights,
+        uniforms: {
+          ...shape,
+          uSliceRows: { int: pairRows },
+          uKbSlice: { int: Math.ceil(w.blocks / slices) }
+        },
+        output: out,
+        rect: { x: 0, y: 0, width, height: pairRows * slices }
+      })
+      this.slicing.set(out.id, { split: slices, stride: pairRows })
+      return
+    }
+    this.slicing.set(out.id, { split: 1, stride: 0 })
     this.gpu.run({
       name: "matmul",
       program: this.gpu.program(
@@ -814,39 +885,53 @@ export class Engine {
 
   /**
    * Rows [row0, row0 + rows) of x's partial sums of squares, into the rms
-   * buffer; x is f32, or a pair tensor (a matmul's output).
+   * buffer; x is f32, a pair tensor (a matmul's output), or a split
+   * matmul's partial sums over `split` slices.
    */
-  private rms(x: Texture, row0: number, rows: number, pair = false) {
+  private rms(x: Texture, row0: number, rows: number, split = -1) {
     const texels = this.config.hiddenSize / 4
     this.gpu.run({
       name: "rms",
-      program: this.gpu.program(K.rmsPartial(pair)),
+      program: this.gpu.program(
+        K.rmsPartial(split < 0 ? "f32" : split > 0 ? "split" : "pair")
+      ),
       inputs: { uX: x },
       uniforms: {
         uTexels: { int: texels },
-        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) }
+        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) },
+        uSplitIn: { int: Math.max(split, 0) },
+        ...this.pairIn(x)
       },
       output: this.buffers.rms,
       rect: { x: 0, y: row0, width: K.RMS_PARTS, height: rows }
     })
   }
 
+  /**
+   * h2 out = rms-normed x · norm. x's rows' sums of squares are in its last
+   * columns (the add that wrote it drew them), or, with `ownSums` false,
+   * are computed here into the rms buffer first.
+   */
   private normToH2(
     x: Texture,
     norm: Texture,
     out: Texture,
     rows: number,
-    rowIn = -1
+    rowIn = -1,
+    ownSums = true
   ) {
     const { hiddenSize } = this.config
-    if (rowIn < 0) this.rms(x, 0, rows)
-    else this.rms(x, rowIn, 1)
+    if (!ownSums) {
+      if (rowIn < 0) this.rms(x, 0, rows)
+      else this.rms(x, rowIn, 1)
+    }
     this.gpu.run({
       name: "norm",
       program: this.gpu.program(K.NORM_TO_H2),
-      inputs: { uX: x, uR: this.buffers.rms, uNorm: norm },
+      inputs: { uX: x, uR: ownSums ? x : this.buffers.rms, uNorm: norm },
       uniforms: {
         uRowIn: { int: rowIn },
+        uROff: { int: ownSums ? hiddenSize / 4 : 0 },
         uTexels: { int: hiddenSize / 4 },
         uEps: this.config.normEps
       },
@@ -855,52 +940,87 @@ export class Engine {
     })
   }
 
-  /** out = h + post-norm(y): the sandwich norm and the residual add. */
+  /**
+   * out = h + post-norm(y): the sandwich norm and the residual add, with
+   * out's rows' sums of squares drawn into its last columns in the same pass
+   * (same output texture: no new render pass). y is a pair tensor, or a
+   * split matmul's partial sums over `split` slices.
+   */
   private addNormed(
     h: Texture,
     y: Texture,
     norm: Texture,
     out: Texture,
-    rows: number
+    rows: number,
+    split = 0
   ) {
     const { hiddenSize } = this.config
-    this.rms(y, 0, rows, true)
+    const texels = hiddenSize / 4
+    this.rms(y, 0, rows, split)
+    const read = (source: string) =>
+      this.gpu.program(split ? K.fromPartials(source, ["uY"]) : source)
+    const common = {
+      uTexels: { int: texels },
+      uEps: this.config.normEps,
+      uROff: { int: 0 },
+      uSplitIn: { int: split },
+      ...this.pairIn(y)
+    }
+    const inputs = { uH: h, uY: y, uR: this.buffers.rms, uNorm: norm }
     this.gpu.run({
       name: "add",
-      program: this.gpu.program(K.ADD_NORMED),
-      inputs: { uH: h, uY: y, uR: this.buffers.rms, uNorm: norm },
+      program: read(K.ADD_NORMED),
+      inputs,
+      uniforms: common,
+      output: out,
+      rect: { x: 0, y: 0, width: texels, height: rows }
+    })
+    this.gpu.run({
+      name: "add",
+      program: read(K.RMS_OF_ADD),
+      inputs,
       uniforms: {
-        uTexels: { int: hiddenSize / 4 },
-        uEps: this.config.normEps
+        ...common,
+        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) },
+        uBase: { int: texels }
       },
       output: out,
-      rect: { x: 0, y: 0, width: hiddenSize / 4, height: rows }
+      rect: { x: texels, y: 0, width: K.RMS_PARTS, height: rows }
     })
   }
 
+  /** The conv block; returns out_proj's split (see `project`). */
   private convolve(layer: NonNullable<GpuLayer["conv"]>, rows: number) {
     const c = this.config
     const b = this.buffers
     const dt = c.hiddenSize / 4
-    this.matmul(b.normed, layer.inProj, b.bcx, rows)
+    const split = this.project(b.normed, layer.inProj, b.bcx, rows)
+    const bcx = split ? b.partial : b.bcx
+    const read = (source: string) =>
+      this.gpu.program(split ? K.fromPartials(source, ["uBCx"]) : source)
     this.gpu.run({
       name: "conv",
-      program: this.gpu.program(K.shortConv(c.convKernel)),
-      inputs: { uBCx: b.bcx, uState: layer.state[0], uConv: layer.kernel },
-      uniforms: { uDt: { int: dt } },
+      program: read(K.shortConv(c.convKernel)),
+      inputs: { uBCx: bcx, uState: layer.state[0], uConv: layer.kernel },
+      uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
       output: b.convOut,
       rect: { x: 0, y: 0, width: c.hiddenSize / 8, height: rows }
     })
     this.gpu.run({
       name: "conv",
-      program: this.gpu.program(K.convState(c.convKernel)),
-      inputs: { uBCx: b.bcx, uState: layer.state[0] },
-      uniforms: { uDt: { int: dt }, uM: { int: rows } },
+      program: read(K.convState(c.convKernel)),
+      inputs: { uBCx: bcx, uState: layer.state[0] },
+      uniforms: {
+        uDt: { int: dt },
+        uM: { int: rows },
+        uSplitIn: { int: split },
+        ...this.pairIn(bcx)
+      },
       output: layer.state[1],
       rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
     })
     layer.state.reverse()
-    this.matmul(b.convOut, layer.outProj, b.opOut, rows)
+    return this.project(b.convOut, layer.outProj, b.opOut, rows)
   }
 
   private attend(
@@ -916,15 +1036,18 @@ export class Engine {
     const pairTexels = (sliding ? c.ropeDimsSliding : c.ropeDimsFull) / 8
     const qDims = c.numHeads * c.headDim
     const kvDims = c.numKvHeads * c.headDim
-    this.matmul(b.normed, layer.qkvg, b.qkvg, rows)
+    const split = this.project(b.normed, layer.qkvg, b.qkvg, rows)
+    const qkvgIn = split ? b.partial : b.qkvg
+    const read = (source: string) =>
+      this.gpu.program(split ? K.fromPartials(source, ["uQKVG"]) : source)
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
     this.gpu.run({
       name: "heads",
-      program: this.gpu.program(
-        K.headPrep({ out: "f32", rope: true, norm: true })
-      ),
-      inputs: { uQKVG: b.qkvg, uNorm: layer.qNorm, uRope: rope },
+      program: read(K.headPrep({ out: "f32", rope: true, norm: true })),
+      inputs: { uQKVG: qkvgIn, uNorm: layer.qNorm, uRope: rope },
       uniforms: {
+        uSplitIn: { int: split },
+        ...this.pairIn(qkvgIn),
         uBase: { int: 0 },
         uPairTexels: { int: pairTexels },
         uPos0: { int: pos0 },
@@ -945,11 +1068,11 @@ export class Engine {
       const offset = row0 - m0
       this.gpu.run({
         name: "heads",
-        program: this.gpu.program(
-          K.headPrep({ out: "h2", rope: true, norm: true })
-        ),
-        inputs: { uQKVG: b.qkvg, uNorm: layer.kNorm, uRope: rope },
+        program: read(K.headPrep({ out: "h2", rope: true, norm: true })),
+        inputs: { uQKVG: qkvgIn, uNorm: layer.kNorm, uRope: rope },
         uniforms: {
+          uSplitIn: { int: split },
+          ...this.pairIn(qkvgIn),
           uBase: { int: qDims / 4 },
           uPairTexels: { int: pairTexels },
           uPos0: { int: pos0 },
@@ -962,9 +1085,11 @@ export class Engine {
       })
       this.gpu.run({
         name: "heads",
-        program: this.gpu.program(K.VALUES),
-        inputs: { uQKVG: b.qkvg },
+        program: read(K.VALUES),
+        inputs: { uQKVG: qkvgIn },
         uniforms: {
+          uSplitIn: { int: split },
+          ...this.pairIn(qkvgIn),
           uBase: { int: (qDims + kvDims) / 4 },
           uRowOffset: { int: offset }
         },
@@ -1021,9 +1146,11 @@ export class Engine {
       })
       this.gpu.run({
         name: "attend",
-        program: this.gpu.program(K.ATTEND),
-        inputs: { uS: b.scores, uV: layer.values, uQKVG: b.qkvg },
+        program: read(K.ATTEND),
+        inputs: { uS: b.scores, uV: layer.values, uQKVG: qkvgIn },
         uniforms: {
+          uSplitIn: { int: split },
+          ...this.pairIn(qkvgIn),
           ...ring,
           uJ0: { int: j0 },
           uKeys: { int: keys },
@@ -1035,7 +1162,7 @@ export class Engine {
       })
       m0 += slice
     }
-    this.matmul(b.attnOut, layer.o, b.opOut, rows)
+    return this.project(b.attnOut, layer.o, b.opOut, rows)
   }
 
   /**
@@ -1053,14 +1180,29 @@ export class Engine {
       )
     }
     let last = 0
-    for (let start = 0; start < tokens.length; start += this.batchSize) {
-      const batch = Array.from(
-        { length: Math.min(this.batchSize, tokens.length - start) },
-        (_, i) => tokens[start + i]
-      )
+    let start = 0
+    for (const size of this.batchSizes(tokens.length)) {
+      const from = start
+      start += size
+      const batch = Array.from({ length: size }, (_, i) => tokens[from + i])
       last = await this.forwardBatch(batch, probe)
     }
     return this.logits(last)
+  }
+
+  /**
+   * How `count` tokens split into forward batches: full batches, and a
+   * last one that may run up to `capacity` so a short tail rides along.
+   */
+  batchSizes(count: number): Array<number> {
+    const sizes: Array<number> = []
+    let left = count
+    while (left > this.capacity) {
+      sizes.push(this.batchSize)
+      left -= this.batchSize
+    }
+    if (left > 0) sizes.push(left)
+    return sizes
   }
 
   /** Reads tokens into the cache without computing logits (for timing). */
@@ -1079,11 +1221,11 @@ export class Engine {
       )
     }
     let last = 0
-    for (let start = 0; start < tokens.length; start += this.batchSize) {
-      const batch = Array.from(
-        { length: Math.min(this.batchSize, tokens.length - start) },
-        (_, i) => tokens[start + i]
-      )
+    let start = 0
+    for (const size of this.batchSizes(tokens.length)) {
+      const from = start
+      start += size
+      const batch = Array.from({ length: size }, (_, i) => tokens[from + i])
       last = await this.forwardBatch(batch, undefined)
     }
     return last
@@ -1292,6 +1434,7 @@ export class Engine {
             program: this.gpu.program(
               h2 === "pair" ? K.PAIR_TO_F32 : K.H2_TO_F32
             ),
+            uniforms: this.pairIn(tex),
             inputs: { uX: tex },
             output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
@@ -1312,14 +1455,15 @@ export class Engine {
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       const [h, next] = b.residual
-      this.normToH2(h, layer.operatorNorm, b.normed, rows)
+      this.normToH2(h, layer.operatorNorm, b.normed, rows, -1, i > 0)
       await look(i, "operator_norm", b.normed, c.hiddenSize, true)
+      let opSplit = 0
       if (layer.conv) {
-        this.convolve(layer.conv, rows)
+        opSplit = this.convolve(layer.conv, rows)
         await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
       } else if (layer.attention) {
-        this.attend(layer.attention, layer.type, rows, pos0)
+        opSplit = this.attend(layer.attention, layer.type, rows, pos0)
         const qkvgDims =
           (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
         await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
@@ -1327,7 +1471,14 @@ export class Engine {
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)
       }
       await look(i, "op_out", b.opOut, c.hiddenSize, "pair")
-      this.addNormed(h, b.opOut, layer.postOperatorNorm, next, rows)
+      this.addNormed(
+        h,
+        opSplit ? b.partial : b.opOut,
+        layer.postOperatorNorm,
+        next,
+        rows,
+        opSplit
+      )
       await look(i, "after_op", next, c.hiddenSize)
       this.normToH2(next, layer.ffnNorm, b.normed, rows)
       if (rows <= SPLIT_ROWS) {
@@ -1351,14 +1502,24 @@ export class Engine {
           name: "swiglu",
           program: this.gpu.program(K.SWIGLU),
           inputs: { uGU: b.gateUp },
-          uniforms: { uHalf: { int: c.intermediateSize / 4 } },
+          uniforms: {
+            uHalf: { int: c.intermediateSize / 4 },
+            ...this.pairIn(b.gateUp)
+          },
           output: b.act,
           rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
         })
       }
-      this.matmul(b.act, layer.down, b.ffnOut, rows)
+      const downSplit = this.project(b.act, layer.down, b.ffnOut, rows)
       await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
-      this.addNormed(next, b.ffnOut, layer.postFfnNorm, h, rows)
+      this.addNormed(
+        next,
+        downSplit ? b.partial : b.ffnOut,
+        layer.postFfnNorm,
+        h,
+        rows,
+        downSplit
+      )
       await look(i, "l_out", h, c.hiddenSize)
     }
     this.position += rows
