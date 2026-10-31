@@ -61,12 +61,15 @@ async function main() {
     { name: "RGBA16UI", internal: gl.RGBA16UI, format: gl.RGBA_INTEGER, type: gl.UNSIGNED_SHORT, bytes: 8, float: false },
     { name: "RGBA32UI", internal: gl.RGBA32UI, format: gl.RGBA_INTEGER, type: gl.UNSIGNED_INT, bytes: 16, float: false }
   ]
-  // 64 MiB per texture: past any cache, about one big layer's weights.
-  const total = 64 * 2 ** 20
-  const width = 4096
+  // 64 MiB per texture (less on GPUs with small textures): past any
+  // cache, about one big layer's weights.
+  const max = gpu.limits.maxTextureSize
+  const width = Math.min(4096, max)
+  const total = Math.min(64 * 2 ** 20, width * max * 2)
+  const tall = Math.min(8192, max)
   const outs = {
-    strip: [0, 1].map(() => gpu.texture(gl.RGBA32F, 128, 8192)),
-    rows: [0, 1].map(() => gpu.texture(gl.RGBA32F, 8192, 128))
+    strip: [0, 1].map(() => gpu.texture(gl.RGBA32F, 128, tall)),
+    rows: [0, 1].map(() => gpu.texture(gl.RGBA32F, tall, 128))
   }
   for (const f of formats) {
     const rows = total / f.bytes / width

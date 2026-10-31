@@ -1158,7 +1158,7 @@ async function smoke(params: {
     let steps = 0
     let i = 0
     while (i < out.length) {
-      const draft = lookupDraft([...history, out[i]], 3)
+      const draft = lookupDraft([...history, out[i]], 7)
       let accepted = 0
       while (accepted < draft.length && out[i + 1 + accepted] === draft[accepted]) accepted++
       const kept = 1 + accepted
@@ -1177,7 +1177,7 @@ async function smoke(params: {
   // drafts by prompt lookup checked in one batch, greedy, so the tokens
   // must match the plain loop's exactly.
   // The worker's policy (src/worker.ts: DRAFT_MATCH, DRAFTS).
-  for (const [minMatch, maxDrafts] of [[2, 3]]) {
+  for (const [minMatch, maxDrafts] of [[2, 7]]) {
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)
     let tok = await pick(await engine.forwardHidden(prompt))

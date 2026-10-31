@@ -335,10 +335,7 @@ ${L.join("\n")}
  * to output 0 and 4q + 2, 4q + 3 to output 1, as pair texels, at row
  * s · uSliceRows + q for K-slice s (pfq reads them).
  */
-function matmulQuadSource(o: { zeros: boolean; half?: boolean }) {
-  // Half: each block's dots and sums in mediump (full rate on GPUs with
-  // half-precision ALUs); the scaled block results add up in highp.
-  const P = o.half ? "mediump " : ""
+function matmulQuadSource(o: { zeros: boolean }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -348,16 +345,16 @@ function matmulQuadSource(o: { zeros: boolean; half?: boolean }) {
       : `const vec4 z = vec4(8.0);`
   )
   line(
-    `${P}vec4 b0 = vec4(0.0); ${P}vec4 b1 = vec4(0.0); ${P}vec4 b2 = vec4(0.0); ${P}vec4 b3 = vec4(0.0);`
+    `vec4 b0 = vec4(0.0); vec4 b1 = vec4(0.0); vec4 b2 = vec4(0.0); vec4 b3 = vec4(0.0);`
   )
-  line(`${P}float s0 = 0.0; ${P}float s1 = 0.0; ${P}float s2 = 0.0; ${P}float s3 = 0.0;`)
+  line(`float s0 = 0.0; float s1 = 0.0; float s2 = 0.0; float s3 = 0.0;`)
   for (let j = 0; j < 8; j++) {
     line(`{`)
     for (const r of [0, 1, 2, 3])
-      line(`  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0);`)
     const half = j & 1 ? "h2hi" : "h2lo"
     for (const t of [0, 1, 2, 3]) {
-      line(`  { ${P}vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
       line(`    s${t} += dot(a, vec4(1.0));`)
       line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
     }
@@ -1770,17 +1767,19 @@ uniform int uLogitRows;
 uniform int uHeadSplit;
 uniform int uHeadStride;
 uniform ivec4 uExtra;
+uniform ivec4 uExtra2;
 /* The batch row that logits row 0 is (when rows are picked one at a time). */
 uniform int uPenaltyRow0;
 /*
  * Token id's logit with the repetition penalty for row r of a batch: the
- * mask's seen tokens, and the batch's drafts before row r (uExtra: draft i
- * is row i + 1's input, so rows after it have seen it).
+ * mask's seen tokens, and the batch's drafts before row r (uExtra, then
+ * uExtra2: draft i is row i + 1's input, so rows after it have seen it).
  */
 float penalized(float v, uint m, int id, int r) {
   if (m == 2u) return -1e30;
   bool seen = m == 1u;
   for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) seen = true;
+  for (int k = 0; k < 4; k++) if (k + 4 < r && uExtra2[k] == id) seen = true;
   if (seen) return v < 0.0 ? v * uPenalty : v / uPenalty;
   return v;
 }

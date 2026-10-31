@@ -48,15 +48,15 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
 /** Waits `ms`, or rejects when `signal` aborts. */
 const sleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms)
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer)
-        reject(signal.reason)
-      },
-      { once: true }
-    )
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", abort, { once: true })
   })
 
 /**
@@ -119,9 +119,13 @@ export async function download(
       loaded = 0
     }
     let total = file.bytes ?? 0
-    for (let attempt = 0; ; attempt++) {
+    // Failures in a row with no bytes gained: an interruption that made
+    // progress (iOS suspending the page, a dropped connection) starts over.
+    let attempt = 0
+    for (;;) {
       // Already whole (the marker was all that was missing).
       if (file.bytes !== undefined && loaded === file.bytes) break
+      const start = loaded
       try {
         const response = await fetch(fileUrl(file), {
           signal,
@@ -141,19 +145,27 @@ export async function download(
         if (!total) total = loaded + length
         const reader = response.body?.getReader()
         if (!reader) throw new Error("No response body.")
-        for (;;) {
-          const { done: end, value } = await reader.read()
-          if (end) break
-          access.write(value, { at: loaded })
-          loaded += value.byteLength
-          onProgress(loaded, total)
+        try {
+          for (;;) {
+            const { done: end, value } = await reader.read()
+            if (end) break
+            access.write(value, { at: loaded })
+            loaded += value.byteLength
+            onProgress(loaded, total)
+          }
+          access.flush()
+        } catch (error) {
+          // (A write failed: stop the response rather than let it run on.)
+          reader.cancel().catch(() => undefined)
+          throw error
         }
-        access.flush()
         break
       } catch (error) {
-        if (signal?.aborted || attempt + 1 >= ATTEMPTS) throw error
-        await sleep(1000 * 2 ** attempt, signal)
+        if (signal?.aborted) throw error
         loaded = await size()
+        attempt = loaded > start ? 1 : attempt + 1
+        if (attempt >= ATTEMPTS) throw error
+        await sleep(1000 * 2 ** (attempt - 1), signal)
       }
     }
     const final = await size()

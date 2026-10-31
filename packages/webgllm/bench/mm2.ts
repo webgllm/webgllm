@@ -609,7 +609,9 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
       }
       log(`PASS ${label}, chained: ${(best * 1000).toFixed(1)} µs per pass`)
     }
-    // The same 1-pixel pass, into big textures (4096 × 512 RGBA32F).
+    // The same 1-pixel pass, into big textures (4096 × 512 RGBA32F),
+    // without render-area hints first.
+    gpu.hints = 0
     const big = [0, 1, 2].map(() => gpu.texture(gl.RGBA32F, 4096, 512))
     const runBig = (i: number) =>
       gpu.run({
@@ -642,7 +644,7 @@ void main() { o = texelFetch(uX, ivec2(0), 0) + 1.0; }`)
       }
       log(`PASS 1 pixel into 4096x512 f32, hints ${hints === 1 ? "scissor" : hints === 2 ? "invalidate" : "scissor+invalidate"}: ${(bestHint * 1000).toFixed(1)} µs per pass`)
     }
-    gpu.hints = 0
+    gpu.hints = 1
     // Same output texture every pass (an atlas: each pass draws its own
     // 1-pixel spot), reading textures that aren't attached: no framebuffer
     // switch between passes.

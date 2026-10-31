@@ -43,7 +43,7 @@ let loading: {
  * as fast as one token, and the tokens kept are distributed exactly as
  * without drafts.
  */
-const DRAFTS = 3
+const DRAFTS = 7
 /**
  * Guessing (see Engine.forwardGuess) stops while fewer than this share of
  * the last GUESS_WINDOW guesses were the token drawn: a wrong guess holds

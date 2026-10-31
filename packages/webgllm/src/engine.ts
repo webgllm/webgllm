@@ -132,11 +132,20 @@ export const TUNING = {
    * of nothing but dots (see MATMUL_F16); 0: they dequantize as they read.
    */
   f16Matmul: 1,
+  /**
+   * ...for batches of at least this many tokens: dequantizing every matrix
+   * costs about as much as the f16 matmul saves on ~40 tokens (LFM3 on a
+   * PowerVR GPU), so short batches read the weights in place.
+   */
+  f16MinRows: 64,
   /** 1: reads of candidates nothing runs behind (no guess) block rather than poll a fence. */
   blockingReads: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
   renderHints: 1,
-  /** 1: the f16 matmul's dots in mediump (faster where it's half precision, less exact). */
+  /**
+   * 1: the f16 matmul's dots in mediump (faster where that's half
+   * precision, less exact); options.matmulPrecision "mediump" turns it on.
+   */
   f16Half: 0,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
@@ -265,7 +274,7 @@ const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
 export const MAX_CHUNKS = 64
 /** Batches this small split their matmuls along K (see TUNING). */
-const SPLIT_ROWS = 4
+const SPLIT_ROWS = 8
 
 export class Engine {
   readonly gpu: Gpu
@@ -327,6 +336,7 @@ export class Engine {
     this.capacity = this.batchSize + this.batchSize / 8
     this.scaleBatch = options.scaleBatch ?? true
     this.precision = options.matmulPrecision ?? "highp"
+    this.gpu.hints = TUNING.renderHints
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
     this.quadMatmuls = options.quadMatmuls ?? this.baseBatch >= 256
@@ -366,6 +376,8 @@ export class Engine {
     ) {
       throw new Error("The model's weights are incomplete.")
     }
+    // The f16 prompt matmul's scratch now, not in the middle of a prompt.
+    if (TUNING.f16Matmul > 0) this.f16Scratch()
     await this.gpu.finish()
   }
 
@@ -1227,10 +1239,15 @@ export class Engine {
 
   /**
    * The f16 prompt matmul's scratch: one matrix's dequantized weights (rows
-   * wrapped into columns uHd tall) and the activations as RGBA16F. Null
-   * until a prompt needs it; false where RGBA16F can't be drawn into.
+   * wrapped into columns uHd tall) and the activations as RGBA16F, in two
+   * textures used in turn (a matmul's conversion needn't wait for the last
+   * matmul's reads). Null until made; false where RGBA16F can't be drawn
+   * into.
    */
-  private f16: { w: Texture; a: Texture; hd: number } | null | false = null
+  private f16:
+    | { w: Texture; a: [Texture, Texture]; hd: number; next: number }
+    | null
+    | false = null
 
   private f16Scratch() {
     if (this.f16 !== null) return this.f16
@@ -1257,8 +1274,11 @@ export class Engine {
     const kMax = Math.max(...mats.map((m) => m.K))
     this.f16 = {
       w: this.gpu.texture(GL.RGBA16F, best.width, best.hd),
-      a: this.gpu.texture(GL.RGBA16F, kMax / 4, this.capacity),
-      hd: best.hd
+      a: [0, 1].map(() =>
+        this.gpu.texture(GL.RGBA16F, kMax / 4, this.capacity)
+      ) as [Texture, Texture],
+      hd: best.hd,
+      next: 0
     }
     return this.f16
   }
@@ -1296,9 +1316,14 @@ export class Engine {
         w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
       )
       const slices = Math.ceil(w.blocks / kbSlice)
-      const f = TUNING.f16Matmul > 0 ? this.f16Scratch() : false
+      const f =
+        TUNING.f16Matmul > 0 && rows >= TUNING.f16MinRows
+          ? this.f16Scratch()
+          : false
       if (f) {
         const kq = w.K / 4
+        const fa = f.a[f.next]
+        f.next ^= 1
         this.gpu.run({
           name: "dequant",
           program: this.gpu.program(K.dequantRgba4({ zeros: !!w.zeros })),
@@ -1328,19 +1353,23 @@ export class Engine {
           name: "dequant",
           program: this.gpu.program(K.H2_TO_F16),
           inputs: { uA: a },
-          output: f.a,
+          output: fa,
           rect: {
             x: 0,
             y: 0,
             width: kq,
-            height: Math.min(quadRows * 4, f.a.height)
+            height: Math.min(quadRows * 4, fa.height)
           }
         })
         const kqSlice = kbSlice * 8
         this.gpu.run({
           name: "matmul",
-          program: this.gpu.program(K.matmulF16({ half: TUNING.f16Half > 0 })),
-          inputs: { uW: f.w, uA: f.a },
+          program: this.gpu.program(
+            K.matmulF16({
+              half: TUNING.f16Half > 0 || this.precision === "mediump"
+            })
+          ),
+          inputs: { uW: f.w, uA: fa },
           uniforms: {
             uKq: { int: kq },
             uHd: { int: f.hd },
@@ -1357,7 +1386,7 @@ export class Engine {
       }
       this.gpu.run({
         name: "matmul",
-        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros, half: this.precision === "mediump" })),
+        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
         inputs: weights,
         uniforms: {
           ...shape,
@@ -2333,12 +2362,9 @@ export class Engine {
     const head = this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
-    const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as [
-      number,
-      number,
-      number,
-      number
-    ]
+    type Ivec4 = [number, number, number, number]
+    const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4
+    const extra2 = [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -2346,6 +2372,7 @@ export class Engine {
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
       uExtra: { ivec4: extra },
+      uExtra2: { ivec4: extra2 },
       uPenaltyRow0: { int: penaltyRow0 }
     }
     this.gpu.run({
