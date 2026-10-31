@@ -120,6 +120,11 @@ export class Gpu {
   private boundFb: WebGLFramebuffer | null = null
   /** Pass names not to draw: for timing what the rest costs (results are wrong). */
   skip = new Set<string>()
+  /**
+   * Pass names to draw twice, into the same target (no new render pass):
+   * for timing what their fragments cost beyond the pass itself.
+   */
+  repeat = new Set<string>()
   /** Fragments per draw before a pass is split into bands (GPU watchdog). */
   maxFragmentsPerDraw = 1 << 22
 
@@ -391,11 +396,14 @@ export class Gpu {
       1,
       Math.floor(this.maxFragmentsPerDraw / rect.width)
     )
-    for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
-      const height = Math.min(rowsPerBand, rect.y + rect.height - y)
-      gl.viewport(rect.x, y, rect.width, height)
-      gl.drawArrays(gl.TRIANGLES, 0, 3)
-      this.draws++
+    const times = pass.name && this.repeat.has(pass.name) ? 2 : 1
+    for (let n = 0; n < times; n++) {
+      for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
+        const height = Math.min(rowsPerBand, rect.y + rect.height - y)
+        gl.viewport(rect.x, y, rect.width, height)
+        gl.drawArrays(gl.TRIANGLES, 0, 3)
+        this.draws++
+      }
     }
   }
 

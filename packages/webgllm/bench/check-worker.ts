@@ -563,6 +563,29 @@ async function smoke(params: {
     }
     const full = await step("everything", [])
     {
+      // Fragment work per kind of pass: each drawn twice (same target, no
+      // new render pass), GPU time added. Best of 3 rounds of 16 tokens.
+      const gpuTime = async () => {
+        let best = Infinity
+        for (let round = 0; round < 3; round++) {
+          await engine.gpu.finish()
+          const t = performance.now()
+          for (let i = 0; i < 16; i++) await engine.forwardNoLogits([tokens[i]])
+          await engine.gpu.finish()
+          best = Math.min(best, (performance.now() - t) / 16)
+        }
+        return best
+      }
+      const base = await gpuTime()
+      const parts: Array<string> = []
+      for (const name of ["matmul", "rms", "add", "swiglu", "heads", "conv", "scores", "attend"]) {
+        engine.gpu.repeat = new Set([name])
+        parts.push(`${name} ${(await gpuTime() - base).toFixed(2)}`)
+      }
+      engine.gpu.repeat = new Set()
+      log(`WORK (ms per token, fragments only; base ${base.toFixed(2)}): ${parts.join(", ")}`)
+    }
+    {
       // JS issue time: forwards queued, timed before the wait.
       await engine.gpu.finish()
       const ti = performance.now()

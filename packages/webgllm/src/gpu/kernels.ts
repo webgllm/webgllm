@@ -1017,6 +1017,7 @@ uniform int uGroup;
 uniform int uGateTexel;
 uniform int uKt;
 uniform int uPanelRows;
+uniform int uVOff;
 out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
@@ -1028,27 +1029,52 @@ void main() {
   int panel = r / uPanelRows;
   int row = r - panel * uPanelRows;
   int sx = panel * uKt;
+  // Whole score texels, two at a time with their own sums, so the reads
+  // go out together (masked keys score -1e30: weight 0).
   int texels = (uKeys + 3) / 4;
-  float mx = -1e30;
-  for (int i = 0; i < texels; i++) {
-    vec4 s = texelFetch(uS, ivec2(sx + i, row), 0);
-    mx = max(mx, max(max(s.x, s.y), max(s.z, s.w)));
+  vec4 m0 = vec4(-1e30);
+  vec4 m1 = vec4(-1e30);
+  int i = 0;
+  for (; i + 1 < texels; i += 2) {
+    m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
+    m1 = max(m1, texelFetch(uS, ivec2(sx + i + 1, row), 0));
   }
-  float l = 0.0;
+  if (i < texels) m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
+  m0 = max(m0, m1);
+  float mx = max(max(m0.x, m0.y), max(m0.z, m0.w));
+  int vx = uVOff + kh * ${U} + u;
+  vec4 l4 = vec4(0.0);
   vec4 lo = vec4(0.0);
   vec4 hi = vec4(0.0);
-  for (int i = 0; i < texels; i++) {
-    vec4 e = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx);
-    l += dot(e, vec4(1.0));
-    for (int c = 0; c < 4; c++) {
-      int j = 4 * i + c;
-      if (j >= uKeys) break;
-      int vj = uJ0 + j;
-      uvec4 v = texelFetch(uV, ivec2(kh * ${U} + u, uRing > 0 ? vj % uRing : vj), 0);
-      lo += e[c] * h2lo(v);
-      hi += e[c] * h2hi(v);
+  vec4 lo1 = vec4(0.0);
+  vec4 hi1 = vec4(0.0);
+  for (i = 0; i < texels; i += 2) {
+    bool two = i + 1 < texels;
+    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx);
+    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx) : vec4(0.0);
+    l4 += e0 + e1;
+    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j1 = j0 + 4;
+    if (uRing > 0) {
+      j0 = j0 - (j0 / uRing) * uRing;
+      j1 = j1 - (j1 / uRing) * uRing;
     }
+    uvec4 a0 = texelFetch(uV, ivec2(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, ivec2(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, ivec2(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, ivec2(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, ivec2(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, ivec2(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, ivec2(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, ivec2(vx, j1.w), 0);
+    lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
+    hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
+    lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
+    hi1 += e1.x * h2hi(b0) + e1.y * h2hi(b1) + e1.z * h2hi(b2) + e1.w * h2hi(b3);
   }
+  lo += lo1;
+  hi += hi1;
+  float l = dot(l4, vec4(1.0));
   ${
     gate
       ? `float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
@@ -1066,9 +1092,10 @@ function valuesSource(headDim: number) {
 uniform usampler2D uQKVG;
 uniform int uBase;
 uniform int uRowOffset;
+uniform int uXOff;
 out uvec4 o;
 void main() {
-  int x = int(gl_FragCoord.x);
+  int x = int(gl_FragCoord.x) - uXOff;
   int m = int(gl_FragCoord.y) - uRowOffset;
   int head = x / ${U};
   int t = uBase + head * ${2 * U} + (x % ${U}) * 2;
@@ -1411,6 +1438,28 @@ export function fromPartials(source: string, names: Array<string>) {
   if (out === undefined) {
     out = fromPartialsSource(source, names)
     bySource.set(key, out)
+  }
+  return out
+}
+
+const splitCache = new Map<string, Map<number, string>>()
+/**
+ * `source` with pf's slice count fixed at `split` (a constant, not a
+ * uniform), so its loop unrolls to exactly that many reads, no branches.
+ */
+export function withSplit(source: string, split: number) {
+  let bySource = splitCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    splitCache.set(source, bySource)
+  }
+  let out = bySource.get(split)
+  if (out === undefined) {
+    out = source.replace(
+      "uniform int uSplitIn;",
+      `const int uSplitIn = ${split};`
+    )
+    bySource.set(split, out)
   }
   return out
 }

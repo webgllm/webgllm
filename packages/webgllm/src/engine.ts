@@ -59,8 +59,8 @@ type GpuLayer = {
     o: GpuMatrix
     qNorm: Texture
     kNorm: Texture
-    keys: Texture
-    values: Texture
+    /** The key and value cache: keys, then values from column kvDims / 8. */
+    kv: Texture
     /**
      * Rows in the cache when it's a ring (sliding-window layers: the window
      * plus a batch, position p at row p % ring); 0 for a full cache.
@@ -584,8 +584,7 @@ export class Engine {
         o: this.matrix(w.attention.o),
         qNorm: this.vector(w.attention.qNorm),
         kNorm: this.vector(w.attention.kNorm),
-        keys: this.h2(kvDims, rows),
-        values: this.h2(kvDims, rows),
+        kv: this.h2(2 * kvDims, rows),
         ring
       }
     }
@@ -600,18 +599,15 @@ export class Engine {
    */
   private snapshots = new Map<
     number,
-    { conv: Array<Texture>; windows: Array<[Texture, Texture]> }
+    { conv: Array<Texture>; windows: Array<Texture> }
   >()
 
   private freeSnapshot(saved: {
     conv: Array<Texture>
-    windows: Array<[Texture, Texture]>
+    windows: Array<Texture>
   }) {
     saved.conv.forEach((t) => this.gpu.delete(t))
-    saved.windows.forEach(([k, v]) => {
-      this.gpu.delete(k)
-      this.gpu.delete(v)
-    })
+    saved.windows.forEach((kv) => this.gpu.delete(kv))
   }
 
   /**
@@ -656,7 +652,7 @@ export class Engine {
     const W = this.config.slidingWindow
     const saved = {
       conv: [] as Array<Texture>,
-      windows: [] as Array<[Texture, Texture]>
+      windows: [] as Array<Texture>
     }
     for (const layer of this.layers) {
       if (layer.conv) {
@@ -671,11 +667,9 @@ export class Engine {
       }
       const a = layer.attention
       if (a?.ring) {
-        const keys = this.gpu.texture(GL.RGBA32UI, a.keys.width, W)
-        const values = this.gpu.texture(GL.RGBA32UI, a.values.width, W)
-        this.copyPositions(a.keys, a.ring, keys, W, Math.max(0, at - W), at)
-        this.copyPositions(a.values, a.ring, values, W, Math.max(0, at - W), at)
-        saved.windows.push([keys, values])
+        const kv = this.gpu.texture(GL.RGBA32UI, a.kv.width, W)
+        this.copyPositions(a.kv, a.ring, kv, W, Math.max(0, at - W), at)
+        saved.windows.push(kv)
       }
     }
     this.snapshots.set(at, saved)
@@ -720,9 +714,8 @@ export class Engine {
       }
       const a = layer.attention
       if (a?.ring) {
-        const [keys, values] = saved.windows[w++]
-        this.copyPositions(keys, W, a.keys, a.ring, Math.max(0, at - W), at)
-        this.copyPositions(values, W, a.values, a.ring, Math.max(0, at - W), at)
+        const kv = saved.windows[w++]
+        this.copyPositions(kv, W, a.kv, a.ring, Math.max(0, at - W), at)
       }
     }
     this.position = at
@@ -810,8 +803,8 @@ export class Engine {
   }
 
   /** `source`, reading `names` from the last split matmul's partials. */
-  private fromSplit(source: string, names: Array<string>) {
-    return K.fromPartials(source, names)
+  private fromSplit(source: string, names: Array<string>, split: number) {
+    return K.withSplit(K.fromPartials(source, names), split)
   }
 
   /** How each pair tensor was last written: K-slices stacked, rows apart. */
@@ -994,7 +987,9 @@ export class Engine {
     this.gpu.run({
       name: "rms",
       program: this.gpu.program(
-        K.rmsPartial(split < 0 ? "f32" : split > 0 ? "split" : "pair")
+        split > 0
+          ? K.withSplit(K.rmsPartial("split"), split)
+          : K.rmsPartial(split < 0 ? "f32" : "pair")
       ),
       inputs: { uX: x },
       uniforms: {
@@ -1063,7 +1058,7 @@ export class Engine {
     const normed = !!norm
     if (normed) this.rms(y, 0, rows, split)
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uY"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uY"], split) : source)
     const common = {
       uTexels: { int: texels },
       uEps: this.config.normEps,
@@ -1126,7 +1121,7 @@ export class Engine {
     const split = this.project(input.a, layer.inProj, b.bcx, rows, input.norm)
     const bcx = split ? this.partials() : b.bcx
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uBCx"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uBCx"], split) : source)
     this.gpu.run({
       name: "conv",
       program: read(K.shortConv(c.convKernel)),
@@ -1180,7 +1175,7 @@ export class Engine {
     const split = this.project(input.a, layer.qkvg, b.qkvg, rows, input.norm)
     const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
-      this.gpu.program(split ? this.fromSplit(source, ["uQKVG"]) : source)
+      this.gpu.program(split ? this.fromSplit(source, ["uQKVG"], split) : source)
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
     this.gpu.run({
       name: "heads",
@@ -1225,9 +1220,10 @@ export class Engine {
           uEps: c.normEps,
           uScale: 1
         },
-        output: layer.keys,
+        output: layer.kv,
         rect: { x: 0, y: row0, width: kvDims / 8, height: run }
       })
+      // Values beside the keys: same texture, so no new render pass.
       this.gpu.run({
         name: "heads",
         program: read(K.values(c.headDim)),
@@ -1236,10 +1232,11 @@ export class Engine {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
           uBase: { int: (qDims + kvDims) / 4 },
-          uRowOffset: { int: offset }
+          uRowOffset: { int: offset },
+          uXOff: { int: kvDims / 8 }
         },
-        output: layer.values,
-        rect: { x: 0, y: row0, width: kvDims / 8, height: run }
+        output: layer.kv,
+        rect: { x: kvDims / 8, y: row0, width: kvDims / 8, height: run }
       })
       m0 += run
     }
@@ -1271,7 +1268,7 @@ export class Engine {
       this.gpu.run({
         name: "scores",
         program: this.gpu.program(K.scores(c.headDim)),
-        inputs: { uQ: b.q, uK: layer.keys },
+        inputs: { uQ: b.q, uK: layer.kv },
         uniforms: {
           ...ring,
           uJ0: { int: j0 },
@@ -1292,7 +1289,7 @@ export class Engine {
       this.gpu.run({
         name: "attend",
         program: read(K.attend(c.headDim, c.attentionGate)),
-        inputs: { uS: b.scores, uV: layer.values, uQKVG: qkvgIn },
+        inputs: { uS: b.scores, uV: layer.kv, uQKVG: qkvgIn },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
@@ -1300,7 +1297,8 @@ export class Engine {
           uJ0: { int: j0 },
           uKeys: { int: keys },
           uGroup: { int: group },
-          uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
+          uGateTexel: { int: (qDims + 2 * kvDims) / 4 },
+          uVOff: { int: kvDims / 8 }
         },
         output: b.attnOut,
         rect: { x: 0, y: m0, width: qDims / 8, height: slice }
@@ -1859,7 +1857,7 @@ export class Engine {
           : this.splitPartials(b.normed, layer.gateUp, rows)
         this.gpu.run({
           name: "swiglu",
-          program: this.gpu.program(K.REDUCE_SWIGLU),
+          program: this.gpu.program(K.withSplit(K.REDUCE_SWIGLU, slices)),
           inputs: { uP: this.partials() },
           uniforms: {
             uSplitIn: { int: slices },
