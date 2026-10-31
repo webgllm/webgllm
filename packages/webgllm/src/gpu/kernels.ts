@@ -1176,6 +1176,144 @@ void main() {
 }`
 }
 
+/**
+ * Attention for long key ranges, part 1: like attend, but over one chunk
+ * of uChunkTexels score texels, so many fragments share a query's keys.
+ * Row c · uSliceQ + (m - uM0): chunk c of query m. Outputs the chunk's
+ * softmax-weighted sum of values (dims 0..3 and 4..7, relative to the
+ * chunk's own max) and (max, sum of weights); attendCombine adds chunks.
+ */
+function attendChunkSource(headDim: number) {
+  const U = headDim / 8
+  return `${HEADER}
+uniform sampler2D uS;
+uniform usampler2D uV;
+uniform int uRows;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uGroup;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uVOff;
+uniform int uSliceQ;
+uniform int uChunkTexels;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = y / uSliceQ;
+  int qi = y - c * uSliceQ;
+  int h = x / ${U};
+  int u = x - h * ${U};
+  int kh = h / uGroup;
+  int r = h * uRows + qi;
+  int panel = r / uPanelRows;
+  int row = r - panel * uPanelRows;
+  int sx = panel * uKt;
+  int texels = (uKeys + 3) / 4;
+  int t0 = c * uChunkTexels;
+  int t1 = min(texels, t0 + uChunkTexels);
+  vec4 m0 = vec4(-1e30);
+  vec4 m1 = vec4(-1e30);
+  int i = t0;
+  for (; i + 1 < t1; i += 2) {
+    m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
+    m1 = max(m1, texelFetch(uS, ivec2(sx + i + 1, row), 0));
+  }
+  if (i < t1) m0 = max(m0, texelFetch(uS, ivec2(sx + i, row), 0));
+  m0 = max(m0, m1);
+  float mx = max(max(m0.x, m0.y), max(m0.z, m0.w));
+  if (mx < -1e29) {
+    // Every key in the chunk masked: it adds nothing.
+    o0 = vec4(0.0);
+    o1 = vec4(0.0);
+    o2 = vec4(-1e30, 0.0, 0.0, 0.0);
+    return;
+  }
+  int vx = uVOff + kh * ${U} + u;
+  vec4 l4 = vec4(0.0);
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  vec4 lo1 = vec4(0.0);
+  vec4 hi1 = vec4(0.0);
+  for (i = t0; i < t1; i += 2) {
+    bool two = i + 1 < t1;
+    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx);
+    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx) : vec4(0.0);
+    l4 += e0 + e1;
+    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j1 = j0 + 4;
+    if (uRing > 0) {
+      j0 = j0 - (j0 / uRing) * uRing;
+      j1 = j1 - (j1 / uRing) * uRing;
+    }
+    uvec4 a0 = texelFetch(uV, ivec2(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, ivec2(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, ivec2(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, ivec2(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, ivec2(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, ivec2(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, ivec2(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, ivec2(vx, j1.w), 0);
+    lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
+    hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
+    lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
+    hi1 += e1.x * h2hi(b0) + e1.y * h2hi(b1) + e1.z * h2hi(b2) + e1.w * h2hi(b3);
+  }
+  o0 = lo + lo1;
+  o1 = hi + hi1;
+  o2 = vec4(mx, dot(l4, vec4(1.0)), 0.0, 0.0);
+}`
+}
+
+/**
+ * Attention for long key ranges, part 2: query m's chunks (attendChunk)
+ * rescaled to the largest max and added up, times the head's gate, as h2.
+ */
+function attendCombineSource(headDim: number, gate: boolean) {
+  const U = headDim / 8
+  return `${HEADER}
+uniform sampler2D uP0;
+uniform sampler2D uP1;
+uniform sampler2D uP2;
+uniform usampler2D uQKVG;
+uniform int uM0;
+uniform int uSliceQ;
+uniform int uChunks;
+uniform int uGateTexel;
+out uvec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${U};
+  int qi = m - uM0;
+  float mx = -1e30;
+  for (int c = 0; c < uChunks; c++)
+    mx = max(mx, texelFetch(uP2, ivec2(x, c * uSliceQ + qi), 0).x);
+  float l = 0.0;
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  for (int c = 0; c < uChunks; c++) {
+    ivec2 p = ivec2(x, c * uSliceQ + qi);
+    vec2 ml = texelFetch(uP2, p, 0).xy;
+    float w = exp(ml.x - mx);
+    l += ml.y * w;
+    lo += w * texelFetch(uP0, p, 0);
+    hi += w * texelFetch(uP1, p, 0);
+  }
+  ${
+    gate
+      ? `float gate = pf(uQKVG, uGateTexel + h / 4, m)[h & 3];
+  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
+      : "float scale = 1.0 / l;"
+  }
+  o = packH2(lo * scale, hi * scale);
+}`
+}
+
 /** Values into the h2 cache: 8 dims per texel, rows offset to the cache position. */
 function valuesSource(headDim: number) {
   const U = headDim / 8
@@ -1625,3 +1763,6 @@ export function withPairSplit(source: string, split: number) {
   }
   return out
 }
+
+export const attendChunk = memo(attendChunkSource)
+export const attendCombine = memo(attendCombineSource)

@@ -108,6 +108,12 @@ export const TUNING = {
   maxSplit: 16,
   /** Pixels per row summing its squares (at most K.RMS_PARTS). */
   rmsParts: 64,
+  /**
+   * Attention over more than twice this many score texels (4 keys each)
+   * splits each query's keys into chunks of at least this many, summed by
+   * another pass, so many fragments share the work (0: never).
+   */
+  attendChunkTexels: 64,
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
@@ -177,6 +183,8 @@ const MAX_SNAPSHOTS = 8
  */
 const SCORE_ROWS = 32
 const SCORE_ROWS_LARGE = 64
+/** Most key chunks per query in chunked attention (see attendChunk). */
+const ATTEND_CHUNKS = 16
 /** Logits per chunk when picking candidates on the GPU. */
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
@@ -357,6 +365,20 @@ export class Engine {
           Math.min(M, this.batchSize >= 256 ? SCORE_ROWS_LARGE : SCORE_ROWS)
       ),
       attnOut: this.h2(qDims, M),
+      /**
+       * Chunked attention's partial results (desktop batches): weighted
+       * values (two textures) and (max, sum), per query and chunk.
+       */
+      attnChunks:
+        this.batchSize >= 256
+          ? ([0, 1, 2].map(() =>
+              this.gpu.texture(
+                GL.RGBA32F,
+                qDims / 8,
+                SCORE_ROWS_LARGE * ATTEND_CHUNKS
+              )
+            ) as [Texture, Texture, Texture])
+          : null,
       gateUp: this.pair(2 * I, M),
       act: this.h2(I, M),
       ffnOut: this.pair(D, 2 * M),
@@ -1395,6 +1417,58 @@ export class Engine {
           height: Math.min(panelRows, total)
         }
       })
+      const chunkBufs = b.attnChunks
+      const chunkTexels = Math.max(
+        TUNING.attendChunkTexels,
+        Math.ceil(kt / ATTEND_CHUNKS)
+      )
+      const chunks = Math.ceil(kt / chunkTexels)
+      if (
+        chunkBufs &&
+        TUNING.attendChunkTexels > 0 &&
+        kt > 2 * TUNING.attendChunkTexels &&
+        slice * chunks <= chunkBufs[0].height
+      ) {
+        // Long key ranges: chunks of keys in parallel, then combined.
+        this.gpu.run({
+          name: "attend",
+          program: this.gpu.program(K.attendChunk(c.headDim)),
+          inputs: { uS: b.scores, uV: layer.kv },
+          uniforms: {
+            ...ring,
+            uJ0: { int: j0 },
+            uKeys: { int: keys },
+            uGroup: { int: group },
+            uVOff: { int: kvDims / 8 },
+            uSliceQ: { int: slice },
+            uChunkTexels: { int: chunkTexels }
+          },
+          output: chunkBufs,
+          rect: { x: 0, y: 0, width: qDims / 8, height: slice * chunks }
+        })
+        this.gpu.run({
+          name: "attend",
+          program: read(K.attendCombine(c.headDim, c.attentionGate)),
+          inputs: {
+            uP0: chunkBufs[0],
+            uP1: chunkBufs[1],
+            uP2: chunkBufs[2],
+            ...qkvgInputs
+          },
+          uniforms: {
+            uSplitIn: { int: split },
+            ...this.pairIn(qkvgIn),
+            uM0: { int: m0 },
+            uSliceQ: { int: slice },
+            uChunks: { int: chunks },
+            uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
+          },
+          output: b.attnOut,
+          rect: { x: 0, y: m0, width: qDims / 8, height: slice }
+        })
+        m0 += slice
+        continue
+      }
       this.gpu.run({
         name: "attend",
         program: read(K.attend(c.headDim, c.attentionGate)),

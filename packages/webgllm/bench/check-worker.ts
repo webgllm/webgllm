@@ -1013,6 +1013,12 @@ async function smoke(params: {
 }
 
 onmessage = ({ data }) => {
+  // ?tune=knob:value,knob:value sets TUNING before anything runs.
+  for (const pair of ((data as { tune?: string }).tune ?? "").split(",")) {
+    const [knob, value] = pair.split(":")
+    if (knob && value !== undefined)
+      (TUNING as Record<string, number>)[knob] = Number(value)
+  }
   ;(data.smoke ? smoke(data) : run(data)).then(
     () => postMessage({ type: "done" }),
     (error: unknown) =>
