@@ -21,6 +21,12 @@ type GpuMatrix = {
   bits: 4 | 6 | 8
   /** Quants in byte textures rather than RGBA32UI. */
   bytes: boolean
+  /**
+   * 4-bit quants in an RGBA4 texture: texel (column · rowTexels + kb · 32 +
+   * r · 8 + j, row) holds row r's weights 32kb + 4j .. + 3 of the group, so
+   * the texture unit splits and converts them (layer weights).
+   */
+  rgba4: boolean
   blocks: number
   /** Row groups (N / 4). */
   groups: number
@@ -60,6 +66,30 @@ type GpuLayer = {
   }
   gateUp: GpuMatrix
   down: GpuMatrix
+}
+
+/**
+ * Q4_0 block rows (16 bytes: weight i in byte i's low nibble, weight
+ * 16 + i in its high nibble) as RGBA4 texels of 4 consecutive weights
+ * (UNSIGNED_SHORT_4_4_4_4: the first weight in the top nibble): word w of a
+ * block row gives texels w (low nibbles) and 4 + w (high nibbles).
+ */
+function toRgba4(words: Uint32Array) {
+  const out = new Uint16Array(words.length * 2)
+  const four = (x: number) =>
+    ((x & 15) << 12) |
+    (((x >>> 8) & 15) << 8) |
+    (((x >>> 16) & 15) << 4) |
+    ((x >>> 24) & 15)
+  for (let row = 0; row < words.length; row += 4) {
+    const o = row * 2
+    for (let w = 0; w < 4; w++) {
+      const x = words[row + w]
+      out[o + w] = four(x & 0x0f0f0f0f)
+      out[o + 4 + w] = four((x >>> 4) & 0x0f0f0f0f)
+    }
+  }
+  return out
 }
 
 export type EngineOptions = {
@@ -102,8 +132,6 @@ const SCORE_ROWS = 32
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
 export const MAX_CHUNKS = 64
-/** Batches this small sum each norm's row inside the pass that uses it. */
-const FUSED_NORM_ROWS = 8
 /** Batches this small split their matmuls along K... */
 const SPLIT_ROWS = 4
 /** ...into up to this many slices... */
@@ -218,6 +246,11 @@ export class Engine {
     return this.gpu.texture(GL.RGBA32UI, dims / 8, rows)
   }
 
+  /** A pair tensor: texel (x, y) holds features 4x.. of tokens 2y, 2y + 1 as halves. */
+  private pair(dims: number, rows: number) {
+    return this.gpu.texture(GL.RGBA32UI, dims / 4, Math.ceil(rows / 2))
+  }
+
   private allocate() {
     const c = this.config
     const M = this.batchSize
@@ -227,12 +260,12 @@ export class Engine {
     return {
       ids: this.gpu.texture(GL.R32UI, 1, M),
       residual: [this.f32(D, M), this.f32(D, M)] as [Texture, Texture],
-      rms: this.gpu.texture(GL.RGBA32F, 1, M),
+      rms: this.gpu.texture(GL.RGBA32F, K.RMS_PARTS, M),
       normed: this.h2(D, M),
-      opOut: this.f32(D, M),
-      bcx: this.f32(3 * D, M),
+      opOut: this.pair(D, M),
+      bcx: this.pair(3 * D, M),
       convOut: this.h2(D, M),
-      qkvg: this.f32(qkvg, M),
+      qkvg: this.pair(qkvg, M),
       q: this.f32(c.numHeads * c.headDim, M),
       scores: this.gpu.texture(
         GL.RGBA32F,
@@ -240,9 +273,9 @@ export class Engine {
         c.numHeads * Math.min(M, SCORE_ROWS)
       ),
       attnOut: this.h2(c.numHeads * c.headDim, M),
-      gateUp: this.f32(2 * c.intermediateSize, M),
+      gateUp: this.pair(2 * c.intermediateSize, M),
       act: this.h2(c.intermediateSize, M),
-      ffnOut: this.f32(D, M),
+      ffnOut: this.pair(D, M),
       lastNormed: this.h2(D, 1),
       logits: this.gpu.texture(
         GL.RGBA32F,
@@ -281,7 +314,7 @@ export class Engine {
 
   /** A quantized matrix as textures, filled with `m`. */
   private matrix(m: QuantMatrix): GpuMatrix {
-    const gm = this.allocateMatrix(m.N, m.K, m.bits, !!m.zeros)
+    const gm = this.allocateMatrix(m.N, m.K, m.bits, !!m.zeros, m.bits === 4)
     this.writeMatrix(gm, m, 0)
     return gm
   }
@@ -294,9 +327,38 @@ export class Engine {
     N: number,
     K: number,
     bits: 4 | 6 | 8,
-    withZeros: boolean
+    withZeros: boolean,
+    rgba4 = false
   ): GpuMatrix {
     const max = this.gpu.limits.maxTextureSize
+    if (rgba4) {
+      const blocks = K / 32
+      const groups = N / 4
+      const rowTexels = blocks * 32
+      const columns = Math.ceil(groups / max)
+      const rowsPerColumn = Math.ceil(groups / columns)
+      if (columns * rowTexels > max) {
+        throw new GpuError(
+          `A ${N}×${K} matrix doesn't fit in this GPU's textures.`
+        )
+      }
+      return {
+        N,
+        K,
+        bits,
+        bytes: false,
+        rgba4: true,
+        blocks,
+        groups,
+        rowsPerColumn,
+        rowTexels,
+        quants: this.gpu.texture(GL.RGBA4, columns * rowTexels, rowsPerColumn),
+        scales: this.gpu.texture(GL.RGBA16F, columns * blocks, rowsPerColumn),
+        zeros: withZeros
+          ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
+          : null
+      }
+    }
     // A block row: 4-bit 16 bytes, 8-bit 32, as RGBA32UI texels (1, 2) or
     // byte texels (4, 8); a Q6_K super-block row, 208 bytes: 52 byte texels
     // (always bytes: its kernels split them with float math, faster than
@@ -326,6 +388,7 @@ export class Engine {
       K,
       bits,
       bytes,
+      rgba4: false,
       blocks,
       groups,
       rowsPerColumn,
@@ -351,6 +414,17 @@ export class Engine {
       const run = Math.min(g0 + groups - g, rowsPerColumn - y)
       const local = g - g0
       const quants = m.quants.subarray(local * words, (local + run) * words)
+      if (gm.rgba4) {
+        this.gpu.write(
+          gm.quants,
+          { x: column * rowTexels, y, width: rowTexels, height: run },
+          {
+            format: GL.RGBA,
+            type: GL.UNSIGNED_SHORT_4_4_4_4,
+            pixels: toRgba4(quants)
+          }
+        )
+      } else
       this.gpu.write(
         gm.quants,
         { x: column * rowTexels, y, width: rowTexels, height: run },
@@ -629,101 +703,131 @@ export class Engine {
     }
   }
 
+  /** out (a pair tensor) = a · wᵀ for `rows` tokens of h2 activations. */
   private matmul(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
     const bits = w.bits
     if (bits === 6)
       throw new GpuError("Q6_K weights are only read as the output head.")
-    // A few rows: split K so the GPU has enough fragments to keep busy.
-    const split =
-      rows <= SPLIT_ROWS
-        ? Math.max(
-            1,
-            Math.min(
-              MAX_SPLIT,
-              Math.ceil(SPLIT_FRAGMENTS / (w.groups * rows)),
-              w.blocks / 8
-            )
-          )
-        : 1
-    if (split > 1) {
+    const weights = {
+      uA: a,
+      uW: w.quants,
+      uS: w.scales,
+      ...(w.zeros && { uZ: w.zeros })
+    }
+    const shape = {
+      uKb: { int: w.blocks },
+      uH: { int: w.rowsPerColumn },
+      uRowTexels: { int: w.rowTexels },
+      uG: { int: w.groups }
+    }
+    if (rows <= SPLIT_ROWS) {
+      const slices = this.splitPartials(a, w, rows)
+      this.gpu.run({
+        name: "matmul",
+        program: this.gpu.program(K.REDUCE_PAIR),
+        inputs: { uP: this.buffers.partial },
+        uniforms: { uSplit: { int: slices }, uRows: { int: rows } },
+        output: out,
+        rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
+      })
+      return
+    }
+    this.gpu.run({
+      name: "matmul",
+      program: this.gpu.program(
+        w.rgba4
+          ? K.matmulPair({ zeros: !!w.zeros })
+          : K.matmul({
+              bits,
+              zeros: !!w.zeros,
+              wrap: false,
+              precision: this.precision,
+              bytes: w.bytes,
+              pair: true
+            })
+      ),
+      inputs: weights,
+      uniforms: shape,
+      output: out,
+      rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) }
+    })
+  }
+
+  /**
+   * A few rows' matmul split along K, so the GPU has enough fragments to
+   * keep busy: partial sums into the partial buffer (row m · slices + s).
+   * Returns the number of slices.
+   */
+  private splitPartials(a: Texture, w: GpuMatrix, rows: number) {
+    const bits = w.bits
+    if (bits === 6)
+      throw new GpuError("Q6_K weights are only read as the output head.")
+    const weights = {
+      uA: a,
+      uW: w.quants,
+      uS: w.scales,
+      ...(w.zeros && { uZ: w.zeros })
+    }
+    const shape = {
+      uKb: { int: w.blocks },
+      uH: { int: w.rowsPerColumn },
+      uRowTexels: { int: w.rowTexels },
+      uG: { int: w.groups }
+    }
+    {
+      const split = Math.max(
+        1,
+        Math.min(
+          MAX_SPLIT,
+          Math.ceil(SPLIT_FRAGMENTS / (w.groups * rows)),
+          w.blocks / 8
+        )
+      )
       const kbSlice = Math.ceil(w.blocks / split)
       const slices = Math.ceil(w.blocks / kbSlice)
       this.gpu.run({
         name: "matmul",
         program: this.gpu.program(
-          K.matmul({
-            bits,
-            zeros: !!w.zeros,
-            wrap: false,
-            precision: this.precision,
-            bytes: w.bytes,
-            split: true
-          })
+          w.rgba4
+            ? K.matmulSplitRgba4({ zeros: !!w.zeros })
+            : K.matmul({
+                bits,
+                zeros: !!w.zeros,
+                wrap: false,
+                precision: this.precision,
+                bytes: w.bytes,
+                split: true
+              })
         ),
-        inputs: {
-          uA: a,
-          uW: w.quants,
-          uS: w.scales,
-          ...(w.zeros && { uZ: w.zeros })
-        },
+        inputs: weights,
         uniforms: {
-          uKb: { int: w.blocks },
-          uH: { int: w.rowsPerColumn },
-          uRowTexels: { int: w.rowTexels },
-          uG: { int: w.groups },
+          ...shape,
           uSplit: { int: slices },
           uKbSlice: { int: kbSlice }
         },
         output: this.buffers.partial,
         rect: { x: 0, y: 0, width: w.groups, height: rows * slices }
       })
-      this.gpu.run({
-        name: "matmul",
-        program: this.gpu.program(K.REDUCE_SLICES),
-        inputs: { uP: this.buffers.partial },
-        uniforms: { uSplit: { int: slices } },
-        output: out,
-        rect: { x: 0, y: 0, width: w.groups, height: rows }
-      })
-      return
+      return slices
     }
-    const program = this.gpu.program(
-      K.matmul({
-        bits,
-        zeros: !!w.zeros,
-        wrap: false,
-        precision: this.precision,
-        bytes: w.bytes
-      })
-    )
-    this.gpu.run({
-      name: "matmul",
-      program,
-      inputs: {
-        uA: a,
-        uW: w.quants,
-        uS: w.scales,
-        ...(w.zeros && { uZ: w.zeros })
-      },
-      uniforms: {
-        uKb: { int: w.blocks },
-        uH: { int: w.rowsPerColumn },
-        uRowTexels: { int: w.rowTexels },
-        uG: { int: w.groups }
-      },
-      output: out,
-      rect: { x: 0, y: 0, width: w.groups, height: rows }
-    })
   }
 
-  private rms(x: Texture, out: Texture, rows: number, texels: number) {
+  /**
+   * Rows [row0, row0 + rows) of x's partial sums of squares, into the rms
+   * buffer; x is f32, or a pair tensor (a matmul's output).
+   */
+  private rms(x: Texture, row0: number, rows: number, pair = false) {
+    const texels = this.config.hiddenSize / 4
     this.gpu.run({
       name: "rms",
-      program: this.gpu.program(K.RMS),
+      program: this.gpu.program(K.rmsPartial(pair)),
       inputs: { uX: x },
-      uniforms: { uTexels: { int: texels }, uEps: this.config.normEps },
-      output: out,
-      rect: { x: 0, y: 0, width: 1, height: rows }
+      uniforms: {
+        uTexels: { int: texels },
+        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) }
+      },
+      output: this.buffers.rms,
+      rect: { x: 0, y: row0, width: K.RMS_PARTS, height: rows }
     })
   }
 
@@ -735,28 +839,17 @@ export class Engine {
     rowIn = -1
   ) {
     const { hiddenSize } = this.config
-    if (rows <= FUSED_NORM_ROWS) {
-      // A few rows: each fragment sums the row itself, one draw instead of two.
-      this.gpu.run({
-        name: "norm",
-        program: this.gpu.program(K.NORM_TO_H2_FUSED),
-        inputs: { uX: x, uNorm: norm },
-        uniforms: {
-          uRowIn: { int: rowIn },
-          uTexels: { int: hiddenSize / 4 },
-          uEps: this.config.normEps
-        },
-        output: out,
-        rect: { x: 0, y: 0, width: hiddenSize / 8, height: rows }
-      })
-      return
-    }
-    this.rms(x, this.buffers.rms, rowIn < 0 ? rows : rowIn + 1, hiddenSize / 4)
+    if (rowIn < 0) this.rms(x, 0, rows)
+    else this.rms(x, rowIn, 1)
     this.gpu.run({
       name: "norm",
       program: this.gpu.program(K.NORM_TO_H2),
       inputs: { uX: x, uR: this.buffers.rms, uNorm: norm },
-      uniforms: { uRowIn: { int: rowIn } },
+      uniforms: {
+        uRowIn: { int: rowIn },
+        uTexels: { int: hiddenSize / 4 },
+        uEps: this.config.normEps
+      },
       output: out,
       rect: { x: 0, y: 0, width: hiddenSize / 8, height: rows }
     })
@@ -771,25 +864,15 @@ export class Engine {
     rows: number
   ) {
     const { hiddenSize } = this.config
-    if (rows <= FUSED_NORM_ROWS) {
-      this.gpu.run({
-        name: "add",
-        program: this.gpu.program(K.ADD_NORMED_FUSED),
-        inputs: { uH: h, uY: y, uNorm: norm },
-        uniforms: {
-          uTexels: { int: hiddenSize / 4 },
-          uEps: this.config.normEps
-        },
-        output: out,
-        rect: { x: 0, y: 0, width: hiddenSize / 4, height: rows }
-      })
-      return
-    }
-    this.rms(y, this.buffers.rms, rows, hiddenSize / 4)
+    this.rms(y, 0, rows, true)
     this.gpu.run({
       name: "add",
       program: this.gpu.program(K.ADD_NORMED),
       inputs: { uH: h, uY: y, uR: this.buffers.rms, uNorm: norm },
+      uniforms: {
+        uTexels: { int: hiddenSize / 4 },
+        uEps: this.config.normEps
+      },
       output: out,
       rect: { x: 0, y: 0, width: hiddenSize / 4, height: rows }
     })
@@ -890,18 +973,30 @@ export class Engine {
       })
       m0 += run
     }
-    // Queries in slices of SCORE_ROWS, so the scores buffer stays small:
-    // each slice sees keys up to its last query (and, in sliding layers,
-    // from its first query's window on).
+    // Queries in slices, so the scores buffer stays small: each slice sees
+    // keys up to its last query (and, in sliding layers, from its first
+    // query's window on). The buffer holds SCORE_ROWS queries of every head
+    // at the full context's width; with fewer keys than that, panels of
+    // them sit side by side and a slice holds more queries.
     const group = c.numHeads / c.numKvHeads
-    for (let m0 = 0; m0 < rows; m0 += SCORE_ROWS) {
-      const slice = Math.min(SCORE_ROWS, rows - m0)
+    const panelRows = b.scores.height
+    for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
+      const widest = Math.ceil((pos0 + rows - j0) / 4)
+      const panels = Math.max(1, Math.floor(b.scores.width / widest))
+      const slice = Math.min(
+        rows - m0,
+        Math.max(1, Math.floor((panels * panelRows) / c.numHeads))
+      )
       const keys = pos0 + m0 + slice - j0
+      const kt = Math.ceil(keys / 4)
+      const total = c.numHeads * slice
       const ring = {
         uRows: { int: slice },
         uM0: { int: m0 },
-        uRing: { int: layer.ring }
+        uRing: { int: layer.ring },
+        uKt: { int: kt },
+        uPanelRows: { int: panelRows }
       }
       this.gpu.run({
         name: "scores",
@@ -913,14 +1008,15 @@ export class Engine {
           uKeys: { int: keys },
           uPos0: { int: pos0 },
           uWindow: { int: sliding ? c.slidingWindow : 0 },
-          uGroup: { int: group }
+          uGroup: { int: group },
+          uTotalRows: { int: total }
         },
         output: b.scores,
         rect: {
           x: 0,
           y: 0,
-          width: Math.ceil(keys / 4),
-          height: c.numHeads * slice
+          width: Math.ceil(total / panelRows) * kt,
+          height: Math.min(panelRows, total)
         }
       })
       this.gpu.run({
@@ -937,6 +1033,7 @@ export class Engine {
         output: b.attnOut,
         rect: { x: 0, y: m0, width: qDims / 8, height: slice }
       })
+      m0 += slice
     }
     this.matmul(b.attnOut, layer.o, b.opOut, rows)
   }
@@ -1185,14 +1282,16 @@ export class Engine {
       name: string,
       tex: Texture,
       dims: number,
-      h2 = false
+      h2: boolean | "pair" = false
     ) => {
       if (!probe) return
       await probe(layer, name, async () => {
         let src = tex
         if (h2) {
           this.gpu.run({
-            program: this.gpu.program(K.H2_TO_F32),
+            program: this.gpu.program(
+              h2 === "pair" ? K.PAIR_TO_F32 : K.H2_TO_F32
+            ),
             inputs: { uX: tex },
             output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
@@ -1217,31 +1316,48 @@ export class Engine {
       await look(i, "operator_norm", b.normed, c.hiddenSize, true)
       if (layer.conv) {
         this.convolve(layer.conv, rows)
-        await look(i, "in_proj", b.bcx, 3 * c.hiddenSize)
+        await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
       } else if (layer.attention) {
         this.attend(layer.attention, layer.type, rows, pos0)
         const qkvgDims =
           (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
-        await look(i, "qkvg", b.qkvg, qkvgDims)
+        await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)
       }
-      await look(i, "op_out", b.opOut, c.hiddenSize)
+      await look(i, "op_out", b.opOut, c.hiddenSize, "pair")
       this.addNormed(h, b.opOut, layer.postOperatorNorm, next, rows)
       await look(i, "after_op", next, c.hiddenSize)
       this.normToH2(next, layer.ffnNorm, b.normed, rows)
-      this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
-      this.gpu.run({
-        name: "swiglu",
-        program: this.gpu.program(K.SWIGLU),
-        inputs: { uGU: b.gateUp },
-        uniforms: { uHalf: { int: c.intermediateSize / 4 } },
-        output: b.act,
-        rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
-      })
+      if (rows <= SPLIT_ROWS) {
+        // A few rows: the split matmul's slices are summed and through
+        // SwiGLU in one pass.
+        const slices = this.splitPartials(b.normed, layer.gateUp, rows)
+        this.gpu.run({
+          name: "swiglu",
+          program: this.gpu.program(K.REDUCE_SWIGLU),
+          inputs: { uP: b.partial },
+          uniforms: {
+            uSplit: { int: slices },
+            uHalf: { int: c.intermediateSize / 4 }
+          },
+          output: b.act,
+          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+        })
+      } else {
+        this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
+        this.gpu.run({
+          name: "swiglu",
+          program: this.gpu.program(K.SWIGLU),
+          inputs: { uGU: b.gateUp },
+          uniforms: { uHalf: { int: c.intermediateSize / 4 } },
+          output: b.act,
+          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+        })
+      }
       this.matmul(b.act, layer.down, b.ffnOut, rows)
-      await look(i, "ffn_out", b.ffnOut, c.hiddenSize)
+      await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
       this.addNormed(next, b.ffnOut, layer.postFfnNorm, h, rows)
       await look(i, "l_out", h, c.hiddenSize)
     }

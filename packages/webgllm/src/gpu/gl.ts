@@ -27,7 +27,10 @@ export const GL = {
   HALF_FLOAT: 0x140b,
   RGBA: 0x1908,
   RGBA32F: 0x8814,
+  RGBA4: 0x8056,
+  UNSIGNED_SHORT_4_4_4_4: 0x8033,
   RGBA16F: 0x881a,
+  R32F: 0x822e,
   R32UI: 0x8236,
   R8UI: 0x8232,
   RGBA32UI: 0x8d70,
@@ -39,6 +42,8 @@ export const GL = {
 
 /** A 2D texture used as a tensor. */
 export type Texture = {
+  /** Unique per texture, for caching framebuffers over several outputs. */
+  id: number
   tex: WebGLTexture
   width: number
   height: number
@@ -67,7 +72,11 @@ export type Pass = {
   inputs: Record<string, Texture>
   /** Integer uniforms go as `{ int: n }`; plain numbers are floats. */
   uniforms?: Record<string, Uniform | { int: number }>
-  output: Texture
+  /**
+   * The texture drawn into, or several of one size (multiple render
+   * targets: the shader's output `location` i writes texture i).
+   */
+  output: Texture | Array<Texture>
   /** The rectangle to draw, in texels; the whole output by default. */
   rect?: { x: number; y: number; width: number; height: number }
 }
@@ -84,6 +93,7 @@ const TEXEL_BYTES: Record<number, number> = {
   [0x8814]: 16, // RGBA32F
   [0x881a]: 8, // RGBA16F
   [0x8d7c]: 4, // RGBA8UI
+  [0x8056]: 2, // RGBA4
   [0x8d8e]: 4, // RGBA8I
   [0x8058]: 4, // RGBA8
   [0x822e]: 4, // R32F
@@ -96,7 +106,8 @@ export class Gpu {
   readonly limits: GpuLimits
   private vertexShader: WebGLShader
   private programs = new Map<string, Program>()
-  private framebuffers = new WeakMap<WebGLTexture, WebGLFramebuffer>()
+  private framebuffers = new Map<string, WebGLFramebuffer>()
+  private nextId = 1
   private lost = false
   /** Bytes in textures created and not deleted. */
   bytes = 0
@@ -254,7 +265,7 @@ export class Gpu {
     }
     const bytes = width * height * (TEXEL_BYTES[internal] ?? 16)
     this.bytes += bytes
-    return { tex, width, height, internal, bytes }
+    return { id: this.nextId++, tex, width, height, internal, bytes }
   }
 
   /** Writes `pixels` into a rectangle of a texture. */
@@ -280,34 +291,49 @@ export class Gpu {
   }
 
   delete(texture: Texture) {
-    const fb = this.framebuffers.get(texture.tex)
-    if (fb) this.gl.deleteFramebuffer(fb)
+    for (const [key, fb] of this.framebuffers) {
+      if (key.split(",").includes(String(texture.id))) {
+        this.gl.deleteFramebuffer(fb)
+        this.framebuffers.delete(key)
+      }
+    }
     this.gl.deleteTexture(texture.tex)
     this.bytes -= texture.bytes
   }
 
-  private framebuffer(texture: Texture) {
-    let fb = this.framebuffers.get(texture.tex)
+  private framebuffer(output: Texture | Array<Texture>) {
+    const textures = Array.isArray(output) ? output : [output]
+    const key = textures.map((t) => t.id).join(",")
+    let fb = this.framebuffers.get(key)
     if (!fb) {
       const gl = this.gl
+      if (textures.length > this.limits.maxDrawBuffers) {
+        throw new GpuError(
+          `This GPU draws into ${this.limits.maxDrawBuffers} textures at once; a pass needs ${textures.length}.`
+        )
+      }
       const created = gl.createFramebuffer()
       if (!created) throw new GpuError("Couldn't create a framebuffer.")
       fb = created
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
-      gl.framebufferTexture2D(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        gl.TEXTURE_2D,
-        texture.tex,
-        0
+      textures.forEach((texture, i) =>
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0 + i,
+          gl.TEXTURE_2D,
+          texture.tex,
+          0
+        )
       )
+      if (textures.length > 1)
+        gl.drawBuffers(textures.map((_, i) => gl.COLOR_ATTACHMENT0 + i))
       const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
       if (status !== gl.FRAMEBUFFER_COMPLETE && !gl.isContextLost()) {
         throw new GpuError(
           `Can't render to this texture (framebuffer status 0x${status.toString(16)}).`
         )
       }
-      this.framebuffers.set(texture.tex, fb)
+      this.framebuffers.set(key, fb)
     }
     return fb
   }
@@ -318,12 +344,13 @@ export class Gpu {
     if (pass.name && this.skip.has(pass.name)) return
     const gl = this.gl
     const { program } = pass
+    const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
     gl.useProgram(program.program)
     let unit = 0
     for (const name of program.samplers) {
       const input = pass.inputs[name]
       if (!input) throw new GpuError(`Pass is missing input ${name}.`)
-      if (input.tex === pass.output.tex)
+      if (outputs.some((o) => o.tex === input.tex))
         throw new GpuError(`Pass reads and writes ${name}.`)
       gl.activeTexture(gl.TEXTURE0 + unit)
       gl.bindTexture(gl.TEXTURE_2D, input.tex)
@@ -344,8 +371,8 @@ export class Gpu {
     const rect = pass.rect ?? {
       x: 0,
       y: 0,
-      width: pass.output.width,
-      height: pass.output.height
+      width: outputs[0].width,
+      height: outputs[0].height
     }
     // Bands of rows, each its own draw, so no single draw runs long enough
     // to trip the GPU watchdog.

@@ -44,6 +44,14 @@ const MIN_REPLY_TOKENS = 32
 const release = (engine: Engine) =>
   engine.gpu.gl.getExtension("WEBGL_lose_context")?.loseContext()
 
+/**
+ * Prompt tokens per forward batch. The prompt matmuls compute two tokens
+ * per fragment, so a big GPU needs big batches to stay busy; phones keep
+ * small ones, for memory (~45 MB less).
+ */
+const promptBatch = () =>
+  /Android|iPhone|iPad|Mobile/.test(navigator.userAgent) ? 128 : 512
+
 class Superseded extends Error {
   constructor() {
     super("Switched to another model.")
@@ -118,7 +126,8 @@ async function load(
   // The GPU first: a browser or GPU that can't run the model says so before
   // a gigabyte downloads.
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    contextLength: meta.context
+    contextLength: meta.context,
+    batchSize: promptBatch()
   })
   try {
     const { maxTextureSize } = engine.gpu.limits

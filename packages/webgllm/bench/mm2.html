@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mm2</title>
+    <style>
+      body {
+        font:
+          12px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      // ?model=…gguf&batch=128&precision=highp&layers=1
+      const params = new URLSearchParams(location.search)
+      const out = document.getElementById("out")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+        void fetch("/log", { method: "POST", body: text }).catch(
+          () => undefined
+        )
+      }
+      log(navigator.userAgent)
+      const worker = new Worker("/bundle/bench/mm2.js", {
+        type: "module"
+      })
+      worker.onmessage = ({ data }) => {
+        if (data.type === "log") log(data.text)
+        else if (data.type === "error") log(`ERROR: ${data.message}\nALL DONE`)
+        else if (data.type === "done") log("ALL DONE")
+      }
+      worker.onerror = (e) => log(`worker error: ${e.message}\nALL DONE`)
+      worker.postMessage({
+        model: params.get("model") ?? "LFM3-1.7B-QAD-Q4_0.gguf",
+        format: params.get("format") ?? "gguf",
+        onnx: params.get("onnx") ?? undefined,
+        ring: params.get("ring") !== "0",
+        batch: Number(params.get("batch") ?? 128),
+        precision: params.get("precision") ?? "highp",
+        layers: params.get("layers") !== "0",
+        smoke: params.get("smoke") === "1",
+        mm: params.get("mm") === "1",
+        texels: params.get("texels") ?? undefined,
+        quarter: params.get("quarter") === "1",
+        tokens: params.get("tokens") ? Number(params.get("tokens")) : undefined,
+        question: params.get("q") ?? undefined,
+        length: params.get("len") ? Number(params.get("len")) : undefined,
+        skip: params.get("skip") ? params.get("skip").split(",") : undefined
+      })
+    </script>
+  </body>
+</html>

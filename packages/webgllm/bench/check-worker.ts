@@ -445,6 +445,7 @@ async function smoke(params: {
   /** Pad the question to about this many prompt tokens, to time prompt reading. */
   length?: number
   skip?: Array<string>
+  texels?: "bytes" | "words"
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -465,7 +466,8 @@ async function smoke(params: {
   const canvas = new OffscreenCanvas(1, 1)
   const engine = new Engine(canvas, {
     batchSize: params.batch,
-    matmulPrecision: params.precision
+    matmulPrecision: params.precision,
+    weightTexels: params.texels
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
@@ -577,10 +579,19 @@ async function smoke(params: {
     const { ids, logits } = await engine.candidates(row, 50, 1.1)
     return ids[argmax(logits)]
   }
-  const t1 = performance.now()
-  engine.setSeen(prompt, tokenizer.vocabSize)
-  let token = await pick(await engine.forwardHidden(prompt))
-  const promptMs = performance.now() - t1
+  // The prompt three times (median), each from an empty cache.
+  const times: Array<number> = []
+  let token = 0
+  for (let run = 0; run < 3; run++) {
+    engine.reset()
+    await engine.gpu.finish()
+    const t1 = performance.now()
+    engine.setSeen(prompt, tokenizer.vocabSize)
+    token = await pick(await engine.forwardHidden(prompt))
+    times.push(performance.now() - t1)
+  }
+  const promptMs = [...times].sort((x, y) => x - y)[1]
+  log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms`)
   const out: Array<number> = []
   const t2 = performance.now()
   for (let i = 0; i < (params.length ? 64 : 48); i++) {
