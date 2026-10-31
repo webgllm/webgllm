@@ -1221,6 +1221,8 @@ uniform int uGroup;
 uniform int uKt;
 uniform int uPanelRows;
 uniform int uTotalRows;
+uniform int uSegRows;
+uniform int uSegKeys;
 ${KV_AT}
 ${members.map((i) => `layout(location = ${i}) out vec4 o${i};`).join("\n")}
 void main() {
@@ -1233,6 +1235,9 @@ void main() {
     ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
     return;
   }
+  // Key segment s of a long range: its rows follow segment s - 1's.
+  int s = y / uSegRows;
+  y -= s * uSegRows;
   int g = y / uRows;
   int m = uM0 + (y - g * uRows);
   int h0 = g * ${G};
@@ -1240,7 +1245,7 @@ void main() {
   int qpos = uPos0 + m;
   // The 4 keys' rows (masked ones read row 0 and are dropped below), and
   // each query texel read once for all 4.
-  ivec4 j = uJ0 + 4 * x + ivec4(0, 1, 2, 3);
+  ivec4 j = uJ0 + s * uSegKeys + 4 * x + ivec4(0, 1, 2, 3);
   bvec4 live = bvec4(true);
   ivec4 row = j;
   for (int c = 0; c < 4; c++) {
@@ -1400,6 +1405,9 @@ uniform int uVOff;
 uniform int uSliceQ;
 uniform int uChunkTexels;
 uniform int uChunk0;
+uniform int uSegRows;
+uniform int uSegKeys;
+uniform int uSegChunks;
 ${KV_AT}
 ${members
   .map(
@@ -1412,16 +1420,20 @@ void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
   int qi = y % uSliceQ;
-  // Chunk c of this pass's keys: rows from chunk uChunk0 on.
-  int c = y / uSliceQ - uChunk0;
+  // Chunk c of key segment s of this pass's keys (uSegChunks each): rows
+  // from chunk uChunk0 on. The segment's scores are its own rows.
+  int cg = y / uSliceQ - uChunk0;
+  int s = cg / uSegChunks;
+  int c = cg - s * uSegChunks;
   int g = x / ${U};
   int u = x - g * ${U};
   int kh = (g * ${G}) / uGroup;
-  int r = g * uRows + qi;
+  int r = s * uSegRows + g * uRows + qi;
   int panel = r / uPanelRows;
   int row = r - panel * uPanelRows;
   int sx = panel * uKt;
-  int texels = (uKeys + 3) / 4;
+  int sj0 = uJ0 + s * uSegKeys;
+  int texels = (max(0, min(uKeys - s * uSegKeys, uSegKeys)) + 3) / 4;
   int t0 = c * uChunkTexels;
   int t1 = min(texels, t0 + uChunkTexels);
   int vx = uVOff + kh * ${U} + u;
@@ -1461,7 +1473,7 @@ ${
     vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx0);
     vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx0) : vec4(0.0);
     l0 += e0 + e1;
-    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j0 = sj0 + 4 * i + ivec4(0, 1, 2, 3);
     ivec4 j1 = j0 + 4;
     if (uRing > 0) {
       j0 = j0 - (j0 / uRing) * uRing;
@@ -1486,7 +1498,7 @@ ${
   // -1e30, so exp(score - max) is exp(0) = 1 for masked keys; its weights
   // are zeroed below.)
   for (int i = t0; i < t1; i++) {
-    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j0 = sj0 + 4 * i + ivec4(0, 1, 2, 3);
     if (uRing > 0) j0 = j0 - (j0 / uRing) * uRing;
     uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
     uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);

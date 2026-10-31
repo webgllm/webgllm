@@ -808,13 +808,16 @@ async function smoke(params: {
       enableThinking: false
     })
   if (params.length) {
-    let pad = ""
-    while (
+    // Repeats of the filler from its token count (re-encoding the whole
+    // prompt per repeat is quadratic), then a few more to reach the length.
+    const count = (pad: string) =>
       tokenizer.encodeChat([{ role: "user", content: pad + question }], {
         addGenerationPrompt: true
-      }).length < params.length
-    )
-      pad += filler
+      }).length
+    const base = count("")
+    const per = count(filler) - base
+    let pad = filler.repeat(Math.max(0, Math.floor((params.length - base) / per)))
+    while (count(pad) < params.length) pad += filler
     question = `${pad}\n\n${question}`
   }
   const prompt = encode()
@@ -929,7 +932,40 @@ async function smoke(params: {
       `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
   }
-  if (prompt.length > 1000) {
+  const checks = (params as { checks?: boolean }).checks !== false
+  const compare = (params as { compare?: string }).compare
+  if (compare) {
+    // ?compare=knob:a,b: the prompt and 16 writing steps with TUNING[knob]
+    // = a, then b, logits compared step by step.
+    const [knob, values] = compare.split(":")
+    const [a, b] = values.split(",").map(Number)
+    const run = async (v: number) => {
+      const saved = (TUNING as Record<string, number>)[knob]
+      ;(TUNING as Record<string, number>)[knob] = v
+      try {
+        engine.reset()
+        const out: Array<Float32Array> = [await engine.forward(prompt)]
+        for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+        return out
+      } finally {
+        ;(TUNING as Record<string, number>)[knob] = saved
+      }
+    }
+    const ra = await run(a)
+    const rb = await run(b)
+    let worst = 0
+    let same = 0
+    for (let i = 0; i < ra.length; i++) {
+      const r = compareLogits(rb[i], ra[i])
+      worst = Math.max(worst, r.kl)
+      if (r.top1) same++
+    }
+    log(
+      `COMPARE ${knob}=${a} vs ${b} over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${ra.length}`
+    )
+    engine.reset()
+  }
+  if (prompt.length > 1000 && checks) {
     // Chunked attention (long key ranges) against the one-pass kernel: the
     // same prompt and 16 writing steps, logits compared step by step.
     const run = async (chunkTexels: number) => {
@@ -954,7 +990,7 @@ async function smoke(params: {
       `CHUNK CHECK: chunked vs one-pass attention over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${plain.length}`
     )
   }
-  if (prompt.length > 1000) {
+  if (prompt.length > 1000 && checks) {
     // Segmented attention (key ranges past the scores buffer's width, each
     // segment's chunks combined) against whole rows: 512-key segments.
     const run = async (texels: number) => {
@@ -982,7 +1018,7 @@ async function smoke(params: {
       `SEGMENT CHECK: 512-key segments vs whole rows over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${whole.length}`
     )
   }
-  if (params.ab || params.abDecode || prompt.length > 1000) {
+  if (params.ab || params.abDecode || compare || (prompt.length > 1000 && checks)) {
     // The A/B runs and checks left the cache elsewhere: read the prompt again.
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)

@@ -395,6 +395,7 @@ export class Gpu {
     const gl = this.gl
     const { program } = pass
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
+    this.lastOutput = outputs[0]
     gl.useProgram(program.program)
     let unit = 0
     for (const name of program.samplers) {
@@ -487,8 +488,43 @@ export class Gpu {
       if (gl.getSyncParameter(oldest, gl.SYNC_STATUS) === gl.SIGNALED) {
         gl.deleteSync(oldest)
         this.paced.shift()
-      } else await new Promise((resolve) => setTimeout(resolve, 1))
+        continue
+      }
+      // A page the browser counts as hidden has its timers throttled (a
+      // 1 ms wait can take a second, or a minute): then wait by reading a
+      // pixel of the last pass's output instead, which blocks until the
+      // GPU has done the queue. The queue stays bounded either way.
+      if (performance.now() < this.throttledUntil) {
+        this.readBack()
+        for (const f of this.paced) gl.deleteSync(f)
+        this.paced = []
+        break
+      }
+      const t = performance.now()
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      if (performance.now() - t > 50)
+        this.throttledUntil = performance.now() + 2000
     }
+  }
+
+  /** Until when pace waits by reading back, not by timers (see pace). */
+  private throttledUntil = 0
+  /** The last pass's first output, for readBack. */
+  private lastOutput: Texture | null = null
+
+  /** Reads a pixel of the last pass's output: returns once the GPU has done it. */
+  private readBack() {
+    const t = this.lastOutput
+    if (!t || this.isLost) return
+    const gl = this.gl
+    const float = t.internal === gl.RGBA32F || t.internal === gl.RGBA16F
+    const fb = this.framebuffer(t)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    this.boundFb = fb
+    if (float) gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, new Float32Array(4))
+    else if (t.internal === gl.RGBA32UI)
+      gl.readPixels(0, 0, 1, 1, gl.RGBA_INTEGER, gl.UNSIGNED_INT, new Uint32Array(4))
+    else gl.finish()
   }
 
   /** Flushes issued passes to the GPU, so it starts on them. */

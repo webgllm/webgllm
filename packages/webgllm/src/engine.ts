@@ -137,6 +137,10 @@ export const TUNING = {
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
    */
   foldNorm: 2,
+  /** 1: writing sizes its attention chunks by the key count (see attend). */
+  attendDecodeChunking: 1,
+  /** Key segments per scores pass (0: as many as the scores buffer holds). */
+  segmentGroup: 0,
   /**
    * The worker's speculative decoding (see worker.ts): drafts follow an
    * earlier occurrence of at least draftMatch last tokens; they're used
@@ -149,12 +153,15 @@ export const TUNING = {
   /** 1: few-row conv blocks draw their output and new state in one pass. */
   fuseConv: 1,
   /**
-   * Prompt batches run at most paceAhead chunks of this many layers ahead
-   * of the GPU (0: unpaced), so the browser's GPU process never holds
-   * seconds of work and pages keep drawing (see Gpu.pace).
+   * Prompt batches run at most paceAhead chunks ahead of the GPU, each
+   * about this many full-batch layers of matmul work (attention counted
+   * by paceAttention; 0: unpaced), so the browser's GPU process never
+   * holds seconds of work and pages keep drawing (see Gpu.pace).
    */
   paceLayers: 4,
-  paceAhead: 2
+  paceAhead: 2,
+  /** What an attention multiply-add costs against a matmul one, for pacing. */
+  paceAttention: 4
 }
 
 /**
@@ -1568,12 +1575,13 @@ export class Engine {
     })
   }
 
-  private attend(
+  private async attend(
     layer: NonNullable<GpuLayer["attention"]>,
     type: LayerType,
     rows: number,
     pos0: number,
-    input: MatIn
+    input: MatIn,
+    paced = false
   ) {
     const c = this.config
     const b = this.buffers
@@ -1724,7 +1732,26 @@ export class Engine {
       }
       const keys = pos0 + m0 + slice - j0
       const kt = Math.ceil(keys / 4)
-      const chunkTexels = texelsPer(Math.min(kt, segTexels))
+      const segments = Math.ceil(kt / segTexels)
+      // Chunks a segment holds, the last one's padded with empty chunks.
+      const segChunksOf = (t: number) => Math.ceil(Math.min(kt, segTexels) / t)
+      const chunksOf = (t: number) => segments * segChunksOf(t)
+      let chunkTexels = texelsPer(Math.min(kt, segTexels))
+      if (rows <= SPLIT_ROWS && TUNING.attendDecodeChunking > 0) {
+        // Writing: few queries, so the chunks are the parallel work. About
+        // √(kt / 2) texels each balances the chunk pass (each fragment
+        // walks a chunk) against the combine (each walks every chunk).
+        const segKt = Math.min(kt, segTexels)
+        let t = Math.min(
+          segKt,
+          Math.max(
+            TUNING.attendChunkTexels,
+            2 ** Math.round(Math.log2(Math.sqrt(kt / 2)))
+          )
+        )
+        while (t < segKt && slice * chunksOf(t) > chunkRows) t *= 2
+        chunkTexels = t
+      }
       const total = rowGroups * slice
       const ring = {
         uRows: { int: slice },
@@ -1734,34 +1761,35 @@ export class Engine {
         uPanelRows: { int: panelRows },
         ...kvAt
       }
-      const scores = (sj0: number, sKeys: number) =>
+      // Attention's multiply-adds over `n` keys, in matmul terms.
+      const attentionWork = (n: number) =>
+        slice * n * c.numHeads * c.headDim * 2 * TUNING.paceAttention
+      // Segments stack as rows: segment s of a pass at rows s · total on.
+      const segRows = { uSegRows: { int: total }, uSegKeys: { int: 4 * segTexels } }
+      const scores = (sj0: number, sKeys: number, n: number) =>
         this.gpu.run({
           name: "scores",
           program: this.gpu.program(K.scores(c.headDim, G)),
           inputs: { uQ: b.q, uK: layer.kv },
           uniforms: {
             ...ring,
+            ...segRows,
             uJ0: { int: sj0 },
             uKeys: { int: sKeys },
             uPos0: { int: pos0 },
             uWindow: { int: sliding ? c.slidingWindow : 0 },
             uGroup: { int: group },
-            uTotalRows: { int: total }
+            uTotalRows: { int: n * total }
           },
           output: G === 1 ? scoreTex[0] : scoreTex,
           rect: {
             x: 0,
             y: 0,
-            width: Math.ceil(total / panelRows) * Math.min(kt, segTexels),
-            height: Math.min(panelRows, total)
+            width: Math.ceil((n * total) / panelRows) * Math.min(kt, segTexels),
+            height: Math.min(panelRows, n * total)
           }
         })
-      const segments = Math.ceil(kt / segTexels)
-      const chunks =
-        segments > 1
-          ? (segments - 1) * Math.ceil(segTexels / chunkTexels) +
-            Math.ceil((kt - (segments - 1) * segTexels) / chunkTexels)
-          : Math.ceil(kt / chunkTexels)
+      const chunks = chunksOf(chunkTexels)
       const chunkPast =
         rows <= SPLIT_ROWS
           ? Math.max(TUNING.attendChunkTexelsDecode, 2 * TUNING.attendChunkTexels)
@@ -1773,22 +1801,29 @@ export class Engine {
           kt > chunkPast &&
           slice * chunks <= chunkRows)
       ) {
-        // Long key ranges: chunks of keys in parallel, then combined.
+        // Long key ranges: chunks of keys in parallel, then combined. As
+        // many segments as the scores buffer holds go in one scores pass
+        // and one chunk pass (writing reads every key in 3 passes).
         const chunkBufs = this.chunkBuffers(slice * chunks, G)
+        const segChunks = segChunksOf(chunkTexels)
+        const fit = Math.max(1, Math.floor((panels * panelRows) / total))
+        const perPass = Math.min(segments, fit, TUNING.segmentGroup || Infinity)
         let chunk0 = 0
-        for (let s = 0; s < segments; s++) {
-          const sj0 = j0 + 4 * s * segTexels
-          const sKeys = Math.min(keys - 4 * s * segTexels, 4 * segTexels)
-          const sChunks = Math.ceil(Math.ceil(sKeys / 4) / chunkTexels)
-          scores(sj0, sKeys)
+        for (let s0 = 0; s0 < segments; s0 += perPass) {
+          const n = Math.min(perPass, segments - s0)
+          const gj0 = j0 + 4 * s0 * segTexels
+          const gKeys = Math.min(keys - 4 * s0 * segTexels, 4 * n * segTexels)
+          scores(gj0, gKeys, n)
           this.gpu.run({
             name: "attend",
             program: this.gpu.program(K.attendChunk(c.headDim, G)),
             inputs: { ...sIn, uV: layer.kv },
             uniforms: {
               ...ring,
-              uJ0: { int: sj0 },
-              uKeys: { int: sKeys },
+              ...segRows,
+              uSegChunks: { int: segChunks },
+              uJ0: { int: gj0 },
+              uKeys: { int: gKeys },
               uGroup: { int: group },
               uVOff: { int: kvDims / 8 },
               uSliceQ: { int: slice },
@@ -1800,10 +1835,11 @@ export class Engine {
               x: 0,
               y: chunk0 * slice,
               width: qDims / 8 / G,
-              height: slice * sChunks
+              height: slice * n * segChunks
             }
           })
-          chunk0 += sChunks
+          chunk0 += n * segChunks
+          if (paced) await this.charge(attentionWork(gKeys))
         }
         this.gpu.run({
           name: "attend",
@@ -1826,7 +1862,8 @@ export class Engine {
         m0 += slice
         continue
       }
-      scores(j0, keys)
+      if (paced) await this.charge(attentionWork(keys))
+      scores(j0, keys, 1)
       this.gpu.run({
         name: "attend",
         program: read(K.attend(c.headDim, c.attentionGate, G)),
@@ -2518,15 +2555,11 @@ export class Engine {
     }
     await look(-1, "embedding", b.residual[0], c.hiddenSize)
 
+    const paced = rows > SPLIT_ROWS
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
-      if (
-        rows > SPLIT_ROWS &&
-        TUNING.paceLayers > 0 &&
-        i > 0 &&
-        i % TUNING.paceLayers === 0
-      )
-        await this.gpu.pace(TUNING.paceAhead)
+      // (From layer 0: batches follow each other with no wait between.)
+      if (paced) await this.charge(0)
       const [h, next] = b.residual
       const fold = foldAt(i)
       // (Layer 0 folds only if the embedding drew its sums and input.)
@@ -2544,7 +2577,14 @@ export class Engine {
         await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
       } else if (layer.attention) {
-        opSplit = this.attend(layer.attention, layer.type, rows, pos0, opIn)
+        opSplit = await this.attend(
+          layer.attention,
+          layer.type,
+          rows,
+          pos0,
+          opIn,
+          paced
+        )
         const qkvgDims =
           (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
         await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
@@ -2619,8 +2659,39 @@ export class Engine {
               : undefined
       )
       await look(i, "l_out", h, c.hiddenSize)
+      if (paced) this.unpaced += rows * this.layerWork(i)
     }
     this.position += rows
     return rows - 1
+  }
+
+  /** Work queued on the GPU since the last pace (multiply-adds, roughly). */
+  private unpaced = 0
+  private work: Array<number> | null = null
+
+  /** Layer i's matmul multiply-adds per token. */
+  private layerWork(i: number) {
+    this.work ??= this.layers.map((l) =>
+      [l.conv?.inProj, l.conv?.outProj, l.attention?.qkvg, l.attention?.o, l.gateUp, l.down]
+        .filter((m): m is GpuMatrix => !!m)
+        .reduce((sum, m) => sum + m.N * m.K, 0)
+    )
+    return this.work[i]
+  }
+
+  /**
+   * Counts `work` as queued, and paces (see Gpu.pace) once paceLayers
+   * full-batch layers' worth is: long attention charges its own work, so
+   * a single long layer is split too.
+   */
+  private async charge(work: number) {
+    this.unpaced += work
+    if (TUNING.paceLayers <= 0) return
+    const mean =
+      this.layers.reduce((sum, _, i) => sum + this.layerWork(i), 0) /
+      this.layers.length
+    if (this.unpaced < TUNING.paceLayers * this.batchSize * mean) return
+    this.unpaced = 0
+    await this.gpu.pace(TUNING.paceAhead)
   }
 }
