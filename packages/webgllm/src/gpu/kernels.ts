@@ -744,20 +744,29 @@ void pairs(vec4 B, out vec4 h0, out vec4 h1, out vec4 h2, out vec4 h3) {
 // An int8 scale from its byte.
 float sc8(float b) { return b < 128.0 ? b : b - 256.0; }`
 
-/** The output head from a Q6_K embedding: `matmul` with `wrap`, for 6-bit weights. */
+/**
+ * The output head from a Q6_K embedding: `matmul` with `wrap`, for 6-bit
+ * weights. For each word position the four groups' activations are decoded
+ * once and shared by the fragment's 4 rows; each row reads its 3 weight
+ * texels and the 2 scale texels for that half.
+ */
 export const MATMUL_Q6_K_HEAD = (() => {
   const C = "xyzw"
   const body: Array<string> = []
-  const line = (s: string) => body.push(`      ${s}`)
-  for (const r of [0, 1, 2, 3]) {
-    line(`{`)
-    line(`  int t0 = wx + (sb * 4 + ${r}) * 52;`)
-    for (let i = 0; i < 4; i++)
-      line(`  vec4 S${i} = vec4(texelFetch(uW, ivec2(t0 + ${48 + i}, gr), 0));`)
-    line(`  float sum = 0.0;`)
-    for (const n of [0, 1]) {
-      for (let w = 0; w < 8; w++) {
+  const line = (s: string) => body.push(`    ${s}`)
+  line(`vec4 s = vec4(0.0);`)
+  for (const n of [0, 1]) {
+    for (let w = 0; w < 8; w++) {
+      const half = w & 1 ? "h2hi" : "h2lo"
+      line(`{`)
+      for (let g = 0; g < 4; g++) {
+        line(
+          `  vec4 A${g} = ${half}(texelFetch(uA, ivec2(sb * 32 + ${16 * n + 4 * g + (w >> 1)}, m), 0));`
+        )
+      }
+      for (const r of [0, 1, 2, 3]) {
         line(`  {`)
+        line(`    int t0 = wx + (sb * 4 + ${r}) * 52;`)
         line(`    vec4 a0, a1, b0, b1, h0, h1, h2, h3;`)
         line(
           `    nibbles(vec4(texelFetch(uW, ivec2(t0 + ${16 * n + w}, gr), 0)), a0, a1);`
@@ -768,26 +777,26 @@ export const MATMUL_Q6_K_HEAD = (() => {
         line(
           `    pairs(vec4(texelFetch(uW, ivec2(t0 + ${32 + 8 * n + w}, gr), 0)), h0, h1, h2, h3);`
         )
-        const groups = [
-          "a0 + 16.0 * h0",
-          "b0 + 16.0 * h1",
-          "a1 + 16.0 * h2",
-          "b1 + 16.0 * h3"
-        ]
-        for (const [g, q] of groups.entries()) {
-          const k = 8 * n + (w >> 2) + 2 * g
-          const texel = 16 * n + 4 * g + (w >> 1)
-          const half = w & 1 ? "h2hi" : "h2lo"
-          line(
-            `    sum += sc8(S${k >> 2}.${C[k & 3]}) * dot(${q} - 32.0, ${half}(texelFetch(uA, ivec2(sb * 32 + ${texel}, m), 0)));`
-          )
-        }
+        // Scales 8n + (w >> 2) + 2g: groups 0 and 1 in texel 48 + 2n,
+        // groups 2 and 3 in the next.
+        line(
+          `    vec4 SA = vec4(texelFetch(uW, ivec2(t0 + ${48 + 2 * n}, gr), 0));`
+        )
+        line(
+          `    vec4 SB = vec4(texelFetch(uW, ivec2(t0 + ${49 + 2 * n}, gr), 0));`
+        )
+        const c0 = C[w >> 2]
+        const c2 = C[(w >> 2) + 2]
+        line(`    s.${C[r]} += sc8(SA.${c0}) * dot(a0 + 16.0 * h0 - 32.0, A0)`)
+        line(`      + sc8(SA.${c2}) * dot(b0 + 16.0 * h1 - 32.0, A1)`)
+        line(`      + sc8(SB.${c0}) * dot(a1 + 16.0 * h2 - 32.0, A2)`)
+        line(`      + sc8(SB.${c2}) * dot(b1 + 16.0 * h3 - 32.0, A3);`)
         line(`  }`)
       }
+      line(`}`)
     }
-    line(`  acc.${C[r]} += d.${C[r]} * sum;`)
-    line(`}`)
   }
+  line(`acc += d * s;`)
   return `${HEADER}${H2}${Q6_K_UNPACK}
 uniform usampler2D uA;
 uniform usampler2D uW;
