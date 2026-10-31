@@ -150,6 +150,20 @@ async function runWebgl(text: string) {
   const worker = new Worker("/bundle/src/worker.js", { type: "module" })
   const model = params.get("model") ?? "onnx-community/LFM3-1.7B-ONNX"
   const speculative = params.get("speculative") !== "0"
+  // ?tune=knob:value,… sets engine TUNING knobs in the worker.
+  const tune = Object.fromEntries(
+    (params.get("tune") ?? "")
+      .split(",")
+      .filter(Boolean)
+      .map((pair) => {
+        const [knob, value] = pair.split(":")
+        return [knob, Number(value)]
+      })
+  )
+  if (Object.keys(tune).length) {
+    worker.postMessage({ type: "tune", values: tune })
+    log(`tuning: ${JSON.stringify(tune)}`)
+  }
   let lastPct = -10
   let ready: () => void = () => undefined
   let failed: (e: Error) => void = () => undefined

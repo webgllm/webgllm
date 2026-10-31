@@ -542,6 +542,9 @@ async function smoke(params: {
   await engine.load(await modelPieces(params))
   // Profile: the prompt with each kind of pass left out in turn.
   if (params.skip) {
+    log(
+      `textures: ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB (batch ${params.batch})`
+    )
     const tokens = Array.from(
       { length: params.length ?? 512 },
       (_, i) => 1000 + (i % 5000)
@@ -550,11 +553,15 @@ async function smoke(params: {
     await engine.forward(tokens.slice(0, 8))
     const time = async (label: string, skip: Array<string>) => {
       engine.gpu.skip = new Set(skip)
-      engine.reset()
-      await engine.gpu.finish()
-      const t = performance.now()
-      await engine.forward(tokens)
-      const ms = performance.now() - t
+      // Best of 5 (the first also compiles anything new).
+      let ms = Infinity
+      for (let round = 0; round < 5; round++) {
+        engine.reset()
+        await engine.gpu.finish()
+        const t = performance.now()
+        await engine.forward(tokens)
+        ms = Math.min(ms, performance.now() - t)
+      }
       log(`PROFILE ${label.padEnd(16)} ${ms.toFixed(0)} ms`)
       return ms
     }
@@ -845,6 +852,12 @@ async function smoke(params: {
     const [a, b] = values.split(",").map(Number)
     const runs: Record<string, Array<number>> = { [a]: [], [b]: [] }
     const original = (TUNING as Record<string, number>)[knob]
+    // One untimed run of each first: new settings may compile programs.
+    for (const v of [a, b]) {
+      ;(TUNING as Record<string, number>)[knob] = v
+      engine.reset()
+      await pick(await engine.forwardHidden(prompt))
+    }
     for (let i = 0; i < 10; i++) {
       const v = i % 2 === 0 ? a : b
       ;(TUNING as Record<string, number>)[knob] = v

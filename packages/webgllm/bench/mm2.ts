@@ -781,19 +781,20 @@ async function shapes(gpu: Gpu, batch: number) {
     for (const x of [w, sc, a, ...outs]) gpu.delete(x)
   }
   for (const [label, N, K] of [
-    ["gate+up as 2 K-slices", 30720, 1024],
-    ["gate+up as 4 K-slices", 61440, 512],
-    ["in_proj", 6144, 2048],
-    ["in_proj as 2 K-slices", 12288, 1024],
-    ["in_proj as 4 K-slices", 24576, 512],
-    ["qkvg", 3088, 2048],
-    ["qkvg as 2 K-slices", 6176, 1024],
-    ["qkvg as 4 K-slices", 12352, 512],
-    ["o as 2 K-slices", 4096, 1024],
-    ["o as 4 K-slices", 8192, 512],
-    ["down as 2 K-slices", 4096, 3840],
-    ["down as 4 K-slices", 8192, 1920],
-    ["down as 8 K-slices", 16384, 960]
+    ["350M in_proj", 3072, 1024],
+    ["350M in_proj as 2 K-slices", 6144, 512],
+    ["350M in_proj as 4 K-slices", 12288, 256],
+    ["350M qkvg", 2048, 1024],
+    ["350M qkvg as 2 K-slices", 4096, 512],
+    ["350M qkvg as 4 K-slices", 8192, 256],
+    ["350M o", 1024, 1024],
+    ["350M o as 2 K-slices", 2048, 512],
+    ["350M o as 4 K-slices", 4096, 256],
+    ["350M gate+up", 9216, 1024],
+    ["350M gate+up as 2 K-slices", 18432, 512],
+    ["350M down as 2 K-slices", 2048, 2304],
+    ["350M down as 4 K-slices", 4096, 1152],
+    ["350M down as 8 K-slices", 8192, 576]
 ] as const) {
     const blocks = K / 32
     const G = N / 4
@@ -815,8 +816,7 @@ async function shapes(gpu: Gpu, batch: number) {
             ]
           : [
               { weights: "rgba4", acts: "h2", tokens: 4 },
-              { weights: "rgba4", acts: "h2", tokens: 4, fold: true },
-              { weights: "rgba4", acts: "h2", tokens: 8, fold: true }
+              { weights: "rgba4", acts: "h2", tokens: 2 }
             ]
       for (const v of variants) {
         const T = v.tokens

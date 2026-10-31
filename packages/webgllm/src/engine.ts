@@ -137,6 +137,11 @@ type MatIn = { a: Texture; norm?: Texture | "prescaled" }
 
 export type EngineOptions = {
   /**
+   * Scale the prompt batch up for smaller models, keeping about the same
+   * buffer memory (default true).
+   */
+  scaleBatch?: boolean
+  /**
    * Four tokens per fragment in prompt matmuls (a quarter fewer weight
    * reads per multiply; ~40 MB more at a 512-token batch). Default: for
    * batches of 256 or more.
@@ -196,18 +201,22 @@ export class Engine {
   readonly gpu: Gpu
   config!: ModelConfig
   readonly contextLength: number
-  readonly batchSize: number
+  /** Tokens per prompt batch: options.batchSize, scaled to the model (see configure). */
+  batchSize: number
+  /** options.batchSize: whether the engine runs with desktop-size batches. */
+  private readonly baseBatch: number
   /**
    * Rows the batch buffers hold: a batch, plus room for a short tail of the
    * prompt to join the last batch rather than cost a pass of its own.
    */
-  readonly capacity: number
+  capacity: number
   private precision: "highp" | "mediump"
   private bytes: boolean
   private ringCache: boolean
   private layers: Array<GpuLayer> = []
   private embedding!: GpuMatrix
   private readonly quadMatmuls: boolean
+  private readonly scaleBatch: boolean
   /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
   private quads = new Map<number, Texture>()
   private finalNorm!: Texture
@@ -223,12 +232,14 @@ export class Engine {
   ) {
     this.gpu = new Gpu(canvas)
     this.contextLength = options.contextLength ?? 8192
-    this.batchSize = options.batchSize ?? 128
+    this.baseBatch = options.batchSize ?? 128
+    this.batchSize = this.baseBatch
     this.capacity = this.batchSize + this.batchSize / 8
+    this.scaleBatch = options.scaleBatch ?? true
     this.precision = options.matmulPrecision ?? "highp"
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
-    this.quadMatmuls = options.quadMatmuls ?? this.batchSize >= 256
+    this.quadMatmuls = options.quadMatmuls ?? this.baseBatch >= 256
     for (const name of options.skip ?? []) this.gpu.skip.add(name)
   }
 
@@ -270,6 +281,15 @@ export class Engine {
 
   private configure(config: ModelConfig) {
     this.config = config
+    if (this.scaleBatch) {
+      // Smaller models take bigger batches (fewer, fuller passes) in about
+      // the same buffer memory: per token it goes with hidden + FFN width,
+      // against LFM3's 2048 + 7680, in powers of two (LFM2.5 350M: 2×).
+      const ratio = (2048 + 7680) / (config.hiddenSize + config.intermediateSize)
+      const scale = 2 ** Math.max(0, Math.min(2, Math.round(Math.log2(ratio))))
+      this.batchSize = this.baseBatch * scale
+      this.capacity = this.batchSize + this.batchSize / 8
+    }
     this.buffers = this.allocate()
     if (this.quadMatmuls) {
       const b = this.buffers
@@ -362,7 +382,7 @@ export class Engine {
         GL.RGBA32F,
         scoreTexels,
         c.numHeads *
-          Math.min(M, this.batchSize >= 256 ? SCORE_ROWS_LARGE : SCORE_ROWS)
+          Math.min(M, this.baseBatch >= 256 ? SCORE_ROWS_LARGE : SCORE_ROWS)
       ),
       attnOut: this.h2(qDims, M),
       /**
@@ -370,7 +390,7 @@ export class Engine {
        * values (two textures) and (max, sum), per query and chunk.
        */
       attnChunks:
-        this.batchSize >= 256
+        this.baseBatch >= 256
           ? ([0, 1, 2].map(() =>
               this.gpu.texture(
                 GL.RGBA32F,

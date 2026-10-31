@@ -41,6 +41,8 @@ export type WorkerRequest =
       pipeline?: boolean
     }
   | { type: "stop"; id: string }
+  /** For benchmarks: engine tuning knobs (see TUNING in engine.ts). */
+  | { type: "tune"; values: Record<string, number> }
 
 export type WorkerResponse =
   | {

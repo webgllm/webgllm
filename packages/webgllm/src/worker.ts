@@ -5,7 +5,7 @@
  * time: loading another frees the previous one.
  */
 import { blobSource } from "./byte-source.js"
-import { Engine, MAX_CHUNKS } from "./engine.js"
+import { Engine, MAX_CHUNKS, TUNING } from "./engine.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
@@ -540,7 +540,9 @@ async function generate(request: GenerateRequest) {
 let queue: Promise<void> = Promise.resolve()
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type === "load") {
+  if (data.type === "tune") {
+    Object.assign(TUNING, data.values)
+  } else if (data.type === "load") {
     void startLoad(data.model).catch(() => undefined)
   } else if (data.type === "stop") {
     stopped.add(data.id)
