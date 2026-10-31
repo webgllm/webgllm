@@ -40,6 +40,8 @@ type Variant = {
    * large sums, so the dots can run in half precision.
    */
   centered?: boolean
+  /** One token, K split into this many slices (fragment (g, slice)), as writing does. */
+  split?: number
 }
 
 function kernel(v: Variant) {
@@ -212,12 +214,17 @@ uniform ${v.acts === "f16" ? "sampler2D" : "usampler2D"} uA;
 uniform ${v.weights === "rgba4" || v.weights === "unorm8" ? "sampler2D" : "usampler2D"} uW;
 uniform sampler2D uS;
 uniform int uKb;
+uniform int uKbS;
 ${outs}
 void main() {
   int g = int(gl_FragCoord.x);
-  int m0 = int(gl_FragCoord.y) * ${T};
+  ${
+    v.split
+      ? "int m0 = 0; int kb0 = int(gl_FragCoord.y) * uKbS; int kb1 = kb0 + uKbS;"
+      : `int m0 = int(gl_FragCoord.y) * ${T}; int kb0 = 0; int kb1 = uKb;`
+  }
   ${Array.from({ length: T }, (_, t) => `vec4 acc${t} = vec4(0.0);`).join(" ")}
-  for (int kb = 0; kb < uKb; kb++) {
+  for (int kb = kb0; kb < kb1; kb++) {
 ${L.join("\n")}
   }
   ${writes}
@@ -1080,7 +1087,12 @@ void main() { o = ${read}; }`)
               { weights: "rgba4", acts: "f16", tokens: 1 },
               { weights: "rgba4", acts: "h2", tokens: 1 },
               { weights: "unorm8", acts: "h2", tokens: 1 },
-              { weights: "words", acts: "h2", tokens: 1 }
+              { weights: "words", acts: "h2", tokens: 1 },
+              ...[4, 8, 16].flatMap((split) =>
+                (["rgba4", "bytes", "unorm8", "words"] as const).map(
+                  (weights): Variant => ({ weights, acts: "h2", tokens: 1, split })
+                )
+              )
             ]
           : [
               { weights: "rgba4", acts: "h2", tokens: 4 },
@@ -1095,7 +1107,7 @@ void main() { o = ${read}; }`)
             ]
       for (const v of variants) {
         const T = v.tokens
-        const rows = Math.max(1, M / T)
+        const rows = v.split ?? Math.max(1, M / T)
         const outs = [0, 1].map((): Array<Texture> =>
           T === 1
             ? [gpu.texture(gl.RGBA32F, G, rows)]
@@ -1118,7 +1130,7 @@ void main() { o = ${read}; }`)
                       : wBytes,
               uS: scales
             },
-            uniforms: { uKb: { int: blocks } },
+            uniforms: { uKb: { int: blocks }, uKbS: { int: Math.ceil(blocks / (v.split ?? 1)) } },
             output: outs[i % 2].length === 1 ? outs[i % 2][0] : outs[i % 2]
           })
         run(0)
@@ -1134,7 +1146,7 @@ void main() { o = ${read}; }`)
           best = Math.min(best, (performance.now() - t0) / n)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}${v.centered ? " centered" : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}${v.centered ? " centered" : ""}${v.split ? ` split ${v.split}` : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
@@ -1147,7 +1159,7 @@ void main() { o = ${read}; }`)
         [12, 2, " fold", { fold: true }],
         [16, 2, " fold", { fold: true }]
       ] as Array<[number, number, string, { sameActs?: boolean; outputs?: number; fold?: boolean }]>) {
-        if (N % rows) continue
+        if (N % rows || M < T) continue
         const width = N / rows
         const count = opts.outputs ?? (rows * T) / 8
         const outs = [0, 1].map(() =>

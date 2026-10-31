@@ -22,6 +22,14 @@ type GpuMatrix = {
   bits: 4 | 6 | 8
   /** Quants in byte textures rather than RGBA32UI. */
   bytes: boolean
+  /** 4-bit byte quants in RGBA8 (normalized) rather than RGBA8UI. */
+  unorm: boolean
+  /**
+   * Scales and zero points packed: `scales` is RGBA32UI, each texel the
+   * block's 4 scales then its 4 zero points as halves (one fetch for both);
+   * `zeros` is null.
+   */
+  packed: boolean
   /**
    * 4-bit quants in an RGBA4 texture: texel (column · rowTexels + kb · 32 +
    * r · 8 + j, row) holds row r's weights 32kb + 4j .. + 3 of the group, so
@@ -145,6 +153,15 @@ export const TUNING = {
    * their consumers read (set before the model loads).
    */
   halfPartials: 1,
+  /**
+   * 1: 4-bit byte weights' scales and zero points in one RGBA32UI texel a
+   * block (one fetch, not two; set before the model loads).
+   */
+  packZeros: 1,
+  /** 1: 4-bit byte weights in RGBA8 (normalized) textures (set before the model loads). */
+  unormBytes: 1,
+  /** 1: 4-bit layer weights in RGBA4 textures; 0: byte textures (set before the model loads). */
+  layerRgba4: 0,
   /** 1: the pick's argmax from the chunk maxima's positions, its loops with constant bounds. */
   fastPick: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
@@ -280,6 +297,14 @@ const ATTEND_CHUNKS = 16
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
 export const MAX_CHUNKS = 64
+/** Half-float bits of the integers 0 .. 255 (zero points packed as halves). */
+const HALF_INT = Uint16Array.from({ length: 256 }, (_, n) => {
+  if (n === 0) return 0
+  const e = Math.floor(Math.log2(n))
+  // n = 1.m · 2^e: 10 mantissa bits (exact for n < 2048).
+  return ((e + 15) << 10) | (((n / 2 ** e - 1) * 1024) & 1023)
+})
+
 /** Batches this small split their matmuls along K (see TUNING). */
 const SPLIT_ROWS = 8
 
@@ -733,7 +758,13 @@ export class Engine {
 
   /** A quantized matrix as textures, filled with `m`. */
   private matrix(m: QuantMatrix): GpuMatrix {
-    const gm = this.allocateMatrix(m.N, m.K, m.bits, !!m.zeros, m.bits === 4)
+    const gm = this.allocateMatrix(
+      m.N,
+      m.K,
+      m.bits,
+      !!m.zeros,
+      m.bits === 4 && TUNING.layerRgba4 > 0
+    )
     this.writeMatrix(gm, m, 0)
     return gm
   }
@@ -766,6 +797,8 @@ export class Engine {
         K,
         bits,
         bytes: false,
+        unorm: false,
+        packed: false,
         rgba4: true,
         blocks,
         groups,
@@ -791,11 +824,15 @@ export class Engine {
       bits === 6 || (this.bytes && columns * blocks * 4 * byteTexels <= max)
     const texelsPerBlockRow = bytes ? byteTexels : byteTexels / 4
     const rowTexels = blocks * 4 * texelsPerBlockRow
+    const unorm = bytes && bits === 4 && TUNING.unormBytes > 0
+    const packed = bytes && bits === 4 && withZeros && TUNING.packZeros > 0
     const quantFormat = !bytes
       ? GL.RGBA32UI
       : bits === 8
         ? GL.RGBA8I
-        : GL.RGBA8UI
+        : unorm
+          ? GL.RGBA8
+          : GL.RGBA8UI
     const rowsPerColumn = Math.ceil(groups / columns)
     if (columns * rowTexels > max) {
       throw new GpuError(
@@ -807,16 +844,23 @@ export class Engine {
       K,
       bits,
       bytes,
+      unorm,
+      packed,
       rgba4: false,
       blocks,
       groups,
       rowsPerColumn,
       rowTexels,
       quants: this.gpu.texture(quantFormat, columns * rowTexels, rowsPerColumn),
-      scales: this.gpu.texture(GL.RGBA16F, columns * blocks, rowsPerColumn),
-      zeros: withZeros
-        ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
-        : null
+      scales: this.gpu.texture(
+        packed ? GL.RGBA32UI : GL.RGBA16F,
+        columns * blocks,
+        rowsPerColumn
+      ),
+      zeros:
+        withZeros && !packed
+          ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
+          : null
     }
   }
 
@@ -848,7 +892,7 @@ export class Engine {
         gm.quants,
         { x: column * rowTexels, y, width: rowTexels, height: run },
         {
-          format: GL.RGBA_INTEGER,
+          format: gm.unorm ? GL.RGBA : GL.RGBA_INTEGER,
           type: !gm.bytes
             ? GL.UNSIGNED_INT
             : m.bits === 8
@@ -869,6 +913,25 @@ export class Engine {
                 )
         }
       )
+      if (gm.packed && m.zeros) {
+        // Each texel: 4 scales then 4 zero points, as halves.
+        const n = run * blocks * 4
+        const at = local * blocks * 4
+        const texels = new Uint32Array(n)
+        for (let t = 0; t < n; t += 4) {
+          const d = m.scales.subarray(at + t, at + t + 4)
+          const z = m.zeros.subarray(at + t, at + t + 4)
+          texels[t] = d[0] | (d[1] << 16)
+          texels[t + 1] = d[2] | (d[3] << 16)
+          texels[t + 2] = (HALF_INT[z[0]] | (HALF_INT[z[1]] << 16)) >>> 0
+          texels[t + 3] = (HALF_INT[z[2]] | (HALF_INT[z[3]] << 16)) >>> 0
+        }
+        this.gpu.write(
+          gm.scales,
+          { x: column * blocks, y, width: blocks, height: run },
+          { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: texels }
+        )
+      } else
       this.gpu.write(
         gm.scales,
         { x: column * blocks, y, width: blocks, height: run },
@@ -1270,7 +1333,8 @@ export class Engine {
         l.gateUp,
         l.down
       ])
-      .filter((m): m is GpuMatrix => !!m && m.rgba4)
+      .filter((m): m is GpuMatrix => !!m && m.bits === 4)
+    if (mats.length === 0) return (this.f16 = false)
     const max = this.gpu.limits.maxTextureSize
     // The column height that fits every matrix in the least texture.
     let best: { hd: number; width: number } | null = null
@@ -1310,7 +1374,7 @@ export class Engine {
       uG: { int: w.groups }
     }
     const partner = this.quads.get(out.id)
-    if (w.rgba4 && partner && TUNING.quad > 0) {
+    if ((w.rgba4 || w.bits === 4) && partner && TUNING.quad > 0) {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
       const quadRows = Math.ceil(rows / 4)
@@ -1325,8 +1389,9 @@ export class Engine {
         w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
       )
       const slices = Math.ceil(w.blocks / kbSlice)
+      // (Byte texels have no matmulQuad: the f16 path at any size.)
       const f =
-        TUNING.f16Matmul > 0 && rows >= TUNING.f16MinRows
+        TUNING.f16Matmul > 0 && (rows >= TUNING.f16MinRows || !w.rgba4)
           ? this.f16Scratch()
           : false
       if (f) {
@@ -1335,7 +1400,16 @@ export class Engine {
         f.next ^= 1
         this.gpu.run({
           name: "dequant",
-          program: this.gpu.program(K.dequantRgba4({ zeros: !!w.zeros })),
+          program: this.gpu.program(
+            w.rgba4
+              ? K.dequantRgba4({ zeros: !!w.zeros })
+              : K.dequantBytes({
+                  zeros: !!w.zeros,
+                  words: !w.bytes,
+                  unorm: w.unorm,
+                  packed: w.packed
+                })
+          ),
           inputs: {
             uW: w.quants,
             uS: w.scales,
@@ -1393,22 +1467,24 @@ export class Engine {
         this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
         return
       }
-      this.gpu.run({
-        name: "matmul",
-        program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
-        inputs: weights,
-        uniforms: {
-          ...shape,
-          uSliceRows: { int: quadRows },
-          uKbSlice: { int: kbSlice }
-        },
-        output: [out, partner],
-        rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
-        // (Per block: 4 rows' weights and 4 tokens' activations.)
-        work: kbSlice * 40
-      })
-      this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
-      return
+      if (w.rgba4) {
+        this.gpu.run({
+          name: "matmul",
+          program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
+          inputs: weights,
+          uniforms: {
+            ...shape,
+            uSliceRows: { int: quadRows },
+            uKbSlice: { int: kbSlice }
+          },
+          output: [out, partner],
+          rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
+          // (Per block: 4 rows' weights and 4 tokens' activations.)
+          work: kbSlice * 40
+        })
+        this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
+        return
+      }
     }
     if (w.rgba4) {
       // Narrow matrices split K in two, stacked in the output, so there are
@@ -1448,6 +1524,8 @@ export class Engine {
           wrap: false,
           precision: this.precision,
           bytes: w.bytes,
+          unorm: w.unorm,
+          packed: w.packed,
           pair: true
         })
       ),
@@ -1470,8 +1548,10 @@ export class Engine {
     rows: number,
     norm?: Texture | "prescaled"
   ) {
-    if (norm && !w.rgba4)
-      throw new Error("Only RGBA4 matmuls fold the norm in.")
+    // RGBA4 and 4-bit byte texels have the split kernel that folds norms.
+    const own = w.rgba4 || (w.bits === 4 && w.bytes)
+    if (norm && !own)
+      throw new Error("Only 4-bit RGBA4 or byte matmuls fold the norm in.")
     const bits = w.bits
     if (bits === 6)
       throw new GpuError("Q6_K weights are only read as the output head.")
@@ -1503,9 +1583,12 @@ export class Engine {
       this.gpu.run({
         name: "matmul",
         program: this.gpu.program(
-          w.rgba4
+          own
             ? K.matmulSplitRgba4({
                 zeros: !!w.zeros,
+                bytes: !w.rgba4,
+                unorm: w.unorm,
+                packed: w.packed,
                 normed: !norm ? false : norm === "prescaled" ? norm : "weights"
               })
             : K.matmul({
@@ -1514,6 +1597,8 @@ export class Engine {
                 wrap: false,
                 precision: this.precision,
                 bytes: w.bytes,
+                unorm: w.unorm,
+                packed: w.packed,
                 split: true
               })
         ),
@@ -2652,14 +2737,16 @@ export class Engine {
     const e = this.embedding
     // A few rows: the split matmuls apply the norm to the residual as they
     // read it (no norm pass; see TUNING.foldNorm).
+    const folds = (m?: GpuMatrix) =>
+      !!m && (m.rgba4 || (m.bits === 4 && m.bytes))
     const foldAt = (j: number) => {
       const l = this.layers[j]
       return (
         rows <= SPLIT_ROWS &&
         TUNING.foldNorm > 0 &&
         !probe &&
-        (l.conv?.inProj ?? l.attention?.qkvg)?.rgba4 === true &&
-        l.gateUp.rgba4
+        folds(l.conv?.inProj ?? l.attention?.qkvg) &&
+        folds(l.gateUp)
       )
     }
     const prescaled = TUNING.foldNorm === 2 && this.mrt.scaled

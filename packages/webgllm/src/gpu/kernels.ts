@@ -106,6 +106,10 @@ function memo<A extends Array<unknown>>(
 export type MatmulOptions = {
   bits: 4 | 8
   zeros: boolean
+  /** 4-bit bytes in RGBA8 (normalized: the texture unit converts them) rather than RGBA8UI. */
+  unorm?: boolean
+  /** Scales and zero points packed in one h2 texel (uS: RGBA32UI, scales then zeros); no uZ. */
+  packed?: boolean
   /**
    * One input row, its output spread over a 2D texture (the output head:
    * 32,000 texels is wider than some GPUs allow). Otherwise output texel
@@ -145,8 +149,14 @@ function matmulSource(o: MatmulOptions) {
   const rows = [0, 1, 2, 3]
   const body: Array<string> = []
   const line = (s: string) => body.push(`    ${s}`)
-  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
-  if (o.zeros) line(`vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`)
+  if (o.packed) {
+    line(`uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(`vec4 d = h2lo(sz);`)
+    line(`vec4 z = h2hi(sz);`)
+  } else {
+    line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    if (o.zeros) line(`vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`)
+  }
   for (const j of [0, 1, 2, 3]) {
     line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
     line(`${P}vec4 A${2 * j} = h2lo(a${j});`)
@@ -167,7 +177,9 @@ function matmulSource(o: MatmulOptions) {
           // Bytes 4w..4w+3 of the block row: low nibbles are weights
           // 4w..4w+3, high nibbles 16+4w.., split exactly in floats.
           line(
-            `  { ${P}vec4 B = vec4(texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0));`
+            o.unorm
+              ? `  { ${P}vec4 B = floor(texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0) * 255.0 + 0.5);`
+              : `  { ${P}vec4 B = vec4(texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0));`
           )
           line(`    ${P}vec4 hi = floor(B * 0.0625);`)
           line(`    ${P}vec4 lo = B - 16.0 * hi;`)
@@ -181,7 +193,7 @@ function matmulSource(o: MatmulOptions) {
         }
         line(`    b += dot(lo, A${w}) + dot(hi, A${w + 4}); }`)
       }
-      const zero = o.zeros ? `z.${"xyzw"[r]}` : "8.0"
+      const zero = o.zeros || o.packed ? `z.${"xyzw"[r]}` : "8.0"
       line(
         `  acc.${"xyzw"[r]} += d.${"xyzw"[r]} * (float(b) - ${zero} * float(sa));`
       )
@@ -232,12 +244,13 @@ function matmulSource(o: MatmulOptions) {
   int m = y;
   int kb0 = 0;
   int kb1 = uKb;`
-  const weights = o.bytes && o.bits === 8 ? "isampler2D" : "usampler2D"
+  const weights =
+    o.bytes && o.bits === 8 ? "isampler2D" : o.unorm ? "sampler2D" : "usampler2D"
   return `${HEADER}
 uniform usampler2D uA;
 uniform ${weights} uW;
-uniform sampler2D uS;
-${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
 uniform int uKb;
 uniform int uH;
 uniform int uRowTexels;
@@ -433,6 +446,64 @@ void main() {
 }`
 }
 
+/**
+ * DEQUANT_RGBA4 for 4-bit weights in byte texels (RGBA8UI: texel
+ * (kb · 16 + r · 4 + w) of a row group holds row r's bytes 4w .. 4w + 3,
+ * low nibbles weights 4w + i, high nibbles 16 + 4w + i) or, with `words`,
+ * RGBA32UI (texel kb · 4 + r, word w those 4 bytes).
+ */
+function dequantBytesSource(o: {
+  zeros: boolean
+  words: boolean
+  unorm?: boolean
+  packed?: boolean
+}) {
+  return `${HEADER}
+uniform ${o.unorm ? "sampler2D" : "usampler2D"} uW;
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  int w = j & 3;
+  ${
+    o.words
+      ? `uint word = comp(texelFetch(uW, ivec2(col * uRowTexels + kb * 4 + r, gr), 0), w);
+  uvec4 b = (uvec4(word) >> uvec4(0u, 8u, 16u, 24u)) & 255u;`
+      : o.unorm
+        ? `uvec4 b = uvec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + w, gr), 0) * 255.0 + 0.5);`
+        : `uvec4 b = texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + w, gr), 0);`
+  }
+  vec4 q = vec4(j < 4 ? b & 15u : b >> 4u);
+  ${
+    o.packed
+      ? `uvec4 sz = texelFetch(uS, ivec2(col * uKb + kb, gr), 0);
+  float d = comp(h2lo(sz), r);
+  float z = comp(h2hi(sz), r);`
+      : `float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  float z = ${o.zeros ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))" : "8.0"};`
+  }
+  o = (q - z) * d;
+}`
+}
+
 /** h2 activations (8 halves a texel) as RGBA16F (4 a texel), for the f16 matmul. */
 export const H2_TO_F16 = `${HEADER}
 uniform usampler2D uA;
@@ -506,6 +577,15 @@ void main() {
 function matmulSplitRgba4Source(o: {
   zeros: boolean
   /**
+   * 4-bit weights in byte texels (RGBA8UI, as dequantBytes reads them)
+   * rather than RGBA4: half the fetches, nibbles split in floats.
+   */
+  bytes?: boolean
+  /** With bytes: in RGBA8 (normalized) rather than RGBA8UI. */
+  unorm?: boolean
+  /** Scales and zero points in one h2 texel (see MatmulOptions.packed). */
+  packed?: boolean
+  /**
    * Apply the RMS norm to the residual: "weights" reads the f32 residual
    * and multiplies by the norm weights (uNorm) here, "prescaled" reads
    * h2(x · weights) the add drew at column uAOff of uA. Either way the
@@ -515,12 +595,18 @@ function matmulSplitRgba4Source(o: {
 }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
-  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
-  line(
-    o.zeros
-      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
-      : `const vec4 z = vec4(8.0);`
-  )
+  if (o.packed) {
+    line(`uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(`vec4 d = h2lo(sz);`)
+    line(`vec4 z = h2hi(sz);`)
+  } else {
+    line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(
+      o.zeros
+        ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+        : `const vec4 z = vec4(8.0);`
+    )
+  }
   if (o.normed === "weights") {
     // x · norm weights from the f32 residual; the row's 1 / RMS is applied
     // to the sums at the end (it's the same for the whole row).
@@ -540,14 +626,41 @@ function matmulSplitRgba4Source(o: {
   }
   line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
   line(`vec4 b = vec4(0.0);`)
-  for (const r of [0, 1, 2, 3]) {
-    const terms = Array.from(
-      { length: 8 },
-      (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0), A${j})`
-    )
-    line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
+  if (o.bytes) {
+    // Byte texel kb · 16 + r · 4 + w: row r's weights 4w + i (low
+    // nibbles) and 16 + 4w + i (high). With byte B = lo + 16 hi,
+    // lo · A_w + hi · A_w+4 = B · A_w + hi · (A_w+4 − 16 A_w): the
+    // difference once per block, then a floor and two dots per texel.
+    // Texel column w at a time: its helper lives only while its four
+    // rows' bytes are read (fewer registers live through the block).
+    // Normalized bytes come as B / 255: B · A sums go in bb, times 255
+    // once a block; hi = floor(B / 16) as floor(B' · 255 / 16 + 1 / 32).
+    line(`vec4 bb = vec4(0.0);`)
+    for (const w of [0, 1, 2, 3]) {
+      line(`{`)
+      line(`  vec4 C = A${w + 4} - 16.0 * A${w};`)
+      for (const r of [0, 1, 2, 3]) {
+        const fetch = `texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0)`
+        line(o.unorm ? `  { vec4 B = ${fetch};` : `  { vec4 B = vec4(${fetch});`)
+        line(`    bb.${"xyzw"[r]} += dot(B, A${w});`)
+        line(
+          `    b.${"xyzw"[r]} += dot(floor(${o.unorm ? "B * 15.9375 + 0.03125" : "B * 0.0625"}), C); }`
+        )
+      }
+      line(`}`)
+    }
+    line(o.unorm ? `b += 255.0 * bb;` : `b += bb;`)
+    line(`acc += d * (b - z * sa);`)
+  } else {
+    for (const r of [0, 1, 2, 3]) {
+      const terms = Array.from(
+        { length: 8 },
+        (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0), A${j})`
+      )
+      line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
+    }
+    line(`acc += d * (15.0 * b - z * sa);`)
   }
-  line(`acc += d * (15.0 * b - z * sa);`)
   const inputs =
     o.normed === "weights"
       ? `${RMS_SCALE}\nuniform sampler2D uA;\nuniform sampler2D uNorm;`
@@ -555,9 +668,9 @@ function matmulSplitRgba4Source(o: {
         ? `${RMS_SCALE}\nuniform usampler2D uA;\nuniform int uAOff;`
         : "uniform usampler2D uA;"
   return `${HEADER}${inputs}
-uniform sampler2D uW;
-uniform sampler2D uS;
-${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform ${o.bytes && !o.unorm ? "usampler2D" : "sampler2D"} uW;
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
 uniform int uKb;
 uniform int uH;
 uniform int uRowTexels;
@@ -2222,6 +2335,7 @@ export function withSplit(source: string, split: number) {
 
 export const matmulQuad = memo(matmulQuadSource)
 export const dequantRgba4 = memo(dequantRgba4Source)
+export const dequantBytes = memo(dequantBytesSource)
 export const matmulF16 = memo(matmulF16Source)
 
 const quadCache = new Map<string, Map<string, string>>()

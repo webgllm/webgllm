@@ -39,3 +39,9 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 - gate|up and SwiGLU in one pass with no K-split (576 fragments for the 350M, each over all of K): 3× slower on the Pixel and 1.8× on an M3. Writing passes need thousands of fragments; a pass fewer doesn't pay for that.
 - Fewer RMS partial sums (rmsParts 16): no change; 4: 14% slower.
 - Output head in 1 or 2 K-slices instead of 4: no change.
+- Transform feedback for writing's chain (tf.html): a vertex shader per step writing a buffer the next step reads as a uniform block beat fragment passes for 1024-wide matrices on the Pixel (162 vs 267 µs a step), not 2048-wide; copying its buffer back into a texture costs 1–4 ms on the Pixel, and uniform blocks are 16 KB on some GPUs, so it isn't used.
+- 8 rows a writing-matmul fragment (two row groups sharing a block's activations): 3× slower on the Pixel and on an M3.
+
+## Weight texels (Oct 31)
+
+4-bit layer weights now live in byte texels (RGBA8, normalized), not RGBA4: half the fetches per block, which a fetch-bound GPU (PowerVR) turns into writing speed (LFM3 12.8 → 16.6 tok/s, 350M +17%). Apple GPUs split RGBA4's nibbles for free in the texture unit and pay for the byte split in ALU; scales and zero points share one texel and the split takes a floor and two dots per texel, leaving the M3 2–4% behind RGBA4 (TUNING.layerRgba4 = 1 restores it).

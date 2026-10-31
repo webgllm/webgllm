@@ -30,6 +30,7 @@ export const GL = {
   RGBA: 0x1908,
   RGBA32F: 0x8814,
   RGBA4: 0x8056,
+  RGBA8: 0x8058,
   UNSIGNED_SHORT_4_4_4_4: 0x8033,
   RGBA16F: 0x881a,
   R32F: 0x822e,
