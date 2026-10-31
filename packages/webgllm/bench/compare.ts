@@ -2,7 +2,8 @@
  * The other runtimes on the same prompt as check.html's smoke test, for
  * comparison: Transformers.js on WebGPU (the transformers-js package's own
  * worker, driven through its messages) and wllama with every layer on
- * WebGPU. `?run=tjs` or `?run=wllama`; results go to the server's log.
+ * WebGPU, or each on the CPU in WebAssembly. `?run=tjs`, `tjs-cpu`, `wllama`
+ * or `wllama-cpu`; results go to the server's log.
  */
 import { loadTokenizer } from "../src/tokenizer.js"
 
@@ -57,11 +58,11 @@ function summarize(
 }
 
 /** Transformers.js on WebGPU, through the transformers-js package's worker. */
-async function runTjs(text: string) {
-  const worker = new Worker("/bundle-tjs/src/worker.js", {
-    type: "module",
-    name: "transformers-js"
-  })
+async function runTjs(text: string, cpu = false) {
+  const worker = new Worker(
+    cpu ? "/bundle/bench/tjs-cpu-worker.js" : "/bundle-tjs/src/worker.js",
+    { type: "module", name: "transformers-js" }
+  )
   let lastPct = -10
   const pending = new Map<
     string,
@@ -95,7 +96,7 @@ async function runTjs(text: string) {
   await new Promise<void>((resolve, reject) => {
     ready = resolve
     failed = reject
-    worker.postMessage({ type: "load", modelId: model, dtype: "q4f16" })
+    worker.postMessage({ type: "load", modelId: model, dtype: cpu ? "q4" : "q4f16" })
   })
   log(
     `Transformers.js loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`
@@ -126,15 +127,18 @@ async function runTjs(text: string) {
     const promptTps = (input / (s.promptMs ?? 1)) * 1000
     const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
     log(
-      `Transformers.js WebGPU run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
+      `Transformers.js ${cpu ? "WASM" : "WebGPU"} run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
     )
     runs.push({ promptTps, decodeTps, ttftMs: s.promptMs ?? 0 })
   }
-  summarize("Transformers.js WebGPU, onnx-community ONNX q4f16", runs)
+  summarize(
+    cpu ? "Transformers.js WASM (CPU), onnx-community ONNX q4" : "Transformers.js WebGPU, onnx-community ONNX q4f16",
+    runs
+  )
 }
 
 /** wllama (llama.cpp in WebAssembly) with every layer offloaded to WebGPU. */
-async function runWllama(text: string) {
+async function runWllama(text: string, gpu = true) {
   const url = "/wllama/index.js"
   const { Wllama, LoggerWithoutDebug } = (await import(
     /* @vite-ignore */ url
@@ -169,11 +173,11 @@ async function runWllama(text: string) {
   const t0 = performance.now()
   await wllama.loadModelFromUrl(`/models/${model}`, {
     n_ctx: 2048,
-    n_gpu_layers: 999,
+    n_gpu_layers: gpu ? 999 : 0,
     swa_full: true
   })
   log(
-    `wllama loaded ${model} with n_gpu_layers 999 in ${((performance.now() - t0) / 1000).toFixed(1)} s (${wasm})`
+    `wllama loaded ${model} with n_gpu_layers ${gpu ? 999 : 0} in ${((performance.now() - t0) / 1000).toFixed(1)} s (${wasm})`
   )
   const generate = (content: string, maxTokens: number) =>
     wllama.createChatCompletion({
@@ -191,7 +195,7 @@ async function runWllama(text: string) {
     const promptTps = (t.prompt_n / t.prompt_ms) * 1000
     const decodeTps = (t.predicted_n / t.predicted_ms) * 1000
     log(
-      `wllama WebGPU run ${i + 1}: ${t.prompt_n} prompt tokens in ${t.prompt_ms?.toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${t.predicted_n} tokens at ${decodeTps.toFixed(1)} tokens/s`
+      `wllama ${gpu ? "WebGPU" : "WASM"} run ${i + 1}: ${t.prompt_n} prompt tokens in ${t.prompt_ms?.toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${t.predicted_n} tokens at ${decodeTps.toFixed(1)} tokens/s`
     )
     if (i === 0)
       log(
@@ -199,7 +203,7 @@ async function runWllama(text: string) {
       )
     runs.push({ promptTps, decodeTps, ttftMs: t.prompt_ms })
   }
-  summarize(`wllama WebGPU, ${model}`, runs)
+  summarize(`wllama ${gpu ? "WebGPU" : "WASM (CPU)"}, ${model}`, runs)
   await wllama.exit()
 }
 
@@ -208,8 +212,10 @@ async function main() {
   const text = await promptText(Number(params.get("len") ?? 512))
   const run = params.get("run")
   if (run === "tjs") await runTjs(text)
+  else if (run === "tjs-cpu") await runTjs(text, true)
   else if (run === "wllama") await runWllama(text)
-  else log("Pass ?run=tjs or ?run=wllama.")
+  else if (run === "wllama-cpu") await runWllama(text, false)
+  else log("Pass ?run=tjs, tjs-cpu, wllama or wllama-cpu.")
 }
 
 main().then(
