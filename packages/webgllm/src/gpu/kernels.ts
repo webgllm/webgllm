@@ -55,6 +55,26 @@ vec4 pf(highp sampler2D s, int x, int m) {
 /** Kept for kernels that name it; the helpers are in HEADER. */
 const H2 = ""
 
+/**
+ * A kernel builder that returns the same string for the same options: a
+ * pass looks its program up by source, and a string built once has its
+ * hash cached, so issuing a pass doesn't rebuild and rehash kilobytes.
+ */
+function memo<A extends Array<unknown>>(
+  build: (...args: A) => string
+): (...args: A) => string {
+  const cache = new Map<string, string>()
+  return (...args: A) => {
+    const key = JSON.stringify(args)
+    let source = cache.get(key)
+    if (source === undefined) {
+      source = build(...args)
+      cache.set(key, source)
+    }
+    return source
+  }
+}
+
 export type MatmulOptions = {
   bits: 4 | 8
   zeros: boolean
@@ -92,7 +112,7 @@ export type MatmulOptions = {
  * uRowTexels (quant texels per row group per column), uG (row groups);
  * with `wrap`, uOutW (output texels per row) and uRow (the input row).
  */
-export function matmul(o: MatmulOptions) {
+function matmulSource(o: MatmulOptions) {
   const P = o.precision === "mediump" ? "mediump " : ""
   const rows = [0, 1, 2, 3]
   const body: Array<string> = []
@@ -224,7 +244,7 @@ ${body.join("\n")}
  * fetches of one token per fragment, in the 16 bytes a fragment can write
  * without slowing down. Sums are f32: per block d · (Σ q·a − zero · Σ a).
  */
-export function matmulPair(o: { zeros: boolean }) {
+function matmulPairSource(o: { zeros: boolean }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -288,7 +308,16 @@ ${L.join("\n")}
  * token per fragment: a fragment writing several tokens' sums (several
  * outputs) runs slower than their own fragments reading the same weights.
  */
-export function matmulSplitRgba4(o: { zeros: boolean; normed?: boolean }) {
+function matmulSplitRgba4Source(o: {
+  zeros: boolean
+  /**
+   * Apply the RMS norm to the residual: "weights" reads the f32 residual
+   * and multiplies by the norm weights (uNorm) here, "prescaled" reads
+   * h2(x · weights) the add drew at column uAOff of uA. Either way the
+   * row's 1 / RMS (from the residual uR's sums of squares) is applied last.
+   */
+  normed?: false | "weights" | "prescaled"
+}) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -297,13 +326,18 @@ export function matmulSplitRgba4(o: { zeros: boolean; normed?: boolean }) {
       ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
       : `const vec4 z = vec4(8.0);`
   )
-  if (o.normed) {
+  if (o.normed === "weights") {
     // x · norm weights from the f32 residual; the row's 1 / RMS is applied
     // to the sums at the end (it's the same for the whole row).
     for (let j = 0; j < 8; j++)
       line(
         `vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
       )
+  } else if (o.normed === "prescaled") {
+    for (const j of [0, 1, 2, 3]) {
+      line(`uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, m), 0);`)
+      line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+    }
   } else
   for (const j of [0, 1, 2, 3]) {
     line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
@@ -319,7 +353,13 @@ export function matmulSplitRgba4(o: { zeros: boolean; normed?: boolean }) {
     line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
   }
   line(`acc += d * (15.0 * b - z * sa);`)
-  return `${HEADER}${o.normed ? `${RMS_SCALE}\nuniform sampler2D uA;\nuniform sampler2D uNorm;` : "uniform usampler2D uA;"}
+  const inputs =
+    o.normed === "weights"
+      ? `${RMS_SCALE}\nuniform sampler2D uA;\nuniform sampler2D uNorm;`
+      : o.normed === "prescaled"
+        ? `${RMS_SCALE}\nuniform usampler2D uA;\nuniform int uAOff;`
+        : "uniform usampler2D uA;"
+  return `${HEADER}${inputs}
 uniform sampler2D uW;
 uniform sampler2D uS;
 ${o.zeros ? "uniform usampler2D uZ;" : ""}
@@ -355,7 +395,7 @@ ${L.join("\n")}
  * sums over blocks [s · uKbSlice, (s + 1) · uKbSlice); HEAD_SUM adds the
  * slices when there's more than one.
  */
-export function headRgba4(o: { zeros: boolean }) {
+function headRgba4Source(o: { zeros: boolean }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
@@ -477,7 +517,7 @@ void main() {
  * Embedding rows for token ids (uIds: R32UI, one id per row) from the
  * quantized embedding: f32 output, 4 features per texel.
  */
-export function embed(o: {
+function embedSource(o: {
   bits: 4 | 8
   zeros: boolean
   bytes: boolean
@@ -549,7 +589,7 @@ export const RMS_PARTS = 64
  * `kind`: x is f32, a pair tensor, or a split matmul's partial sums
  * (read through pf).
  */
-export function rmsPartial(kind: "f32" | "pair" | "split") {
+function rmsPartialSource(kind: "f32" | "pair" | "split") {
   const pair = kind !== "f32"
   return `${HEADER}
 uniform ${kind === "pair" ? "usampler2D" : "sampler2D"} uX;
@@ -627,16 +667,51 @@ float rowScale(int m) { return 1.0; }
 vec4 added(int x, int m, float rs) { return pf(uY, x, m); }`
 }
 
+/**
+ * The add's outputs: the residual texture, and with `mrt` the h2 texture
+ * the next split matmuls read (see addScaled; other draws leave zeros).
+ */
+function addOutputs(mrt: boolean) {
+  return mrt
+    ? "layout(location = 0) out vec4 o;\nlayout(location = 1) out uvec4 o2;"
+    : "out vec4 o;"
+}
+
 /** f32 out = h + y, y through the sandwich norm when `normed`. */
-export function addNormed(normed: boolean) {
+function addNormedSource(normed: boolean, mrt = false) {
   return `${HEADER}
 uniform sampler2D uH;
 uniform usampler2D uY;
 ${addedY(normed)}
-out vec4 o;
+${addOutputs(mrt)}
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   o = texelFetch(uH, p, 0) + added(p.x, p.y, rowScale(p.y));
+  ${mrt ? "o2 = uvec4(0u);" : ""}
+}`
+}
+
+/**
+ * ADD_NORMED's output times the next norm's weights (uNext), as h2 into
+ * the add's second output from column uBase (texel j: features 8j..8j+7):
+ * what the next split matmuls read (they apply the 1 / RMS).
+ */
+function addScaledSource(normed: boolean) {
+  return `${HEADER}
+uniform sampler2D uH;
+uniform usampler2D uY;
+uniform sampler2D uNext;
+uniform int uBase;
+${addedY(normed)}
+${addOutputs(true)}
+void main() {
+  int j = int(gl_FragCoord.x) - uBase;
+  int m = int(gl_FragCoord.y);
+  float rs = rowScale(m);
+  vec4 a = (texelFetch(uH, ivec2(2 * j, m), 0) + added(2 * j, m, rs)) * texelFetch(uNext, ivec2(2 * j, 0), 0);
+  vec4 b = (texelFetch(uH, ivec2(2 * j + 1, m), 0) + added(2 * j + 1, m, rs)) * texelFetch(uNext, ivec2(2 * j + 1, 0), 0);
+  o = vec4(0.0);
+  o2 = packH2(a, b);
 }`
 }
 
@@ -645,14 +720,14 @@ void main() {
  * computed from its inputs, so they can be drawn in the same pass as the
  * add itself (into the residual's last RMS_PARTS columns, from uBase).
  */
-export function rmsOfAdd(normed: boolean) {
+function rmsOfAddSource(normed: boolean, mrt = false) {
   return `${HEADER}
 uniform sampler2D uH;
 uniform usampler2D uY;
 ${addedY(normed)}
 uniform int uChunk;
 uniform int uBase;
-out vec4 o;
+${addOutputs(mrt)}
 void main() {
   int p = int(gl_FragCoord.x) - uBase;
   int m = int(gl_FragCoord.y);
@@ -665,6 +740,7 @@ void main() {
     s += v * v;
   }
   o = s;
+  ${mrt ? "o2 = uvec4(0u);" : ""}
 }`
 }
 
@@ -672,7 +748,7 @@ void main() {
  * A kernel that reads matmul outputs (`names`) as pair tensors, made to
  * read a split matmul's partial sums instead (pf's other overload).
  */
-export function fromPartials(source: string, names: Array<string>) {
+function fromPartialsSource(source: string, names: Array<string>) {
   let out = source
   for (const name of names)
     out = out.replace(`uniform usampler2D ${name};`, `uniform sampler2D ${name};`)
@@ -685,7 +761,7 @@ export function fromPartials(source: string, names: Array<string>) {
  * B·x from the state (uState: width-1 rows, oldest first). h2 output.
  * Weights uConv: texel (c / 4, k) holds tap k of channels c..c+3.
  */
-export function shortConv(width: number) {
+function shortConvSource(width: number) {
   const taps = Array.from({ length: width }, (_, k) => k)
     .map(
       (k) => `  {
@@ -728,7 +804,7 @@ ${taps}
  * The convolution's state after a batch of uM tokens: the last width-1
  * values of B·x, oldest first, from this batch or the previous state.
  */
-export function convState(width: number) {
+function convStateSource(width: number) {
   return `${HEADER}
 uniform usampler2D uBCx;
 uniform sampler2D uState;
@@ -752,7 +828,7 @@ void main() {
  * speculative decoding, which may keep only some of a batch's tokens):
  * block p - 1 (width - 1 rows) holds convState's output for uM = p.
  */
-export function convPrefixes(width: number) {
+function convPrefixesSource(width: number) {
   const w = width - 1
   return `${HEADER}
 uniform usampler2D uBCx;
@@ -792,7 +868,7 @@ void main() {
  * j; the dims after 2P aren't rotated. Writes f32 (`out: "f32"`, 4 dims per texel, for
  * queries) or h2 (8 dims per texel, for the key cache).
  */
-export function headPrep(o: {
+function headPrepSource(o: {
   out: "f32" | "h2"
   rope: boolean
   norm: boolean
@@ -865,7 +941,7 @@ void main() {
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
  * (later than the query, outside the sliding window, past uKeys) get -1e30.
  */
-export function scores(headDim: number) {
+function scoresSource(headDim: number) {
   const U = headDim / 8
   return `${HEADER}
 uniform sampler2D uQ;
@@ -926,7 +1002,7 @@ void main() {
  * times the head's sigmoid gate (from the q|k|v|gate projection at texel
  * uGateTexel). h2 output: 8 dims of one head per texel.
  */
-export function attend(headDim: number, gate: boolean) {
+function attendSource(headDim: number, gate: boolean) {
   const U = headDim / 8
   return `${HEADER}
 uniform sampler2D uS;
@@ -984,7 +1060,7 @@ void main() {
 }
 
 /** Values into the h2 cache: 8 dims per texel, rows offset to the cache position. */
-export function values(headDim: number) {
+function valuesSource(headDim: number) {
   const U = headDim / 8
   return `${HEADER}
 uniform usampler2D uQKVG;
@@ -1305,3 +1381,36 @@ void main() {
   float d = texelFetch(uS, ivec2(col * uKb + sb, gr), 0)[r];
   o = (d * sc) * (low + 16.0 * high - 32.0);
 }`
+
+export const matmul = memo(matmulSource)
+export const matmulPair = memo(matmulPairSource)
+export const matmulSplitRgba4 = memo(matmulSplitRgba4Source)
+export const headRgba4 = memo(headRgba4Source)
+export const embed = memo(embedSource)
+export const rmsPartial = memo(rmsPartialSource)
+export const addNormed = memo(addNormedSource)
+export const addScaled = memo(addScaledSource)
+export const rmsOfAdd = memo(rmsOfAddSource)
+export const shortConv = memo(shortConvSource)
+export const convState = memo(convStateSource)
+export const convPrefixes = memo(convPrefixesSource)
+export const headPrep = memo(headPrepSource)
+export const scores = memo(scoresSource)
+export const attend = memo(attendSource)
+export const values = memo(valuesSource)
+const partialsCache = new Map<string, Map<string, string>>()
+/** fromPartialsSource, memoized (sources are memoized, so lookups are cheap). */
+export function fromPartials(source: string, names: Array<string>) {
+  let bySource = partialsCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    partialsCache.set(source, bySource)
+  }
+  const key = names.join(",")
+  let out = bySource.get(key)
+  if (out === undefined) {
+    out = fromPartialsSource(source, names)
+    bySource.set(key, out)
+  }
+  return out
+}

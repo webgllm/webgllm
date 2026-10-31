@@ -110,12 +110,18 @@ export const TUNING = {
   rmsParts: 64,
   /** K-slices of the RGBA4 output head (more than 1 adds a pass to sum them). */
   headSplit: 4,
-  /** 1: few-token matmuls apply the RMS norm as they read (no norm pass). */
-  foldNorm: 0
+  /**
+   * Few-token matmuls apply the RMS norm as they read, with no norm pass:
+   * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
+   */
+  foldNorm: 2
 }
 
-/** A matmul's input: h2 activations, or the f32 residual and the norm to apply. */
-type MatIn = { a: Texture; norm?: Texture }
+/**
+ * A matmul's input: h2 activations, or the f32 residual and the norm to
+ * apply (its weights, or "prescaled": already applied by the add).
+ */
+type MatIn = { a: Texture; norm?: Texture | "prescaled" }
 
 export type EngineOptions = {
   /**
@@ -296,7 +302,18 @@ export class Engine {
       // The hidden state, and its rows' partial sums of squares in the last
       // RMS_PARTS columns (drawn with the add that writes it).
       residual: [0, 1].map(() =>
-        this.gpu.texture(GL.RGBA32F, D / 4 + K.RMS_PARTS, M)
+        // The residual, its rows' sums of squares, and room for the
+        // scaled texture's columns (written alongside, unused here).
+        this.gpu.texture(GL.RGBA32F, D / 4 + K.RMS_PARTS + D / 8, M)
+      ) as [Texture, Texture],
+      /**
+       * For a few rows, h2(residual · the next norm's weights) from column
+       * D/4 + RMS_PARTS, drawn with the add (its second output; see
+       * addNormed): one per residual texture.
+       */
+      scaled: [0, 1].map(() =>
+        // (Same size as the residual: a framebuffer's textures must match.)
+        this.gpu.texture(GL.RGBA32UI, D / 4 + K.RMS_PARTS + D / 8, M)
       ) as [Texture, Texture],
       rms: this.gpu.texture(GL.RGBA32F, K.RMS_PARTS, M),
       normed: this.h2(D, M),
@@ -779,7 +796,7 @@ export class Engine {
     w: GpuMatrix,
     out: Texture,
     rows: number,
-    norm?: Texture
+    norm?: Texture | "prescaled"
   ) {
     if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows, norm)
     if (norm) throw new Error("Only split matmuls fold the norm in.")
@@ -894,7 +911,7 @@ export class Engine {
     a: Texture,
     w: GpuMatrix,
     rows: number,
-    norm?: Texture
+    norm?: Texture | "prescaled"
   ) {
     if (norm && !w.rgba4)
       throw new Error("Only RGBA4 matmuls fold the norm in.")
@@ -930,7 +947,10 @@ export class Engine {
         name: "matmul",
         program: this.gpu.program(
           w.rgba4
-            ? K.matmulSplitRgba4({ zeros: !!w.zeros, normed: !!norm })
+            ? K.matmulSplitRgba4({
+                zeros: !!w.zeros,
+                normed: !norm ? false : norm === "prescaled" ? norm : "weights"
+              })
             : K.matmul({
                 bits,
                 zeros: !!w.zeros,
@@ -940,12 +960,17 @@ export class Engine {
                 split: true
               })
         ),
-        inputs: norm ? { ...weights, uNorm: norm, uR: a } : weights,
+        inputs: !norm
+          ? weights
+          : norm === "prescaled"
+            ? { ...weights, uA: this.scaledOf(a), uR: a }
+            : { ...weights, uNorm: norm, uR: a },
         uniforms: {
           ...shape,
           uSplit: { int: slices },
           uKbSlice: { int: kbSlice },
           ...(norm && {
+            uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
             uROff: { int: this.config.hiddenSize / 4 },
             uParts: { int: TUNING.rmsParts },
             uTexels: { int: this.config.hiddenSize / 4 },
@@ -1029,7 +1054,8 @@ export class Engine {
     norm: Texture | undefined,
     out: Texture,
     rows: number,
-    split = 0
+    split = 0,
+    next?: Texture
   ) {
     const { hiddenSize } = this.config
     const texels = hiddenSize / 4
@@ -1051,26 +1077,41 @@ export class Engine {
       uY: y,
       ...(norm && { uR: this.buffers.rms, uNorm: norm })
     }
+    // With `next`, a second output: h2(x · next's weights), drawn in the
+    // same pass, for the next split matmuls (no norm pass).
+    const mrt = !!next
+    const output = next ? [out, this.scaledOf(out)] : out
     this.gpu.run({
       name: "add",
-      program: read(K.addNormed(normed)),
+      program: read(K.addNormed(normed, mrt)),
       inputs,
       uniforms: common,
-      output: out,
+      output,
       rect: { x: 0, y: 0, width: texels, height: rows }
     })
     this.gpu.run({
       name: "add",
-      program: read(K.rmsOfAdd(normed)),
+      program: read(K.rmsOfAdd(normed, mrt)),
       inputs,
       uniforms: {
         ...common,
         uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
         uBase: { int: texels }
       },
-      output: out,
+      output,
       rect: { x: texels, y: 0, width: TUNING.rmsParts, height: rows }
     })
+    if (next) {
+      const base = texels + K.RMS_PARTS
+      this.gpu.run({
+        name: "add",
+        program: read(K.addScaled(normed)),
+        inputs: { ...inputs, uNext: next },
+        uniforms: { ...common, uBase: { int: base } },
+        output,
+        rect: { x: base, y: 0, width: texels / 2, height: rows }
+      })
+    }
   }
 
   /** The conv block; returns out_proj's split (see `project`). */
@@ -1603,6 +1644,12 @@ export class Engine {
     })
   }
 
+  /** The scaled texture drawn with residual texture `r` (see buffers.scaled). */
+  private scaledOf(r: Texture) {
+    const b = this.buffers
+    return r === b.residual[0] ? b.scaled[0] : b.scaled[1]
+  }
+
   private headScratch: Texture | null = null
 
   /**
@@ -1754,14 +1801,22 @@ export class Engine {
       // A few rows: the split matmuls apply the norm to the residual as
       // they read it (no norm pass). The embedding has no sums of squares
       // for that, so layer 0 normalizes first.
-      const fold =
-        rows <= SPLIT_ROWS &&
-        TUNING.foldNorm > 0 &&
-        !probe &&
-        (layer.conv?.inProj ?? layer.attention?.qkvg)?.rgba4 === true &&
-        layer.gateUp.rgba4
+      const foldAt = (j: number) => {
+        const l = this.layers[j]
+        return (
+          rows <= SPLIT_ROWS &&
+          TUNING.foldNorm > 0 &&
+          !probe &&
+          (l.conv?.inProj ?? l.attention?.qkvg)?.rgba4 === true &&
+          l.gateUp.rgba4
+        )
+      }
+      const fold = foldAt(i)
+      const prescaled = TUNING.foldNorm === 2
       const opIn: MatIn =
-        fold && i > 0 ? { a: h, norm: layer.operatorNorm } : { a: b.normed }
+        fold && i > 0
+          ? { a: h, norm: prescaled ? "prescaled" : layer.operatorNorm }
+          : { a: b.normed }
       if (!opIn.norm) {
         this.normToH2(h, layer.operatorNorm, b.normed, rows, -1, i > 0)
         await look(i, "operator_norm", b.normed, c.hiddenSize, true)
@@ -1786,7 +1841,8 @@ export class Engine {
         layer.postOperatorNorm,
         next,
         rows,
-        opSplit
+        opSplit,
+        fold && prescaled ? layer.ffnNorm : undefined
       )
       await look(i, "after_op", next, c.hiddenSize)
       if (!fold) this.normToH2(next, layer.ffnNorm, b.normed, rows)
@@ -1794,7 +1850,12 @@ export class Engine {
         // A few rows: the split matmul's slices are summed and through
         // SwiGLU in one pass.
         const slices = fold
-          ? this.splitPartials(next, layer.gateUp, rows, layer.ffnNorm)
+          ? this.splitPartials(
+              next,
+              layer.gateUp,
+              rows,
+              prescaled ? "prescaled" : layer.ffnNorm
+            )
           : this.splitPartials(b.normed, layer.gateUp, rows)
         this.gpu.run({
           name: "swiglu",
@@ -1829,7 +1890,10 @@ export class Engine {
         layer.postFfnNorm,
         h,
         rows,
-        downSplit
+        downSplit,
+        prescaled && i + 1 < this.layers.length && foldAt(i + 1)
+          ? this.layers[i + 1].operatorNorm
+          : undefined
       )
       await look(i, "l_out", h, c.hiddenSize)
     }

@@ -563,6 +563,16 @@ async function smoke(params: {
     }
     const full = await step("everything", [])
     {
+      // JS issue time: forwards queued, timed before the wait.
+      await engine.gpu.finish()
+      const ti = performance.now()
+      for (let i = 0; i < 16; i++) await engine.forwardNoLogits([tokens[i]])
+      const issue = (performance.now() - ti) / 16
+      await engine.gpu.finish()
+      const total = (performance.now() - ti) / 16
+      log(`ISSUE: ${issue.toFixed(2)} ms/token in JS; ${total.toFixed(2)} ms/token with the wait`)
+    }
+    {
       // Which passes a writing step starts render passes for.
       const trace: Array<string> = []
       engine.gpu.trace = trace
