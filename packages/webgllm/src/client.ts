@@ -134,10 +134,10 @@ function keepDownloads() {
 }
 
 /**
- * Textures the engine needs, in texels per side: the 8,192-token cache and
- * rotary table are that many rows.
+ * Textures the engine needs, in texels per side: LFM3's split matmuls'
+ * partial sums are 3,840 wide. (The cache wraps past a texture's height.)
  */
-const MIN_TEXTURE_SIZE = 8192
+const MIN_TEXTURE_SIZE = 4096
 
 /**
  * Whether this browser can run the engine: WebGL 2 with float render

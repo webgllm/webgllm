@@ -45,6 +45,11 @@ export type ModelConfig = {
   layerTypes: Array<LayerType>
   /** Tokens a sliding-attention layer sees, the current one included. */
   slidingWindow: number
+  /**
+   * Positions the model reads: config.json's max_position_embeddings, the
+   * GGUF's context_length.
+   */
+  contextLength: number
   ropeThetaFull: number
   ropeThetaSliding: number
   /**

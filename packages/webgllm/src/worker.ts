@@ -157,16 +157,9 @@ async function load(
   // The GPU first: a browser or GPU that can't run the model says so before
   // a gigabyte downloads.
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    contextLength: meta.context,
     batchSize: promptBatch()
   })
   try {
-    const { maxTextureSize } = engine.gpu.limits
-    if (maxTextureSize < meta.context) {
-      throw new GpuError(
-        `This GPU's textures go up to ${maxTextureSize} texels; the model needs ${meta.context}.`
-      )
-    }
     const {
       cached,
       tokenizerFile,

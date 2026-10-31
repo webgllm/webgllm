@@ -735,7 +735,12 @@ void main() {
 }`
 }
 
-/** Per row: x = inverse RMS of an f32 tensor's row (uTexels texels), y = mean square. */
+/**
+ * The RoPE table's two parts (see Engine.ropeTable): positions below this,
+ * and multiples of it; headPrep adds a position's two angles.
+ */
+export const ROPE_LOW = 1024
+
 /** Pixels per row that each sum a slice of the row's squares (RMS_PARTIAL). */
 export const RMS_PARTS = 64
 
@@ -1022,8 +1027,9 @@ void main() {
 /**
  * RMS-normalized and rotated head vectors. Reads one head (32 f32 texels
  * from texel uBase + head * 32) of the q|k|v|gate projection, normalizes it
- * with uNorm (32 texels), and applies RoPE from the table uRope (row =
- * position; texels 0..15 cos, 16..31 sin of frequencies 0..63). The
+ * with uNorm (32 texels), and applies RoPE from the table uRope (texels
+ * 0..15 cos, 16..31 sin of frequencies 0..63, for positions below
+ * ROPE_LOW and for multiples of it). The
  * rotated dims come first (the loaders order them so): dim j pairs with
  * j + P for j < P, P = rotated dims / 2 = 4 · uPairTexels, with frequency
  * j; the dims after 2P aren't rotated. Writes f32 (`out: "f32"`, 4 dims per texel, for
@@ -1049,8 +1055,15 @@ vec4 rotated(int base, int t, int pos, float inv) {
   int tp = first ? t + uPairTexels : t - uPairTexels;
   int f = first ? t : tp;
   vec4 p = pf(uQKVG, base + tp, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(tp, 0), 0)" : ""};
-  vec4 cs = texelFetch(uRope, ivec2(f, pos), 0);
-  vec4 sn = texelFetch(uRope, ivec2(${T / 2} + f, pos), 0);
+  // pos = lo + ${ROPE_LOW} · hi: cos and sin of each part's angle, added.
+  int lo = pos & ${ROPE_LOW - 1};
+  int hi = ${ROPE_LOW} + (pos >> ${Math.log2(ROPE_LOW)});
+  vec4 c1 = texelFetch(uRope, ivec2(f, lo), 0);
+  vec4 s1 = texelFetch(uRope, ivec2(${T / 2} + f, lo), 0);
+  vec4 c2 = texelFetch(uRope, ivec2(f, hi), 0);
+  vec4 s2 = texelFetch(uRope, ivec2(${T / 2} + f, hi), 0);
+  vec4 cs = c1 * c2 - s1 * s2;
+  vec4 sn = s1 * c2 + c1 * s2;
   return first ? v * cs - p * sn : v * cs + p * sn;`
       : "return v;"
   }
@@ -1063,13 +1076,14 @@ uniform int uBase;
 uniform int uPairTexels;
 uniform int uPos0;
 uniform int uRowOffset;
+uniform int uXOff;
 uniform float uEps;
 uniform float uScale;
 int m;
 ${prep}
 out ${o.out === "f32" ? "vec4" : "uvec4"} o;
 void main() {
-  int x = int(gl_FragCoord.x);
+  int x = int(gl_FragCoord.x) - uXOff;
   m = int(gl_FragCoord.y) - uRowOffset;
   int head = x / ${T / texelsPerOut};
   int t0 = (x % ${T / texelsPerOut}) * ${texelsPerOut};
@@ -1095,6 +1109,18 @@ void main() {
 }
 
 /**
+ * Where cache slot `slot` (a position, or its ring row) of texel x lives:
+ * caches taller than 2^uKvShift rows wrap into blocks uKvWidth texels wide,
+ * side by side.
+ */
+const KV_AT = `
+uniform int uKvShift;
+uniform int uKvWidth;
+ivec2 kvAt(int x, int slot) {
+  return ivec2(x + (slot >> uKvShift) * uKvWidth, slot & ((1 << uKvShift) - 1));
+}`
+
+/**
  * Attention scores, 4 keys per texel, for the uRows queries from uM0: row
  * h * uRows + (m - uM0) holds query m of head h against keys uJ0 + 4x ..
  * + 3. With uRing > 0 the cache is a ring of that many rows (position j at
@@ -1118,6 +1144,7 @@ uniform int uGroup;
 uniform int uKt;
 uniform int uPanelRows;
 uniform int uTotalRows;
+${KV_AT}
 out vec4 o;
 void main() {
   // Panels of uKt texels side by side, each holding uPanelRows rows: row r
@@ -1140,14 +1167,18 @@ void main() {
     row[c] = live[c] ? (uRing > 0 ? j[c] % uRing : j[c]) : 0;
   }
   if (!any(live)) { o = vec4(-1e30); return; }
+  ivec2 p0 = kvAt(kh * ${U}, row.x);
+  ivec2 p1 = kvAt(kh * ${U}, row.y);
+  ivec2 p2 = kvAt(kh * ${U}, row.z);
+  ivec2 p3 = kvAt(kh * ${U}, row.w);
   vec4 acc = vec4(0.0);
   for (int u = 0; u < ${U}; u++) {
     vec4 qa = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u, m), 0);
     vec4 qb = texelFetch(uQ, ivec2(h * ${2 * U} + 2 * u + 1, m), 0);
-    uvec4 k0 = texelFetch(uK, ivec2(kh * ${U} + u, row.x), 0);
-    uvec4 k1 = texelFetch(uK, ivec2(kh * ${U} + u, row.y), 0);
-    uvec4 k2 = texelFetch(uK, ivec2(kh * ${U} + u, row.z), 0);
-    uvec4 k3 = texelFetch(uK, ivec2(kh * ${U} + u, row.w), 0);
+    uvec4 k0 = texelFetch(uK, ivec2(p0.x + u, p0.y), 0);
+    uvec4 k1 = texelFetch(uK, ivec2(p1.x + u, p1.y), 0);
+    uvec4 k2 = texelFetch(uK, ivec2(p2.x + u, p2.y), 0);
+    uvec4 k3 = texelFetch(uK, ivec2(p3.x + u, p3.y), 0);
     acc += vec4(
       dot(qa, h2lo(k0)) + dot(qb, h2hi(k0)),
       dot(qa, h2lo(k1)) + dot(qb, h2hi(k1)),
@@ -1179,6 +1210,7 @@ uniform int uGateTexel;
 uniform int uKt;
 uniform int uPanelRows;
 uniform int uVOff;
+${KV_AT}
 out uvec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
@@ -1220,14 +1252,14 @@ void main() {
       j0 = j0 - (j0 / uRing) * uRing;
       j1 = j1 - (j1 / uRing) * uRing;
     }
-    uvec4 a0 = texelFetch(uV, ivec2(vx, j0.x), 0);
-    uvec4 a1 = texelFetch(uV, ivec2(vx, j0.y), 0);
-    uvec4 a2 = texelFetch(uV, ivec2(vx, j0.z), 0);
-    uvec4 a3 = texelFetch(uV, ivec2(vx, j0.w), 0);
-    uvec4 b0 = texelFetch(uV, ivec2(vx, j1.x), 0);
-    uvec4 b1 = texelFetch(uV, ivec2(vx, j1.y), 0);
-    uvec4 b2 = texelFetch(uV, ivec2(vx, j1.z), 0);
-    uvec4 b3 = texelFetch(uV, ivec2(vx, j1.w), 0);
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, kvAt(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, kvAt(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, kvAt(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, kvAt(vx, j1.w), 0);
     lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
     hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
     lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
@@ -1249,7 +1281,8 @@ void main() {
 /**
  * Attention for long key ranges, part 1: like attend, but over one chunk
  * of uChunkTexels score texels, so many fragments share a query's keys.
- * Row c · uSliceQ + (m - uM0): chunk c of query m. Outputs the chunk's
+ * Row (uChunk0 + c) · uSliceQ + (m - uM0): chunk c of query m (several
+ * passes, one per segment of a long key range, fill rows side by side). Outputs the chunk's
  * softmax-weighted sum of values (dims 0..3 and 4..7, relative to the
  * chunk's own max) and (max, sum of weights); attendCombine adds chunks.
  */
@@ -1268,14 +1301,17 @@ uniform int uPanelRows;
 uniform int uVOff;
 uniform int uSliceQ;
 uniform int uChunkTexels;
+uniform int uChunk0;
+${KV_AT}
 layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
 layout(location = 2) out vec4 o2;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
-  int c = y / uSliceQ;
-  int qi = y - c * uSliceQ;
+  int qi = y % uSliceQ;
+  // Chunk c of this pass's keys: rows from chunk uChunk0 on.
+  int c = y / uSliceQ - uChunk0;
   int h = x / ${U};
   int u = x - h * ${U};
   int kh = h / uGroup;
@@ -1320,14 +1356,14 @@ void main() {
       j0 = j0 - (j0 / uRing) * uRing;
       j1 = j1 - (j1 / uRing) * uRing;
     }
-    uvec4 a0 = texelFetch(uV, ivec2(vx, j0.x), 0);
-    uvec4 a1 = texelFetch(uV, ivec2(vx, j0.y), 0);
-    uvec4 a2 = texelFetch(uV, ivec2(vx, j0.z), 0);
-    uvec4 a3 = texelFetch(uV, ivec2(vx, j0.w), 0);
-    uvec4 b0 = texelFetch(uV, ivec2(vx, j1.x), 0);
-    uvec4 b1 = texelFetch(uV, ivec2(vx, j1.y), 0);
-    uvec4 b2 = texelFetch(uV, ivec2(vx, j1.z), 0);
-    uvec4 b3 = texelFetch(uV, ivec2(vx, j1.w), 0);
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, kvAt(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, kvAt(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, kvAt(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, kvAt(vx, j1.w), 0);
     lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
     hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
     lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);

@@ -60,18 +60,18 @@ Both builds were checked tensor by tensor against a reference:
 - **Prompts** are read 128 tokens at a time; big passes are split into bands of rows, under mobile GPUs' watchdogs.
 - **Sampling:** with top-k (LFM3's 50), the GPU applies the repetition penalty and picks the 50 chunks of 256 logits with the largest logits, which hold the top 50 tokens for sure, so writing a token reads back ~50 KB rather than every logit. Readbacks go through a pixel buffer and a fence.
 - **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state and the sliding-window layers' last window are saved after each prompt batch and reply (the latest 8), to resume from.
-- **Context:** 8,192 tokens. Sliding-window layers keep only their window plus a batch, in a ring.
+- **Context:** the model's own (LFM3: 262,144 tokens; LFM2.5: 128,000). Full-attention caches start at 1,024 tokens and double as a chat grows, wrapping into side-by-side blocks past the GPU's texture height; sliding-window layers keep only their window plus a batch, in a ring. Past 8,192 keys, attention reads them in segments and combines them.
 
 ### Memory
 
-GPU textures, with the 8,192-token cache, and the most JavaScript memory a load takes (it streams the weights, a layer or a chunk of the embedding at a time):
+GPU textures at load (phone-size batches, the 1,024-token cache), and the most JavaScript memory a load takes (it streams the weights, a layer or a chunk of the embedding at a time):
 
 | Model                           | GPU textures | Peak JavaScript memory while loading |
 | ------------------------------- | ------------ | ------------------------------------ |
-| `daveycodez/LFM3-1.7B-Web`      | 1,014 MiB    | ~110 MiB                             |
-| `onnx-community/LFM3-1.7B-ONNX` | 1,105 MiB    | ~110 MiB                             |
-| `LiquidAI/LFM3-1.7B-GGUF`       | 1,143 MiB    | ~110 MiB                             |
+| `daveycodez/LFM3-1.7B-Web`      | 932 MiB      | ~110 MiB                             |
+| `onnx-community/LFM3-1.7B-ONNX` | 1,025 MiB    | ~110 MiB                             |
+| `LiquidAI/LFM3-1.7B-GGUF`       | 1,062 MiB    | ~110 MiB                             |
 
-That's for iPhone Safari's ~2 GB limit on a page, which the tokenizer and the page itself also count against.
+That's for iPhone Safari's ~2 GB limit on a page, which the tokenizer and the page itself also count against. The cache grows from there with the chat; if the GPU runs out of memory growing it, the reply stops with an error asking for a new session.
 
 **Status:** early (0.x); the API may change. See the [repository README](https://github.com/daveycodez/tanstack-ai-browser#readme).

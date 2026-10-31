@@ -42,8 +42,6 @@ export type WebGlModelMeta = {
     capabilities: ReadonlyArray<"tools" | "thinking">
   }
   size: string
-  /** Tokens a chat can hold, prompt and reply together, in this runtime. */
-  context: number
   /** Reasoning levels for `chat({ reasoning })`: the template's enable_thinking. */
   reasoning?: ModelReasoning
   sampling: Sampling
@@ -89,12 +87,6 @@ const LFM3_SAMPLING = {
   repetition_penalty: 1.1
 } as const satisfies Sampling
 
-/**
- * Tokens a chat may hold: the attention cache for 8,192 tokens is 88 MB in
- * halves, and a full context already takes a long time to read on a phone.
- */
-const CONTEXT = 8192
-
 const LFM3_REPO = {
   repo: "LiquidAI/LFM3-1.7B",
   revision: "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7"
@@ -125,7 +117,6 @@ const LFM3_1_7B_GGUF = {
   },
   supports: TOOLS_AND_THINKING,
   size: "1.7b",
-  context: CONTEXT,
   reasoning: THINKING_SWITCH,
   sampling: LFM3_SAMPLING,
   toolFormat: "lfm3"
@@ -161,7 +152,6 @@ const LFM3_1_7B_WEB = {
   },
   supports: TOOLS_AND_THINKING,
   size: "1.7b",
-  context: CONTEXT,
   reasoning: THINKING_SWITCH,
   sampling: LFM3_SAMPLING,
   toolFormat: "lfm3"
@@ -196,7 +186,6 @@ const LFM3_1_7B_ONNX = {
   },
   supports: TOOLS_AND_THINKING,
   size: "1.7b",
-  context: CONTEXT,
   reasoning: THINKING_SWITCH,
   sampling: LFM3_SAMPLING,
   toolFormat: "lfm3"
@@ -231,7 +220,6 @@ function lfm2Onnx(o: {
     },
     supports: o.thinking ? TOOLS_AND_THINKING : TOOLS,
     size: o.size,
-    context: CONTEXT,
     ...(o.thinking && { reasoning: ALWAYS_THINKS }),
     sampling: o.thinking ? LFM2_5_THINKING_SAMPLING : LFM2_5_SAMPLING,
     toolFormat: "lfm2"

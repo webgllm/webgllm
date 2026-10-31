@@ -46,6 +46,7 @@
         format: params.get("format") ?? "gguf",
         onnx: params.get("onnx") ?? undefined,
         ring: params.get("ring") !== "0",
+        kvRows: params.get("kvrows") ? Number(params.get("kvrows")) : undefined,
         batch: Number(params.get("batch") ?? 128),
         precision: params.get("precision") ?? "highp",
         layers: params.get("layers") !== "0",

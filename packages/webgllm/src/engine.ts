@@ -119,6 +119,11 @@ export const TUNING = {
    * extra combine pass costs more than one long loop until then.
    */
   attendChunkTexelsDecode: 256,
+  /**
+   * Score texels per query row (4 keys each; the scores buffer's width at
+   * load): longer key ranges are read in segments of this many (see attend).
+   */
+  scoreTexels: 2048,
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
@@ -165,10 +170,18 @@ export type EngineOptions = {
   ringCache?: boolean
   /** Pass kinds not to draw, for profiling (outputs are wrong). */
   skip?: Array<string>
-  /** Tokens the cache holds, prompt and reply together. */
+  /**
+   * Most tokens the cache may hold, prompt and reply together: the model's
+   * own context length when left out. The cache grows to it as it fills.
+   */
   contextLength?: number
   /** Most tokens per forward batch. */
   batchSize?: number
+  /**
+   * Rows per block of a full-attention cache (a power of two): the texture
+   * height when left out. Smaller exercises the cache's wrapping, for tests.
+   */
+  kvBlockRows?: number
   /** Precision of the matmuls' per-block sums. */
   matmulPrecision?: "highp" | "mediump"
   /** Weights in byte textures (faster on the GPUs tried) or in RGBA32UI texels. */
@@ -192,12 +205,14 @@ const OUT_WIDTH = 1024
 /** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
 const MAX_SNAPSHOTS = 8
 /**
- * Queries per attention slice (see attend): more is fewer passes and more
- * fragments per pass, for a bigger scores buffer (64: ~33 MB at an 8192
- * context), so it's 64 only for desktop-size batches.
+ * Queries of each head per attention slice (see attend), a quarter of a
+ * batch in this range: more is fewer passes and more fragments per pass,
+ * for a bigger scores buffer.
  */
 const SCORE_ROWS = 32
 const SCORE_ROWS_LARGE = 128
+/** Positions a full-attention layer's cache holds at first: it doubles as needed. */
+const KV_START = 1024
 /** Most key chunks per query in chunked attention (see attendChunk). */
 const ATTEND_CHUNKS = 16
 /** Logits per chunk when picking candidates on the GPU. */
@@ -210,7 +225,19 @@ const SPLIT_ROWS = 4
 export class Engine {
   readonly gpu: Gpu
   config!: ModelConfig
-  readonly contextLength: number
+  /** Most tokens the cache holds: the model's, or options.contextLength (see configure). */
+  contextLength = 0
+  private readonly contextCap: number
+  /**
+   * Full-attention caches wrap into blocks of 2^kvShift rows, side by side
+   * (see kvAt in kernels.ts), so they grow past a texture's height.
+   */
+  private kvShift = 0
+  /** Positions the full-attention caches hold now (see reserve). */
+  private kvPositions = 0
+  /** Chunked attention's partial results, made when first needed (see attend). */
+  private chunkBufs: [Texture, Texture, Texture] | null = null
+  private readonly kvBlockRows: number
   /** Tokens per prompt batch: options.batchSize, scaled to the model (see configure). */
   batchSize: number
   /** options.batchSize: whether the engine runs with desktop-size batches. */
@@ -241,7 +268,8 @@ export class Engine {
     options: EngineOptions = {}
   ) {
     this.gpu = new Gpu(canvas)
-    this.contextLength = options.contextLength ?? 8192
+    this.contextCap = options.contextLength ?? Infinity
+    this.kvBlockRows = options.kvBlockRows ?? Infinity
     this.baseBatch = options.batchSize ?? 128
     this.batchSize = this.baseBatch
     this.capacity = this.batchSize + this.batchSize / 8
@@ -300,6 +328,19 @@ export class Engine {
       this.batchSize = this.baseBatch * scale
       this.capacity = this.batchSize + this.batchSize / 8
     }
+    // The cache's blocks of rows, side by side, fit a texture's width.
+    const max = this.gpu.limits.maxTextureSize
+    const kvWidth = this.kvWidth()
+    this.kvShift = Math.min(
+      Math.floor(Math.log2(Math.min(max, this.kvBlockRows))),
+      Math.ceil(Math.log2(Math.max(2, config.contextLength)))
+    )
+    this.contextLength = Math.min(
+      config.contextLength,
+      this.contextCap,
+      Math.floor(max / kvWidth) * 2 ** this.kvShift
+    )
+    this.kvPositions = Math.min(KV_START, 2 ** this.kvShift)
     this.buffers = this.allocate()
     if (this.quadMatmuls) {
       const b = this.buffers
@@ -314,23 +355,28 @@ export class Engine {
   }
 
   /**
-   * cos and sin of every position × frequency, computed in doubles: texels
-   * 0..15 cos, 16..31 sin of frequencies 0..63. Frequencies past the
-   * rotated dims are 0 (no rotation).
+   * cos and sin of position × frequency, computed in doubles: texels 0..15
+   * cos, 16..31 sin of frequencies 0..63. Rows 0..ROPE_LOW - 1 are those
+   * positions, the rows after them multiples of ROPE_LOW: headPrep adds a
+   * position's two parts' angles, so the table stays small at any context
+   * length (~1,300 rows at 262,144). Frequencies past the rotated dims are
+   * 0 (no rotation).
    */
   private ropeTable(theta: number, rotatedDims: number) {
     const { headDim } = this.config
     const half = headDim / 2
-    const table = new Float32Array(this.contextLength * half * 2)
-    for (let pos = 0; pos < this.contextLength; pos++) {
+    const rows = K.ROPE_LOW + Math.ceil(this.contextLength / K.ROPE_LOW)
+    const table = new Float32Array(rows * half * 2)
+    for (let r = 0; r < rows; r++) {
+      const pos = r < K.ROPE_LOW ? r : (r - K.ROPE_LOW) * K.ROPE_LOW
       for (let i = 0; i < half; i++) {
         const freq = i < rotatedDims / 2 ? theta ** ((-2 * i) / headDim) : 0
         const angle = pos * freq
-        table[pos * headDim + i] = Math.cos(angle)
-        table[pos * headDim + half + i] = Math.sin(angle)
+        table[r * headDim + i] = Math.cos(angle)
+        table[r * headDim + half + i] = Math.sin(angle)
       }
     }
-    return this.gpu.texture(GL.RGBA32F, headDim / 4, this.contextLength, {
+    return this.gpu.texture(GL.RGBA32F, headDim / 4, rows, {
       format: GL.RGBA,
       type: GL.FLOAT,
       pixels: table
@@ -355,7 +401,6 @@ export class Engine {
     const M = this.capacity
     const D = c.hiddenSize
     const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
-    const scoreTexels = Math.ceil(this.contextLength / 4)
     const qDims = c.numHeads * c.headDim
     const I = c.intermediateSize
     // Each tensor has its own texture: sharing one between tensors that are
@@ -389,25 +434,10 @@ export class Engine {
       q: this.f32(c.numHeads * c.headDim, M),
       scores: this.gpu.texture(
         GL.RGBA32F,
-        scoreTexels,
-        c.numHeads *
-          Math.min(M, this.baseBatch >= 256 ? SCORE_ROWS_LARGE : SCORE_ROWS)
+        Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)),
+        c.numHeads * Math.min(M, this.scoreRows())
       ),
       attnOut: this.h2(qDims, M),
-      /**
-       * Chunked attention's partial results (desktop batches): weighted
-       * values (two textures) and (max, sum), per query and chunk.
-       */
-      attnChunks:
-        this.baseBatch >= 256
-          ? ([0, 1, 2].map(() =>
-              this.gpu.texture(
-                GL.RGBA32F,
-                qDims / 8,
-                SCORE_ROWS_LARGE * ATTEND_CHUNKS
-              )
-            ) as [Texture, Texture, Texture])
-          : null,
       gateUp: this.pair(2 * I, M),
       act: this.h2(I, M),
       ffnOut: this.pair(D, 2 * M),
@@ -450,6 +480,99 @@ export class Engine {
         SPLIT_ROWS * 32
       )
     }
+  }
+
+  /** Texels per cache row: a layer's keys, then its values (h2). */
+  private kvWidth() {
+    const c = this.config
+    return (2 * c.numKvHeads * c.headDim) / 8
+  }
+
+  /** A full-attention cache for `positions` tokens, in blocks of 2^kvShift rows. */
+  private kvTexture(positions: number) {
+    const rows = 2 ** this.kvShift
+    return this.gpu.texture(
+      GL.RGBA32UI,
+      this.kvWidth() * Math.ceil(positions / rows),
+      Math.min(positions, rows)
+    )
+  }
+
+  /** Queries of each head per attention slice: a quarter of a batch, 32 to 128. */
+  private scoreRows() {
+    return Math.min(SCORE_ROWS_LARGE, Math.max(SCORE_ROWS, this.baseBatch / 4))
+  }
+
+  /**
+   * Makes room in the full-attention caches for tokens up to `end`: twice
+   * the positions (or as many as asked), copied into a bigger texture of the
+   * same layout. Sliding layers' rings never grow.
+   */
+  private reserve(end: number) {
+    if (end <= this.kvPositions) return
+    const block = 2 ** this.kvShift
+    let positions = Math.min(
+      this.contextLength,
+      Math.max(end, 2 * this.kvPositions)
+    )
+    // Whole blocks past the first; a power of two within it.
+    positions =
+      positions > block
+        ? Math.ceil(positions / block) * block
+        : 2 ** Math.ceil(Math.log2(positions))
+    for (const layer of this.layers) {
+      const a = layer.attention
+      if (!a || a.ring) continue
+      const kv = this.kvTexture(positions)
+      this.gpu.run({
+        name: "grow",
+        program: this.gpu.program(K.COPY_POSITIONS),
+        inputs: { uX: a.kv },
+        uniforms: {
+          uPos0: { int: 0 },
+          uRow0: { int: 0 },
+          uMod: { int: a.kv.height }
+        },
+        output: kv,
+        rect: { x: 0, y: 0, width: a.kv.width, height: a.kv.height }
+      })
+      this.gpu.delete(a.kv)
+      a.kv = kv
+    }
+    if (this.gpu.outOfMemory()) {
+      throw new GpuError(
+        `The GPU ran out of memory growing the cache to ${positions} tokens. Start a new session to keep going.`
+      )
+    }
+    this.kvPositions = positions
+  }
+
+  /** Back to the starting cache size, for a new sequence. */
+  private shrink() {
+    const start = Math.min(KV_START, 2 ** this.kvShift)
+    if (this.kvPositions <= start) return
+    for (const layer of this.layers) {
+      const a = layer.attention
+      if (!a || a.ring) continue
+      this.gpu.delete(a.kv)
+      a.kv = this.kvTexture(start)
+    }
+    this.kvPositions = start
+  }
+
+  /**
+   * Chunked attention's partial results: weighted values (two textures)
+   * and (max, sum), for `rows` (query, chunk) pairs at least.
+   */
+  private chunkBuffers(rows: number) {
+    if (this.chunkBufs && this.chunkBufs[0].height >= rows) return this.chunkBufs
+    const c = this.config
+    const height = Math.max(rows, this.scoreRows() * ATTEND_CHUNKS)
+    this.chunkBufs?.forEach((t) => this.gpu.delete(t))
+    this.chunkBufs = [0, 1, 2].map(() =>
+      this.gpu.texture(GL.RGBA32F, (c.numHeads * c.headDim) / 8, height)
+    ) as [Texture, Texture, Texture]
+    return this.chunkBufs
   }
 
   private vector(values: Float32Array, rows = 1) {
@@ -669,13 +792,12 @@ export class Engine {
         window < this.contextLength
           ? window
           : 0
-      const rows = ring || this.contextLength
       layer.attention = {
         qkvg: this.matrix(w.attention.qkvg),
         o: this.matrix(w.attention.o),
         qNorm: this.vector(w.attention.qNorm),
         kNorm: this.vector(w.attention.kNorm),
-        kv: this.h2(2 * kvDims, rows),
+        kv: ring ? this.h2(2 * kvDims, ring) : this.kvTexture(this.kvPositions),
         ring
       }
     }
@@ -833,6 +955,7 @@ export class Engine {
     this.draft = null
     this.guessAt = null
     this.position = 0
+    this.shrink()
     for (const saved of this.snapshots.values()) this.freeSnapshot(saved)
     this.snapshots.clear()
     const zero = new Float32Array(
@@ -869,7 +992,7 @@ export class Engine {
     await this.logits(await this.forwardHidden([0]))
     this.snapshot()
     this.reset()
-    if (this.buffers.attnChunks && TUNING.attendChunkTexels > 0) {
+    if (TUNING.attendChunkTexels > 0) {
       // Chunked attention (long key ranges) too, forced on for a short
       // batch and a token.
       const saved = TUNING.attendChunkTexels
@@ -1354,18 +1477,29 @@ export class Engine {
         uPairTexels: { int: pairTexels },
         uPos0: { int: pos0 },
         uRowOffset: { int: 0 },
+        uXOff: { int: 0 },
         uEps: c.normEps,
         uScale: 1 / Math.sqrt(c.headDim)
       },
       output: b.q,
       rect: { x: 0, y: 0, width: qDims / 4, height: rows }
     })
-    // Keys and values into the cache at positions pos0..., in up to two
-    // runs of rows where a ring cache wraps around.
-    const length = layer.ring || this.contextLength
+    // Keys and values into the cache at positions pos0..., in runs of rows
+    // split where a ring cache wraps around or a block of rows ends. (A
+    // ring is one block, however tall.)
+    const kvWidth = this.kvWidth()
+    const kvShift = layer.ring ? 30 : this.kvShift
+    const blockRows = 2 ** kvShift
+    const kvAt = { uKvShift: { int: kvShift }, uKvWidth: { int: kvWidth } }
     for (let m0 = 0; m0 < rows;) {
-      const row0 = (pos0 + m0) % length
-      const run = Math.min(rows - m0, length - row0)
+      const slot = layer.ring ? (pos0 + m0) % layer.ring : pos0 + m0
+      const row0 = slot % blockRows
+      const x0 = Math.floor(slot / blockRows) * kvWidth
+      const run = Math.min(
+        rows - m0,
+        blockRows - row0,
+        layer.ring ? layer.ring - slot : Infinity
+      )
       // A fragment at row y reads token m = y - offset.
       const offset = row0 - m0
       this.gpu.run({
@@ -1381,11 +1515,12 @@ export class Engine {
           uPairTexels: { int: pairTexels },
           uPos0: { int: pos0 },
           uRowOffset: { int: offset },
+          uXOff: { int: x0 },
           uEps: c.normEps,
           uScale: 1
         },
         output: layer.kv,
-        rect: { x: 0, y: row0, width: kvDims / 8, height: run }
+        rect: { x: x0, y: row0, width: kvDims / 8, height: run }
       })
       // Values beside the keys: same texture, so no new render pass.
       this.gpu.run({
@@ -1397,92 +1532,131 @@ export class Engine {
           ...this.pairIn(qkvgIn),
           uBase: { int: (qDims + kvDims) / 4 },
           uRowOffset: { int: offset },
-          uXOff: { int: kvDims / 8 }
+          uXOff: { int: x0 + kvDims / 8 }
         },
         output: layer.kv,
-        rect: { x: kvDims / 8, y: row0, width: kvDims / 8, height: run }
+        rect: { x: x0 + kvDims / 8, y: row0, width: kvDims / 8, height: run }
       })
       m0 += run
     }
     // Queries in slices, so the scores buffer stays small: each slice sees
     // keys up to its last query (and, in sliding layers, from its first
-    // query's window on). The buffer holds SCORE_ROWS queries of every head
-    // at the full context's width; with fewer keys than that, panels of
-    // them sit side by side and a slice holds more queries.
+    // query's window on). The buffer holds scoreRows queries of every head
+    // at TUNING.scoreTexels's width; with fewer keys than that, panels of them
+    // sit side by side and a slice holds more queries. More keys than that
+    // go in segments: each segment's scores, then its chunks of weighted
+    // values (attendChunk), and at the end all chunks combined.
     const group = c.numHeads / c.numKvHeads
     const panelRows = b.scores.height
     for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
       const widest = Math.ceil((pos0 + rows - j0) / 4)
-      const panels = Math.max(1, Math.floor(b.scores.width / widest))
-      const slice = Math.min(
+      const segTexels = Math.min(widest, b.scores.width, TUNING.scoreTexels)
+      const segmentsMax = Math.ceil(widest / segTexels)
+      const panels = Math.max(1, Math.floor(b.scores.width / segTexels))
+      let slice = Math.min(
         rows - m0,
         Math.max(1, Math.floor((panels * panelRows) / c.numHeads))
       )
+      // Chunks per segment: up to ATTEND_CHUNKS of at least
+      // attendChunkTexels texels (fewer where segments are many).
+      const perSegment = Math.max(
+        1,
+        Math.min(
+          ATTEND_CHUNKS,
+          Math.floor(this.gpu.limits.maxTextureSize / segmentsMax)
+        )
+      )
+      const texelsPer = (t: number) =>
+        Math.max(TUNING.attendChunkTexels, Math.ceil(t / perSegment))
+      const chunkRows = this.scoreRows() * ATTEND_CHUNKS
+      if (segmentsMax > 1) {
+        const chunksMax =
+          segmentsMax * Math.ceil(segTexels / texelsPer(segTexels))
+        slice = Math.min(slice, Math.max(1, Math.floor(chunkRows / chunksMax)))
+      }
       const keys = pos0 + m0 + slice - j0
       const kt = Math.ceil(keys / 4)
+      const chunkTexels = texelsPer(Math.min(kt, segTexels))
       const total = c.numHeads * slice
       const ring = {
         uRows: { int: slice },
         uM0: { int: m0 },
         uRing: { int: layer.ring },
-        uKt: { int: kt },
-        uPanelRows: { int: panelRows }
+        uKt: { int: Math.min(kt, segTexels) },
+        uPanelRows: { int: panelRows },
+        ...kvAt
       }
-      this.gpu.run({
-        name: "scores",
-        program: this.gpu.program(K.scores(c.headDim)),
-        inputs: { uQ: b.q, uK: layer.kv },
-        uniforms: {
-          ...ring,
-          uJ0: { int: j0 },
-          uKeys: { int: keys },
-          uPos0: { int: pos0 },
-          uWindow: { int: sliding ? c.slidingWindow : 0 },
-          uGroup: { int: group },
-          uTotalRows: { int: total }
-        },
-        output: b.scores,
-        rect: {
-          x: 0,
-          y: 0,
-          width: Math.ceil(total / panelRows) * kt,
-          height: Math.min(panelRows, total)
-        }
-      })
-      const chunkBufs = b.attnChunks
-      const chunkTexels = Math.max(
-        TUNING.attendChunkTexels,
-        Math.ceil(kt / ATTEND_CHUNKS)
-      )
-      const chunks = Math.ceil(kt / chunkTexels)
+      const scores = (sj0: number, sKeys: number) =>
+        this.gpu.run({
+          name: "scores",
+          program: this.gpu.program(K.scores(c.headDim)),
+          inputs: { uQ: b.q, uK: layer.kv },
+          uniforms: {
+            ...ring,
+            uJ0: { int: sj0 },
+            uKeys: { int: sKeys },
+            uPos0: { int: pos0 },
+            uWindow: { int: sliding ? c.slidingWindow : 0 },
+            uGroup: { int: group },
+            uTotalRows: { int: total }
+          },
+          output: b.scores,
+          rect: {
+            x: 0,
+            y: 0,
+            width: Math.ceil(total / panelRows) * Math.min(kt, segTexels),
+            height: Math.min(panelRows, total)
+          }
+        })
+      const segments = Math.ceil(kt / segTexels)
+      const chunks =
+        segments > 1
+          ? (segments - 1) * Math.ceil(segTexels / chunkTexels) +
+            Math.ceil((kt - (segments - 1) * segTexels) / chunkTexels)
+          : Math.ceil(kt / chunkTexels)
       const chunkPast =
         rows <= SPLIT_ROWS
           ? Math.max(TUNING.attendChunkTexelsDecode, 2 * TUNING.attendChunkTexels)
           : 2 * TUNING.attendChunkTexels
       if (
-        chunkBufs &&
-        TUNING.attendChunkTexels > 0 &&
-        kt > chunkPast &&
-        slice * chunks <= chunkBufs[0].height
+        segments > 1 ||
+        (TUNING.attendChunkTexels > 0 &&
+          kt > chunkPast &&
+          slice * chunks <= chunkRows)
       ) {
         // Long key ranges: chunks of keys in parallel, then combined.
-        this.gpu.run({
-          name: "attend",
-          program: this.gpu.program(K.attendChunk(c.headDim)),
-          inputs: { uS: b.scores, uV: layer.kv },
-          uniforms: {
-            ...ring,
-            uJ0: { int: j0 },
-            uKeys: { int: keys },
-            uGroup: { int: group },
-            uVOff: { int: kvDims / 8 },
-            uSliceQ: { int: slice },
-            uChunkTexels: { int: chunkTexels }
-          },
-          output: chunkBufs,
-          rect: { x: 0, y: 0, width: qDims / 8, height: slice * chunks }
-        })
+        const chunkBufs = this.chunkBuffers(slice * chunks)
+        let chunk0 = 0
+        for (let s = 0; s < segments; s++) {
+          const sj0 = j0 + 4 * s * segTexels
+          const sKeys = Math.min(keys - 4 * s * segTexels, 4 * segTexels)
+          const sChunks = Math.ceil(Math.ceil(sKeys / 4) / chunkTexels)
+          scores(sj0, sKeys)
+          this.gpu.run({
+            name: "attend",
+            program: this.gpu.program(K.attendChunk(c.headDim)),
+            inputs: { uS: b.scores, uV: layer.kv },
+            uniforms: {
+              ...ring,
+              uJ0: { int: sj0 },
+              uKeys: { int: sKeys },
+              uGroup: { int: group },
+              uVOff: { int: kvDims / 8 },
+              uSliceQ: { int: slice },
+              uChunkTexels: { int: chunkTexels },
+              uChunk0: { int: chunk0 }
+            },
+            output: chunkBufs,
+            rect: {
+              x: 0,
+              y: chunk0 * slice,
+              width: qDims / 8,
+              height: slice * sChunks
+            }
+          })
+          chunk0 += sChunks
+        }
         this.gpu.run({
           name: "attend",
           program: read(K.attendCombine(c.headDim, c.attentionGate)),
@@ -1497,7 +1671,7 @@ export class Engine {
             ...this.pairIn(qkvgIn),
             uM0: { int: m0 },
             uSliceQ: { int: slice },
-            uChunks: { int: chunks },
+            uChunks: { int: chunk0 },
             uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
           },
           output: b.attnOut,
@@ -1506,6 +1680,7 @@ export class Engine {
         m0 += slice
         continue
       }
+      scores(j0, keys)
       this.gpu.run({
         name: "attend",
         program: read(K.attend(c.headDim, c.attentionGate)),
@@ -2067,6 +2242,7 @@ export class Engine {
     const b = this.buffers
     const rows = batch.length
     const pos0 = this.position
+    this.reserve(pos0 + rows)
     if (!idsOnGpu) {
       this.gpu.write(
         b.ids,

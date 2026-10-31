@@ -305,6 +305,15 @@ export class Gpu {
     )
   }
 
+  /** Whether the GPU has run out of memory (a texture it couldn't make). */
+  outOfMemory() {
+    const gl = this.gl
+    let out = gl.isContextLost()
+    for (let e = gl.getError(); e !== gl.NO_ERROR && !out; e = gl.getError())
+      out = e === gl.OUT_OF_MEMORY || e === gl.CONTEXT_LOST_WEBGL
+    return out
+  }
+
   delete(texture: Texture) {
     for (const [key, fb] of this.framebuffers) {
       if (key.split(",").includes(String(texture.id))) {

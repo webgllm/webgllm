@@ -148,7 +148,8 @@ async function run(params: {
   const engine = new Engine(canvas, {
     batchSize: params.batch,
     matmulPrecision: params.precision,
-    ringCache: (params as { ring?: boolean }).ring !== false
+    ringCache: (params as { ring?: boolean }).ring !== false,
+    kvBlockRows: (params as { kvRows?: number }).kvRows
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
@@ -534,7 +535,8 @@ async function smoke(params: {
   const engine = new Engine(canvas, {
     batchSize: params.batch,
     matmulPrecision: params.precision,
-    weightTexels: params.texels
+    weightTexels: params.texels,
+    kvBlockRows: (params as { kvRows?: number }).kvRows
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
@@ -937,8 +939,33 @@ async function smoke(params: {
       `CHUNK CHECK: chunked vs one-pass attention over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${plain.length}`
     )
   }
-  if (params.ab || params.abDecode) {
-    // The A/B runs left the cache elsewhere: read the prompt again.
+  if (prompt.length > 1000) {
+    // Segmented attention (key ranges past the scores buffer's width, each
+    // segment's chunks combined) against whole rows: 512-key segments.
+    const run = async (texels: number) => {
+      const saved = TUNING.scoreTexels
+      TUNING.scoreTexels = texels
+      engine.reset()
+      const out: Array<Float32Array> = [await engine.forward(prompt)]
+      for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+      TUNING.scoreTexels = saved
+      return out
+    }
+    const whole = await run(TUNING.scoreTexels)
+    const segmented = await run(128)
+    let worst = 0
+    let same = 0
+    for (let i = 0; i < whole.length; i++) {
+      const r = compareLogits(segmented[i], whole[i])
+      worst = Math.max(worst, r.kl)
+      if (r.top1) same++
+    }
+    log(
+      `SEGMENT CHECK: 512-key segments vs whole rows over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${whole.length}`
+    )
+  }
+  if (params.ab || params.abDecode || prompt.length > 1000) {
+    // The A/B runs and checks left the cache elsewhere: read the prompt again.
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)
     token = await pick(await engine.forwardHidden(prompt))

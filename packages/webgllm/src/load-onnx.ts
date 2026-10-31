@@ -792,6 +792,7 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
     vocabSize,
     layerTypes,
     slidingWindow: num("sliding_window", 0),
+    contextLength: num("max_position_embeddings"),
     ropeThetaFull: theta(fullRope),
     ropeThetaSliding: theta(slidingRope),
     ropeDimsFull: rotated(fullRope),
