@@ -1,7 +1,8 @@
 /**
  * The WebGL 2 worker: downloads a model to the Origin Private File System,
  * uploads its weights to the GPU on an OffscreenCanvas, and runs
- * generations, streaming each one's text back. One model at a time.
+ * generations one at a time, streaming each one's text back. One model at a
+ * time: loading another frees the previous one.
  */
 import { blobSource } from "./byte-source.js"
 import { Engine, MAX_CHUNKS } from "./engine.js"
@@ -15,6 +16,7 @@ import { createSampler } from "./sampler.js"
 import { download, storedFile } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
+import { THINK_OPEN } from "./reply.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -27,14 +29,28 @@ type Loaded = {
 }
 
 let current: Loaded | null = null
-let loading: { model: string; promise: Promise<Loaded> } | null = null
+let loading: {
+  model: string
+  promise: Promise<Loaded>
+  abort: AbortController
+} | null = null
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
 /** Below this much room for a reply, the chat is too long to answer. */
 const MIN_REPLY_TOKENS = 32
 
-async function fetchFiles(model: WebGlTextModel) {
+/** Drops an engine's GPU memory now rather than whenever it's collected. */
+const release = (engine: Engine) =>
+  engine.gpu.gl.getExtension("WEBGL_lose_context")?.loseContext()
+
+class Superseded extends Error {
+  constructor() {
+    super("Switched to another model.")
+  }
+}
+
+async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
   const meta = modelMeta(model)
   const weights: Array<ModelFile> =
     meta.files.kind === "gguf"
@@ -70,103 +86,133 @@ async function fetchFiles(model: WebGlTextModel) {
     all.map((file, i) =>
       stored[i]
         ? Promise.resolve(stored[i])
-        : download(file, (bytes, size) => {
-            loaded[i] = bytes
-            totals[i] = Math.max(totals[i], size)
-            report()
-          })
+        : download(
+            file,
+            (bytes, size) => {
+              loaded[i] = bytes
+              totals[i] = Math.max(totals[i], size)
+              report()
+            },
+            signal
+          )
     )
   )
   const [tokenizerFile, tokenizerConfigFile, ...rest] = files
   // tokenizer_config.json's template when the model has no file for it.
   const templateFile = template.length ? rest.shift() : undefined
-  const weightFiles = rest
   return {
     meta,
     cached,
     tokenizerFile,
     tokenizerConfigFile,
     templateFile,
-    weightFiles
+    weightFiles: rest
   }
 }
 
-async function load(model: WebGlTextModel): Promise<Loaded> {
-  const {
-    meta,
-    cached,
-    tokenizerFile,
-    tokenizerConfigFile,
-    templateFile,
-    weightFiles
-  } = await fetchFiles(model)
-  post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
-  const tokenizer = loadTokenizer({
-    tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
-    tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
-      string,
-      unknown
-    >,
-    ...(templateFile && { chatTemplate: await templateFile.text() })
-  })
+async function load(
+  model: WebGlTextModel,
+  signal: AbortSignal
+): Promise<Loaded> {
+  const meta = modelMeta(model)
+  // The GPU first: a browser or GPU that can't run the model says so before
+  // a gigabyte downloads.
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     contextLength: meta.context
   })
-  const pieces =
-    meta.files.kind === "gguf"
-      ? loadGguf(blobSource(weightFiles[0]))
-      : loadOnnx({
-          config: JSON.parse(await weightFiles[0].text()) as Record<
-            string,
-            unknown
-          >,
-          graph: blobSource(weightFiles[1]),
-          data: blobSource(weightFiles[2])
-        })
-  let layers = 0
-  await engine.load(pieces, (piece) => {
-    if (piece.kind === "config") layers = piece.config.numLayers + 2
-    if (
-      piece.kind === "layer" ||
-      piece.kind === "embedding" ||
-      piece.kind === "finalNorm"
-    ) {
-      const count = piece.kind === "layer" ? piece.layer + 1 : layers
-      post({
-        type: "progress",
-        model,
-        progress:
-          (cached ? 0 : 0.9) + (cached ? 1 : 0.1) * Math.min(count / layers, 1),
-        cached
-      })
+  try {
+    const { maxTextureSize } = engine.gpu.limits
+    if (maxTextureSize < meta.context) {
+      throw new GpuError(
+        `This GPU's textures go up to ${maxTextureSize} texels; the model needs ${meta.context}.`
+      )
     }
-  })
-  engine.reset()
-  return { model, engine, tokenizer, cached: [] }
+    const {
+      cached,
+      tokenizerFile,
+      tokenizerConfigFile,
+      templateFile,
+      weightFiles
+    } = await fetchFiles(model, signal)
+    post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
+    const tokenizer = loadTokenizer({
+      tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
+      tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
+        string,
+        unknown
+      >,
+      ...(templateFile && { chatTemplate: await templateFile.text() })
+    })
+    const pieces =
+      meta.files.kind === "gguf"
+        ? loadGguf(blobSource(weightFiles[0]))
+        : loadOnnx({
+            config: JSON.parse(await weightFiles[0].text()) as Record<
+              string,
+              unknown
+            >,
+            graph: blobSource(weightFiles[1]),
+            data: blobSource(weightFiles[2])
+          })
+    let layers = 0
+    await engine.load(pieces, (piece) => {
+      if (signal.aborted) throw new Superseded()
+      if (piece.kind === "config") layers = piece.config.numLayers + 2
+      if (
+        piece.kind === "layer" ||
+        piece.kind === "embedding" ||
+        piece.kind === "finalNorm"
+      ) {
+        const count = piece.kind === "layer" ? piece.layer + 1 : layers
+        post({
+          type: "progress",
+          model,
+          progress:
+            (cached ? 0 : 0.9) +
+            (cached ? 1 : 0.1) * Math.min(count / layers, 1),
+          cached
+        })
+      }
+    })
+    if (signal.aborted) throw new Superseded()
+    engine.reset()
+    return { model, engine, tokenizer, cached: [] }
+  } catch (error) {
+    // A failed or superseded load frees its textures now.
+    release(engine)
+    throw error
+  }
 }
 
-function startLoad(model: string) {
-  if (current?.model === model) {
+/** Loads `model` unless it's loaded (or loading), replacing any other. */
+function startLoad(model: string): Promise<Loaded> {
+  if (current?.model === model && !current.engine.gpu.isLost) {
     post({ type: "ready", model })
     return Promise.resolve(current)
   }
   if (loading?.model === model) return loading.promise
-  // Free the previous model's textures by dropping its context.
+  // Stop a load of another model, and free the loaded one.
+  loading?.abort.abort()
   if (current) {
-    current.engine.gpu.gl.getExtension("WEBGL_lose_context")?.loseContext()
+    release(current.engine)
     current = null
   }
-  const promise = load(model as WebGlTextModel)
-  loading = { model, promise }
+  const abort = new AbortController()
+  const promise = load(model as WebGlTextModel, abort.signal)
+  const entry = { model, promise, abort }
+  loading = entry
   promise.then(
     (loaded) => {
-      if (loading?.promise !== promise) return
+      if (loading !== entry) {
+        release(loaded.engine)
+        return
+      }
       loading = null
       current = loaded
       post({ type: "ready", model })
     },
     (error: unknown) => {
-      if (loading?.promise !== promise) return
+      if (loading !== entry) return
       loading = null
       post({ type: "load-error", model, message: errorMessage(error) })
     }
@@ -183,12 +229,24 @@ const errorMessage = (error: unknown) =>
       ? error.message
       : String(error)
 
-async function generate(request: Extract<WorkerRequest, { type: "generate" }>) {
+type GenerateRequest = Extract<WorkerRequest, { type: "generate" }>
+
+async function generate(request: GenerateRequest) {
   const { id } = request
   const requested = performance.now()
-  const target = loading?.promise ?? (current ? Promise.resolve(current) : null)
-  if (!target) throw new Error("No model is loaded.")
-  const model = await target
+  const empty: RunTimings = {
+    inputTokens: 0,
+    cachedTokens: 0,
+    outputTokens: 0,
+    firstTokenMs: null,
+    promptMs: 0,
+    decodeMs: 0
+  }
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  // The model this request is for: loaded again if its GPU context was
+  // lost, or loaded if another was asked for since.
+  const model = await startLoad(request.model)
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
   const { engine, tokenizer } = model
   const prompt = tokenizer.encodeChat(request.chat, {
     tools: request.tools.length ? request.tools : undefined,
@@ -225,6 +283,22 @@ async function generate(request: Extract<WorkerRequest, { type: "generate" }>) {
     engine.snapshot()
     if (stopped.has(id)) break
   }
+  const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
+  const stats: RunTimings = {
+    inputTokens: prompt.length,
+    cachedTokens: start,
+    outputTokens: 0,
+    firstTokenMs: null,
+    promptMs: performance.now() - promptStart,
+    decodeMs: 0
+  }
+  if (
+    stopped.has(id) ||
+    maxTokens <= 0 ||
+    model.cached.length < prompt.length
+  ) {
+    return post({ type: "done", id, stats })
+  }
 
   const { sampling } = request
   // With top-k sampling (LFM3's card: 50), the GPU applies the repetition
@@ -250,23 +324,28 @@ async function generate(request: Extract<WorkerRequest, { type: "generate" }>) {
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
     return sampler.sample(logits)
   }
-  let token = await next()
-  const promptMs = performance.now() - promptStart
 
+  // When the template opens the thinking itself (LFM3 with thinking on ends
+  // the prompt with `<think>`), the reply starts inside it: say so first,
+  // as the model would have, so the thinking reads as thinking.
+  if (prompt[prompt.length - 1] === tokenizer.specialTokens.think) {
+    post({ type: "token", id, text: THINK_OPEN })
+  }
+
+  let token = await next()
+  stats.promptMs = performance.now() - promptStart
+  const firstTokenAt = performance.now()
+  stats.firstTokenMs = firstTokenAt - requested
   const decoder = tokenizer.createStreamDecoder({ skipSpecialTokens: false })
   const eos = tokenizer.specialTokens.eos
-  const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
-  let outputTokens = 0
-  const firstTokenAt = performance.now()
-  const firstTokenMs: number | null = firstTokenAt - requested
   while (!stopped.has(id)) {
-    outputTokens++
+    stats.outputTokens++
     if (token === eos) break
     if (onGpu) engine.markSeen(token)
     else sampler.see([token])
     const text = decoder.push(token)
     if (text) post({ type: "token", id, text })
-    if (outputTokens >= maxTokens) break
+    if (stats.outputTokens >= maxTokens) break
     row = await engine.forwardHidden([token])
     model.cached.push(token)
     token = await next()
@@ -274,16 +353,15 @@ async function generate(request: Extract<WorkerRequest, { type: "generate" }>) {
   const rest = decoder.flush()
   if (rest) post({ type: "token", id, text: rest })
   engine.snapshot()
-  const stats: RunTimings = {
-    inputTokens: prompt.length,
-    cachedTokens: start,
-    outputTokens,
-    firstTokenMs,
-    promptMs,
-    decodeMs: firstTokenMs === null ? 0 : performance.now() - firstTokenAt
-  }
+  stats.decodeMs = performance.now() - firstTokenAt
   post({ type: "done", id, stats })
 }
+
+/**
+ * Generations run one after another: they share the engine and its cache,
+ * so one must finish (or stop) before the next reads its prompt.
+ */
+let queue: Promise<void> = Promise.resolve()
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   if (data.type === "load") {
@@ -291,9 +369,11 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else {
-    generate(data)
+    queue = queue
+      .then(() => generate(data))
       .catch((error: unknown) => {
-        // A lost GPU context can't be used again: load afresh next time.
+        // A lost GPU context can't be used again: the next generation
+        // loads the model afresh.
         if (current?.engine.gpu.isLost) current = null
         post({ type: "error", id: data.id, message: errorMessage(error) })
       })

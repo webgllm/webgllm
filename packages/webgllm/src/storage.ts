@@ -1,6 +1,10 @@
 /**
  * Model files in the Origin Private File System: downloaded once (resuming
  * where a dropped connection left off), then read from disk, offline too.
+ * Runs in the worker: files are written through sync access handles, which
+ * every browser with OPFS has in workers (Safari before 26 has no
+ * `createWritable`). A file counts as downloaded once its `.done` marker
+ * exists, so an interrupted download is never mistaken for a whole one.
  */
 import { fileUrl } from "./model-meta.js"
 import type { ModelFile } from "./model-meta.js"
@@ -12,6 +16,16 @@ const ATTEMPTS = 6
 const diskName = (file: ModelFile) =>
   `${file.repo}@${file.revision}/${file.path}`.replace(/[^\w.@-]+/g, "_")
 
+const marker = (file: ModelFile) => `${diskName(file)}.done`
+
+type SyncAccessHandle = {
+  getSize: () => number
+  truncate: (size: number) => void
+  write: (data: Uint8Array, options: { at: number }) => number
+  flush: () => void
+  close: () => void
+}
+
 async function dir() {
   const root = await navigator.storage.getDirectory()
   return root.getDirectoryHandle(DIR, { create: true })
@@ -20,9 +34,9 @@ async function dir() {
 /** The downloaded file, or null if it isn't complete on disk. */
 export async function storedFile(file: ModelFile): Promise<File | null> {
   try {
-    const handle = await (await dir()).getFileHandle(diskName(file))
-    const stored = await handle.getFile()
-    // A partial download is kept under its own name until it's complete.
+    const folder = await dir()
+    await folder.getFileHandle(marker(file))
+    const stored = await (await folder.getFileHandle(diskName(file))).getFile()
     return file.bytes === undefined || stored.size === file.bytes
       ? stored
       : null
@@ -43,69 +57,66 @@ export async function download(
   const done = await storedFile(file)
   if (done) return done
   const folder = await dir()
-  const partName = `${diskName(file)}.part`
-  const part = await folder.getFileHandle(partName, { create: true })
-  let loaded = (await part.getFile()).size
-  let total = file.bytes ?? 0
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const response = await fetch(fileUrl(file), {
-        signal,
-        headers: loaded > 0 ? { Range: `bytes=${loaded}-` } : {},
-        referrerPolicy: "no-referrer"
-      })
-      if (response.status === 200 && loaded > 0) loaded = 0
-      else if (!response.ok)
-        throw new Error(`HTTP ${response.status} for ${file.path}`)
-      const length = Number(response.headers.get("Content-Length") ?? 0)
-      if (!total) total = loaded + length
-      const writable = await part.createWritable({
-        keepExistingData: loaded > 0
-      })
-      if (loaded > 0) await writable.seek(loaded)
-      else await writable.truncate(0)
-      const reader = response.body?.getReader()
-      if (!reader) throw new Error("No response body.")
+  const handle = await folder.getFileHandle(diskName(file), { create: true })
+  const access = (await (
+    handle as FileSystemFileHandle & {
+      createSyncAccessHandle: () => Promise<SyncAccessHandle>
+    }
+  ).createSyncAccessHandle()) as SyncAccessHandle
+  try {
+    let loaded = access.getSize()
+    if (file.bytes !== undefined && loaded > file.bytes) {
+      access.truncate(0)
+      loaded = 0
+    }
+    let total = file.bytes ?? 0
+    for (let attempt = 0; ; attempt++) {
+      // Already whole (the marker was all that was missing).
+      if (file.bytes !== undefined && loaded === file.bytes) break
       try {
+        const response = await fetch(fileUrl(file), {
+          signal,
+          headers: loaded > 0 ? { Range: `bytes=${loaded}-` } : {},
+          referrerPolicy: "no-referrer"
+        })
+        // Nothing past the end: the file was whole (its size wasn't known).
+        if (response.status === 416 && loaded > 0) break
+        if (response.status === 200 && loaded > 0) {
+          // The server sent the whole file instead of the rest.
+          access.truncate(0)
+          loaded = 0
+        } else if (!response.ok) {
+          throw new Error(`HTTP ${response.status} for ${file.path}`)
+        }
+        const length = Number(response.headers.get("Content-Length") ?? 0)
+        if (!total) total = loaded + length
+        const reader = response.body?.getReader()
+        if (!reader) throw new Error("No response body.")
         for (;;) {
           const { done: end, value } = await reader.read()
           if (end) break
-          await writable.write(value)
+          access.write(value, { at: loaded })
           loaded += value.byteLength
           onProgress(loaded, total)
         }
-      } finally {
-        await writable.close()
+        access.flush()
+        break
+      } catch (error) {
+        if (signal?.aborted || attempt + 1 >= ATTEMPTS) throw error
+        await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt))
+        loaded = access.getSize()
       }
-      break
-    } catch (error) {
-      if (signal?.aborted || attempt + 1 >= ATTEMPTS) throw error
-      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt))
-      loaded = (await part.getFile()).size
     }
-  }
-  // Complete: give it its real name.
-  const finished = await part.getFile()
-  if (file.bytes !== undefined && finished.size !== file.bytes) {
-    await folder.removeEntry(partName)
-    throw new Error(
-      `${file.path} downloaded as ${finished.size} bytes, expected ${file.bytes}.`
-    )
-  }
-  const movable = part as FileSystemFileHandle & {
-    move?: (name: string) => Promise<void>
-  }
-  if (movable.move) {
-    try {
-      await movable.move(diskName(file))
-      return (await folder.getFileHandle(diskName(file))).getFile()
-    } catch {
-      // Not supported for this handle: copy instead.
+    if (file.bytes !== undefined && access.getSize() !== file.bytes) {
+      const size = access.getSize()
+      access.truncate(0)
+      throw new Error(
+        `${file.path} downloaded as ${size} bytes, expected ${file.bytes}.`
+      )
     }
+  } finally {
+    access.close()
   }
-  const target = await folder.getFileHandle(diskName(file), { create: true })
-  const out = await target.createWritable()
-  await finished.stream().pipeTo(out)
-  await folder.removeEntry(partName)
-  return target.getFile()
+  await folder.getFileHandle(marker(file), { create: true })
+  return handle.getFile()
 }

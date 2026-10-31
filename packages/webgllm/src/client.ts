@@ -92,8 +92,28 @@ function post(message: WorkerRequest) {
       name: "webgl"
     })
     worker.onmessage = handleMessage
+    worker.onerror = (event) =>
+      failWorker(event.message || "The model's worker stopped.")
   }
   worker.postMessage(message)
+}
+
+/**
+ * The worker failed to start or crashed: everything waiting on it fails,
+ * and the next request starts a new one.
+ */
+function failWorker(message: string) {
+  worker?.terminate()
+  worker = null
+  if (loaded) {
+    modelStatus(loaded.model as WebGlTextModel).set({ state: "error", message })
+    loaded.load.reject(new Error(message))
+    loaded = null
+  }
+  for (const [id, generation] of generations) {
+    generations.delete(id)
+    generation.onEnd(message)
+  }
 }
 
 let askedToKeep = false
@@ -108,14 +128,22 @@ function keepDownloads() {
 }
 
 /**
+ * Textures the engine needs, in texels per side: the 8,192-token cache and
+ * rotary table are that many rows.
+ */
+const MIN_TEXTURE_SIZE = 8192
+
+/**
  * Whether this browser can run the engine: WebGL 2 with float render
- * targets, on an OffscreenCanvas in a worker.
+ * targets and big enough textures, on an OffscreenCanvas in a worker.
  */
 export function hasWebGl2(): boolean {
   if (typeof OffscreenCanvas === "undefined") return false
   try {
     const gl = new OffscreenCanvas(1, 1).getContext("webgl2")
-    const ok = !!gl?.getExtension("EXT_color_buffer_float")
+    const ok =
+      !!gl?.getExtension("EXT_color_buffer_float") &&
+      (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) >= MIN_TEXTURE_SIZE
     gl?.getExtension("WEBGL_lose_context")?.loseContext()
     return ok
   } catch {
@@ -152,6 +180,7 @@ export type GenerationEnd = { failure?: string; stats?: RunTimings }
  */
 export async function* generate(request: {
   id: string
+  model: WebGlTextModel
   chat: Array<ChatMessage>
   tools: Array<ChatTool>
   thinking?: boolean
@@ -160,6 +189,8 @@ export async function* generate(request: {
   signal?: AbortSignal
 }): AsyncGenerator<string, GenerationEnd> {
   const { id, signal } = request
+  // Stopped before it started (say, while the model downloaded).
+  if (signal?.aborted) return {}
   const queue: Array<string> = []
   let wake: (() => void) | null = null
   let finished = false
@@ -180,6 +211,7 @@ export async function* generate(request: {
   post({
     type: "generate",
     id,
+    model: request.model,
     chat: request.chat,
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),
@@ -200,6 +232,12 @@ export async function* generate(request: {
     }
   } finally {
     signal?.removeEventListener("abort", onAbort)
+    // The caller stopped reading before the end: stop the worker too, so it
+    // doesn't keep generating into the next request.
+    if (!finished) {
+      generations.delete(id)
+      post({ type: "stop", id })
+    }
   }
   return end
 }

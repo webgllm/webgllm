@@ -35,21 +35,29 @@ export function createSampler({
             x < 0 ? x * repetition_penalty : x / repetition_penalty
         }
       }
-      // The k largest, in no order: replace the smallest kept when beaten.
       const k = Math.max(
         1,
         Math.min(top_k > 0 ? top_k : logits.length, logits.length)
       )
-      const keptIds = new Int32Array(k)
-      const kept = new Float32Array(k).fill(-Infinity)
-      let smallest = 0
-      for (let i = 0; i < logits.length; i++) {
-        const x = logits[i]
-        if (!(x > kept[smallest])) continue
-        kept[smallest] = x
-        keptIds[smallest] = i
-        smallest = 0
-        for (let j = 1; j < k; j++) if (kept[j] < kept[smallest]) smallest = j
+      let keptIds: Int32Array
+      let kept: Float32Array
+      if (k >= logits.length) {
+        // Every token kept (no top-k): no selection to make.
+        keptIds = Int32Array.from({ length: logits.length }, (_, i) => i)
+        kept = logits.slice()
+      } else {
+        // The k largest, in no order: replace the smallest kept when beaten.
+        keptIds = new Int32Array(k)
+        kept = new Float32Array(k).fill(-Infinity)
+        let smallest = 0
+        for (let i = 0; i < logits.length; i++) {
+          const x = logits[i]
+          if (!(x > kept[smallest])) continue
+          kept[smallest] = x
+          keptIds[smallest] = i
+          smallest = 0
+          for (let j = 1; j < k; j++) if (kept[j] < kept[smallest]) smallest = j
+        }
       }
       let best = 0
       for (let j = 1; j < k; j++) if (kept[j] > kept[best]) best = j

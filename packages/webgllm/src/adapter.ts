@@ -354,6 +354,7 @@ export class WebGlTextAdapter<
 
     const stream = generate({
       id: nextId("call"),
+      model: this.model,
       chat,
       tools: toTools(options.tools),
       thinking: enableThinking(options.reasoning, model),
@@ -453,6 +454,7 @@ export class WebGlTextAdapter<
       .join("\n\n")
     const stream = generate({
       id: nextId("call"),
+      model: this.model,
       chat: [
         { role: "system", content: system },
         ...toChatMessages(chatOptions.messages)

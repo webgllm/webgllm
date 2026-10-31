@@ -23,6 +23,8 @@ export type WorkerRequest =
   | {
       type: "generate"
       id: string
+      /** The model to run it on: loaded first if it isn't (or its GPU context was lost). */
+      model: string
       chat: Array<ChatMessage>
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
