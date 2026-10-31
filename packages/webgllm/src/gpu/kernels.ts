@@ -1819,6 +1819,93 @@ void main() {
   o = vec4(mx, 0.0, 0.0, 0.0);
 }`
 
+/**
+ * CHUNK_MAX, also noting where in the chunk its first largest logit is
+ * (.y), so the argmax needn't walk the chunk again.
+ */
+export const CHUNK_MAX_AT = `${HEADER}
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform int uOutW;
+uniform float uPenalty;
+${PENALIZED}
+out vec4 o;
+void main() {
+  int c = int(gl_FragCoord.x);
+  int r = int(gl_FragCoord.y);
+  float mx = -3e38;
+  int at = 0;
+  for (int t = 0; t < 64; t++) {
+    vec4 v = chunkTexel(c, t, r);
+    if (v.x > mx) { mx = v.x; at = 4 * t; }
+    if (v.y > mx) { mx = v.y; at = 4 * t + 1; }
+    if (v.z > mx) { mx = v.z; at = 4 * t + 2; }
+    if (v.w > mx) { mx = v.w; at = 4 * t + 3; }
+  }
+  o = vec4(mx, float(at), 0.0, 0.0);
+}`
+
+/**
+ * CHUNK_ARGMAX from CHUNK_MAX_AT's maxima and positions: the first chunk
+ * with the largest maximum, scanned 8 chunks at a time (independent reads),
+ * then that chunk's position. uChunks is fixed by withChunks.
+ */
+export const CHUNK_ARGMAX_AT = `${HEADER}
+uniform sampler2D uMax;
+uniform int uChunks;
+uniform int uRow;
+out uvec4 o;
+void main() {
+  float t0 = -3e38, t1 = -3e38, t2 = -3e38, t3 = -3e38, t4 = -3e38, t5 = -3e38, t6 = -3e38, t7 = -3e38;
+  int b0 = 0, b1 = 1, b2 = 2, b3 = 3, b4 = 4, b5 = 5, b6 = 6, b7 = 7;
+  for (int i = 0; i < uChunks; i += 8) {
+    float v0 = texelFetch(uMax, ivec2(i, uRow), 0).x;
+    float v1 = i + 1 < uChunks ? texelFetch(uMax, ivec2(i + 1, uRow), 0).x : -3e38;
+    float v2 = i + 2 < uChunks ? texelFetch(uMax, ivec2(i + 2, uRow), 0).x : -3e38;
+    float v3 = i + 3 < uChunks ? texelFetch(uMax, ivec2(i + 3, uRow), 0).x : -3e38;
+    float v4 = i + 4 < uChunks ? texelFetch(uMax, ivec2(i + 4, uRow), 0).x : -3e38;
+    float v5 = i + 5 < uChunks ? texelFetch(uMax, ivec2(i + 5, uRow), 0).x : -3e38;
+    float v6 = i + 6 < uChunks ? texelFetch(uMax, ivec2(i + 6, uRow), 0).x : -3e38;
+    float v7 = i + 7 < uChunks ? texelFetch(uMax, ivec2(i + 7, uRow), 0).x : -3e38;
+    if (v0 > t0) { t0 = v0; b0 = i; }
+    if (v1 > t1) { t1 = v1; b1 = i + 1; }
+    if (v2 > t2) { t2 = v2; b2 = i + 2; }
+    if (v3 > t3) { t3 = v3; b3 = i + 3; }
+    if (v4 > t4) { t4 = v4; b4 = i + 4; }
+    if (v5 > t5) { t5 = v5; b5 = i + 5; }
+    if (v6 > t6) { t6 = v6; b6 = i + 6; }
+    if (v7 > t7) { t7 = v7; b7 = i + 7; }
+  }
+  // Merged with ties to the lower index, as CHUNK_RANK ranks them.
+  float top = t0;
+  int best = b0;
+  if (t1 > top || (t1 == top && b1 < best)) { top = t1; best = b1; }
+  if (t2 > top || (t2 == top && b2 < best)) { top = t2; best = b2; }
+  if (t3 > top || (t3 == top && b3 < best)) { top = t3; best = b3; }
+  if (t4 > top || (t4 == top && b4 < best)) { top = t4; best = b4; }
+  if (t5 > top || (t5 == top && b5 < best)) { top = t5; best = b5; }
+  if (t6 > top || (t6 == top && b6 < best)) { top = t6; best = b6; }
+  if (t7 > top || (t7 == top && b7 < best)) { top = t7; best = b7; }
+  int at = int(texelFetch(uMax, ivec2(best, uRow), 0).y);
+  o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
+}`
+
+const chunksCache = new Map<string, Map<number, string>>()
+/** `source` with its chunk count fixed at `n`, so its loops have a constant bound. */
+export function withChunks(source: string, n: number) {
+  let bySource = chunksCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    chunksCache.set(source, bySource)
+  }
+  let out = bySource.get(n)
+  if (out === undefined) {
+    out = source.replace("uniform int uChunks;", `const int uChunks = ${n};`)
+    bySource.set(n, out)
+  }
+  return out
+}
+
 /** Each chunk's rank by its largest logit (0 = largest; ties by index). */
 export const CHUNK_RANK = `${HEADER}
 uniform sampler2D uMax;

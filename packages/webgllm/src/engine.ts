@@ -140,6 +140,8 @@ export const TUNING = {
   f16MinRows: 64,
   /** 1: reads of candidates nothing runs behind (no guess) block rather than poll a fence. */
   blockingReads: 1,
+  /** 1: the pick's argmax from the chunk maxima's positions, its loops with constant bounds. */
+  fastPick: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
   renderHints: 1,
   /**
@@ -2365,6 +2367,7 @@ export class Engine {
     type Ivec4 = [number, number, number, number]
     const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4
     const extra2 = [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4
+    const fast = TUNING.fastPick > 0
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -2377,7 +2380,7 @@ export class Engine {
     }
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(K.CHUNK_MAX),
+      program: this.gpu.program(fast ? K.CHUNK_MAX_AT : K.CHUNK_MAX),
       inputs: { uLogits: head.logits, uMask: b.mask },
       uniforms: picking,
       output: b.chunkMax,
@@ -2388,7 +2391,9 @@ export class Engine {
       // the chunk maxima: the forward waits on this, not on the gather.
       this.gpu.run({
         name: "pick",
-        program: this.gpu.program(K.CHUNK_ARGMAX),
+        program: this.gpu.program(
+          fast ? K.withChunks(K.CHUNK_ARGMAX_AT, total) : K.CHUNK_ARGMAX
+        ),
         inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask },
         uniforms: {
           ...picking,
@@ -2401,7 +2406,9 @@ export class Engine {
     }
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(K.CHUNK_RANK),
+      program: this.gpu.program(
+        fast ? K.withChunks(K.CHUNK_RANK, total) : K.CHUNK_RANK
+      ),
       inputs: { uMax: b.chunkMax },
       uniforms: { uChunks: { int: total } },
       output: b.chunkRank,
@@ -2409,7 +2416,9 @@ export class Engine {
     })
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(K.CHUNK_BY_RANK),
+      program: this.gpu.program(
+        fast ? K.withChunks(K.CHUNK_BY_RANK, total) : K.CHUNK_BY_RANK
+      ),
       inputs: { uRank: b.chunkRank },
       uniforms: { uChunks: { int: total } },
       output: b.chunkByRank,

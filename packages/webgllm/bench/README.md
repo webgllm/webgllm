@@ -33,3 +33,9 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 ## mm2.html
 
 `?batch=512&only=LFM3`: matmul layouts on the model's shapes (random weights; each timed draw's output gets read, so PowerVR can't skip it). On the Pixel the engine's RGBA4, 4-tokens-per-fragment prompt layout is fastest (~285 GFLOP/s); byte and word texels unpacked in the shader are 10–25% slower.
+
+## Writing experiments that lost (Pixel 10 Pro, Oct 31)
+
+- gate|up and SwiGLU in one pass with no K-split (576 fragments for the 350M, each over all of K): 3× slower on the Pixel and 1.8× on an M3. Writing passes need thousands of fragments; a pass fewer doesn't pay for that.
+- Fewer RMS partial sums (rmsParts 16): no change; 4: 14% slower.
+- Output head in 1 or 2 K-slices instead of 4: no change.
