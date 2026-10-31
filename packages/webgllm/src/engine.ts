@@ -98,7 +98,13 @@ function toRgba4(words: Uint32Array) {
  */
 export const TUNING = {
   /** Prompt matmuls with at most this many row groups split K in two. */
-  sliceGroups: 1024
+  sliceGroups: 1024,
+  /** Few-token matmuls split K until they have about this many fragments... */
+  splitFragments: 4096,
+  /** ...into at most this many slices (the partial buffer holds 32). */
+  maxSplit: 16,
+  /** Pixels per row summing its squares (at most K.RMS_PARTS). */
+  rmsParts: 64
 }
 
 export type EngineOptions = {
@@ -141,12 +147,8 @@ const SCORE_ROWS = 32
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
 export const MAX_CHUNKS = 64
-/** Batches this small split their matmuls along K... */
+/** Batches this small split their matmuls along K (see TUNING). */
 const SPLIT_ROWS = 4
-/** ...into up to this many slices... */
-const MAX_SPLIT = 16
-/** ...for about this many fragments per matmul. */
-const SPLIT_FRAGMENTS = 4096
 
 export class Engine {
   readonly gpu: Gpu
@@ -324,7 +326,7 @@ export class Engine {
       partial: this.gpu.texture(
         GL.RGBA32F,
         Math.max(2 * c.intermediateSize, qkvg, 3 * D) / 4,
-        SPLIT_ROWS * MAX_SPLIT
+        SPLIT_ROWS * 32
       )
     }
   }
@@ -849,9 +851,9 @@ export class Engine {
       const split = Math.max(
         1,
         Math.min(
-          MAX_SPLIT,
-          Math.ceil(SPLIT_FRAGMENTS / (w.groups * rows)),
-          w.blocks / 8
+          TUNING.maxSplit,
+          Math.ceil(TUNING.splitFragments / (w.groups * rows)),
+          w.blocks / 4
         )
       )
       const kbSlice = Math.ceil(w.blocks / split)
@@ -898,12 +900,12 @@ export class Engine {
       inputs: { uX: x },
       uniforms: {
         uTexels: { int: texels },
-        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) },
+        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
         uSplitIn: { int: Math.max(split, 0) },
         ...this.pairIn(x)
       },
       output: this.buffers.rms,
-      rect: { x: 0, y: row0, width: K.RMS_PARTS, height: rows }
+      rect: { x: 0, y: row0, width: TUNING.rmsParts, height: rows }
     })
   }
 
@@ -932,6 +934,7 @@ export class Engine {
       uniforms: {
         uRowIn: { int: rowIn },
         uROff: { int: ownSums ? hiddenSize / 4 : 0 },
+        uParts: { int: TUNING.rmsParts },
         uTexels: { int: hiddenSize / 4 },
         uEps: this.config.normEps
       },
@@ -963,6 +966,7 @@ export class Engine {
       uTexels: { int: texels },
       uEps: this.config.normEps,
       uROff: { int: 0 },
+      uParts: { int: TUNING.rmsParts },
       uSplitIn: { int: split },
       ...this.pairIn(y)
     }
@@ -981,11 +985,11 @@ export class Engine {
       inputs,
       uniforms: {
         ...common,
-        uChunk: { int: Math.ceil(texels / K.RMS_PARTS) },
+        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
         uBase: { int: texels }
       },
       output: out,
-      rect: { x: texels, y: 0, width: K.RMS_PARTS, height: rows }
+      rect: { x: texels, y: 0, width: TUNING.rmsParts, height: rows }
     })
   }
 

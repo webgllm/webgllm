@@ -444,7 +444,7 @@ void main() {
 
 /** Per row: x = inverse RMS of an f32 tensor's row (uTexels texels), y = mean square. */
 /** Pixels per row that each sum a slice of the row's squares (RMS_PARTIAL). */
-export const RMS_PARTS = 16
+export const RMS_PARTS = 64
 
 /**
  * Partial sums of squares: pixel (p, m) sums texels [p·uChunk, (p+1)·uChunk)
@@ -481,10 +481,11 @@ const RMS_SCALE = `
 uniform sampler2D uR;
 uniform int uROff;
 uniform int uTexels;
+uniform int uParts;
 uniform float uEps;
 float rmsScale(int m) {
   vec4 s = vec4(0.0);
-  for (int p = 0; p < ${RMS_PARTS}; p++) s += texelFetch(uR, ivec2(uROff + p, m), 0);
+  for (int p = 0; p < uParts; p++) s += texelFetch(uR, ivec2(uROff + p, m), 0);
   return inversesqrt(dot(s, vec4(1.0)) / float(uTexels * 4) + uEps);
 }
 `

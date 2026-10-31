@@ -459,6 +459,28 @@ async function run(params: {
 }
 
 /** Without reference tensors: a chat prompt, and a greedy reply decoded. */
+/**
+ * Up to `max` draft tokens for what follows `tokens`: the tokens that
+ * followed the latest earlier occurrence of its last 3 (else 2, else 1).
+ */
+function lookupDraft(tokens: Array<number>, max: number): Array<number> {
+  for (let n = 3; n >= 1; n--) {
+    if (tokens.length <= n) continue
+    const tail = tokens.slice(-n)
+    for (let start = tokens.length - n - 1; start >= 0; start--) {
+      let match = true
+      for (let j = 0; j < n; j++) {
+        if (tokens[start + j] !== tail[j]) {
+          match = false
+          break
+        }
+      }
+      if (match) return tokens.slice(start + n, Math.min(start + n + max, tokens.length))
+    }
+  }
+  return []
+}
+
 async function smoke(params: {
   model: string
   format?: "gguf" | "onnx"
@@ -472,6 +494,7 @@ async function smoke(params: {
   skip?: Array<string>
   texels?: "bytes" | "words"
   ab?: string
+  abDecode?: string
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -655,6 +678,27 @@ async function smoke(params: {
       `AB ${knob}=${a}: ${med(runs[a]).toFixed(1)} ms (${runs[a].map((t) => t.toFixed(0)).join(" ")}); ${knob}=${b}: ${med(runs[b]).toFixed(1)} ms (${runs[b].map((t) => t.toFixed(0)).join(" ")})`
     )
   }
+  // The same for writing: ?abDecode=knob:a,b, 16 steps per value, 4 rounds.
+  if (params.abDecode) {
+    const [knob, values] = params.abDecode.split(":")
+    const [a, b] = values.split(",").map(Number)
+    const perToken: Record<string, Array<number>> = { [a]: [], [b]: [] }
+    const original = (TUNING as Record<string, number>)[knob]
+    engine.reset()
+    let next = await pick(await engine.forwardHidden(prompt))
+    for (let i = 0; i < 8; i++) {
+      const v = i % 2 === 0 ? a : b
+      ;(TUNING as Record<string, number>)[knob] = v
+      const t = performance.now()
+      for (let s2 = 0; s2 < 16; s2++) next = await pick(await engine.forwardHidden([next]))
+      perToken[v].push((performance.now() - t) / 16)
+    }
+    ;(TUNING as Record<string, number>)[knob] = original
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
+    log(
+      `AB DECODE ${knob}=${a}: ${med(perToken[a]).toFixed(2)} ms/token (${perToken[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(perToken[b]).toFixed(2)} ms/token (${perToken[b].map((t) => t.toFixed(1)).join(" ")})`
+    )
+  }
   const promptMs = [...times].sort((x, y) => x - y)[1]
   log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms; GPU ${gpuTimes.map((t) => t.toFixed(0)).join(", ")} ms`)
   const out: Array<number> = []
@@ -667,6 +711,27 @@ async function smoke(params: {
   }
   const decodeMs = performance.now() - t2
   log(`REPLY: ${JSON.stringify(tokenizer.decode(out))}`)
+  // How speculative decoding with prompt lookup would fare on this reply:
+  // at each step, draft up to 3 tokens by matching the history's last
+  // 3, 2 or 1 tokens earlier in the history, and count how many of the
+  // drafts the (greedy) reply actually continues with.
+  {
+    const history = [...prompt]
+    let steps = 0
+    let i = 0
+    while (i < out.length) {
+      const draft = lookupDraft([...history, out[i]], 3)
+      let accepted = 0
+      while (accepted < draft.length && out[i + 1 + accepted] === draft[accepted]) accepted++
+      const kept = 1 + accepted
+      history.push(...out.slice(i, i + kept))
+      i += kept
+      steps++
+    }
+    log(
+      `SPECULATIVE (prompt lookup, 3 drafts): ${out.length} tokens in ${steps} verify steps, ${(out.length / steps).toFixed(2)} tokens per step`
+    )
+  }
   log(
     `prompt ${promptMs.toFixed(0)} ms (${((prompt.length / promptMs) * 1000).toFixed(1)} tokens/s), ${out.length} tokens in ${decodeMs.toFixed(0)} ms (${((out.length / decodeMs) * 1000).toFixed(1)} tokens/s)`
   )
