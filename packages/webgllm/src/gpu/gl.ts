@@ -120,6 +120,8 @@ export class Gpu {
   passes = 0
   /** When set, collects the name of each pass that starts a render pass. */
   trace: Array<string> | null = null
+  /** With `trace`: draws per pass name. */
+  drawTrace: Map<string, number> | null = null
   private boundFb: WebGLFramebuffer | null = null
   /** Pass names not to draw: for timing what the rest costs (results are wrong). */
   skip = new Set<string>()
@@ -418,6 +420,10 @@ export class Gpu {
         gl.viewport(rect.x, y, rect.width, height)
         gl.drawArrays(gl.TRIANGLES, 0, 3)
         this.draws++
+        if (this.drawTrace) {
+          const key = `${pass.name ?? ""}(${program.samplers.join(",")})`
+          this.drawTrace.set(key, (this.drawTrace.get(key) ?? 0) + 1)
+        }
       }
     }
   }

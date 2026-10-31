@@ -710,9 +710,16 @@ async function smoke(params: {
       // Which passes a writing step starts render passes for.
       const trace: Array<string> = []
       engine.gpu.trace = trace
+      const drawTrace = new Map<string, number>()
+      engine.gpu.drawTrace = drawTrace
       const before = engine.gpu.passes
       await engine.forward([tokens[0]])
       engine.gpu.trace = null
+      engine.gpu.drawTrace = null
+      log(
+        `DRAWS per writing step: ` +
+          [...drawTrace].sort((a, b) => b[1] - a[1]).map(([n, c]) => `${n} ${c}`).join(", ")
+      )
       const counts = new Map<string, number>()
       for (const name of trace) counts.set(name, (counts.get(name) ?? 0) + 1)
       log(

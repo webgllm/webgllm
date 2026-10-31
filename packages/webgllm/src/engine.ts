@@ -3,7 +3,7 @@
  * forward pass a batch of tokens at a time, keeping the attention cache and
  * the convolutions' state on the GPU between calls.
  */
-import { GL, Gpu, GpuError } from "./gpu/gl.js"
+import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import type {
@@ -137,6 +137,8 @@ export const TUNING = {
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
    */
   foldNorm: 2,
+  /** 1: few-row conv blocks draw their output and new state in one pass. */
+  fuseConv: 1,
   /**
    * Prompt batches run at most paceAhead chunks of this many layers ahead
    * of the GPU (0: unpaced), so the browser's GPU process never holds
@@ -437,6 +439,11 @@ export class Engine {
       // (Room for more K-slices of 4-token matmuls: see matmulQuad.)
       bcx: this.pair(3 * D, this.quadMatmuls ? 2 * M : M),
       convOut: this.h2(D, M),
+      /**
+       * A few rows' convolution output, drawn with the new state in one
+       * pass (see convFused): the state's size, h2 in its first D / 8 texels.
+       */
+      convSmall: this.gpu.texture(GL.RGBA32UI, D / 4, this.convRows()),
       qkvg: this.pair(qkvg, 2 * M),
       q: this.f32(c.numHeads * c.headDim, M),
       /**
@@ -493,6 +500,11 @@ export class Engine {
         SPLIT_ROWS * 32
       )
     }
+  }
+
+  /** Rows of the conv state textures (and convSmall): a few rows' batch or the state. */
+  private convRows() {
+    return Math.max(SPLIT_ROWS, this.config.convKernel - 1)
   }
 
   /** Texels per cache row: a layer's keys, then its values (h2). */
@@ -806,7 +818,8 @@ export class Engine {
         inProj: this.matrix(w.conv.inProj),
         outProj: this.matrix(w.conv.outProj),
         kernel: this.vector(taps, width),
-        state: [this.f32(D, width - 1), this.f32(D, width - 1)],
+        // (As tall as convSmall: see convFused.)
+        state: [0, 1].map(() => this.f32(D, this.convRows())) as [Texture, Texture],
         prefixes: this.f32(D, (width - 1) * SPLIT_ROWS)
       }
     }
@@ -988,7 +1001,7 @@ export class Engine {
     for (const saved of this.snapshots.values()) this.freeSnapshot(saved)
     this.snapshots.clear()
     const zero = new Float32Array(
-      this.config.hiddenSize * (this.config.convKernel - 1)
+      this.config.hiddenSize * this.convRows()
     )
     for (const layer of this.layers) {
       for (const state of layer.conv?.state ?? []) {
@@ -1430,6 +1443,30 @@ export class Engine {
           : this.readPair(source, "uBCx", bcx)
       )
     const bcxIn = { uBCx: bcx, ...(!split && this.quadInputs("uBCx", bcx)) }
+    if (rows <= SPLIT_ROWS && TUNING.fuseConv > 0) {
+      // A few rows: the output and the new state in one pass.
+      this.gpu.run({
+        name: "conv",
+        program: read(K.convFused(c.convKernel)),
+        inputs: { ...bcxIn, uState: layer.state[0], uConv: layer.kernel },
+        uniforms: {
+          uDt: { int: dt },
+          uM: { int: rows },
+          uSplitIn: { int: split },
+          ...this.pairIn(bcx)
+        },
+        output: [b.convSmall, layer.state[1]],
+        rect: {
+          x: 0,
+          y: 0,
+          width: dt,
+          height: Math.max(rows, c.convKernel - 1)
+        }
+      })
+      this.convPrefixes(layer, rows, bcxIn, read, split)
+      layer.state.reverse()
+      return this.project(b.convSmall, layer.outProj, b.opOut, rows)
+    }
     this.gpu.run({
       name: "conv",
       program: read(K.shortConv(c.convKernel)),
@@ -1451,19 +1488,30 @@ export class Engine {
       output: layer.state[1],
       rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
     })
-    if (this.keepPrefixes && rows > 1) {
-      // The state after each shorter prefix too, for accept().
-      this.gpu.run({
-        name: "conv",
-        program: read(K.convPrefixes(c.convKernel)),
-        inputs: { ...bcxIn, uState: layer.state[0] },
-        uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
-        output: layer.prefixes,
-        rect: { x: 0, y: 0, width: dt, height: (c.convKernel - 1) * rows }
-      })
-    }
+    this.convPrefixes(layer, rows, bcxIn, read, split)
     layer.state.reverse()
     return this.project(b.convOut, layer.outProj, b.opOut, rows)
+  }
+
+  /** In a draft batch, the conv state after each shorter prefix too, for accept(). */
+  private convPrefixes(
+    layer: NonNullable<GpuLayer["conv"]>,
+    rows: number,
+    bcxIn: Record<string, Texture>,
+    read: (source: string) => Program,
+    split: number
+  ) {
+    if (!this.keepPrefixes || rows <= 1) return
+    const c = this.config
+    const dt = c.hiddenSize / 4
+    this.gpu.run({
+      name: "conv",
+      program: read(K.convPrefixes(c.convKernel)),
+      inputs: { ...bcxIn, uState: layer.state[0] },
+      uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcxIn.uBCx) },
+      output: layer.prefixes,
+      rect: { x: 0, y: 0, width: dt, height: (c.convKernel - 1) * rows }
+    })
   }
 
   private attend(

@@ -487,6 +487,78 @@ async function main(params: { batch?: number }) {
   const gl = gpu.gl
   log(`GPU: ${gpu.limits.renderer}`)
   if (params.batch) return shapes(gpu, params.batch)
+  {
+    // Transform feedback chains: vertex shaders writing buffers, each draw
+    // reading the last one's output as a uniform buffer, no framebuffer.
+    const compile = (type: number, src: string) => {
+      const sh = gl.createShader(type)!
+      gl.shaderSource(sh, src)
+      gl.compileShader(sh)
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+        throw new Error(gl.getShaderInfoLog(sh) ?? "compile")
+      return sh
+    }
+    const xfb = (vs: string) => {
+      const prog = gl.createProgram()!
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs))
+      gl.attachShader(
+        prog,
+        compile(gl.FRAGMENT_SHADER, "#version 300 es\nprecision highp float;\nout vec4 c;\nvoid main() { c = vec4(0.0); }")
+      )
+      gl.transformFeedbackVaryings(prog, ["o"], gl.SEPARATE_ATTRIBS)
+      gl.linkProgram(prog)
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+        throw new Error(gl.getProgramInfoLog(prog) ?? "link")
+      return prog
+    }
+    const prog = xfb(`#version 300 es
+precision highp float;
+layout(std140) uniform In { vec4 v[1024]; };
+out vec4 o;
+void main() { o = v[gl_VertexID] * 0.5 + 1.0; }`)
+    gl.uniformBlockBinding(prog, gl.getUniformBlockIndex(prog, "In"), 0)
+    const bufs = [0, 1].map(() => {
+      const b = gl.createBuffer()!
+      gl.bindBuffer(gl.UNIFORM_BUFFER, b)
+      gl.bufferData(gl.UNIFORM_BUFFER, 16384, gl.DYNAMIC_COPY)
+      return b
+    })
+    gl.bindBuffer(gl.UNIFORM_BUFFER, null)
+    const tf = gl.createTransformFeedback()
+    gl.enable(gl.RASTERIZER_DISCARD)
+    gl.useProgram(prog)
+    const step = (i: number) => {
+      const src = bufs[i % 2]
+      const dst = bufs[(i + 1) % 2]
+      gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, null)
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf)
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null)
+      gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, src)
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, dst)
+      gl.beginTransformFeedback(gl.POINTS)
+      gl.drawArrays(gl.POINTS, 0, 1024)
+      gl.endTransformFeedback()
+      gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null)
+      gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null)
+    }
+    for (let i = 0; i < 50; i++) step(i)
+    await gpu.finish()
+    let best = Infinity
+    for (let round = 0; round < 3; round++) {
+      const t0 = performance.now()
+      for (let i = 0; i < 500; i++) step(i)
+      await gpu.finish()
+      best = Math.min(best, (performance.now() - t0) / 500)
+    }
+    log(`PASS transform feedback chain (UBO in, buffer out), 1024 vec4: ${(best * 1000).toFixed(1)} µs per draw`)
+    // Check it really chained: read the last output.
+    const out = new Float32Array(4)
+    gl.bindBuffer(gl.COPY_READ_BUFFER, bufs[0])
+    gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, out)
+    gl.bindBuffer(gl.COPY_READ_BUFFER, null)
+    log(`PASS transform feedback value after the chain: ${out[0]} (2 for a working chain)`)
+    gl.disable(gl.RASTERIZER_DISCARD)
+  }
   // Bare pass cost: tiny passes alternating between two outputs (each a new
   // framebuffer, as in a forward), and the same into one output.
   {

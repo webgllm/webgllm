@@ -990,6 +990,63 @@ void main() {
 }
 
 /**
+ * shortConv and convState in one draw, for a few rows: output 0 is the
+ * convolution's h2 output (texels x < uDt / 2, rows < uM), output 1 the
+ * state after the batch (rows < width - 1); the two outputs are one size.
+ */
+function convFusedSource(width: number) {
+  const w = width - 1
+  const taps = Array.from({ length: width }, (_, k) => k)
+    .map(
+      (k) => `    {
+      int t = m - ${w - k};
+      vec4 y0;
+      vec4 y1;
+      if (t >= 0) {
+        y0 = pf(uBCx, c0, t) * pf(uBCx, 2 * dt + c0, t);
+        y1 = pf(uBCx, c0 + 1, t) * pf(uBCx, 2 * dt + c0 + 1, t);
+      } else {
+        y0 = texelFetch(uState, ivec2(c0, ${w} + t), 0);
+        y1 = texelFetch(uState, ivec2(c0 + 1, ${w} + t), 0);
+      }
+      a0 += texelFetch(uConv, ivec2(c0, ${k}), 0) * y0;
+      a1 += texelFetch(uConv, ivec2(c0 + 1, ${k}), 0) * y1;
+    }`
+    )
+    .join("\n")
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+uniform int uDt;
+uniform int uM;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int dt = uDt;
+  o0 = uvec4(0u);
+  o1 = vec4(0.0);
+  if (m < ${w}) {
+    int t = uM - ${w} + m;
+    o1 = t >= 0
+      ? pf(uBCx, x, t) * pf(uBCx, 2 * dt + x, t)
+      : texelFetch(uState, ivec2(x, uM + m), 0);
+  }
+  if (2 * x < dt && m < uM) {
+    int c0 = 2 * x;
+    vec4 a0 = vec4(0.0);
+    vec4 a1 = vec4(0.0);
+${taps}
+    vec4 C0 = pf(uBCx, dt + c0, m);
+    vec4 C1 = pf(uBCx, dt + c0 + 1, m);
+    o0 = packH2(C0 * a0, C1 * a1);
+  }
+}`
+}
+
+/**
  * The convolution's state after each prefix of a few-token batch (for
  * speculative decoding, which may keep only some of a batch's tokens):
  * block p - 1 (width - 1 rows) holds convState's output for uM = p.
@@ -1899,6 +1956,7 @@ export const addScaled = memo(addScaledSource)
 export const rmsOfAdd = memo(rmsOfAddSource)
 export const shortConv = memo(shortConvSource)
 export const convState = memo(convStateSource)
+export const convFused = memo(convFusedSource)
 export const convPrefixes = memo(convPrefixesSource)
 export const headPrep = memo(headPrepSource)
 export const scores = memo(scoresSource)
