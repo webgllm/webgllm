@@ -164,7 +164,12 @@ export const TUNING = {
   paceLayers: 4,
   paceAhead: 2,
   /** What an attention multiply-add costs against a matmul one, for pacing. */
-  paceAttention: 4
+  paceAttention: 4,
+  /**
+   * Writing flushes queued passes every this many layers (0: only at the
+   * readback), so the GPU starts on a token while the rest is still issued.
+   */
+  flushLayers: 1
 }
 
 /**
@@ -2605,6 +2610,8 @@ export class Engine {
       const layer = this.layers[i]
       // (From layer 0: batches follow each other with no wait between.)
       if (paced) await this.charge(0)
+      else if (TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
+        this.gpu.flush()
       const [h, next] = b.residual
       const fold = foldAt(i)
       // (Layer 0 folds only if the embedding drew its sums and input.)

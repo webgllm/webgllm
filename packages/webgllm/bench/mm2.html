@@ -47,6 +47,7 @@
         onnx: params.get("onnx") ?? undefined,
         ring: params.get("ring") !== "0",
         batch: Number(params.get("batch") ?? 128),
+        only: params.get("only") ?? undefined,
         precision: params.get("precision") ?? "highp",
         layers: params.get("layers") !== "0",
         smoke: params.get("smoke") === "1",

@@ -482,11 +482,11 @@ void main() { o = vec4(0.0); }`)
   }
 }
 
-async function main(params: { batch?: number }) {
+async function main(params: { batch?: number; only?: string }) {
   const gpu = new Gpu(new OffscreenCanvas(1, 1))
   const gl = gpu.gl
   log(`GPU: ${gpu.limits.renderer}`)
-  if (params.batch) return shapes(gpu, params.batch)
+  if (params.batch) return shapes(gpu, params.batch, params.only)
   {
     // Transform feedback chains: vertex shaders writing buffers, each draw
     // reading the last one's output as a uniform buffer, no framebuffer.
@@ -848,10 +848,55 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
   if (params.batch === 0) return
 }
 
-async function shapes(gpu: Gpu, batch: number) {
+async function shapes(gpu: Gpu, batch: number, only?: string) {
   const gl = gpu.gl
   const params = { batch }
-  {
+  // PowerVR skips draws whose output is overwritten unread: each timed
+  // matmul's output gets one texel read, so every draw runs.
+  const scratch = gpu.texture(gl.RGBA32F, 1, 1)
+  const touch = (sampler: string, read: string) =>
+    gpu.program(`#version 300 es
+precision highp float;
+uniform highp ${sampler} uX;
+out vec4 o;
+void main() { o = ${read}; }`)
+  const touchF = touch("sampler2D", "texelFetch(uX, ivec2(0), 0)")
+  const touchU = touch("usampler2D", "vec4(texelFetch(uX, ivec2(0), 0))")
+  const run0 = gpu.run.bind(gpu)
+  gpu.run = (pass) => {
+    run0(pass)
+    if (pass.name !== "mm") return
+    const out = Array.isArray(pass.output) ? pass.output[0] : pass.output
+    run0({
+      program: out.internal === gl.RGBA32UI ? touchU : touchF,
+      inputs: { uX: out },
+      output: scratch,
+      rect: { x: 0, y: 0, width: 1, height: 1 }
+    })
+  }
+  // Random weights: some GPUs compress constant (all-zero) textures.
+  let seed = 1
+  const noise = (bytes: number) => {
+    const words = new Uint32Array(Math.ceil(bytes / 4))
+    for (let i = 0; i < words.length; i++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0
+      words[i] = seed
+    }
+    return words.buffer
+  }
+  const randomTexture = (internal: number, width: number, height: number) => {
+    const n = width * height
+    const data =
+      internal === gl.RGBA4
+        ? { format: gl.RGBA, type: gl.UNSIGNED_SHORT_4_4_4_4, pixels: new Uint16Array(noise(n * 2), 0, n) }
+        : internal === gl.RGBA8UI
+          ? { format: gl.RGBA_INTEGER, type: gl.UNSIGNED_BYTE, pixels: new Uint8Array(noise(n * 4), 0, n * 4) }
+          : internal === gl.RGBA8
+            ? { format: gl.RGBA, type: gl.UNSIGNED_BYTE, pixels: new Uint8Array(noise(n * 4), 0, n * 4) }
+            : { format: gl.RGBA_INTEGER, type: gl.UNSIGNED_INT, pixels: new Uint32Array(noise(n * 16), 0, n * 4) }
+    return gpu.texture(internal, width, height, data)
+  }
+  if (batch >= 2) {
     // gate|up 15360 × 2048 fused with SwiGLU: 3840 fragments wide.
     const N = 15360
     const K = 2048
@@ -904,12 +949,13 @@ async function shapes(gpu: Gpu, batch: number) {
     ["LFM3 gate+up as 2 K-slices", 30720, 1024],
     ["LFM3 down as 4 K-slices", 8192, 1920]
 ] as const) {
+    if (only && !label.startsWith(only)) continue
     const blocks = K / 32
     const G = N / 4
-    const wRgba4 = gpu.texture(gl.RGBA4, blocks * 32, G)
-    const wBytes = gpu.texture(gl.RGBA8UI, blocks * 16, G)
-    const wWords = G <= 16384 ? gpu.texture(gl.RGBA32UI, blocks * 4, G) : null
-    const wUnorm8 = gpu.texture(gl.RGBA8, blocks * 16, G)
+    const wRgba4 = randomTexture(gl.RGBA4, blocks * 32, G)
+    const wBytes = randomTexture(gl.RGBA8UI, blocks * 16, G)
+    const wWords = G <= 16384 ? randomTexture(gl.RGBA32UI, blocks * 4, G) : null
+    const wUnorm8 = randomTexture(gl.RGBA8, blocks * 16, G)
     const scales = gpu.texture(gl.RGBA16F, blocks, G)
     for (const M of [params.batch ?? 512]) {
       const aF16 = gpu.texture(gl.RGBA16F, K / 4, M)
@@ -920,10 +966,16 @@ async function shapes(gpu: Gpu, batch: number) {
           ? [
               { weights: "bytes", acts: "h2", tokens: 1 },
               { weights: "bytes", acts: "f16", tokens: 1 },
-              { weights: "rgba4", acts: "f16", tokens: 1 }
+              { weights: "rgba4", acts: "f16", tokens: 1 },
+              { weights: "rgba4", acts: "h2", tokens: 1 },
+              { weights: "unorm8", acts: "h2", tokens: 1 },
+              { weights: "words", acts: "h2", tokens: 1 }
             ]
           : [
-              { weights: "rgba4", acts: "h2", tokens: 4 }
+              { weights: "rgba4", acts: "h2", tokens: 4 },
+              { weights: "bytes", acts: "h2", tokens: 4 },
+              { weights: "unorm8", acts: "h2", tokens: 4 },
+              { weights: "words", acts: "h2", tokens: 4 }
             ]
       for (const v of variants) {
         const T = v.tokens

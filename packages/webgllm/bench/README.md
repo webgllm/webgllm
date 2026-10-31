@@ -25,3 +25,11 @@ Results print in the server's terminal.
 The first step, before the engine: one Q4_0 matmul kernel on every LFM3 projection shape at 128 tokens (`?run=gpu`), against wllama's relaxed-SIMD build reading the same number of tokens (`?run=cpu`). On a Pixel 10 Pro in Firefox, LFM3's matmuls for 128 tokens took 1.49 s (86 tokens/s) against 24.5 prompt tokens/s for wllama's whole model, so the engine was built.
 
 Pitfalls it found: PowerVR merges and skips full-screen draws whose output is overwritten later, even across framebuffer switches, so a timed draw must read the previous draw's output; `unpackUnorm2x16` returns wrong values on that driver; a readback costs 10 to 35 ms of fixed latency there.
+
+## bandwidth.html
+
+How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGBA4, RGBA8, RGBA8UI, RGBA16UI, RGBA32UI) and by how many texels each fragment reads. Each draw reads the previous draw's output, so no driver can skip one. On the Pixel 10 Pro (Chrome) the best layout reads ~23 GB/s, and RGBA4 tops out at ~19 GB/s (~9 G fetches/s); 16-byte texels are slowest. LFM3's writing matmuls already read their weights at ~16–17 GB/s there.
+
+## mm2.html
+
+`?batch=512&only=LFM3`: matmul layouts on the model's shapes (random weights; each timed draw's output gets read, so PowerVR can't skip it). On the Pixel the engine's RGBA4, 4-tokens-per-fragment prompt layout is fastest (~285 GFLOP/s); byte and word texels unpacked in the shader are 10–25% slower.
