@@ -810,7 +810,7 @@ export class Engine {
         : null
     }
     const made = [true, false].map((rgba4) => {
-      const gm = this.allocateMatrix(m.N, m.K, 4, !!fake.zeros, rgba4)
+      const gm = this.allocateMatrix(m.N, m.K, 4, !!fake.zeros, rgba4, true)
       this.writeMatrix(gm, fake, 0)
       return gm
     })
@@ -848,13 +848,19 @@ export class Engine {
     }
   }
 
+  /** `source` (reading w's scales and zeros) as w stores them. */
+  private scalesOf(w: GpuMatrix, source: string) {
+    return w.packed ? K.withPackedScales(source) : source
+  }
+
   private matrix(m: QuantMatrix): GpuMatrix {
     const gm = this.allocateMatrix(
       m.N,
       m.K,
       m.bits,
       !!m.zeros,
-      m.bits === 4 && this.rgba4Layers
+      m.bits === 4 && this.rgba4Layers,
+      true
     )
     this.writeMatrix(gm, m, 0)
     return gm
@@ -869,10 +875,13 @@ export class Engine {
     K: number,
     bits: 4 | 6 | 8,
     withZeros: boolean,
-    rgba4 = false
+    rgba4 = false,
+    /** A layer matrix: scales and zero points may be packed (see GpuMatrix.packed). */
+    layer = false
   ): GpuMatrix {
     const max = this.gpu.limits.maxTextureSize
     if (rgba4) {
+      const packed = layer && withZeros && TUNING.packZeros > 0
       const blocks = K / 32
       const groups = N / 4
       const rowTexels = blocks * 32
@@ -889,17 +898,22 @@ export class Engine {
         bits,
         bytes: false,
         unorm: false,
-        packed: false,
+        packed,
         rgba4: true,
         blocks,
         groups,
         rowsPerColumn,
         rowTexels,
         quants: this.gpu.texture(GL.RGBA4, columns * rowTexels, rowsPerColumn),
-        scales: this.gpu.texture(GL.RGBA16F, columns * blocks, rowsPerColumn),
-        zeros: withZeros
-          ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
-          : null
+        scales: this.gpu.texture(
+          packed ? GL.RGBA32UI : GL.RGBA16F,
+          columns * blocks,
+          rowsPerColumn
+        ),
+        zeros:
+          withZeros && !packed
+            ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
+            : null
       }
     }
     // A block row: 4-bit 16 bytes, 8-bit 32, as RGBA32UI texels (1, 2) or
@@ -916,7 +930,8 @@ export class Engine {
     const texelsPerBlockRow = bytes ? byteTexels : byteTexels / 4
     const rowTexels = blocks * 4 * texelsPerBlockRow
     const unorm = bytes && bits === 4 && TUNING.unormBytes > 0
-    const packed = bytes && bits === 4 && withZeros && TUNING.packZeros > 0
+    const packed =
+      layer && bytes && bits === 4 && withZeros && TUNING.packZeros > 0
     const quantFormat = !bytes
       ? GL.RGBA32UI
       : bits === 8
@@ -1493,7 +1508,7 @@ export class Engine {
           name: "dequant",
           program: this.gpu.program(
             w.rgba4
-              ? K.dequantRgba4({ zeros: !!w.zeros })
+              ? this.scalesOf(w, K.dequantRgba4({ zeros: !!w.zeros || w.packed }))
               : K.dequantBytes({
                   zeros: !!w.zeros,
                   words: !w.bytes,
@@ -1561,7 +1576,9 @@ export class Engine {
       if (w.rgba4) {
         this.gpu.run({
           name: "matmul",
-          program: this.gpu.program(K.matmulQuad({ zeros: !!w.zeros })),
+          program: this.gpu.program(
+            this.scalesOf(w, K.matmulQuad({ zeros: !!w.zeros || w.packed }))
+          ),
           inputs: weights,
           uniforms: {
             ...shape,
@@ -1590,7 +1607,7 @@ export class Engine {
       this.gpu.run({
         name: "matmul",
         program: this.gpu.program(
-          K.matmulPair({ zeros: !!w.zeros })
+          this.scalesOf(w, K.matmulPair({ zeros: !!w.zeros || w.packed }))
         ),
         inputs: weights,
         uniforms: {

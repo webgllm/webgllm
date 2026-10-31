@@ -2335,6 +2335,32 @@ export function withSplit(source: string, split: number) {
 
 export const matmulQuad = memo(matmulQuadSource)
 export const dequantRgba4 = memo(dequantRgba4Source)
+const packedScalesCache = new Map<string, string>()
+/**
+ * `source` (a kernel reading a 4-bit matrix's scales uS and zero points uZ
+ * texel by texel) reading them packed instead: uS an RGBA32UI texel of
+ * the block's 4 scales then 4 zero points as halves (one fetch, not two).
+ */
+export function withPackedScales(source: string) {
+  let out = packedScalesCache.get(source)
+  if (out === undefined) {
+    out = source
+      .replace("uniform sampler2D uS;", "uniform usampler2D uS;")
+      .replace("uniform usampler2D uZ;", "")
+      .split("vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);")
+      .join("uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0); vec4 d = h2lo(sz);")
+      .split("vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));")
+      .join("vec4 z = h2hi(sz);")
+      .split("float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);")
+      .join("uvec4 sz = texelFetch(uS, ivec2(col * uKb + kb, gr), 0); float d = comp(h2lo(sz), r);")
+      .split("float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))")
+      .join("comp(h2hi(sz), r)")
+    if (out.includes("uZ"))
+      throw new Error("A kernel reads zero points in a way withPackedScales doesn't know.")
+    packedScalesCache.set(source, out)
+  }
+  return out
+}
 export const dequantBytes = memo(dequantBytesSource)
 export const matmulF16 = memo(matmulF16Source)
 
