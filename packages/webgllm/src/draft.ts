@@ -7,9 +7,10 @@
  */
 
 /**
- * Up to `max` tokens that may follow `tokens`: those that followed the
- * latest earlier occurrence of its last 3 tokens (else 2, ... down to
- * `minMatch`), or none.
+ * Tokens that may follow `tokens`: those that followed the latest earlier
+ * occurrence of its last 4 tokens (else 3, ... down to `minMatch`), or
+ * none. A longer match is likelier to go on, so it drafts more: up to
+ * 2^(n−1) tokens after an n-token match, and at most `max`.
  */
 export function lookupDraft(
   tokens: ArrayLike<number>,
@@ -18,7 +19,7 @@ export function lookupDraft(
 ): Array<number> {
   if (max <= 0) return []
   const end = tokens.length
-  for (let n = 3; n >= minMatch; n--) {
+  for (let n = 4; n >= minMatch; n--) {
     if (end <= n) continue
     for (let start = end - n - 1; start >= 0; start--) {
       let match = true
@@ -29,8 +30,9 @@ export function lookupDraft(
         }
       }
       if (!match) continue
+      const most = Math.min(max, 2 ** (n - 1))
       const out: Array<number> = []
-      for (let i = start + n; i < end && out.length < max; i++) out.push(tokens[i])
+      for (let i = start + n; i < end && out.length < most; i++) out.push(tokens[i])
       return out
     }
   }

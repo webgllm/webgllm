@@ -132,6 +132,8 @@ export const TUNING = {
    * of nothing but dots (see MATMUL_F16); 0: they dequantize as they read.
    */
   f16Matmul: 1,
+  /** 1: reads of candidates nothing runs behind (no guess) block rather than poll a fence. */
+  blockingReads: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
   renderHints: 1,
   /** 1: the f16 matmul's dots in mediump (faster where it's half precision, less exact). */
@@ -154,11 +156,10 @@ export const TUNING = {
   /**
    * The worker's speculative decoding (see worker.ts): drafts follow an
    * earlier occurrence of at least draftMatch last tokens; they're used
-   * while recent batches kept draftMinKept drafts on average; with
+   * unless backing off after rejected batches (see worker.ts); with
    * guessDrafts, a draft batch also guesses the token after its last row.
    */
   draftMatch: 2,
-  draftMinKept: 0.75,
   guessDrafts: 0,
   /** Queries per scores slice (0: from the batch size; see scoreRows). */
   scoreRows: 0,
@@ -2401,15 +2402,18 @@ export class Engine {
       rect: { x: 0, y: 0, width: CHUNK / 4 + 2, height: count * rows }
     })
     const texels = CHUNK / 4 + 2
-    const pending = this.gpu.readStart(b.candidates, {
-      x: 0,
-      y: 0,
-      width: texels,
-      height: count * rows
-    })
-    // Read it forward while the candidates go back to the CPU (see guess).
-    if (guess) await this.forwardGuess()
-    const data = await pending()
+    const rect = { x: 0, y: 0, width: texels, height: count * rows }
+    let data: Float32Array
+    if (guess || TUNING.blockingReads <= 0) {
+      const pending = this.gpu.readStart(b.candidates, rect)
+      // Read it forward while the candidates go back to the CPU (see guess).
+      if (guess) await this.forwardGuess()
+      data = await pending()
+    } else {
+      // Nothing to overlap: a blocking read returns as soon as the GPU is
+      // done, where polling a fence adds milliseconds.
+      data = this.gpu.readNow(b.candidates, rect)
+    }
     // The token the GPU guessed (and read forward), as it picked it.
     this.guessedToken = guess ? Math.round(data[(CHUNK / 4 + 1) * 4]) : -1
     const out = []

@@ -52,17 +52,11 @@ const DRAFTS = 3
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
 /**
- * Drafts are used while recent draft batches kept at least
- * TUNING.draftMinKept drafts on average (over the last DRAFT_WINDOW):
- * otherwise guessing, which a draft batch gives up, does more. (Drafts
- * follow an earlier occurrence of TUNING.draftMatch last tokens.)
+ * After a second draft batch in a row with none kept, the next 1 batch's
+ * drafts are skipped, then 2, 4, ... up to this many (a draft batch gives
+ * up guessing, so failed drafts cost a stall); a kept draft resets it.
  */
-const DRAFT_WINDOW = 8
-/**
- * Tokens after which drafting tries again though recent batches kept too
- * few: a reply may start quoting (code, a tool's result) halfway through.
- */
-const DRAFT_RETRY = 32
+const DRAFT_BACKOFF_MAX = 16
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -383,16 +377,26 @@ async function generate(request: GenerateRequest) {
       guesses.filter(Boolean).length >= GUESS_MIN_HITS * guesses.length)
   // The token guessed with the last distribution, or -1.
   let guessed = -1
-  // Drafts kept per recent draft batch (see DRAFT_WINDOW).
-  const draftsKept: Array<number> = []
-  // Tokens written since the last draft batch.
-  let sinceDrafts = 0
-  const drafting = () =>
+  // Backing off drafts (see DRAFT_BACKOFF_MAX): rejected batches in a
+  // row, draft batches still to skip, and how many the next backoff skips.
+  let rejected = 0
+  let skipDrafts = 0
+  let backoff = 1
+  // Drafts for the reply so far, at most `max`, unless backing off.
+  const draftsFor = (max: number) => {
+    if (request.speculative === false || max <= 0) return []
+    const drafts = lookupDraft(history, max, TUNING.draftMatch)
+    if (drafts.length && skipDrafts > 0) {
+      skipDrafts--
+      return []
+    }
+    return drafts
+  }
+  // Whether a draft batch would follow (without counting it as skipped).
+  const draftsNext = () =>
     request.speculative !== false &&
-    (draftsKept.length < DRAFT_WINDOW / 2 ||
-      sinceDrafts >= DRAFT_RETRY ||
-      draftsKept.reduce((a, b) => a + b, 0) >=
-        TUNING.draftMinKept * draftsKept.length)
+    skipDrafts === 0 &&
+    lookupDraft(history, 1, TUNING.draftMatch).length > 0
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
@@ -475,24 +479,21 @@ async function generate(request: GenerateRequest) {
         const more =
           stats.outputTokens < maxTokens - 1 &&
           engine.position < engine.contextLength - 1 &&
-          (!drafting() || lookupDraft(history, 1, TUNING.draftMatch).length === 0)
+          !draftsNext()
         token = draw(await distribution(0, more && guessing()))
         going = emit(token)
-        sinceDrafts++
         continue
       }
       engine.dropGuess()
     }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
-    const drafts = lookupDraft(
-      history,
+    const drafts = draftsFor(
       Math.min(
-        drafting() ? DRAFTS : 0,
+        DRAFTS,
         maxTokens - stats.outputTokens - 1,
         engine.contextLength - engine.position - 1
-      ),
-      TUNING.draftMatch
+      )
     )
     const batch = [token, ...drafts]
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
@@ -529,10 +530,14 @@ async function generate(request: GenerateRequest) {
     if (drafts.length) {
       if (engine.guessing && kept < batch.length) engine.dropGuess()
       engine.accept(kept)
-      draftsKept.push(kept - 1)
-      if (draftsKept.length > DRAFT_WINDOW) draftsKept.shift()
-      sinceDrafts = 0
-    } else sinceDrafts += kept
+      if (kept > 1) {
+        rejected = 0
+        backoff = 1
+      } else if (++rejected >= 2) {
+        skipDrafts = backoff
+        backoff = Math.min(DRAFT_BACKOFF_MAX, backoff * 2)
+      }
+    }
     model.cached.push(...batch.slice(0, kept))
     if (!going || next < 0) break
     token = next
