@@ -122,10 +122,15 @@ async function runTjs(text: string, cpu = false) {
   const runs = []
   for (let i = 0; i < 3; i++) {
     // A different first line each time, so no run reuses another's cache.
+    const wall0 = performance.now()
     const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const wall = performance.now() - wall0
     const input = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
     const promptTps = (input / (s.promptMs ?? 1)) * 1000
     const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
+    log(
+      `  stopwatch: whole reply ${wall.toFixed(0)} ms for ${s.outputTokens} tokens; minus the prompt, ${(((s.outputTokens ?? 1) - 1) / ((wall - (s.promptMs ?? 0)) / 1000)).toFixed(1)} tokens/s`
+    )
     log(
       `Transformers.js ${cpu ? "WASM" : "WebGPU"} run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
     )
