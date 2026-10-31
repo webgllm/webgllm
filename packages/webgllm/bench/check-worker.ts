@@ -500,6 +500,92 @@ async function run(params: {
   void D
 }
 
+/**
+ * ?attn=1: every attention layer's output against the CPU's, from the
+ * GPU's own queries, cache and gates (any model, no reference needed), so
+ * a GPU that gets attention wrong shows where.
+ */
+async function attentionCheck(engine: Engine, prompt: Array<number>) {
+  const c = engine.config
+  const hd = c.headDim
+  const group = c.numHeads / c.numKvHeads
+  const kvDims = c.numKvHeads * hd
+  const gateAt = (c.numHeads + 2 * c.numKvHeads) * hd
+  type Got = { data: Float32Array; rows: number; dims: number; offset: number }
+  const seen = new Map<number, Partial<Record<string, Got>>>()
+  const worst = new Map<number, { rel: number; row: number; n: number; err: number; ref: number; nan: number; nanRows: Array<number> }>()
+  engine.reset()
+  await engine.forward(prompt, async (layer, name, read) => {
+    if (!["q", "qkvg", "attn_out", "kv"].includes(name)) return
+    const got = seen.get(layer) ?? {}
+    got[name] = await read()
+    seen.set(layer, got)
+    if (name !== "kv") return
+    const { q, qkvg, attn_out: out, kv } = got as Record<string, Got>
+    const w = worst.get(layer) ?? { rel: 0, row: -1, n: 0, err: 0, ref: 0, nan: 0, nanRows: [] }
+    const sliding = c.layerTypes[layer] === "sliding_attention"
+    const want = new Float32Array(hd)
+    for (let m = 0; m < q.rows; m++) {
+      const pos = q.offset + m
+      const j0 = sliding ? Math.max(0, pos - c.slidingWindow + 1) : 0
+      let rowErr = 0
+      let rowRef = 0
+      const nan0 = w.nan
+      for (let h = 0; h < c.numHeads; h++) {
+        const kh = Math.floor(h / group)
+        const qo = m * q.dims + h * hd
+        const scores = new Float64Array(pos - j0 + 1)
+        let mx = -Infinity
+        for (let j = j0; j <= pos; j++) {
+          let s = 0
+          const ko = j * kv.dims + kh * hd
+          for (let d = 0; d < hd; d++) s += q.data[qo + d] * kv.data[ko + d]
+          scores[j - j0] = s
+          mx = Math.max(mx, s)
+        }
+        let l = 0
+        want.fill(0)
+        for (let j = j0; j <= pos; j++) {
+          const e = Math.exp(scores[j - j0] - mx)
+          l += e
+          const vo = j * kv.dims + kvDims + kh * hd
+          for (let d = 0; d < hd; d++) want[d] += e * kv.data[vo + d]
+        }
+        const gate = c.attentionGate
+          ? 1 / (1 + Math.exp(-qkvg.data[m * qkvg.dims + gateAt + h]))
+          : 1
+        for (let d = 0; d < hd; d++) {
+          const ref = (want[d] / l) * gate
+          const g = out.data[m * out.dims + h * hd + d]
+          if (!Number.isFinite(g)) w.nan++
+          rowErr += (g - ref) ** 2
+          rowRef += ref * ref
+        }
+      }
+      if (w.nan > nan0) {
+        w.nanRows.push(pos)
+        continue
+      }
+      w.err += rowErr
+      w.ref += rowRef
+      w.n++
+      const rel = Math.sqrt(rowErr / Math.max(rowRef, 1e-30))
+      if (!(rel <= w.rel)) {
+        w.rel = rel
+        w.row = pos
+      }
+    }
+    worst.set(layer, w)
+    seen.delete(layer)
+  })
+  for (const [layer, w] of worst) {
+    log(
+      `ATTN layer ${layer}: rel ${Math.sqrt(w.err / w.ref).toExponential(2)} over ${w.n} finite rows, worst ${w.rel.toExponential(2)} at position ${w.row}${w.nan ? `; ${w.nan} non-finite values in ${w.nanRows.length} rows, positions ${w.nanRows[0]}..${w.nanRows[w.nanRows.length - 1]}` : ""}`
+    )
+  }
+  engine.reset()
+}
+
 /** Without reference tensors: a chat prompt, and a greedy reply decoded. */
 async function smoke(params: {
   model: string
@@ -822,6 +908,7 @@ async function smoke(params: {
   }
   const prompt = encode()
   log(`prompt: ${prompt.length} tokens`)
+  if ((params as { attn?: boolean }).attn) await attentionCheck(engine, prompt)
   // Warm up: compile every shader on a short prompt first.
   engine.reset()
   await engine.forward(prompt.slice(0, 8))

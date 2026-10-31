@@ -1041,6 +1041,7 @@ export class Engine {
   }
 
   private debug: Texture | null = null
+  private kvDebug: Texture | null = null
 
   /** A scratch tensor for probes, made the first time one asks. */
   private debugTexture() {
@@ -2590,6 +2591,31 @@ export class Engine {
         await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)
+        // The cache's keys then values for positions 0.. (one block, no
+        // ring), as f32: for checking attention against the CPU.
+        const kvDims = c.numKvHeads * c.headDim
+        const keys = pos0 + rows
+        const kvCache = layer.attention.kv
+        if (probe && !layer.attention.ring && keys <= 2 ** this.kvShift) {
+          await probe(i, "kv", async () => {
+            const width = (2 * kvDims) / 4
+            if (this.kvDebug?.width !== width || this.kvDebug.height < keys)
+              this.kvDebug = this.f32(2 * kvDims, Math.max(keys, this.capacity))
+            this.gpu.run({
+              program: this.gpu.program(K.H2_TO_F32),
+              inputs: { uX: kvCache },
+              output: this.kvDebug,
+              rect: { x: 0, y: 0, width, height: keys }
+            })
+            const data = await this.gpu.read(this.kvDebug, {
+              x: 0,
+              y: 0,
+              width,
+              height: keys
+            })
+            return { data, rows: keys, dims: 2 * kvDims, offset: 0 }
+          })
+        }
       }
       await look(i, "op_out", b.opOut, c.hiddenSize, "pair")
       this.addNormed(

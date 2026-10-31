@@ -1245,13 +1245,14 @@ void main() {
   int qpos = uPos0 + m;
   // The 4 keys' rows (masked ones read row 0 and are dropped below), and
   // each query texel read once for all 4.
+  // (Whole-vector ops: some compilers get component writes in loops wrong.)
   ivec4 j = uJ0 + s * uSegKeys + 4 * x + ivec4(0, 1, 2, 3);
-  bvec4 live = bvec4(true);
-  ivec4 row = j;
-  for (int c = 0; c < 4; c++) {
-    live[c] = !(j[c] - uJ0 >= uKeys || j[c] > qpos || (uWindow > 0 && qpos - j[c] >= uWindow));
-    row[c] = live[c] ? (uRing > 0 ? j[c] % uRing : j[c]) : 0;
-  }
+  ivec4 inRange = ivec4(lessThan(j - uJ0, ivec4(uKeys)));
+  ivec4 past = ivec4(lessThanEqual(j, ivec4(qpos)));
+  ivec4 inWindow = uWindow > 0 ? ivec4(lessThan(qpos - j, ivec4(uWindow))) : ivec4(1);
+  ivec4 liveInt = inRange * past * inWindow;
+  bvec4 live = bvec4(liveInt);
+  ivec4 row = (uRing > 0 ? j - (j / uRing) * uRing : j) * liveInt;
   if (!any(live)) {
     ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
     return;
@@ -1279,7 +1280,7 @@ ${members
   )
   .join("\n")}
   }
-  ${members.map((i) => `o${i} = mix(vec4(-1e30), acc${i}, vec4(live));`).join("\n  ")}
+  ${members.map((i) => `o${i} = mix(vec4(-1e30), acc${i}, live);`).join("\n  ")}
 }`
 }
 
