@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL info</title>
+    <style>
+      body {
+        font:
+          13px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      // What this browser's WebGL 2 offers, against what the engine needs
+      // (see hasWebGl2 in src/client.ts).
+      const out = document.getElementById("out")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+      }
+      log(navigator.userAgent)
+      log(`OffscreenCanvas: ${typeof OffscreenCanvas !== "undefined"}`)
+      const report = (label, gl) => {
+        if (!gl) {
+          log(`${label}: no webgl2 context`)
+          return
+        }
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info")
+        log(`${label}:`)
+        log(`  renderer ${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)}`)
+        log(`  MAX_TEXTURE_SIZE ${gl.getParameter(gl.MAX_TEXTURE_SIZE)}`)
+        log(`  MAX_DRAW_BUFFERS ${gl.getParameter(gl.MAX_DRAW_BUFFERS)}`)
+        log(`  MAX_COLOR_ATTACHMENTS ${gl.getParameter(gl.MAX_COLOR_ATTACHMENTS)}`)
+        log(`  EXT_color_buffer_float ${!!gl.getExtension("EXT_color_buffer_float")}`)
+        log(`  EXT_color_buffer_half_float ${!!gl.getExtension("EXT_color_buffer_half_float")}`)
+        log(`  extensions ${(gl.getSupportedExtensions() ?? []).join(", ")}`)
+      }
+      try {
+        report("OffscreenCanvas webgl2", typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(1, 1).getContext("webgl2") : null)
+      } catch (e) {
+        log(`OffscreenCanvas webgl2 threw: ${e}`)
+      }
+      try {
+        report("canvas webgl2", document.createElement("canvas").getContext("webgl2"))
+      } catch (e) {
+        log(`canvas webgl2 threw: ${e}`)
+      }
+      log("DONE")
+    </script>
+  </body>
+</html>
