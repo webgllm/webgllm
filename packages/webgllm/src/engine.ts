@@ -195,6 +195,8 @@ export type EngineOptions = {
   contextLength?: number
   /** Most tokens per forward batch. */
   batchSize?: number
+  /** Multi-target draws to treat as unsupported, for testing the fallbacks. */
+  noMrt?: Array<"scaled" | "quad" | "conv" | "chunks">
   /**
    * Rows per block of a full-attention cache (a power of two): the texture
    * height when left out. Smaller exercises the cache's wrapping, for tests.
@@ -270,7 +272,13 @@ export class Engine {
   private ringCache: boolean
   private layers: Array<GpuLayer> = []
   private embedding!: GpuMatrix
-  private readonly quadMatmuls: boolean
+  private quadMatmuls: boolean
+  /**
+   * Draws into several textures at once that this GPU can do (asked of it
+   * at load, see Gpu.canRender); the engine falls back where it can't.
+   */
+  private mrt = { scaled: true, quad: true, conv: true, chunks: true }
+  private readonly noMrt: Set<string>
   private readonly scaleBatch: boolean
   /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
   private quads = new Map<number, Texture>()
@@ -287,6 +295,7 @@ export class Engine {
   ) {
     this.gpu = new Gpu(canvas)
     this.contextCap = options.contextLength ?? Infinity
+    this.noMrt = new Set(options.noMrt ?? [])
     this.kvBlockRows = options.kvBlockRows ?? Infinity
     this.baseBatch = options.batchSize ?? 128
     this.batchSize = this.baseBatch
@@ -359,6 +368,24 @@ export class Engine {
       Math.floor(max / kvWidth) * 2 ** this.kvShift
     )
     this.kvPositions = Math.min(KV_START, 2 ** this.kvShift)
+    const can = (name: string, formats: Array<number>) =>
+      !this.noMrt.has(name) && this.gpu.canRender(formats)
+    this.mrt = {
+      // The add and the embedding with the next matmuls' scaled input.
+      scaled: can("scaled", [GL.RGBA32F, GL.RGBA32UI]),
+      // 4-token matmuls.
+      quad: can("quad", [GL.RGBA32UI, GL.RGBA32UI]),
+      // The conv block's output and state (convFused).
+      conv: can("conv", [GL.RGBA32UI, GL.RGBA32F]),
+      // Chunked attention, one head a fragment (headGroup tries more).
+      chunks: can("chunks", [GL.RGBA32F, GL.RGBA32F, GL.RGBA32F])
+    }
+    this.quadMatmuls &&= this.mrt.quad
+    if (!this.mrt.chunks) {
+      // Without chunked attention, no key segments either: the context
+      // is what one row of scores holds.
+      this.contextLength = Math.min(this.contextLength, 4 * TUNING.scoreTexels)
+    }
     this.buffers = this.allocate()
     if (this.quadMatmuls) {
       const b = this.buffers
@@ -613,7 +640,13 @@ export class Engine {
     const c = this.config
     const group = c.numHeads / c.numKvHeads
     let G = Math.min(group, Math.floor(this.gpu.limits.maxDrawBuffers / 3))
-    while (G > 1 && (group % G || !this.gpu.canRender(GL.RGBA32F, 3 * G))) G--
+    while (
+      G > 1 &&
+      (!this.mrt.chunks ||
+        group % G ||
+        !this.gpu.canRender(new Array(3 * G).fill(GL.RGBA32F)))
+    )
+      G--
     this.group = G
     return G
   }
@@ -1464,7 +1497,7 @@ export class Engine {
           : this.readPair(source, "uBCx", bcx)
       )
     const bcxIn = { uBCx: bcx, ...(!split && this.quadInputs("uBCx", bcx)) }
-    if (rows <= SPLIT_ROWS && TUNING.fuseConv > 0) {
+    if (rows <= SPLIT_ROWS && TUNING.fuseConv > 0 && this.mrt.conv) {
       // A few rows: the output and the new state in one pass.
       this.gpu.run({
         name: "conv",
@@ -1658,7 +1691,12 @@ export class Engine {
     for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
       const widest = Math.ceil((pos0 + rows - j0) / 4)
-      const segTexels = Math.min(widest, scoreWidth, TUNING.scoreTexels)
+      // (Segments need chunked attention: without it, whole rows.)
+      const segTexels = Math.min(
+        widest,
+        scoreWidth,
+        this.mrt.chunks ? TUNING.scoreTexels : Infinity
+      )
       const segmentsMax = Math.ceil(widest / segTexels)
       const panels = Math.max(1, Math.floor(scoreWidth / segTexels))
       let slice = Math.min(
@@ -1730,7 +1768,8 @@ export class Engine {
           : 2 * TUNING.attendChunkTexels
       if (
         segments > 1 ||
-        (TUNING.attendChunkTexels > 0 &&
+        (this.mrt.chunks &&
+          TUNING.attendChunkTexels > 0 &&
           kt > chunkPast &&
           slice * chunks <= chunkRows)
       ) {
@@ -2382,7 +2421,7 @@ export class Engine {
         l.gateUp.rgba4
       )
     }
-    const prescaled = TUNING.foldNorm === 2
+    const prescaled = TUNING.foldNorm === 2 && this.mrt.scaled
     // The embedding draws layer 0's sums of squares and scaled input too.
     const embedFolded = prescaled && e.rgba4 && foldAt(0)
     // The last add draws the final norm's scaled input for the head.

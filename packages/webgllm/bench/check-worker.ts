@@ -149,7 +149,8 @@ async function run(params: {
     batchSize: params.batch,
     matmulPrecision: params.precision,
     ringCache: (params as { ring?: boolean }).ring !== false,
-    kvBlockRows: (params as { kvRows?: number }).kvRows
+    kvBlockRows: (params as { kvRows?: number }).kvRows,
+    noMrt: (params as { noMrt?: Array<"scaled" | "quad" | "conv" | "chunks"> }).noMrt
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
@@ -536,7 +537,8 @@ async function smoke(params: {
     batchSize: params.batch,
     matmulPrecision: params.precision,
     weightTexels: params.texels,
-    kvBlockRows: (params as { kvRows?: number }).kvRows
+    kvBlockRows: (params as { kvRows?: number }).kvRows,
+    noMrt: (params as { noMrt?: Array<"scaled" | "quad" | "conv" | "chunks"> }).noMrt
   })
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`

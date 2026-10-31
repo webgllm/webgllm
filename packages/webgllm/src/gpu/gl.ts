@@ -308,15 +308,16 @@ export class Gpu {
   }
 
   /**
-   * Whether the GPU can draw into `count` textures of this format at once
-   * (some cap the bits a pixel writes: 512 on Apple's mobile GPUs through
-   * ANGLE, so 6 RGBA32F targets fail there).
+   * Whether the GPU can draw into textures of these formats at once (one
+   * per target). Asked of the GPU, not assumed: some cap the bits a pixel
+   * writes (ANGLE on Apple's mobile GPUs: 512, so 6 RGBA32F targets fail).
    */
-  canRender(internal: number, count: number) {
+  canRender(internals: Array<number>) {
     const gl = this.gl
+    const count = internals.length
     if (count > this.limits.maxDrawBuffers) return false
     if (count > (gl.getParameter(gl.MAX_COLOR_ATTACHMENTS) as number)) return false
-    const textures = Array.from({ length: count }, () => this.texture(internal, 1, 1))
+    const textures = internals.map((internal) => this.texture(internal, 1, 1))
     const fb = gl.createFramebuffer()
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
     textures.forEach((t, i) =>
