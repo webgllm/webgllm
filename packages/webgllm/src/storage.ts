@@ -184,24 +184,36 @@ async function writeText(
 }
 
 /**
+ * Whether `name` on disk (a file, or its `.done` or `.etag`) is `file` as
+ * earlier versions of this package saved it, at a pinned commit:
+ * "repo@<commit>/path" made safe. Matched whole, commit included: with "/"
+ * made "_", other files' names can end the same (main's
+ * tokenizer_config.json ends like config.json).
+ */
+export function isOldVersion(name: string, file: ModelFile) {
+  const base = name.replace(/\.(done|etag)$/, "")
+  const prefix = safe(`${file.repo}@`)
+  const own = safe(`/${file.path}`)
+  return (
+    base.startsWith(prefix) &&
+    base.endsWith(own) &&
+    /^[0-9a-f]{40}$/.test(base.slice(prefix.length, base.length - own.length))
+  )
+}
+
+/**
  * Removes the files earlier versions of this package saved for `file` at a
- * pinned commit ("repo@commit/path"), once it's downloaded at main.
+ * pinned commit, once it's downloaded at main.
  */
 async function removeOldVersions(
   folder: FileSystemDirectoryHandle,
   file: ModelFile
 ) {
-  const prefix = safe(`${file.repo}@`)
-  const own = safe(`/${file.path}`)
-  const current = diskName(file)
   const old: Array<string> = []
   for await (const name of (
     folder as unknown as { keys: () => AsyncIterable<string> }
   ).keys()) {
-    const base = name.replace(/\.(done|etag)$/, "")
-    if (base !== current && base.startsWith(prefix) && base.endsWith(own)) {
-      old.push(name)
-    }
+    if (isOldVersion(name, file)) old.push(name)
   }
   for (const name of old) await folder.removeEntry(name).catch(() => undefined)
 }
