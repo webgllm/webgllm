@@ -111,6 +111,7 @@ function half(h: number): number {
  * block in nibble e & 1, low first, of byte e >> 1).
  */
 function decodeRow(m: QuantMatrix, n: number): Float64Array {
+  if (m.bits === 6) return decodeQ6_KRow(m, n)
   const blocks = m.K / 32
   const out = new Float64Array(m.K)
   const g = n >> 2
@@ -142,6 +143,27 @@ function decodeRow(m: QuantMatrix, n: number): Float64Array {
           out[b * 32 + w * 4 + k] = scale * (((word >>> (8 * k)) << 24) >> 24)
       }
     }
+  }
+  return out
+}
+
+/**
+ * A 6-bit QuantMatrix row (ggml Q6_K kept as it is, weights.ts): each
+ * super-block's 208 bytes of ql, qh and scales at (row group, super-block,
+ * row in group), its fp16 d in `scales`; put back into a 210-byte ggml
+ * block and dequantized by q6kRow below.
+ */
+function decodeQ6_KRow(m: QuantMatrix, n: number): Float64Array {
+  const superBlocks = m.K / 256
+  const bytes = new Uint8Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength)
+  const out = new Float64Array(m.K)
+  const block = new Uint8Array(210)
+  for (let s = 0; s < superBlocks; s++) {
+    const at = ((n >> 2) * superBlocks + s) * 4 + (n & 3)
+    block.set(bytes.subarray(at * 208, at * 208 + 208))
+    block[208] = m.scales[at] & 255
+    block[209] = m.scales[at] >> 8
+    out.set(q6kRow(block, 0, 256), s * 256)
   }
   return out
 }
@@ -257,14 +279,55 @@ function sampleRows(N: number, count = 48): Array<number> {
 
 // ------------------------------------------------------------ shape checks
 
+type EmbeddingChunk = { value: QuantMatrix; row0?: number; totalRows?: number }
+
+/**
+ * The embedding's chunks of rows (WeightPiece "embedding": rows row0.. of
+ * totalRows) as one matrix. Every layout is by row group of 4 rows, so a
+ * chunk starting at row r (a multiple of 4) lands r rows' worth of each
+ * array in.
+ */
+function mergeEmbedding(label: string, chunks: Array<EmbeddingChunk>): QuantMatrix | null {
+  if (chunks.length === 0) {
+    fail(`${label}: no embedding`)
+    return null
+  }
+  const first = chunks[0].value
+  const N = chunks[0].totalRows ?? first.N
+  const perRow = (a: { length: number }, m: QuantMatrix) => a.length / m.N
+  const m: QuantMatrix = {
+    N,
+    K: first.K,
+    bits: first.bits,
+    quants: new Uint32Array(perRow(first.quants, first) * N),
+    scales: new Uint16Array(perRow(first.scales, first) * N),
+    zeros: first.zeros ? new Uint8Array(perRow(first.zeros, first) * N) : null,
+    ...(first.raw && { raw: new Uint8Array(perRow(first.raw, first) * N) })
+  }
+  let next = 0
+  for (const { value: c, row0 = 0, totalRows = N } of chunks) {
+    expect(row0 === next, `${label}: chunk at row ${row0}, expected ${next}`)
+    expect(totalRows === N && c.K === m.K && c.bits === m.bits, `${label}: chunk at row ${row0} differs`)
+    expect(row0 % 4 === 0, `${label}: chunk at row ${row0} isn't on a row group`)
+    m.quants.set(c.quants, perRow(c.quants, c) * row0)
+    m.scales.set(c.scales, perRow(c.scales, c) * row0)
+    if (m.zeros && c.zeros) m.zeros.set(c.zeros, perRow(c.zeros, c) * row0)
+    if (m.raw && c.raw) m.raw.set(c.raw, perRow(c.raw, c) * row0)
+    next = row0 + c.N
+  }
+  expect(next === N, `${label}: chunks cover ${next} of ${N} rows`)
+  return m
+}
+
 function checkMatrix(
   label: string,
   m: QuantMatrix,
   N: number,
   K: number,
-  bits: 4 | 8
+  bits: 4 | 6 | 8
 ): void {
-  const blocks = (N * K) / 32
+  // (Q6_K: one scale and 52 words per row per 256-weight super-block.)
+  const blocks = (N * K) / (bits === 6 ? 256 : 32)
   expect(
     m.N === N && m.K === K && m.bits === bits,
     `${label}: ${m.N}x${m.K} ${m.bits}-bit, expected ${N}x${K} ${bits}-bit`
@@ -277,7 +340,7 @@ function checkMatrix(
     )
   } else {
     expect(
-      m.quants.length === blocks * (bits === 4 ? 4 : 8),
+      m.quants.length === blocks * { 4: 4, 6: 52, 8: 8 }[bits],
       `${label}: quants length ${m.quants.length}`
     )
   }
@@ -301,7 +364,9 @@ function checkMatrix(
   expect(bad === 0, `${label}: ${bad} scales are Inf/NaN`)
 }
 
-function checkVector(label: string, v: Float32Array, length: number): void {
+/** (A missing vector, say a norm this model doesn't have, fails too.) */
+function checkVector(label: string, v: Float32Array | undefined, length: number): void {
+  if (!v) return fail(`${label}: missing`)
   expect(
     v instanceof Float32Array && v.length === length,
     `${label}: length ${v.length}, expected ${length}`
@@ -468,7 +533,9 @@ const normDiff = new Map<
   string,
   { maxAbs: number; maxRel: number; corr: number; n: number }
 >()
-function addNorm(kind: string, a: Float32Array, b: Float32Array): void {
+function addNorm(kind: string, a: Float32Array | undefined, b: Float32Array | undefined): void {
+  // (A norm the model doesn't have: in neither format, or a mismatch.)
+  if (!a || !b) return expect(!a && !b, `${kind}: in one format only`)
   let maxAbs = 0
   let maxRel = 0
   for (let i = 0; i < a.length; i++) {
@@ -570,6 +637,23 @@ async function main(): Promise<void> {
   let configG: ModelConfig | undefined
   let configO: ModelConfig | undefined
   const order: Array<string> = []
+  // The embedding comes in chunks of rows, as many as each loader likes:
+  // collected, and checked whole after the rest.
+  const chunksG: Array<EmbeddingChunk> = []
+  const chunksO: Array<EmbeddingChunk> = []
+  const take = async (
+    it: AsyncGenerator<WeightPiece>,
+    first: WeightPiece,
+    into: Array<EmbeddingChunk>,
+    label: string
+  ) => {
+    for (let p: WeightPiece | undefined = first; p; ) {
+      if (p.kind === "embedding") into.push(p)
+      else fail(`${label}: a ${p.kind} piece after the embedding`)
+      const r = await it.next()
+      p = r.done ? undefined : r.value
+    }
+  }
   for (;;) {
     const [pa, pb] = await Promise.all([a.next(), b.next()])
     if (pa.done || pb.done) {
@@ -581,6 +665,13 @@ async function main(): Promise<void> {
     }
     const g = pa.value
     const o = pb.value
+    if (g.kind === "embedding" || o.kind === "embedding") {
+      expect(g.kind === o.kind, `piece kinds differ: ${g.kind} / ${o.kind}`)
+      order.push("embedding")
+      await take(a, g, chunksG, "GGUF")
+      await take(b, o, chunksO, "ONNX")
+      break
+    }
     order.push(g.kind === "layer" ? `layer ${g.layer}` : g.kind)
     expect(g.kind === o.kind, `piece kinds differ: ${g.kind} / ${o.kind}`)
     if (g.kind === "config" && o.kind === "config") {
@@ -624,31 +715,23 @@ async function main(): Promise<void> {
       checkVector("GGUF finalNorm", g.value, configG!.hiddenSize)
       checkVector("ONNX finalNorm", o.value, configO!.hiddenSize)
       addNorm("finalNorm", g.value, o.value)
-    } else if (g.kind === "embedding" && o.kind === "embedding") {
-      checkMatrix(
-        "GGUF embedding",
-        g.value,
-        configG!.vocabSize,
-        configG!.hiddenSize,
-        8
-      )
-      checkMatrix(
-        "ONNX embedding",
-        o.value,
-        configO!.vocabSize,
-        configO!.hiddenSize,
-        4
-      )
-      await checkEmbeddings(
-        gguf,
-        header,
-        graph,
-        onnxData,
-        g.value,
-        o.value,
-        stats
-      )
     }
+  }
+  const embG = mergeEmbedding("GGUF embedding", chunksG)
+  const embO = mergeEmbedding("ONNX embedding", chunksO)
+  if (embG && embO) {
+    console.log(
+      `embedding chunks: GGUF ${chunksG.length} (${embG.bits}-bit), ONNX ${chunksO.length} (${embO.bits}-bit)`
+    )
+    checkMatrix(
+      "GGUF embedding",
+      embG,
+      configG!.vocabSize,
+      configG!.hiddenSize,
+      embG.bits === 6 ? 6 : embG.bits === 4 ? 4 : 8
+    )
+    checkMatrix("ONNX embedding", embO, configO!.vocabSize, configO!.hiddenSize, 4)
+    await checkEmbeddings(gguf, header, graph, onnxData, embG, embO, stats)
   }
   const expectedOrder = [
     "config",
@@ -813,12 +896,12 @@ async function rawCheckGguf(
   }
   const same = (
     label: string,
-    got: Float32Array,
+    got: Float32Array | undefined,
     want: ArrayLike<number>,
     perm?: Int32Array
   ) => {
     expect(
-      got.every((v, k) => v === want[perm ? perm[k] : k]),
+      !!got && got.every((v, k) => v === want[perm ? perm[k] : k]),
       `GGUF ${label} values`
     )
   }
@@ -918,9 +1001,9 @@ async function rawCheckOnnx(
   const p = `model.layers.${i}.`
   const f16 = async (name: string) =>
     f16Array(await readOnnxInit(data, graph, name))
-  const same = (label: string, got: Float32Array, want: Float64Array) => {
+  const same = (label: string, got: Float32Array | undefined, want: Float64Array) => {
     expect(
-      got.every((v, k) => v === want[k]),
+      !!got && got.every((v, k) => v === want[k]),
       `ONNX ${label} values`
     )
   }
@@ -1041,48 +1124,36 @@ async function checkEmbeddings(
   stats: RequantStats
 ): Promise<void> {
   const D = g.K
-  console.log("\n== GGUF embedding: Q6_K → 8-bit")
-  console.log(
-    `whole matrix (${stats.count} weights): max |err| ${stats.maxError.toExponential(3)}, ` +
-      `RMS err ${Math.sqrt(stats.sumSquaredError / stats.count).toExponential(3)}, ` +
-      `RMS err / RMS weight ${Math.sqrt(stats.sumSquaredError / stats.sumSquared).toExponential(3)}`
-  )
-  // Independently: dequantize sampled raw Q6_K rows and compare with the 8-bit rows.
   const info = header.tensors.get("token_embd.weight")!
   const rowBytes = info.byteLength / g.N
-  let maxErr = 0
-  let maxRelBlock = 0
-  let sse = 0
-  let ss = 0
-  let n = 0
-  for (const r of sampleRows(g.N, 4000)) {
-    const raw = await gguf.read(info.offset + r * rowBytes, rowBytes)
-    const want = q6kRow(raw, 0, D)
-    const got = decodeRow(g, r)
-    for (let b = 0; b < D / 32; b++) {
-      let max = 0
-      for (let j = 0; j < 32; j++)
-        max = Math.max(max, Math.abs(want[b * 32 + j]))
-      for (let j = 0; j < 32; j++) {
-        const e = Math.abs(got[b * 32 + j] - want[b * 32 + j])
-        maxErr = Math.max(maxErr, e)
-        if (max > 0) maxRelBlock = Math.max(maxRelBlock, e / max)
-        sse += e * e
-        ss += want[b * 32 + j] ** 2
-        n++
+  if (g.bits === 6) {
+    // Kept as Q6_K (the head reads it natively): sampled rows decode to
+    // exactly ggml's values from the file's bytes.
+    console.log("\n== GGUF embedding: Q6_K kept as it is")
+    let rows = 0
+    for (const r of sampleRows(g.N, 2000)) {
+      const raw = await gguf.read(info.offset + r * rowBytes, rowBytes)
+      const want = q6kRow(raw, 0, D)
+      const got = decodeRow(g, r)
+      const bad = got.findIndex((v, k) => v !== want[k])
+      if (bad >= 0) {
+        fail(`GGUF embedding row ${r} col ${bad}: ${got[bad]} != ${want[bad]}`)
+        break
       }
+      rows++
     }
+    console.log(`exact rows: ${rows} sampled Q6_K embedding rows`)
+  } else if (stats.count > 0) {
+    // Float embeddings are quantized to 8 bits a weight (32-weight blocks):
+    // the loader's own error over the whole matrix, within what that allows.
+    console.log("\n== GGUF embedding: floats quantized to 8 bits")
+    const rel = Math.sqrt(stats.sumSquaredError / stats.sumSquared)
+    console.log(
+      `whole matrix (${stats.count} weights): max |err| ${stats.maxError.toExponential(3)}, ` +
+        `RMS err ${Math.sqrt(stats.sumSquaredError / stats.count).toExponential(3)}, RMS err / RMS weight ${rel.toExponential(3)}`
+    )
+    expect(rel < 0.02, "8-bit embedding error above 2% of the weights' RMS")
   }
-  console.log(
-    `independent check, ${n / D} sampled rows: max |err| ${maxErr.toExponential(3)}, RMS err ${Math.sqrt(sse / n).toExponential(3)}, ` +
-      `RMS err / RMS weight ${Math.sqrt(sse / ss).toExponential(3)}, max err / block max|w| ${maxRelBlock.toExponential(3)} (0.5/127 = ${(0.5 / 127).toExponential(3)})`
-  )
-  expect(maxRelBlock < 0.5 / 127 + 2e-3, "Q6_K → 8-bit error above half a step")
-  expect(
-    Math.abs(maxErr - stats.maxError) / stats.maxError < 1 ||
-      maxErr <= stats.maxError,
-    "sampled error exceeds the loader's whole-matrix max"
-  )
 
   // ONNX embedding against the raw GatherBlockQuantized bytes.
   const gather = graph.nodes.find((x) => x.opType === "GatherBlockQuantized")!
