@@ -25,16 +25,29 @@ import { THINK_OPEN } from "./reply.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
-/** Resolves when the page answers a "claim" (see claimMemory). */
-let claimed: (() => void) | null = null
+/** Claims the page hasn't answered yet, oldest first (it answers in order). */
+const claims: Array<() => void> = []
 
-/** Asks the page to make room for the model, and waits until it has. */
+/**
+ * Asks the page to make room for the model's `bytes` (in place of what it
+ * claimed before), and waits until it has.
+ */
 function claimMemory(model: string, bytes: number) {
   return new Promise<void>((resolve) => {
-    claimed = resolve
+    claims.push(resolve)
     post({ type: "claim", model, bytes: Math.round(bytes) })
   })
 }
+
+/** A claim again once the textures grow this much past the last one (see generate). */
+const RECLAIM_BYTES = 32 * 2 ** 20
+
+/**
+ * The textures a model takes loaded, per byte of its weight files: what's
+ * claimed before a load (then the textures' bytes, measured). Qwen3.5 2B
+ * and LFM3 1.7B take 1.3–1.4× at 512-token batches.
+ */
+const TEXTURES_PER_FILE_BYTE = 1.4
 
 type Loaded = {
   model: string
@@ -46,6 +59,8 @@ type Loaded = {
   cached: Array<number>
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
+  /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
+  claimed: number
   /**
    * Engine.tune not run yet on this GPU: it runs when the worker is idle
    * (see tuneWhenIdle), then its picks join this note.
@@ -217,10 +232,10 @@ async function load(
     lap("files")
     post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
     // Room for it first: the page unloads other runtimes' models past the
-    // memory budget. The weights take about their size in textures, plus
-    // the cache and working textures.
+    // memory budget. An estimate until it's loaded (then the textures it
+    // took): the weights, the cache and the working textures.
     const weightBytes = weightFiles.reduce((sum, f) => sum + f.size, 0)
-    await claimMemory(model, weightBytes * 1.1)
+    await claimMemory(model, weightBytes * TEXTURES_PER_FILE_BYTE)
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
       tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
@@ -317,12 +332,16 @@ async function load(
       return await load(model, signal, contextLength, true)
     }
     const base = fresh ?? (note?.tuned ? null : note)
+    // What it took, in place of the estimate.
+    await claimMemory(model, engine.gpu.bytes)
+    if (signal.aborted) throw new Superseded()
     return {
       model,
       contextLength,
       engine,
       tokenizer,
       cached: [],
+      claimed: engine.gpu.bytes,
       timings,
       ...(base && { untuned: { key: noteKey, note: base } })
     }
@@ -730,6 +749,12 @@ async function generate(request: GenerateRequest) {
       text: `${compiled} programs compiled during request ${id}: ${names.join(" | ")}`
     })
   }
+  // The cache grew with the chat: claim what the textures take now (the
+  // page may unload other runtimes' models; the reply needn't wait).
+  if (engine.gpu.bytes > model.claimed + RECLAIM_BYTES) {
+    model.claimed = engine.gpu.bytes
+    void claimMemory(model.model, model.claimed)
+  }
   post({ type: "done", id, stats })
 }
 
@@ -783,8 +808,7 @@ function tuneWhenIdle() {
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   if (data.type === "claimed") {
-    claimed?.()
-    claimed = null
+    claims.shift()?.()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
