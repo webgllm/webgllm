@@ -260,6 +260,12 @@ export const TUNING = {
   /** ...for batches of at least this many tokens (fewer go a token at a time). */
   linChunkMin: 4,
   /**
+   * Full-attention caches grow by this many positions at a time (copied
+   * into a bigger texture: see reserve), not doubling (0): at most a
+   * step's worth unused, not up to half the cache.
+   */
+  kvStep: 512,
+  /**
    * Resume points kept for a model with Gated DeltaNet layers (~20 MB each
    * for Qwen3.5 2B; see snapshot): the anchor, where the next user turn's
    * prompt stops sharing this chat's, and the end of the last reply.
@@ -801,15 +807,18 @@ export class Engine {
   private reserve(end: number) {
     if (end <= this.kvPositions) return
     const block = 2 ** this.kvShift
+    const step = TUNING.kvStep
     let positions = Math.min(
       this.contextLength,
-      Math.max(end, 2 * this.kvPositions)
+      step > 0 ? end : Math.max(end, 2 * this.kvPositions)
     )
-    // Whole blocks past the first; a power of two within it.
+    // Whole blocks past the first; within it, whole steps (or a power of two).
     positions =
       positions > block
         ? Math.ceil(positions / block) * block
-        : 2 ** Math.ceil(Math.log2(positions))
+        : step > 0
+          ? Math.min(block, Math.ceil(positions / step) * step)
+          : 2 ** Math.ceil(Math.log2(positions))
     try {
       for (const layer of this.layers) {
         const a = layer.attention
