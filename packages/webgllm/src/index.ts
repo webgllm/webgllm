@@ -4,6 +4,7 @@
  * GGUF and the ONNX build for the web.
  */
 export { webglText, WebGlTextAdapter } from "./adapter.js"
+export type { WebGlTextConfig } from "./adapter.js"
 export type {
   WebGlProviderUsageDetails,
   WebGlTextProviderOptions

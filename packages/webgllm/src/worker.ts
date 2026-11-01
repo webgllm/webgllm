@@ -26,6 +26,8 @@ const post = (message: WorkerResponse) => postMessage(message)
 
 type Loaded = {
   model: string
+  /** The contextLength it was loaded for (the model's own when undefined). */
+  contextLength: number | undefined
   engine: Engine
   tokenizer: Tokenizer
   /** Token ids in the engine's cache, in order. */
@@ -42,6 +44,7 @@ type Loaded = {
 let current: Loaded | null = null
 let loading: {
   model: string
+  contextLength: number | undefined
   promise: Promise<Loaded>
   abort: AbortController
 } | null = null
@@ -156,6 +159,8 @@ const SELF_CHECK_MAX = 1e-2
 async function load(
   model: WebGlTextModel,
   signal: AbortSignal,
+  /** Most tokens a chat may hold: the model's own context length when undefined. */
+  contextLength: number | undefined,
   /** Without multiple render targets: after a failed self-check. */
   plain = false
 ): Promise<Loaded> {
@@ -175,6 +180,7 @@ async function load(
   }
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     batchSize: PROMPT_BATCH,
+    ...(contextLength !== undefined && { contextLength }),
     ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
   })
   lap("context")
@@ -287,11 +293,12 @@ async function load(
         )
       }
       release(engine)
-      return await load(model, signal, true)
+      return await load(model, signal, contextLength, true)
     }
     const base = fresh ?? (note?.tuned ? null : note)
     return {
       model,
+      contextLength,
       engine,
       tokenizer,
       cached: [],
@@ -305,13 +312,25 @@ async function load(
   }
 }
 
-/** Loads `model` unless it's loaded (or loading), replacing any other. */
-function startLoad(model: string): Promise<Loaded> {
-  if (current?.model === model && !current.engine.gpu.isLost) {
+/**
+ * Loads `model` for chats of up to `contextLength` tokens unless it's loaded
+ * (or loading) for them, replacing any other.
+ */
+function startLoad(
+  model: string,
+  contextLength: number | undefined
+): Promise<Loaded> {
+  if (
+    current?.model === model &&
+    current.contextLength === contextLength &&
+    !current.engine.gpu.isLost
+  ) {
     post({ type: "ready", model })
     return Promise.resolve(current)
   }
-  if (loading?.model === model) return loading.promise
+  if (loading?.model === model && loading.contextLength === contextLength) {
+    return loading.promise
+  }
   // Stop a load of another model, and free the loaded one.
   loading?.abort.abort()
   if (current) {
@@ -319,8 +338,8 @@ function startLoad(model: string): Promise<Loaded> {
     current = null
   }
   const abort = new AbortController()
-  const promise = load(model as WebGlTextModel, abort.signal)
-  const entry = { model, promise, abort }
+  const promise = load(model as WebGlTextModel, abort.signal, contextLength)
+  const entry = { model, contextLength, promise, abort }
   loading = entry
   promise.then(
     (loaded) => {
@@ -367,7 +386,7 @@ async function generate(request: GenerateRequest) {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
   // The model this request is for: loaded again if its GPU context was
   // lost, or loaded if another was asked for since.
-  const model = await startLoad(request.model)
+  const model = await startLoad(request.model, request.contextLength)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
   const { engine, tokenizer } = model
   const compiledBefore = engine.gpu.compiled.count
@@ -737,7 +756,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
-    void startLoad(data.model).catch(() => undefined)
+    void startLoad(data.model, data.contextLength).catch(() => undefined)
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else {

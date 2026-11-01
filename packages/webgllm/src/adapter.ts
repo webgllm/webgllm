@@ -232,6 +232,17 @@ let calls = 0
 const nextId = (prefix: string) =>
   `${prefix}_${Date.now().toString(36)}_${(calls++).toString(36)}`
 
+/** Options for `webglText`. */
+export type WebGlTextConfig = {
+  /**
+   * Most tokens a chat may hold, prompt and reply together: the model's
+   * whole context length by default (from its config), never more. The
+   * attention cache grows as a chat fills it either way; a smaller limit
+   * refuses longer chats sooner. Changing it loads the model again.
+   */
+  contextLength?: number
+}
+
 export class WebGlTextAdapter<
   TModel extends WebGlTextModel
 > extends BaseTextAdapter<
@@ -249,8 +260,11 @@ export class WebGlTextAdapter<
   override readonly api = "webgl" as const
   override readonly inputModalities = ["text"] as const
 
-  constructor(model: TModel) {
+  private readonly contextLength: number | undefined
+
+  constructor(model: TModel, config: WebGlTextConfig = {}) {
     super({}, model)
+    this.contextLength = config.contextLength
   }
 
   /** How the model writes tool calls. */
@@ -295,7 +309,7 @@ export class WebGlTextAdapter<
       ...(options.parentRunId && { parentRunId: options.parentRunId })
     }
     try {
-      await loadModel(model)
+      await loadModel(model, this.contextLength)
     } catch (error) {
       const message = `Couldn't load ${model}: ${errorText(error)}`
       yield {
@@ -400,6 +414,7 @@ export class WebGlTextAdapter<
     const stream = generate({
       id: nextId("call"),
       model: this.model,
+      contextLength: this.contextLength,
       chat,
       tools: toTools(options.tools),
       thinking: enableThinking(options.reasoning, model),
@@ -498,7 +513,7 @@ export class WebGlTextAdapter<
     options: StructuredOutputOptions<WebGlTextProviderOptions>
   ): Promise<StructuredOutputResult<unknown>> {
     const { chatOptions, outputSchema } = options
-    await loadModel(this.model)
+    await loadModel(this.model, this.contextLength)
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
       .concat(
@@ -508,6 +523,7 @@ export class WebGlTextAdapter<
     const stream = generate({
       id: nextId("call"),
       model: this.model,
+      contextLength: this.contextLength,
       chat: [
         { role: "system", content: system },
         ...toChatMessages(chatOptions.messages, this.toolFormat)
@@ -553,7 +569,8 @@ export class WebGlTextAdapter<
  * ```
  */
 export function webglText<TModel extends WebGlTextModel>(
-  model: TModel
+  model: TModel,
+  config?: WebGlTextConfig
 ): WebGlTextAdapter<TModel> {
-  return new WebGlTextAdapter(model)
+  return new WebGlTextAdapter(model, config)
 }

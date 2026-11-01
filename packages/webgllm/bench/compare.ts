@@ -78,7 +78,9 @@ async function runWllamaPackage(text: string, gpu = true) {
   const url = "/bundle-wllama/src/client.js"
   const client = (await import(/* @vite-ignore */ url)) as {
     configureRuntime: (options: Record<string, unknown>) => void
+    setContextLength: (model: string, contextLength: number | undefined) => void
     loadModel: (model: string) => Promise<{
+      getLoadedContextInfo: () => { n_ctx: number; n_ctx_train: number }
       createChatCompletion: (
         options: Record<string, unknown>
       ) => Promise<{
@@ -91,7 +93,7 @@ async function runWllamaPackage(text: string, gpu = true) {
   const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
   // llama.cpp's own load log says where the model runs (layers offloaded,
   // the WebGPU device): its lines about that go to this page's log.
-  const relevant = /offload|webgpu|WebGPU|ggml_wgpu|backend|CPU_REPACK|compat/i
+  const relevant = /offload|webgpu|WebGPU|ggml_wgpu|backend|CPU_REPACK|compat|n_ctx|KV buffer|kv_cache|llama_kv|compute buffer/i
   let forwarded = 0
   for (const level of ["log", "info", "warn", "debug"] as const) {
     const original = console[level].bind(console)
@@ -102,8 +104,13 @@ async function runWllamaPackage(text: string, gpu = true) {
     }
   }
   client.configureRuntime({ gpu, debug: true })
+  // ?ctx= sets the context; left out, the model's whole window.
+  const ctx = params.get("ctx")
+  client.setContextLength(model, ctx ? Number(ctx) : undefined)
   const t0 = performance.now()
   const wllama = await client.loadModel(model)
+  const info = wllama.getLoadedContextInfo()
+  log(`wllama context: n_ctx ${info.n_ctx}, n_ctx_train ${info.n_ctx_train}`)
   log(`wllama (package) loaded ${model} ${gpu ? "on WebGPU where it can" : "on the CPU"} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
   const generate = (content: string, maxTokens: number) =>
     wllama.createChatCompletion({

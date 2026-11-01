@@ -48,7 +48,11 @@ type Pending = {
   resolve: () => void
   reject: (error: Error) => void
 }
-let loaded: { model: string; load: Pending } | null = null
+let loaded: {
+  model: string
+  contextLength: number | undefined
+  load: Pending
+} | null = null
 let worker: Worker | null = null
 
 function handleMessage({ data }: MessageEvent<WorkerResponse>) {
@@ -152,9 +156,18 @@ export function hasWebGl2(): boolean {
   }
 }
 
-/** Loads a model (downloading it the first time), replacing any other. */
-export function loadModel(model: WebGlTextModel): Promise<void> {
-  if (loaded?.model === model) return loaded.load.promise
+/**
+ * Loads a model (downloading it the first time), replacing any other, for
+ * chats of up to `contextLength` tokens: the model's own context length by
+ * default. A different context length loads the model again.
+ */
+export function loadModel(
+  model: WebGlTextModel,
+  contextLength?: number
+): Promise<void> {
+  if (loaded?.model === model && loaded.contextLength === contextLength) {
+    return loaded.load.promise
+  }
   if (loaded) {
     modelStatus(loaded.model as WebGlTextModel).set({ state: "idle" })
     loaded.load.reject(new Error("Switched to another model."))
@@ -166,9 +179,13 @@ export function loadModel(model: WebGlTextModel): Promise<void> {
     reject = rej
   })
   promise.catch(() => undefined)
-  loaded = { model, load: { promise, resolve, reject } }
+  loaded = { model, contextLength, load: { promise, resolve, reject } }
   modelStatus(model).set({ state: "loading", progress: 0, cached: true })
-  post({ type: "load", model })
+  post({
+    type: "load",
+    model,
+    ...(contextLength !== undefined && { contextLength })
+  })
   return promise
 }
 
@@ -181,6 +198,8 @@ export type GenerationEnd = { failure?: string; stats?: RunTimings }
 export async function* generate(request: {
   id: string
   model: WebGlTextModel
+  /** The context the model is loaded for (see loadModel). */
+  contextLength?: number
   chat: Array<ChatMessage>
   tools: Array<ChatTool>
   thinking?: boolean
@@ -216,6 +235,9 @@ export async function* generate(request: {
     type: "generate",
     id,
     model: request.model,
+    ...(request.contextLength !== undefined && {
+      contextLength: request.contextLength
+    }),
     chat: request.chat,
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),

@@ -23,12 +23,23 @@ export type RunTimings = {
 }
 
 export type WorkerRequest =
-  | { type: "load"; model: string }
+  | {
+      type: "load"
+      model: string
+      /**
+       * Most tokens a chat may hold, prompt and reply together: the model's
+       * own context length when left out, and never more. A different value
+       * loads the model again.
+       */
+      contextLength?: number
+    }
   | {
       type: "generate"
       id: string
       /** The model to run it on: loaded first if it isn't (or its GPU context was lost). */
       model: string
+      /** The context to load it for, if it's loaded first (see "load"). */
+      contextLength?: number
       chat: Array<ChatMessage>
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
