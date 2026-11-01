@@ -541,8 +541,10 @@ export class Engine {
       this.linChunkBuffers(TUNING.linChunk)
     if (this.quadMatmuls) {
       const b = this.buffers
+      // (Not for a 1×1 stand-in: see allocate.)
       for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj])
-        if (t) this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
+        if (t && t.width * t.height > 1)
+          this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
     }
     this.ropeFull = this.ropeTable(config.ropeThetaFull, config.ropeDimsFull)
     // (Only models with sliding-window layers read the second table.)
@@ -647,6 +649,14 @@ export class Engine {
     const lin = this.linDims()
     const qDims = c.numHeads * c.headDim
     const I = c.intermediateSize
+    // The conv block's tensors only for models with conv layers (1×1
+    // stand-ins otherwise: Qwen3.5 has none).
+    const hasConv = c.layerTypes.includes("conv")
+    const conv = (make: () => Texture) =>
+      hasConv ? make() : this.gpu.texture(GL.RGBA32UI, 1, 1)
+    // Logits for one row at a time where no draft batch is read (see
+    // canDraft: Gated DeltaNet models).
+    const headRows = c.layerTypes.includes("linear_attention") ? 1 : SPLIT_ROWS
     // Each tensor has its own texture: sharing one between tensors that are
     // never alive at once saves ~25 MB at 512 rows, but a pass that writes a
     // texture the pass before read must wait for it, and prompts read ~12%
@@ -672,13 +682,13 @@ export class Engine {
       normed: this.h2(D, M),
       opOut: this.pair(D, 2 * M),
       // (Room for more K-slices of 4-token matmuls: see matmulQuad.)
-      bcx: this.pair(3 * D, this.quadMatmuls ? 2 * M : M),
-      convOut: this.h2(D, M),
+      bcx: conv(() => this.pair(3 * D, this.quadMatmuls ? 2 * M : M)),
+      convOut: conv(() => this.h2(D, M)),
       /**
        * A few rows' convolution output, drawn with the new state in one
        * pass (see convFused): the state's size, h2 in its first D / 8 texels.
        */
-      convSmall: this.gpu.texture(GL.RGBA32UI, D / 4, this.convRows()),
+      convSmall: conv(() => this.gpu.texture(GL.RGBA32UI, D / 4, this.convRows())),
       qkvg: this.pair(qkvg, 2 * M),
       q: this.f32(c.numHeads * c.headDim, M),
       /**
@@ -697,11 +707,11 @@ export class Engine {
       act: this.h2(I, M),
       ffnOut: this.pair(D, 2 * M),
       lastNormed: this.h2(D, SPLIT_ROWS),
-      /** Logits: logitRows rows per token, for up to SPLIT_ROWS tokens. */
+      /** Logits: logitRows rows per token, for up to SPLIT_ROWS tokens (or one: headRows). */
       logits: this.gpu.texture(
         GL.RGBA32F,
         OUT_WIDTH,
-        Math.ceil(c.vocabSize / 4 / OUT_WIDTH) * SPLIT_ROWS
+        Math.ceil(c.vocabSize / 4 / OUT_WIDTH) * headRows
       ),
       /** Per token: 0, 1 seen (repetition penalty), 2 never drawn. Same rows as the logits. */
       mask: this.gpu.texture(
@@ -3566,9 +3576,10 @@ export class Engine {
     // read it don't hold up the next forward's matmuls.
     if (!this.headScratch || this.headScratch.height < height) {
       if (this.headScratch) this.gpu.delete(this.headScratch)
+      // (Room for a draft batch's rows where the model reads them.)
       this.headScratch = this.f32(
         OUT_WIDTH * 4,
-        Math.max(height, split * SPLIT_ROWS * sliceRows)
+        Math.max(height, split * (this.canDraft ? SPLIT_ROWS : 1) * sliceRows)
       )
     }
     return this.headScratch
