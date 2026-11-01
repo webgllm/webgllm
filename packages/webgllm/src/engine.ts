@@ -153,8 +153,12 @@ export const TUNING = {
   /** 1: prompt matmuls take four tokens per fragment (where the engine has room). */
   quad: 1,
   /**
-   * 1: those matmuls dequantize the weights to f16 first, then run a matmul
-   * of nothing but dots (see MATMUL_F16); 0: they dequantize as they read.
+   * How those matmuls read 4-bit weights. 1: byte-texel weights are
+   * dequantized to f16 first, then multiplied by a matmul of nothing but
+   * dots (see MATMUL_F16), and RGBA4 weights are read in place (their own
+   * 4-token kernel: on Apple GPUs, where chooseLayout picks RGBA4, as fast
+   * or faster, and no f16 scratch); 2: RGBA4 weights through f16 too; 0:
+   * every 4-bit matmul reads in place.
    */
   f16Matmul: 1,
   /**
@@ -504,8 +508,9 @@ export class Engine {
       throw new Error("The model's weights are incomplete.")
     }
     // The f16 prompt matmul's scratch now, not in the middle of a prompt
-    // (only 4-token matmuls run it: none, no scratch).
-    if (TUNING.f16Matmul > 0 && this.quadMatmuls) this.f16Scratch()
+    // (only 4-token matmuls on weights that take it run it: none, no
+    // scratch).
+    if (this.quadMatmuls && this.f16Mats().length > 0) this.f16Scratch()
     await this.gpu.finish()
   }
 
@@ -2024,10 +2029,18 @@ export class Engine {
     | null
     | false = null
 
-  private f16Scratch() {
-    if (this.f16 !== null) return this.f16
-    if (!this.gpu.canRender([GL.RGBA16F])) return (this.f16 = false)
-    const mats = this.layers
+  /** Whether 4-bit matrix `w` goes through the f16 prompt matmul (see TUNING.f16Matmul). */
+  private takesF16(w: GpuMatrix) {
+    return (
+      w.bits === 4 &&
+      TUNING.f16Matmul > 0 &&
+      (!w.rgba4 || TUNING.f16Matmul > 1)
+    )
+  }
+
+  /** The layer matrices that go through the f16 prompt matmul. */
+  private f16Mats() {
+    return this.layers
       .flatMap((l) => [
         l.conv?.inProj,
         l.conv?.outProj,
@@ -2039,7 +2052,13 @@ export class Engine {
         l.gateUp,
         l.down
       ])
-      .filter((m): m is GpuMatrix => !!m && m.bits === 4)
+      .filter((m): m is GpuMatrix => !!m && this.takesF16(m))
+  }
+
+  private f16Scratch() {
+    if (this.f16 !== null) return this.f16
+    if (!this.gpu.canRender([GL.RGBA16F])) return (this.f16 = false)
+    const mats = this.f16Mats()
     if (mats.length === 0) return (this.f16 = false)
     const max = this.gpu.limits.maxTextureSize
     // The column height that fits every matrix in the least texture.
@@ -2097,9 +2116,10 @@ export class Engine {
         w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
       )
       const slices = Math.ceil(w.blocks / kbSlice)
-      // (Byte texels have no matmulQuad: the f16 path at any size.)
+      // (Byte texels have no matmulQuad: the f16 path at any size. RGBA4
+      // takes it only with f16Matmul 2, and not for short batches.)
       const f =
-        TUNING.f16Matmul > 0 && (rows >= TUNING.f16MinRows || !w.rgba4)
+        this.takesF16(w) && (!w.rgba4 || rows >= TUNING.f16MinRows)
           ? this.f16Scratch()
           : false
       if (f) {
