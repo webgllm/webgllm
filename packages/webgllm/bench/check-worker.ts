@@ -610,6 +610,7 @@ async function smoke(params: {
   abDecode?: string
   sweep?: string
   programs?: boolean
+  chain?: boolean
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -643,6 +644,43 @@ async function smoke(params: {
   if (params.programs) engine.gpu.salt = `\n// ${Math.random()}`
   const t0 = performance.now()
   await engine.load(await modelPieces(params))
+  // ?chain=1: what chaining greedy tokens on the GPU (no readback between
+  // them) could save: the worker's way (each token read back while the
+  // next is read forward) against the same passes queued, one wait.
+  if (params.chain) {
+    await engine.warmUp()
+    const E = engine as unknown as {
+      forwardBatch(b: Array<number>, p: undefined, idsOnGpu: boolean): Promise<number>
+      head(row: number): void
+    }
+    const prompt = Array.from({ length: 64 }, (_, i) => 1000 + i)
+    for (let round = 0; round < 3; round++) {
+      engine.reset()
+      engine.setSeen(prompt, tokenizer.vocabSize)
+      let row = await engine.forwardHidden(prompt)
+      await engine.argmax(row, 1, 1.1, [], true)
+      engine.keepGuess()
+      let t = performance.now()
+      for (let i = 0; i < 32; i++) {
+        const [token] = await engine.argmax(0, 1, 1.1, [], true)
+        engine.keepGuess()
+        engine.markSeen(token)
+      }
+      const worker = (performance.now() - t) / 32
+      engine.dropGuess()
+      await engine.gpu.finish()
+      t = performance.now()
+      for (let i = 0; i < 32; i++) {
+        await E.forwardBatch([0], undefined, true)
+        E.head(0)
+      }
+      await engine.gpu.finish()
+      const queued = (performance.now() - t) / 32
+      log(`CHAIN worker way ${worker.toFixed(2)} ms/token; forward + head queued ${queued.toFixed(2)} ms/token`)
+      row = 0
+    }
+    return
+  }
   if (params.programs) {
     const loadMs = performance.now() - t0
     const marks: Array<[string, number]> = []
