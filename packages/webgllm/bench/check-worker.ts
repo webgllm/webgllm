@@ -938,8 +938,10 @@ async function smoke(params: {
     {
       const head = (engine as unknown as { head(row: number): void }).head.bind(engine)
       const savedHeadSplit = TUNING.headSplit
+      const savedQ6 = TUNING.q6HeadSplit
       for (const split of [1, 2, 4, 8, 1]) {
         TUNING.headSplit = split
+        TUNING.q6HeadSplit = split
         head(0)
         await engine.gpu.finish()
         const th = performance.now()
@@ -948,6 +950,7 @@ async function smoke(params: {
         log(`HEAD split ${split}: ${((performance.now() - th) / 64).toFixed(2)} ms per head`)
       }
       TUNING.headSplit = savedHeadSplit
+      TUNING.q6HeadSplit = savedQ6
     }
     const tc = performance.now()
     for (let i = 0; i < 16; i++) await engine.candidates(0, 50, 1.05)

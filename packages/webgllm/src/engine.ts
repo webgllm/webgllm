@@ -182,6 +182,16 @@ export const TUNING = {
   quadMaxSplit: 4,
   /** K-slices of the RGBA4 output head (more than 1 adds a pass to sum them). */
   headSplit: 4,
+  /** K-slices of a Q6_K output head (in super-blocks; more than 1 adds a pass to sum them). */
+  q6HeadSplit: 2,
+  /**
+   * 1: a Q6_K embedding in RGBA32UI word texels (13 a super-block row, the
+   * bits split with integer shifts, its head a loop: see
+   * matmulQ6KHeadWords); 0: byte texels (set before the model loads).
+   */
+  q6Words: 1,
+  /** 1: a word-texel Q6_K head reads the last add's scaled input (no norm pass; see headScaled). */
+  q6FoldNorm: 1,
   /**
    * Few-token matmuls apply the RMS norm as they read, with no norm pass:
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
@@ -1098,15 +1108,17 @@ export class Engine {
     }
     // A block row: 4-bit 16 bytes, 8-bit 32, as RGBA32UI texels (1, 2) or
     // byte texels (4, 8); a Q6_K super-block row, 208 bytes: 52 byte texels
-    // (always bytes: its kernels split them with float math, faster than
-    // integer shifts on mobile GPUs).
+    // (their kernels split them with float math, faster than integer
+    // shifts on mobile GPUs) or 13 word texels (TUNING.q6Words).
     const blocks = K / (bits === 6 ? 256 : 32)
     const groups = N / 4
     const columns = Math.ceil(groups / max)
     // Byte texels are 4× as wide: words where a row group wouldn't fit.
     const byteTexels = bits === 6 ? 52 : bits === 4 ? 4 : 8
     const bytes =
-      bits === 6 || (this.bytes && columns * blocks * 4 * byteTexels <= max)
+      bits === 6
+        ? TUNING.q6Words <= 0
+        : this.bytes && columns * blocks * 4 * byteTexels <= max
     const texelsPerBlockRow = bytes ? byteTexels : byteTexels / 4
     const rowTexels = blocks * 4 * texelsPerBlockRow
     const unorm = bytes && bits === 4 && TUNING.unormBytes > 0
@@ -3037,12 +3049,16 @@ export class Engine {
       )
     const b = this.buffers
     const e = this.embedding
-    if (e.rgba4 && this.headScaled) {
+    if (this.headScaled) {
       // The last add drew h2(x · final norm weights): no norm pass.
-      return this.headRgba4(e, rows, row0, sum)
+      return e.rgba4
+        ? this.headRgba4(e, rows, row0, sum)
+        : this.headQ6K(e, rows, sum, row0)
     }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) return this.headRgba4(e, rows, undefined, sum)
+    if (e.bits === 6 && (TUNING.q6HeadSplit > 1 || !e.bytes))
+      return this.headQ6K(e, rows, sum)
     this.gpu.run({
       name: "head",
       program: this.gpu.program(
@@ -3085,6 +3101,110 @@ export class Engine {
 
   private headScratch: Texture | null = null
 
+  /** The texture a head split in `split` K-slices of `rows` rows draws into. */
+  private headTarget(split: number, rows: number) {
+    const sliceRows = this.logitRows
+    const height = split * rows * sliceRows
+    if (split === 1) return this.buffers.logits
+    // Its own texture (not the partial buffer), so the pick passes that
+    // read it don't hold up the next forward's matmuls.
+    if (!this.headScratch || this.headScratch.height < height) {
+      if (this.headScratch) this.gpu.delete(this.headScratch)
+      this.headScratch = this.f32(
+        OUT_WIDTH * 4,
+        Math.max(height, split * SPLIT_ROWS * sliceRows)
+      )
+    }
+    return this.headScratch
+  }
+
+  /**
+   * A split head's slices in `target`: summed into the logits texture by
+   * one more pass, or (`sum` false) left for readers that add them.
+   */
+  private headSlices(
+    target: Texture,
+    split: number,
+    rows: number,
+    sum: boolean
+  ): HeadOut {
+    const b = this.buffers
+    const sliceRows = this.logitRows
+    if (split === 1) return { logits: b.logits, split: 1, stride: 0 }
+    if (!sum) return { logits: target, split, stride: rows * sliceRows }
+    this.gpu.run({
+      name: "head",
+      program: this.gpu.program(K.HEAD_SUM),
+      inputs: { uP: target },
+      uniforms: {
+        uSplit: { int: split },
+        uSliceRows: { int: sliceRows },
+        uRows: { int: rows }
+      },
+      output: b.logits,
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: rows * sliceRows }
+    })
+    return { logits: b.logits, split: 1, stride: 0 }
+  }
+
+  /**
+   * The output head through a Q6_K embedding, split along K in
+   * TUNING.q6HeadSplit slices of super-blocks (as headRgba4's). With
+   * `scaledRow0` (word texels only; see headScaled), reads the last add's
+   * scaled input from that row on instead of lastNormed.
+   */
+  private headQ6K(
+    e: GpuMatrix,
+    rows: number,
+    sum: boolean,
+    scaledRow0?: number
+  ): HeadOut {
+    const b = this.buffers
+    const split = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, e.blocks))
+    const sliceRows = this.logitRows
+    const target = this.headTarget(split, rows)
+    const prescaled = scaledRow0 !== undefined
+    if (prescaled && e.bytes)
+      throw new Error("Only word-texel Q6_K heads read the scaled input.")
+    this.gpu.run({
+      name: "head",
+      program: this.gpu.program(
+        !e.bytes
+          ? K.matmulQ6KHeadWords({ split: split > 1, prescaled })
+          : split > 1
+            ? K.MATMUL_Q6_K_HEAD_SPLIT
+            : K.MATMUL_Q6_K_HEAD
+      ),
+      inputs: {
+        ...(prescaled && { uR: b.residual[0] }),
+        uA: prescaled ? b.scaled[0] : b.lastNormed,
+        uW: e.quants,
+        uS: e.scales
+      },
+      uniforms: {
+        uKb: { int: e.blocks },
+        uH: { int: e.rowsPerColumn },
+        uRowTexels: { int: e.rowTexels },
+        uG: { int: e.groups },
+        uOutW: { int: OUT_WIDTH },
+        uLogitRows: { int: sliceRows },
+        uKbSlice: { int: Math.ceil(e.blocks / split) },
+        uRows: { int: rows },
+        ...(prescaled && {
+          uRowA0: { int: scaledRow0 },
+          uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+          uROff: { int: this.config.hiddenSize / 4 },
+          uParts: { int: TUNING.rmsParts },
+          uTexels: { int: this.config.hiddenSize / 4 },
+          uEps: this.config.normEps
+        })
+      },
+      output: target,
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * rows * sliceRows }
+    })
+    return this.headSlices(target, split, rows, sum)
+  }
+
   /**
    * The output head through RGBA4 weights, split along K in
    * TUNING.headSplit slices (added up by one more pass).
@@ -3104,19 +3224,7 @@ export class Engine {
     const split = Math.max(1, Math.min(TUNING.headSplit, 4, e.blocks))
     const sliceRows = this.logitRows
     const height = split * rows * sliceRows
-    let target = b.logits
-    if (split > 1) {
-      // Its own texture (not the partial buffer), so the pick passes that
-      // read it don't hold up the next forward's matmuls.
-      if (!this.headScratch || this.headScratch.height < height) {
-        if (this.headScratch) this.gpu.delete(this.headScratch)
-        this.headScratch = this.f32(
-          OUT_WIDTH * 4,
-          Math.max(height, split * SPLIT_ROWS * sliceRows)
-        )
-      }
-      target = this.headScratch
-    }
+    const target = this.headTarget(split, rows)
     this.gpu.run({
       name: "head",
       program: this.gpu.program(
@@ -3150,22 +3258,7 @@ export class Engine {
       output: target,
       rect: { x: 0, y: 0, width: OUT_WIDTH, height }
     })
-    if (split === 1) return { logits: b.logits, split: 1, stride: 0 }
-    // Readers that add the slices themselves skip the sum pass.
-    if (!sum) return { logits: target, split, stride: rows * sliceRows }
-    this.gpu.run({
-      name: "head",
-      program: this.gpu.program(K.HEAD_SUM),
-      inputs: { uP: target },
-      uniforms: {
-        uSplit: { int: split },
-        uSliceRows: { int: sliceRows },
-        uRows: { int: rows }
-      },
-      output: b.logits,
-      rect: { x: 0, y: 0, width: OUT_WIDTH, height: rows * sliceRows }
-    })
-    return { logits: b.logits, split: 1, stride: 0 }
+    return this.headSlices(target, split, rows, sum)
   }
 
   /** Logits for one row of the last batch's final residual. */
@@ -3223,7 +3316,10 @@ export class Engine {
     // The embedding draws layer 0's sums of squares and scaled input too.
     const embedFolded = prescaled && e.rgba4 && foldAt(0)
     // The last add draws the final norm's scaled input for the head.
-    this.headScaled = prescaled && e.rgba4 && foldAt(this.layers.length - 1)
+    this.headScaled =
+      prescaled &&
+      (e.rgba4 || (e.bits === 6 && !e.bytes && TUNING.q6FoldNorm > 0)) &&
+      foldAt(this.layers.length - 1)
     if (embedFolded) {
       const texels = c.hiddenSize / 4
       const embedInputs = {
@@ -3259,7 +3355,9 @@ export class Engine {
     this.gpu.run({
       program: this.gpu.program(
         e.bits === 6
-          ? K.EMBED_Q6_K
+          ? e.bytes
+            ? K.EMBED_Q6_K
+            : K.EMBED_Q6_K_WORDS
           : K.embed({
               bits: e.bits,
               zeros: !!e.zeros,
