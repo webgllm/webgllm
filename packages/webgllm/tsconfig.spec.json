@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "out-tsc/spec",
+    "tsBuildInfoFile": "out-tsc/spec/tsconfig.spec.tsbuildinfo",
+    "types": ["node"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"]
+  },
+  "include": ["src/**/*.test.ts"],
+  "references": [{ "path": "./tsconfig.lib.json" }]
+}

@@ -43,6 +43,9 @@
     "dist",
     "!**/*.tsbuildinfo"
   ],
+  "scripts": {
+    "test": "node scripts/test.mjs"
+  },
   "publishConfig": {
     "access": "public"
   },
