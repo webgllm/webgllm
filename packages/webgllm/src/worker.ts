@@ -66,6 +66,13 @@ const DEFAULT_MAX_TOKENS = 4096
 /** Below this much room for a reply, the chat is too long to answer. */
 const MIN_REPLY_TOKENS = 32
 
+/** FNV-1a of a string, as hex (for note keys). */
+function hash(text: string) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193)
+  return (h >>> 0).toString(16)
+}
+
 /** Frees an engine's GPU memory now (see Gpu.dispose). */
 const release = (engine: Engine) => engine.gpu.dispose()
 
@@ -202,7 +209,9 @@ async function load(
       navigator.userAgent,
       model,
       plain ? "plain" : "mrt",
-      Engine.fingerprint
+      // The engine's code and its settings (a remembered check or pick
+      // doesn't carry over to other defaults).
+      `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}`
     ].join("|")
     const note = (await readGpuNotes())[noteKey]
     if (note) engine.preferLayout = note.layout
@@ -633,7 +642,8 @@ async function generate(request: GenerateRequest) {
     if (drafts.length) {
       policy.checkedBatch(drafts.length, kept - 1, stepMs, going ? drafts.length : kept - 1)
       stats.draftBatches = (stats.draftBatches ?? 0) + 1
-      stats.draftsChecked = (stats.draftsChecked ?? 0) + drafts.length
+      stats.draftsChecked =
+        (stats.draftsChecked ?? 0) + (going ? drafts.length : kept - 1)
       stats.draftsKept = (stats.draftsKept ?? 0) + kept - 1
     }
     else policy.alone(stepMs)
@@ -703,11 +713,23 @@ function tuneWhenIdle() {
     })
     if (!picked || current !== loaded) return
     loaded.untuned = undefined
-    await writeGpuNote(untuned.key, { ...untuned.note, tuned: picked })
+    // A new pick reads short batches' results with programs the warm-up
+    // didn't compile: compiled now while the cache is empty (else on the
+    // first short prompt).
+    if (picked.shortSplit !== null && loaded.cached.length === 0 && pending === 0)
+      await loaded.engine.warmUp({ shortOnly: true })
+    // (Not awaited: a request needn't wait on storage.)
+    void writeGpuNote(untuned.key, { ...untuned.note, tuned: picked })
   })()
-    .catch(() => undefined)
+    .catch((error: unknown) => {
+      // Not tried again after every reply: TUNING's splits stay.
+      if (current === loaded) loaded.untuned = undefined
+      post({ type: "log", text: `background tuning failed: ${errorMessage(error)}` })
+    })
     .finally(() => {
       tuning = null
+      // Another model may have loaded meanwhile, waiting on this one.
+      tuneWhenIdle()
     })
 }
 

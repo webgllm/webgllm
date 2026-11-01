@@ -145,6 +145,9 @@ async function run(params: {
   log(`${tokens.length} reference tokens, ${files.size} reference files`)
 
   const canvas = new OffscreenCanvas(1, 1)
+  // The reference check reads every row's logits: prompt batches keep
+  // every row's final hidden state (see TUNING.lastRowOnly).
+  TUNING.lastRowOnly = 0
   const engine = new Engine(canvas, {
     batchSize: params.batch,
     matmulPrecision: params.precision,

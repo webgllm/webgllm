@@ -56,8 +56,11 @@ export class DraftPolicy {
   /** Decayed average ms of a token alone, and of a batch per draft count. */
   private single: number | null = null
   private batch: Array<number | null>
-  /** Drafts proposed but not checked, scored as tokens are drawn. */
-  private shadow: { drafts: Array<number>; at: number } | null = null
+  /**
+   * Drafts found, scored as tokens are drawn from position `from` on (the
+   * ones not checked; those before it a batch checks itself).
+   */
+  private shadow: { drafts: Array<number>; at: number; from: number } | null = null
 
   constructor(
     readonly max: number,
@@ -109,9 +112,12 @@ export class DraftPolicy {
    */
   choose(available: Array<number>): number {
     const best = this.peek(available)
+    // The ones past `best` too: if the batch keeps all it checked, the
+    // tokens drawn after it score them (positions a short batch never
+    // reaches would otherwise keep their old rates).
     this.shadow =
-      best === 0 && available.length
-        ? { drafts: available.slice(0, this.max), at: 0 }
+      available.length > best
+        ? { drafts: available.slice(0, this.max), at: 0, from: best }
         : null
     return best
   }
@@ -145,7 +151,8 @@ export class DraftPolicy {
     if (!s) return
     const i = s.at + 1
     const right = s.drafts[s.at] === token
-    this.outcome(i, right)
+    // (Drafts a batch checked are scored by checkedBatch.)
+    if (s.at >= s.from) this.outcome(i, right)
     s.at++
     if (!right || s.at >= s.drafts.length) this.shadow = null
   }
@@ -156,16 +163,22 @@ export class DraftPolicy {
    * `drafts` if the reply ended first).
    */
   checkedBatch(drafts: number, kept: number, ms: number, judged = drafts) {
-    this.shadow = null
+    // (The shadow, if any, goes on: the batch's kept drafts were drawn
+    // already, and the token drawn after them scores the next draft.)
     for (let i = 1; i <= Math.min(judged, kept + 1); i++) this.outcome(i, i <= kept)
     const old = this.batch[drafts]
-    this.batch[drafts] = old === null ? ms : this.timeDecay * old + (1 - this.timeDecay) * ms
+    this.batch[drafts] =
+      old === null
+        ? Math.min(ms, 3 * this.batchMs(drafts) || ms)
+        : this.timeDecay * old + (1 - this.timeDecay) * Math.min(ms, 3 * old)
   }
 
   /** A token alone (no drafts) took `ms`, waits it overlapped included. */
   alone(ms: number) {
     this.single =
-      this.single === null ? ms : this.timeDecay * this.single + (1 - this.timeDecay) * ms
+      this.single === null
+        ? ms
+        : this.timeDecay * this.single + (1 - this.timeDecay) * Math.min(ms, 3 * this.single)
   }
 
   private outcome(i: number, right: boolean) {

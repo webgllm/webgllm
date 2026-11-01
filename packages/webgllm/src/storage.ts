@@ -61,10 +61,21 @@ export type GpuNote = {
 const NOTES = "gpu-notes.json"
 
 export async function readGpuNotes(): Promise<Record<string, GpuNote>> {
+  return (await readNotes()) ?? {}
+}
+
+/** The notes; {} if there are none yet, null if they couldn't be read. */
+async function readNotes(): Promise<Record<string, GpuNote> | null> {
+  let file: File
   try {
-    const file = await (await (await dir()).getFileHandle(NOTES)).getFile()
+    file = await (await (await dir()).getFileHandle(NOTES)).getFile()
+  } catch (error) {
+    return error instanceof DOMException && error.name === "NotFoundError" ? {} : null
+  }
+  try {
     return JSON.parse(await file.text()) as Record<string, GpuNote>
   } catch {
+    // Unreadable or torn: written over.
     return {}
   }
 }
@@ -79,7 +90,10 @@ export function writeGpuNote(key: string, note: GpuNote): Promise<void> {
 
 async function writeNote(key: string, note: GpuNote) {
   try {
-    const notes = await readGpuNotes()
+    // (Notes that exist but can't be read now, say another tab holds the
+    // file, aren't written over with this one alone.)
+    const notes = await readNotes()
+    if (!notes) return
     // Notes for this GPU, browser and model from older engine code (the
     // key's last part) are stale: dropped.
     const prefix = key.slice(0, key.lastIndexOf("|") + 1)

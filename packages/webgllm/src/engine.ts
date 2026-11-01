@@ -868,12 +868,14 @@ export class Engine {
       // already ran TUNING's), and TUNING's timed once: each sample repeats
       // the matmuls to about 25 ms, so a fast GPU's few milliseconds
       // aren't lost in the wait for it.
+      if (stop()) throw new Stopped()
       for (let c = 1; c < candidates.length; c++) {
         this.tuned[key] = candidates[c]
         run(rows)
       }
       this.tuned[key] = candidates[0]
       await this.gpu.finish()
+      if (stop()) throw new Stopped()
       const t0 = performance.now()
       run(rows)
       await this.gpu.finish()
@@ -881,6 +883,7 @@ export class Engine {
       // An idle GPU clocks down: busy it ~100 ms first, so the clock has
       // come up before anything is timed.
       for (const start = performance.now(); performance.now() - start < 100; ) {
+        if (stop()) throw new Stopped()
         for (let r = 0; r < reps; r++) run(rows)
         await this.gpu.finish()
       }
@@ -1337,6 +1340,8 @@ export class Engine {
 
   /** A copy of row `row` of the last batch's hidden state (its whole residual row). */
   private copyHidden(row: number) {
+    if (this.lastRowOnly && row !== 0)
+      throw new Error("The last batch kept only row 0 (see TUNING.lastRowOnly).")
     const r = this.buffers.residual[0]
     const copy = this.gpu.texture(GL.RGBA32F, r.width, 1)
     this.gpu.run({
@@ -1453,6 +1458,8 @@ export class Engine {
     })
     // The head normalizes the residual itself (the copy has its sums of squares).
     this.headScaled = false
+    // (Only row 0 holds a hidden state.)
+    this.lastRowOnly = true
     return at
   }
 
@@ -1546,7 +1553,9 @@ export class Engine {
    */
   /** Programs each warm-up step compiled (load profiling). */
   warmCounts: Record<string, number> = {}
-  async warmUp() {
+  async warmUp(options: { shortOnly?: boolean } = {}) {
+    // (`shortOnly`: just a short batch, for programs a new Engine.tune pick
+    // reads with; it resets the cache like the rest.)
     // Every program a layer compiles is shared by the layers of its kind:
     // the warm-up reads through the first and last layers (their own
     // variants: folded embedding, last-row tail) and one of each other
@@ -1560,7 +1569,8 @@ export class Engine {
       return keep
     })
     try {
-      await this.warmUpLayers()
+      if (options.shortOnly) await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
+      else await this.warmUpLayers()
     } finally {
       this.layers = all
       // (Per-layer work for pacing, counted over the subset.)
@@ -2641,6 +2651,12 @@ export class Engine {
     return last
   }
 
+  /**
+   * Whether the last batch kept only its last token's hidden state, as row
+   * 0 (see TUNING.lastRowOnly): reading other rows' logits would be wrong.
+   */
+  private lastRowOnly = false
+
   /** Where the last draft batch started, and how many tokens it had. */
   private draft: { pos0: number; rows: number } | null = null
   /** Whether the batch being read keeps each prefix's conv state. */
@@ -3015,6 +3031,10 @@ export class Engine {
    * more than one).
    */
   private head(row0: number, rows = 1, sum = true): HeadOut {
+    if (this.lastRowOnly && (row0 !== 0 || rows !== 1))
+      throw new Error(
+        "The last batch kept only its last token's hidden state (row 0; see TUNING.lastRowOnly)."
+      )
     const b = this.buffers
     const e = this.embedding
     if (e.rgba4 && this.headScaled) {
@@ -3299,6 +3319,7 @@ export class Engine {
     const paced = rows > SPLIT_ROWS
     // Only the last row's logits are asked for (see lastRowOnly).
     const lastRowOnly = TUNING.lastRowOnly > 0 && rows > SPLIT_ROWS && !probe
+    this.lastRowOnly = lastRowOnly
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       // (From layer 0: batches follow each other with no wait between.)

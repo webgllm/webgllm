@@ -158,6 +158,40 @@ describe("DraftPolicy", () => {
     assert.ok(q.rate(2) < q.rate(1))
   })
 
+  test("one stalled batch doesn't stop drafting for the rest of the reply", () => {
+    const p = new DraftPolicy(7)
+    p.alone(15)
+    // The first draft batch stalls (a compile, say): 200 ms against 15.
+    const d = p.choose([1, 2, 3, 4, 5, 6, 7])
+    assert.ok(d > 0)
+    p.checkedBatch(d, d, 200)
+    assert.ok(p.choose([1, 2, 3, 4, 5, 6, 7]) > 0, "still drafting after the stall")
+    // ...and one stalled token alone is soon forgotten: with tokens back at
+    // 15 ms, batches at 20 ms that drafts rarely pay for aren't drawn.
+    const q = new DraftPolicy(7)
+    q.alone(15)
+    q.alone(500)
+    for (let i = 0; i < 10; i++) q.alone(15)
+    for (let i = 0; i < 30; i++) q.checkedBatch(1, 0, 20)
+    assert.equal(q.choose([1, 2]), 0)
+  })
+
+  test("drafts past those checked are scored once a batch keeps every one", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    // Draft 3 has been turned down: batches settle on 2 drafts.
+    for (let i = 0; i < 10; i++) p.checkedBatch(3, 2, 10.5)
+    const before = p.rate(3)
+    const available = [11, 12, 13, 14, 15, 16, 17]
+    const d = p.choose(available)
+    assert.ok(d > 0 && d < 3, `chose ${d}`)
+    for (let i = 0; i < d; i++) p.drawn(available[i]) // the kept drafts, as emitted
+    p.checkedBatch(d, d, 10.5)
+    // The tokens drawn after the batch match the drafts it didn't check.
+    for (let i = d; i < 7; i++) p.drawn(available[i])
+    assert.ok(p.rate(3) > before, `rate(3) ${before} -> ${p.rate(3)}`)
+  })
+
   test("rates stay between 0 and 1", () => {
     const p = new DraftPolicy(7)
     for (let i = 0; i < 200; i++) p.checkedBatch(7, i % 8, 10)
