@@ -1302,6 +1302,225 @@ void main() {
 }`
 }
 
+
+/*
+ * Qwen3.5's Gated DeltaNet (see LinearAttentionWeights in weights.ts), in
+ * passes over these tensors (f32 unless said):
+ * - in: the in_proj output (pair or split partials): q | k | v | z, C4 =
+ *   2·K4 + V4 texels of q|k|v (K4, V4: key and value dims over 4), then z.
+ * - gates: per row, beta of heads 4i..4i+3 at texel i, decay at H4 + i.
+ * - qkv: silu(conv(q|k|v)), C4 texels; conv state: the last width - 1
+ *   rows of raw q|k|v.
+ * - qk: per row, q̂ (L2-normalized, over √dk) in texels 0..K4, k̂ after.
+ * - state: per value head h, S[k][v] at texel (h·dv/4 + v/4, k).
+ * - delta, o: per row, V4 texels.
+ */
+
+/** beta = sigmoid(b), decay = exp(A · softplus(a + dtBias)) from the b|a projection. */
+function linGatesSource(heads4: number) {
+  return `${HEADER}
+uniform usampler2D uBA;
+uniform sampler2D uA;
+uniform sampler2D uDt;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  if (x < ${heads4}) {
+    o = 1.0 / (1.0 + exp(-pf(uBA, x, m)));
+  } else {
+    int i = x - ${heads4};
+    vec4 t = pf(uBA, x, m) + texelFetch(uDt, ivec2(i, 0), 0);
+    vec4 softplus = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+    o = exp(texelFetch(uA, ivec2(i, 0), 0) * softplus);
+  }
+}`
+}
+
+/**
+ * silu of the depthwise causal convolution over q|k|v (uConv: texel (x, k)
+ * holds tap k of channels 4x..4x+3, oldest first), earlier tokens' inputs
+ * from the state (width - 1 rows, oldest first).
+ */
+function linConvSource(width: number) {
+  const w = width - 1
+  const taps = Array.from({ length: width }, (_, k) => k)
+    .map(
+      (k) => `  {
+    int t = m - ${w - k};
+    vec4 y;
+    if (t >= 0) y = pf(uIn, x, t);
+    else y = texelFetch(uState, ivec2(x, ${w} + t), 0);
+    acc += texelFetch(uConv, ivec2(x, ${k}), 0) * y;
+  }`
+    )
+    .join("\n")
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 acc = vec4(0.0);
+${taps}
+  o = acc / (1.0 + exp(-acc));
+}`
+}
+
+/** The convolution's state after uM tokens: their last width - 1 raw inputs. */
+function linConvStateSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform int uM;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int i = int(gl_FragCoord.y);
+  int t = uM - ${width - 1} + i;
+  if (t >= 0) o = pf(uIn, x, t);
+  else o = texelFetch(uState, ivec2(x, uM + i), 0);
+}`
+}
+
+/** q̂ and k̂: each head's q and k over its L2 norm (q also over √dk). */
+function linPrepSource(keyHeadDim: number) {
+  const T = keyHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uQKV;
+uniform int uK4;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int base = (x / ${T}) * ${T};
+  vec4 s = vec4(0.0);
+  for (int i = 0; i < ${T}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(base + i, m), 0);
+    s += v * v;
+  }
+  float inv = inversesqrt(dot(s, vec4(1.0)) + 1e-6);
+  o = texelFetch(uQKV, ivec2(x, m), 0) * inv * (x < uK4 ? ${(1 / Math.sqrt(keyHeadDim)).toFixed(9)} : 1.0);
+}`
+}
+
+/**
+ * The recurrence's first pass, for token row uRow: per value texel,
+ * kv = (decay S)ᵀk̂ and qs = Sᵀq̂ over the head's keys, then delta =
+ * beta (v - kv) and the output o = decay·qs + (q̂·k̂) delta (o read from
+ * the state after the update, without it). `out`: which of the two this
+ * draw writes (both: two render targets).
+ */
+function linDeltaSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  out: "both" | "delta" | "o"
+}) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oDelta;\nlayout(location = 1) out vec4 oOut;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oDelta = d;\n  oOut = decay * qs + qk * d;"
+      : o.out === "delta"
+        ? "oResult = d;"
+        : "oResult = decay * qs + qk * d;"
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uQKV;
+uniform sampler2D uG;
+uniform int uK4;
+uniform int uH4;
+${outs}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kb = h * ${DK4};
+  vec4 kv = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  float qk = 0.0;
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 q = texelFetch(uQK, ivec2(kb + i, m), 0);
+    vec4 k = texelFetch(uQK, ivec2(uK4 + kb + i, m), 0);
+    qk += dot(q, k);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    kv += s0 * k.x + s1 * k.y + s2 * k.z + s3 * k.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  float beta = comp(texelFetch(uG, ivec2(h >> 2, m), 0), h & 3);
+  float decay = comp(texelFetch(uG, ivec2(uH4 + (h >> 2), m), 0), h & 3);
+  vec4 v = texelFetch(uQKV, ivec2(2 * uK4 + x, m), 0);
+  vec4 d = beta * (v - decay * kv);
+  ${write}
+}`
+}
+
+/** The recurrence's second pass: S = decay·S + k̂ deltaᵀ, for token row uRow. */
+function linStateSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+  const DV4 = o.valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uDelta;
+uniform sampler2D uG;
+uniform int uRow;
+uniform int uK4;
+uniform int uH4;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int k = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  float decay = comp(texelFetch(uG, ivec2(uH4 + (h >> 2), uRow), 0), h & 3);
+  int kc = h * ${o.keyHeadDim} + k;
+  float kk = comp(texelFetch(uQK, ivec2(uK4 + (kc >> 2), uRow), 0), kc & 3);
+  o = decay * texelFetch(uS, ivec2(x, k), 0) + kk * texelFetch(uDelta, ivec2(x, uRow), 0);
+}`
+}
+
+/**
+ * The gated RMSNorm, into h2 for out_proj: each head's o over its RMS,
+ * times the weights (shared by the heads) and silu(z) (z from the in_proj
+ * output at texel uZ on).
+ */
+function linNormSource(valueHeadDim: number) {
+  const T = valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uO;
+uniform usampler2D uIn;
+uniform sampler2D uNorm;
+uniform int uZ;
+uniform float uEps;
+out uvec4 o;
+vec4 gated(int t, int m, int base, float inv) {
+  vec4 z = pf(uIn, uZ + t, m);
+  return texelFetch(uO, ivec2(t, m), 0) * inv * texelFetch(uNorm, ivec2(t - base, 0), 0) * (z / (1.0 + exp(-z)));
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int base = ((2 * x) / ${T}) * ${T};
+  vec4 s = vec4(0.0);
+  for (int i = 0; i < ${T}; i++) {
+    vec4 v = texelFetch(uO, ivec2(base + i, m), 0);
+    s += v * v;
+  }
+  float inv = inversesqrt(dot(s, vec4(1.0)) / ${valueHeadDim}.0 + uEps);
+  o = packH2(gated(2 * x, m, base, inv), gated(2 * x + 1, m, base, inv));
+}`
+}
+
 /** Copies rows [uOff, uOff + height) of an f32 tensor to rows [0, height). */
 export const COPY_ROWS = `${HEADER}
 uniform sampler2D uX;
@@ -1393,6 +1612,28 @@ void main() {
       : "o = packH2(rotated(base, t0, pos, inv), rotated(base, t0 + 1, pos, inv));"
   }
 }`
+}
+
+/**
+ * Attention's output gate: none, one sigmoid per head (LFM3: the head's
+ * value at uGateTexel + h / 4), or one per dim (Qwen3.5: output texel x's
+ * 8 dims at texels uGateTexel + 2x, + 1).
+ */
+export type Gate = boolean | "dim"
+
+/** The end of attend and attendCombine: lo, hi over l, times the gate, as h2. */
+function gateOut(gate: Gate) {
+  if (gate === "dim")
+    return `vec4 g0 = pf(uQKVG, uGateTexel + 2 * x, m);
+  vec4 g1 = pf(uQKVG, uGateTexel + 2 * x + 1, m);
+  o = packH2(lo / (l * (1.0 + exp(-g0))), hi / (l * (1.0 + exp(-g1))));`
+  return `${
+    gate
+      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
+  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
+      : "float scale = 1.0 / l;"
+  }
+  o = packH2(lo * scale, hi * scale);`
 }
 
 /**
@@ -1520,7 +1761,7 @@ ${members
  * uGateTexel). h2 output: 8 dims of one head per texel. Scores as
  * scoresSource(G) leaves them.
  */
-function attendSource(headDim: number, gate: boolean, G: number) {
+function attendSource(headDim: number, gate: Gate, G: number) {
   const U = headDim / 8
   return `${HEADER}
 ${sNames(G)
@@ -1601,13 +1842,7 @@ void main() {
   lo += lo1;
   hi += hi1;
   float l = dot(l4, vec4(1.0));
-  ${
-    gate
-      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
-  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
-      : "float scale = 1.0 / l;"
-  }
-  o = packH2(lo * scale, hi * scale);
+  ${gateOut(gate)}
 }`
 }
 
@@ -1774,7 +2009,7 @@ ${members
  * (one head's 8 dims per texel). Head h's chunks are member h % G's
  * textures (uP{3i}..uP{3i+2}), at row group h / G's texels.
  */
-function attendCombineSource(headDim: number, gate: boolean, G: number) {
+function attendCombineSource(headDim: number, gate: Gate, G: number) {
   const U = headDim / 8
   const P = Array.from({ length: 3 * G }, (_, k) => `uP${k}`)
   // Texture k (of 3) of head h's member hm.
@@ -1817,13 +2052,7 @@ void main() {
     lo += w * P0(p);
     hi += w * P1(p);
   }
-  ${
-    gate
-      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
-  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
-      : "float scale = 1.0 / l;"
-  }
-  o = packH2(lo * scale, hi * scale);
+  ${gateOut(gate)}
 }`
 }
 
@@ -2495,6 +2724,13 @@ export const headPrep = memo(headPrepSource)
 export const scores = memo(scoresSource)
 export const attend = memo(attendSource)
 export const values = memo(valuesSource)
+export const linGates = memo(linGatesSource)
+export const linConv = memo(linConvSource)
+export const linConvState = memo(linConvStateSource)
+export const linPrep = memo(linPrepSource)
+export const linDelta = memo(linDeltaSource)
+export const linState = memo(linStateSource)
+export const linNorm = memo(linNormSource)
 const partialsCache = new Map<string, Map<string, string>>()
 /** fromPartialsSource, memoized (sources are memoized, so lookups are cheap). */
 export function fromPartials(source: string, names: Array<string>) {

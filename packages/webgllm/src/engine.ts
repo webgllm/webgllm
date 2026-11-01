@@ -1,5 +1,5 @@
 /**
- * LFM3 on WebGL 2: uploads the weights a loader hands over, and runs the
+ * LFM3, LFM2 and Qwen3.5 on WebGL 2: uploads the weights a loader hands over, and runs the
  * forward pass a batch of tokens at a time, keeping the attention cache and
  * the convolutions' state on the GPU between calls.
  */
@@ -76,6 +76,21 @@ type GpuLayer = {
      * plus a batch, position p at row p % ring); 0 for a full cache.
      */
     ring: number
+  }
+  /** Qwen3.5's Gated DeltaNet (see LinearAttentionWeights). */
+  linear?: {
+    inProj: GpuMatrix
+    ba: GpuMatrix
+    outProj: GpuMatrix
+    /** Taps: texel (c / 4, k). */
+    kernel: Texture
+    /** The last convKernel - 1 rows of raw q|k|v, and the next one (swapped each batch). */
+    convState: [Texture, Texture]
+    /** The recurrent state (see kernels.ts), and the next one (swapped each token). */
+    state: [Texture, Texture]
+    a: Texture
+    dtBias: Texture
+    norm: Texture
   }
   gateUp: GpuMatrix
   down: GpuMatrix
@@ -251,6 +266,8 @@ export type Tuned = { shortSplit: number | null }
 type Snapshot = {
   conv: Array<Texture>
   windows: Array<Texture>
+  /** Each Gated DeltaNet layer's conv state, then its recurrent state. */
+  linear: Array<Texture>
   hidden?: Texture
 }
 
@@ -287,7 +304,7 @@ export type EngineOptions = {
   /** Most tokens per forward batch. */
   batchSize?: number
   /** Multi-target draws to treat as unsupported, for testing the fallbacks. */
-  noMrt?: Array<"scaled" | "quad" | "conv" | "chunks">
+  noMrt?: Array<"scaled" | "quad" | "conv" | "chunks" | "lin">
   /**
    * Rows per block of a full-attention cache (a power of two): the texture
    * height when left out. Smaller exercises the cache's wrapping, for tests.
@@ -315,6 +332,8 @@ export type LayerProbe = (
 const OUT_WIDTH = 1024
 /** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
 const MAX_SNAPSHOTS = 8
+/** ...or for a model with Gated DeltaNet layers, ~20 MB each (Qwen3.5 2B). */
+const MAX_LINEAR_SNAPSHOTS = 3
 /**
  * Queries of each head per attention slice (see attend), a quarter of a
  * batch in this range: more is fewer passes and more fragments per pass,
@@ -376,7 +395,7 @@ export class Engine {
    * Draws into several textures at once that this GPU can do (asked of it
    * at load, see Gpu.canRender); the engine falls back where it can't.
    */
-  private mrt = { scaled: true, quad: true, conv: true, chunks: true }
+  private mrt = { scaled: true, quad: true, conv: true, chunks: true, lin: true }
   private readonly noMrt: Set<string>
   private readonly scaleBatch: boolean
   /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
@@ -491,7 +510,9 @@ export class Engine {
       // The conv block's output and state (convFused).
       conv: can("conv", [GL.RGBA32UI, GL.RGBA32F]),
       // Chunked attention, one head a fragment (headGroup tries more).
-      chunks: can("chunks", [GL.RGBA32F, GL.RGBA32F, GL.RGBA32F])
+      chunks: can("chunks", [GL.RGBA32F, GL.RGBA32F, GL.RGBA32F]),
+      // Gated DeltaNet's delta and output in one pass.
+      lin: can("lin", [GL.RGBA32F, GL.RGBA32F])
     }
     this.quadMatmuls &&= this.mrt.quad
     if (!this.mrt.chunks) {
@@ -502,8 +523,8 @@ export class Engine {
     this.buffers = this.allocate()
     if (this.quadMatmuls) {
       const b = this.buffers
-      for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut])
-        this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
+      for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj])
+        if (t) this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
     }
     this.ropeFull = this.ropeTable(config.ropeThetaFull, config.ropeDimsFull)
     // (Only models with sliding-window layers read the second table.)
@@ -522,13 +543,14 @@ export class Engine {
    */
   private ropeTable(theta: number, rotatedDims: number) {
     const { headDim } = this.config
+    const freqDims = this.config.ropeFreqDims ?? headDim
     const half = headDim / 2
     const rows = K.ROPE_LOW + Math.ceil(this.contextLength / K.ROPE_LOW)
     const table = new Float32Array(rows * half * 2)
     for (let r = 0; r < rows; r++) {
       const pos = r < K.ROPE_LOW ? r : (r - K.ROPE_LOW) * K.ROPE_LOW
       for (let i = 0; i < half; i++) {
-        const freq = i < rotatedDims / 2 ? theta ** ((-2 * i) / headDim) : 0
+        const freq = i < rotatedDims / 2 ? theta ** ((-2 * i) / freqDims) : 0
         const angle = pos * freq
         table[r * headDim + i] = Math.cos(angle)
         table[r * headDim + half + i] = Math.sin(angle)
@@ -554,11 +576,30 @@ export class Engine {
     return this.gpu.texture(GL.RGBA32UI, dims / 4, Math.ceil(rows / 2))
   }
 
+  /** Rows of the q|k|v|gate projection (see AttentionWeights). */
+  private qkvgDims() {
+    const c = this.config
+    return (
+      (c.numHeads + 2 * c.numKvHeads) * c.headDim +
+      (c.gatePerDim ? c.numHeads * c.headDim : c.numHeads)
+    )
+  }
+
+  /** Gated DeltaNet's dims: keys, values, q|k|v channels, value heads. */
+  private linDims() {
+    const l = this.config.linear
+    if (!l) return null
+    const K = l.numKeyHeads * l.keyHeadDim
+    const V = l.numValueHeads * l.valueHeadDim
+    return { K, V, C: 2 * K + V, H: l.numValueHeads, l }
+  }
+
   private allocate() {
     const c = this.config
     const M = this.capacity
     const D = c.hiddenSize
-    const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
+    const qkvg = this.qkvgDims()
+    const lin = this.linDims()
     const qDims = c.numHeads * c.headDim
     const I = c.intermediateSize
     // Each tensor has its own texture: sharing one between tensors that are
@@ -647,9 +688,20 @@ export class Engine {
         TUNING.halfPartials > 0 && this.gpu.canRender([GL.RGBA16F])
           ? GL.RGBA16F
           : GL.RGBA32F,
-        Math.max(2 * c.intermediateSize, qkvg, 3 * D) / 4,
+        Math.max(2 * c.intermediateSize, qkvg, 3 * D, lin ? lin.C + lin.V : 0) / 4,
         SPLIT_ROWS * 32
-      )
+      ),
+      /** Gated DeltaNet's tensors (see kernels.ts). */
+      lin: lin && {
+        inProj: this.pair(lin.C + lin.V, 2 * M),
+        ba: this.pair(2 * lin.H, 2 * M),
+        gates: this.f32(2 * lin.H, M),
+        qkv: this.f32(lin.C, M),
+        qk: this.f32(2 * lin.K, M),
+        delta: this.f32(lin.V, M),
+        o: this.f32(lin.V, M),
+        out: this.h2(lin.V, M)
+      }
     }
   }
 
@@ -1300,6 +1352,30 @@ export class Engine {
         prefixes: this.f32(D, (width - 1) * SPLIT_ROWS)
       }
     }
+    if (w.linear) {
+      const lin = this.linDims()
+      if (!lin) throw new Error("The model's config has no Gated DeltaNet shapes.")
+      const width = lin.l.convKernel
+      const C = lin.C
+      // Channel-major taps → texel (c / 4, k).
+      const taps = new Float32Array(width * C)
+      for (let ch = 0; ch < C; ch++)
+        for (let k = 0; k < width; k++)
+          taps[k * C + ch] = w.linear.conv[ch * width + k]
+      layer.linear = {
+        inProj: this.matrix(w.linear.inProj),
+        ba: this.matrix(w.linear.ba),
+        outProj: this.matrix(w.linear.outProj),
+        kernel: this.vector(taps, width),
+        convState: [0, 1].map(() => this.f32(C, width - 1)) as [Texture, Texture],
+        state: [0, 1].map(() =>
+          this.f32(lin.V, lin.l.keyHeadDim)
+        ) as [Texture, Texture],
+        a: this.vector(w.linear.a),
+        dtBias: this.vector(w.linear.dtBias),
+        norm: this.vector(w.linear.norm)
+      }
+    }
     if (w.attention) {
       const kvDims = c.numKvHeads * c.headDim
       // A sliding-window layer only ever reads its window back: it keeps the
@@ -1335,6 +1411,7 @@ export class Engine {
 
   private freeSnapshot(saved: Snapshot) {
     saved.conv.forEach((t) => this.gpu.delete(t))
+    saved.linear.forEach((t) => this.gpu.delete(t))
     saved.windows.forEach((kv) => this.gpu.delete(kv))
     if (saved.hidden) this.gpu.delete(saved.hidden)
   }
@@ -1417,6 +1494,7 @@ export class Engine {
     const saved: Snapshot = {
       conv: [] as Array<Texture>,
       windows: [] as Array<Texture>,
+      linear: [] as Array<Texture>,
       ...(hiddenRow !== undefined && { hidden: this.copyHidden(hiddenRow) })
     }
     for (const layer of this.layers) {
@@ -1430,6 +1508,17 @@ export class Engine {
         })
         saved.conv.push(copy)
       }
+      if (layer.linear) {
+        for (const state of [layer.linear.convState[0], layer.linear.state[0]]) {
+          const copy = this.gpu.texture(GL.RGBA32F, state.width, state.height)
+          this.gpu.run({
+            program: this.gpu.program(K.COPY),
+            inputs: { uX: state },
+            output: copy
+          })
+          saved.linear.push(copy)
+        }
+      }
       const a = layer.attention
       if (a?.ring) {
         const kv = this.gpu.texture(GL.RGBA32UI, a.kv.width, W)
@@ -1438,8 +1527,11 @@ export class Engine {
       }
     }
     this.snapshots.set(at, saved)
+    const most = this.layers.some((l) => l.linear)
+      ? MAX_LINEAR_SNAPSHOTS
+      : MAX_SNAPSHOTS
     for (const [p, old] of this.snapshots) {
-      if (this.snapshots.size <= MAX_SNAPSHOTS) break
+      if (this.snapshots.size <= most) break
       this.freeSnapshot(old)
       this.snapshots.delete(p)
     }
@@ -1499,6 +1591,7 @@ export class Engine {
     const W = this.config.slidingWindow
     let c = 0
     let w = 0
+    let s = 0
     for (const layer of this.layers) {
       if (layer.conv) {
         this.gpu.run({
@@ -1506,6 +1599,15 @@ export class Engine {
           inputs: { uX: saved.conv[c++] },
           output: layer.conv.state[0]
         })
+      }
+      if (layer.linear) {
+        for (const state of [layer.linear.convState[0], layer.linear.state[0]]) {
+          this.gpu.run({
+            program: this.gpu.program(K.COPY),
+            inputs: { uX: saved.linear[s++] },
+            output: state
+          })
+        }
       }
       const a = layer.attention
       if (a?.ring) {
@@ -1523,7 +1625,7 @@ export class Engine {
   /** A scratch tensor for probes, made the first time one asks. */
   private debugTexture() {
     const c = this.config
-    const qkvg = (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
+    const qkvg = this.qkvgDims()
     this.debug ??= this.f32(
       Math.max(2 * c.intermediateSize, qkvg),
       this.capacity
@@ -1554,7 +1656,31 @@ export class Engine {
           }
         )
       }
+      const l = layer.linear
+      if (l) {
+        for (const state of [...l.convState, ...l.state]) {
+          this.gpu.write(
+            state,
+            { x: 0, y: 0, width: state.width, height: state.height },
+            {
+              format: GL.RGBA,
+              type: GL.FLOAT,
+              pixels: new Float32Array(state.width * state.height * 4)
+            }
+          )
+        }
+      }
     }
+  }
+
+  /**
+   * Whether draft batches (speculative decoding) can be read: a Gated
+   * DeltaNet layer would need its recurrent state after each prefix of the
+   * batch to keep only some of it, so models with them read one token at
+   * a time (the one-token guess still works: see dropGuess).
+   */
+  get canDraft() {
+    return !this.layers.some((l) => l.linear)
   }
 
   /**
@@ -1611,9 +1737,11 @@ export class Engine {
       await this.forwardHidden(new Array(Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1)).fill(0))
       step("batchF16")
     }
-    await this.forwardHidden([0, 0], { draft: true })
-    step("draft")
-    this.accept(1)
+    if (this.canDraft) {
+      await this.forwardHidden([0, 0], { draft: true })
+      step("draft")
+      this.accept(1)
+    }
     await this.logits(await this.forwardHidden([0]))
     step("token")
     this.snapshot()
@@ -1744,6 +1872,9 @@ export class Engine {
         l.conv?.outProj,
         l.attention?.qkvg,
         l.attention?.o,
+        l.linear?.inProj,
+        l.linear?.ba,
+        l.linear?.outProj,
         l.gateUp,
         l.down
       ])
@@ -2539,7 +2670,7 @@ export class Engine {
         }
         this.gpu.run({
           name: "attend",
-          program: read(K.attendCombine(c.headDim, c.attentionGate, G)),
+          program: read(K.attendCombine(c.headDim, this.gate(), G)),
           inputs: {
             ...Object.fromEntries(chunkBufs.map((t, k) => [`uP${k}`, t])),
             ...qkvgInputs
@@ -2563,7 +2694,7 @@ export class Engine {
       scores(j0, keys, 1)
       this.gpu.run({
         name: "attend",
-        program: read(K.attend(c.headDim, c.attentionGate, G)),
+        program: read(K.attend(c.headDim, this.gate(), G)),
         inputs: { ...sIn, uV: layer.kv, ...qkvgInputs },
         uniforms: {
           uSplitIn: { int: split },
@@ -2582,6 +2713,140 @@ export class Engine {
       m0 += slice
     }
     return this.project(b.attnOut, layer.o, b.opOut, rows)
+  }
+
+  /** Attention's output gate (see K.Gate). */
+  private gate(): K.Gate {
+    const c = this.config
+    return c.attentionGate ? (c.gatePerDim ? "dim" : true) : false
+  }
+
+  /**
+   * A Gated DeltaNet block (Qwen3.5; see LinearAttentionWeights): the
+   * gates, in_proj, the convolution, q̂ and k̂, then the recurrence a token
+   * at a time (two passes each), the gated norm. Returns out_proj's split
+   * (see `project`).
+   */
+  private async linearAttend(
+    layer: NonNullable<GpuLayer["linear"]>,
+    rows: number,
+    input: MatIn,
+    paced: boolean
+  ) {
+    const lin = this.linDims()
+    const b = this.buffers
+    const t = b.lin
+    if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const width = lin.l.convKernel
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const C4 = lin.C / 4
+    /** `source` reading pair or split input `name` as `project` left it. */
+    const reader = (name: string, tex: Texture, split: number) => (source: string) =>
+      this.gpu.program(
+        split ? this.fromSplit(source, [name], split) : this.readPair(source, name, tex)
+      )
+    const pairInputs = (name: string, tex: Texture, split: number) => ({
+      [name]: tex,
+      ...(!split && this.quadInputs(name, tex))
+    })
+    // beta and decay.
+    const baSplit = this.project(input.a, layer.ba, t.ba, rows, input.norm)
+    const baIn = baSplit ? this.partials() : t.ba
+    this.gpu.run({
+      name: "linear",
+      program: reader("uBA", baIn, baSplit)(K.linGates(H4)),
+      inputs: {
+        ...pairInputs("uBA", baIn, baSplit),
+        uA: layer.a,
+        uDt: layer.dtBias
+      },
+      uniforms: { uSplitIn: { int: baSplit }, ...this.pairIn(baIn) },
+      output: t.gates,
+      rect: { x: 0, y: 0, width: 2 * H4, height: rows }
+    })
+    // q|k|v|z, then silu(conv(q|k|v)) and the conv state after the batch.
+    const split = this.project(input.a, layer.inProj, t.inProj, rows, input.norm)
+    const inTex = split ? this.partials() : t.inProj
+    const read = reader("uIn", inTex, split)
+    const inInputs = pairInputs("uIn", inTex, split)
+    const inUniforms = { uSplitIn: { int: split }, ...this.pairIn(inTex) }
+    this.gpu.run({
+      name: "linear",
+      program: read(K.linConv(width)),
+      inputs: { ...inInputs, uState: layer.convState[0], uConv: layer.kernel },
+      uniforms: inUniforms,
+      output: t.qkv,
+      rect: { x: 0, y: 0, width: C4, height: rows }
+    })
+    this.gpu.run({
+      name: "linear",
+      program: read(K.linConvState(width)),
+      inputs: { ...inInputs, uState: layer.convState[0] },
+      uniforms: { ...inUniforms, uM: { int: rows } },
+      output: layer.convState[1],
+      rect: { x: 0, y: 0, width: C4, height: width - 1 }
+    })
+    layer.convState.reverse()
+    this.gpu.run({
+      name: "linear",
+      program: this.gpu.program(K.linPrep(dk)),
+      inputs: { uQKV: t.qkv },
+      uniforms: { uK4: { int: K4 } },
+      output: t.qk,
+      rect: { x: 0, y: 0, width: 2 * K4, height: rows }
+    })
+    // The recurrence, a token at a time.
+    const shape = { keyHeadDim: dk, valueHeadDim: dv }
+    const common = { uK4: { int: K4 }, uH4: { int: H4 } }
+    for (let r = 0; r < rows; r++) {
+      const deltaIn = { uS: layer.state[0], uQK: t.qk, uQKV: t.qkv, uG: t.gates }
+      const rect = { x: 0, y: r, width: V4, height: 1 }
+      if (this.mrt.lin) {
+        this.gpu.run({
+          name: "recurrence",
+          program: this.gpu.program(K.linDelta({ ...shape, out: "both" })),
+          inputs: deltaIn,
+          uniforms: common,
+          output: [t.delta, t.o],
+          rect
+        })
+      } else {
+        for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const) {
+          this.gpu.run({
+            name: "recurrence",
+            program: this.gpu.program(K.linDelta({ ...shape, out })),
+            inputs: deltaIn,
+            uniforms: common,
+            output: tex,
+            rect
+          })
+        }
+      }
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.program(K.linState(shape)),
+        inputs: { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uG: t.gates },
+        uniforms: { ...common, uRow: { int: r } },
+        output: layer.state[1],
+        rect: { x: 0, y: 0, width: V4, height: dk }
+      })
+      layer.state.reverse()
+      // (Each token reads and writes the whole state: ~4 multiply-adds an element.)
+      if (paced) await this.charge(4 * lin.V * dk)
+    }
+    this.gpu.run({
+      name: "linear",
+      program: read(K.linNorm(dv)),
+      inputs: { ...inInputs, uO: t.o, uNorm: layer.norm },
+      uniforms: { ...inUniforms, uZ: { int: C4 }, uEps: this.config.normEps },
+      output: t.out,
+      rect: { x: 0, y: 0, width: V4 / 2, height: rows }
+    })
+    return this.project(t.out, layer.outProj, b.opOut, rows)
   }
 
   /**
@@ -2680,6 +2945,8 @@ export class Engine {
    * only a prefix of them afterwards (see accept). Returns the last row.
    */
   private async forwardDraft(tokens: Array<number>) {
+    if (!this.canDraft)
+      throw new Error("This model's Gated DeltaNet layers can't read draft batches.")
     if (tokens.length > SPLIT_ROWS)
       throw new Error(`A draft batch holds ${SPLIT_ROWS} tokens at most.`)
     if (this.position + tokens.length > this.contextLength) {
@@ -2772,7 +3039,11 @@ export class Engine {
    */
   dropGuess() {
     if (this.guessAt === null) return
-    for (const layer of this.layers) layer.conv?.state.reverse()
+    for (const layer of this.layers) {
+      layer.conv?.state.reverse()
+      layer.linear?.convState.reverse()
+      layer.linear?.state.reverse()
+    }
     this.position = this.guessAt
     this.guessAt = null
   }
@@ -3308,7 +3579,8 @@ export class Engine {
         rows <= SPLIT_ROWS &&
         TUNING.foldNorm > 0 &&
         !probe &&
-        folds(l.conv?.inProj ?? l.attention?.qkvg) &&
+        folds(l.conv?.inProj ?? l.attention?.qkvg ?? l.linear?.inProj) &&
+        (!l.linear || folds(l.linear.ba)) &&
         folds(l.gateUp)
       )
     }
@@ -3436,7 +3708,15 @@ export class Engine {
         await look(i, "operator_norm", b.normed, c.hiddenSize, true)
       }
       let opSplit = 0
-      if (layer.conv) {
+      if (layer.linear) {
+        opSplit = await this.linearAttend(layer.linear, rows, opIn, paced)
+        const lin = this.linDims()
+        if (lin && b.lin) {
+          await look(i, "lin_qkv", b.lin.qkv, lin.C)
+          await look(i, "lin_o", b.lin.o, lin.V)
+          await look(i, "lin_out", b.lin.out, lin.V, true)
+        }
+      } else if (layer.conv) {
         opSplit = this.convolve(layer.conv, rows, opIn)
         await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
@@ -3449,9 +3729,7 @@ export class Engine {
           opIn,
           paced
         )
-        const qkvgDims =
-          (c.numHeads + 2 * c.numKvHeads) * c.headDim + c.numHeads
-        await look(i, "qkvg", b.qkvg, qkvgDims, "pair")
+        await look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)
         // The cache's keys then values for positions 0.. (one block, no
@@ -3572,7 +3850,17 @@ export class Engine {
   /** Layer i's matmul multiply-adds per token. */
   private layerWork(i: number) {
     this.work ??= this.layers.map((l) =>
-      [l.conv?.inProj, l.conv?.outProj, l.attention?.qkvg, l.attention?.o, l.gateUp, l.down]
+      [
+        l.conv?.inProj,
+        l.conv?.outProj,
+        l.attention?.qkvg,
+        l.attention?.o,
+        l.linear?.inProj,
+        l.linear?.ba,
+        l.linear?.outProj,
+        l.gateUp,
+        l.down
+      ]
         .filter((m): m is GpuMatrix => !!m)
         .reduce((sum, m) => sum + m.N * m.K, 0)
     )

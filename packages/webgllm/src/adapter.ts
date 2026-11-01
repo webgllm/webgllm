@@ -133,14 +133,16 @@ function assistantToolTurn(
   }
 }
 
-/** The current turn's thinking, for a template that reads it (LFM3's). */
+/** The current turn's thinking, under the key the format's template reads. */
 function withThinking(
   turn: ChatMessage,
   thinking: string,
   format: ToolFormat
 ): ChatMessage {
   // Liquid's guide: keep the reasoning of the current tool-use turn.
-  return format === "lfm3" ? { ...turn, thinking } : turn
+  if (format === "lfm3") return { ...turn, thinking }
+  if (format === "qwen3.5") return { ...turn, reasoning_content: thinking }
+  return turn
 }
 
 /**

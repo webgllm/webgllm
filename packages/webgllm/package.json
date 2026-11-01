@@ -1,7 +1,7 @@
 {
   "name": "@tanstack-ai-browser/webgl",
   "version": "0.0.0",
-  "description": "TanStack AI adapter for LFM3 running in the browser on WebGL 2, for devices without WebGPU",
+  "description": "TanStack AI adapter for LFM3, LFM2.5 and Qwen3.5 running in the browser on WebGL 2, for devices without WebGPU",
   "license": "MIT",
   "author": "daveycodez",
   "repository": {
@@ -19,6 +19,7 @@
     "webgl",
     "webgl2",
     "lfm3",
+    "qwen3.5",
     "gguf",
     "onnx",
     "browser",

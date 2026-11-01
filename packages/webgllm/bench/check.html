@@ -90,6 +90,7 @@
         model: params.get("model") ?? "LFM3-1.7B-QAD-Q4_0.gguf",
         format: params.get("format") ?? "gguf",
         onnx: params.get("onnx") ?? undefined,
+        graph: params.get("graph") ?? undefined,
         ring: params.get("ring") !== "0",
         kvRows: params.get("kvrows") ? Number(params.get("kvrows")) : undefined,
         noMrt: params.get("nomrt") ? params.get("nomrt").split(",") : undefined,

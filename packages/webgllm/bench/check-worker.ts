@@ -29,6 +29,8 @@ let refBase = "/ref/"
 async function modelPieces(params: {
   model: string
   format?: "gguf" | "onnx"
+  /** The ONNX graph's path in its directory (default onnx/model_q4f16.onnx). */
+  graph?: string
 }) {
   if (params.format !== "onnx")
     return loadGguf(await httpSource(`/models/${params.model}`))
@@ -37,8 +39,10 @@ async function modelPieces(params: {
   ).json()) as Record<string, unknown>
   return loadOnnx({
     config,
-    graph: await httpSource(`${onnxDir}/onnx/model_q4f16.onnx`),
-    data: await httpSource(`${onnxDir}/onnx/model_q4f16.onnx_data`)
+    graph: await httpSource(`${onnxDir}/${params.graph ?? "onnx/model_q4f16.onnx"}`),
+    data: await httpSource(
+      `${onnxDir}/${params.graph ?? "onnx/model_q4f16.onnx"}_data`
+    )
   })
 }
 
@@ -131,7 +135,10 @@ async function run(params: {
   batch: number
   precision: "highp" | "mediump"
   layers: boolean
+  onnx?: string
+  graph?: string
 }) {
+  if (params.onnx) onnxDir = `/${params.onnx}`
   refBase = params.format === "onnx" ? "/ref-onnx/" : "/ref/"
   const manifest = (await (
     await fetch(`${refBase}manifest.json`)
@@ -258,16 +265,24 @@ async function run(params: {
     ? async (layer, name, read) => {
         const type = c.layerTypes[layer]
         const full = type === "full_attention"
-        const simple: Record<string, string> = {
-          operator_norm: "operator_norm",
-          in_proj: "conv_in_proj",
-          conv: "conv_gated",
-          op_out: type === "conv" ? "conv_out_proj" : "attn_out_proj",
-          after_op: "resid_mid",
-          ffn_out: "ffn_out",
-          l_out: "l_out",
-          attn_out: "attn_gated"
-        }
+        // Qwen3.5's references are llama.cpp's own tensor names.
+        const simple: Record<string, string> = c.linear
+          ? {
+              op_out: type === "linear_attention" ? "linear_attn_out" : "attn_output",
+              lin_o: "attn_output",
+              after_op: "attn_residual",
+              l_out: "l_out"
+            }
+          : {
+              operator_norm: "operator_norm",
+              in_proj: "conv_in_proj",
+              conv: "conv_gated",
+              op_out: type === "conv" ? "conv_out_proj" : "attn_out_proj",
+              after_op: "resid_mid",
+              ffn_out: "ffn_out",
+              l_out: "l_out",
+              attn_out: "attn_gated"
+            }
         const wanted = [...Object.keys(simple), "qkvg", "q"].includes(name)
         if (!wanted) return
         const file = (n: string) => `${n}-${layer}.bin`
@@ -562,11 +577,18 @@ async function attentionCheck(engine: Engine, prompt: Array<number>) {
           const vo = j * kv.dims + kvDims + kh * hd
           for (let d = 0; d < hd; d++) want[d] += e * kv.data[vo + d]
         }
-        const gate = c.attentionGate
-          ? 1 / (1 + Math.exp(-qkvg.data[m * qkvg.dims + gateAt + h]))
-          : 1
+        const gate = (d: number) =>
+          c.attentionGate
+            ? 1 /
+              (1 +
+                Math.exp(
+                  -qkvg.data[
+                    m * qkvg.dims + gateAt + (c.gatePerDim ? h * hd + d : h)
+                  ]
+                ))
+            : 1
         for (let d = 0; d < hd; d++) {
-          const ref = (want[d] / l) * gate
+          const ref = (want[d] / l) * gate(d)
           const g = out.data[m * out.dims + h * hd + d]
           if (!Number.isFinite(g)) w.nan++
           rowErr += (g - ref) ** 2

@@ -12,6 +12,15 @@
  * this export already have each head's rotated dims first (GroupQueryAttention
  * with a rotary cache of ropeDimsFull / 2 frequencies), which is the layout
  * both loaders produce; the loader checks that against the graph.
+ *
+ * Qwen3.5's export (onnx-community/Qwen3.5-2B-ONNX, decoder_model_merged)
+ * has the same kind of weights under other names: Gated DeltaNet layers
+ * (`gdn`: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj, conv1d,
+ * A_neg_exp = -exp(A_log), dt_bias, norm) and full attention whose q_proj
+ * holds each head's q then its gate (split per head after a Reshape). Its
+ * norms already hold 1 + w. Its lm_head is byte for byte the 4-bit
+ * embedding (embed_tokens_q4f16), so the embedding is read from it and
+ * the separate embedding file isn't needed.
  */
 import { halvesToFloats } from "./half.js"
 import {
@@ -35,6 +44,7 @@ import type {
   ConvWeights,
   LayerType,
   LayerWeights,
+  LinearAttentionWeights,
   ModelConfig,
   QuantMatrix,
   WeightPiece
@@ -250,7 +260,26 @@ export async function* loadOnnx(
     const postFfnNorm = n3 ? await floats(n3, D) : undefined
     let conv: ConvWeights | undefined
     let attention: AttentionWeights | undefined
-    if (l.type === "conv") {
+    let linear: LinearAttentionWeights | undefined
+    if (l.type === "linear_attention") {
+      const lc = config.linear
+      if (!lc) throw new Error("ONNX: the config has no Gated DeltaNet shapes")
+      const [qkvW, zW, bW, aW, outW] = l.matrices as [NBits, NBits, NBits, NBits, NBits]
+      const H = lc.numValueHeads
+      const inProj = await matrix([whole(qkvW), whole(zW, qkvW.N)])
+      const ba = await matrix([whole(bW), whole(aW, H)])
+      const outProj = await matrix([whole(outW)])
+      const [convT, aT, dtT, normT] = l.extra as [OnnxTensor, OnnxTensor, OnnxTensor, OnnxTensor]
+      linear = {
+        inProj,
+        ba,
+        outProj,
+        conv: await floats(convT, qkvW.N * lc.convKernel),
+        a: await floats(aT, H),
+        dtBias: await floats(dtT, H),
+        norm: await floats(normT, lc.valueHeadDim)
+      }
+    } else if (l.type === "conv") {
       const [inProjW, outProjW] = l.matrices as [NBits, NBits]
       const bcx = l.bcx ?? []
       const inProj = await matrix([
@@ -270,11 +299,22 @@ export async function* loadOnnx(
           `ONNX: layer ${i} k/v projections have ${kW.N}/${vW.N} rows`
         )
       const gateTo = qRows + 2 * kv
+      // Qwen3.5's q_proj: each head's q rows, then its gate rows.
+      const perHead = config.gatePerDim
+        ? Array.from({ length: numHeads }, (_, h) => [
+            { start: 2 * h * headDim, rows: headDim, to: h * headDim },
+            {
+              start: (2 * h + 1) * headDim,
+              rows: headDim,
+              to: gateTo + h * headDim
+            }
+          ]).flat()
+        : null
       // Rows: q, k, v, gate (the gate from q_proj's own rows, or its own weight).
       const qkvg = await matrix([
         {
           w: qW,
-          segments: [
+          segments: perHead ?? [
             { ...l.q, to: 0 },
             ...(l.gate ? [{ ...l.gate, to: gateTo }] : [])
           ]
@@ -304,6 +344,7 @@ export async function* loadOnnx(
     if (postFfnNorm) value.postFfnNorm = postFfnNorm
     if (conv) value.conv = conv
     if (attention) value.attention = attention
+    if (linear) value.linear = linear
     yield { kind: "layer", layer: i, value }
   }
 
@@ -331,9 +372,12 @@ type LayerPlan = {
   type: LayerType
   /** operator, post-operator, ffn, post-ffn norms (the post ones: LFM3 only). */
   norms: Array<OnnxTensor | null>
-  /** conv: in_proj, out_proj; attention: q_proj, k, v, o (+ gate_proj); then mlp gate, up, down. */
+  /**
+   * conv: in_proj, out_proj; attention: q_proj, k, v, o (+ gate_proj);
+   * linear: in_proj_qkv, z, b, a, out_proj; then mlp gate, up, down.
+   */
   matrices: Array<NBits>
-  /** conv: the kernel; attention: q_norm, k_norm. */
+  /** conv: the kernel; attention: q_norm, k_norm; linear: conv1d, A, dt_bias, norm. */
   extra: Array<OnnxTensor>
   /** conv: in_proj rows of B, C, x. */
   bcx?: Array<Segment>
@@ -418,6 +462,7 @@ class OnnxModel {
 
   /** What a layer needs, with the graph checked against the layout assumptions. */
   layerPlan(i: number, type: LayerType, config: ModelConfig): LayerPlan {
+    if (config.linear) return this.qwenLayerPlan(i, type, config)
     const D = config.hiddenSize
     const p = `model.layers.${i}.`
     const norm = (n: string) => this.init(`${p}${n}.weight`)
@@ -494,6 +539,86 @@ class OnnxModel {
     }
     const { q: qSeg, gate } = this.qGateSegments(q, config)
     return { type, norms, matrices: [q, k, v, o, ...mlp], extra, q: qSeg, gate }
+  }
+
+  /** A Qwen3.5 layer (Gated DeltaNet or gated full attention). */
+  private qwenLayerPlan(
+    i: number,
+    type: LayerType,
+    config: ModelConfig
+  ): LayerPlan {
+    const D = config.hiddenSize
+    const p = `model.layers.${i}.`
+    const norms = [
+      this.init(`${p}input_layernorm.weight`),
+      null,
+      this.init(`${p}post_attention_layernorm.weight`),
+      null
+    ]
+    const w = (name: string) => this.nbits(`model_layers_${i}_${name}`)
+    const mlp = [w("mlp_gate_proj"), w("mlp_up_proj"), w("mlp_down_proj")]
+    const l = config.linear
+    if (!l) throw new Error("ONNX: the config has no Gated DeltaNet shapes")
+    if (type === "linear_attention") {
+      const keyDim = l.numKeyHeads * l.keyHeadDim
+      const valueDim = l.numValueHeads * l.valueHeadDim
+      const qkv = w("gdn_in_proj_qkv")
+      const z = w("gdn_in_proj_z")
+      const b = w("gdn_in_proj_b")
+      const a = w("gdn_in_proj_a")
+      const out = w("gdn_out_proj")
+      const H = l.numValueHeads
+      if (
+        qkv.N !== 2 * keyDim + valueDim ||
+        z.N !== valueDim ||
+        b.N !== H ||
+        a.N !== H ||
+        out.N !== D ||
+        out.K !== valueDim
+      )
+        throw new Error(`ONNX: layer ${i} Gated DeltaNet shapes don't match`)
+      const conv = this.init(`${p}gdn.conv1d.weight`)
+      if (conv.dims[0] !== qkv.N || conv.dims[conv.dims.length - 1] !== l.convKernel)
+        throw new Error(`ONNX: ${conv.name} is [${conv.dims}]`)
+      return {
+        type,
+        norms,
+        matrices: [qkv, z, b, a, out, ...mlp],
+        extra: [
+          conv,
+          this.init(`${p}gdn.A_neg_exp`),
+          this.init(`${p}gdn.dt_bias`),
+          this.init(`${p}gdn.norm.weight`)
+        ],
+        q: { start: 0, rows: 0 }
+      }
+    }
+    const q = w("attn_q_proj")
+    if (q.N !== 2 * config.numHeads * config.headDim)
+      throw new Error(`ONNX: layer ${i} q_proj has ${q.N} rows, expected q and gate`)
+    // RoPE: non-interleaved over the first ropeDimsFull dims of each head.
+    const rope = this.graph.nodes.find(
+      (n) =>
+        n.opType === "RotaryEmbedding" && n.name.startsWith(`/model/layers.${i}/`)
+    )
+    if (
+      !rope ||
+      rope.attributes.get("rotary_embedding_dim")?.i !== config.ropeDimsFull ||
+      (rope.attributes.get("interleaved")?.i ?? 0) !== 0
+    )
+      throw new Error(
+        `ONNX: layer ${i} doesn't rotate the first ${config.ropeDimsFull} dims, non-interleaved`
+      )
+    return {
+      type,
+      norms,
+      matrices: [q, w("attn_k_proj"), w("attn_v_proj"), w("attn_o_proj"), ...mlp],
+      extra: [
+        this.init(`${p}attn.q_norm.layernorm.weight`),
+        this.init(`${p}attn.k_norm.layernorm.weight`)
+      ],
+      q: { start: 0, rows: config.numHeads * config.headDim }
+    }
   }
 
   /** The output of the MatMulNBits node reading `w`. */
@@ -669,6 +794,12 @@ class OnnxModel {
     const gather = this.graph.nodes.find(
       (n) => n.opType === "GatherBlockQuantized"
     )
+    if (!gather && this.has("lm_head_MatMul_weight_quant")) {
+      // A decoder-only graph (Qwen3.5's): the tied head is the embedding.
+      const head = this.nbits("lm_head")
+      if (head.K !== D) throw new Error(`ONNX: lm_head has K ${head.K}`)
+      return { N: head.N, quant: head.quant, scales: head.scales, zp: head.zp }
+    }
     if (!gather) throw new Error("ONNX: no GatherBlockQuantized embedding")
     const attr = (key: string) => gather.attributes.get(key)?.i
     if (
@@ -729,7 +860,13 @@ function hasAttentionGate(model: OnnxModel, layerTypes: Array<LayerType>) {
 function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
   if (typeof json !== "object" || json === null)
     throw new Error("ONNX: config must be the parsed config.json")
-  const c = json as Record<string, unknown>
+  // Qwen3.5's multimodal config keeps the language model's in text_config.
+  const outer = json as Record<string, unknown>
+  const c = (
+    typeof outer.text_config === "object" && outer.text_config !== null
+      ? outer.text_config
+      : outer
+  ) as Record<string, unknown>
   const num = (key: string, fallback?: number): number => {
     const value = c[key] ?? fallback
     if (typeof value !== "number")
@@ -744,7 +881,12 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
   let layerTypes: Array<LayerType>
   if (Array.isArray(c.layer_types)) {
     layerTypes = c.layer_types.map((t) => {
-      if (t === "conv" || t === "full_attention" || t === "sliding_attention")
+      if (
+        t === "conv" ||
+        t === "full_attention" ||
+        t === "sliding_attention" ||
+        t === "linear_attention"
+      )
         return t
       throw new Error(`config.json: unknown layer type ${String(t)}`)
     })
@@ -794,6 +936,21 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
     return -1
   }
 
+  const hasLinear = layerTypes.includes("linear_attention")
+  const linear = hasLinear
+    ? {
+        numKeyHeads: num("linear_num_key_heads"),
+        numValueHeads: num("linear_num_value_heads"),
+        keyHeadDim: num("linear_key_head_dim"),
+        valueHeadDim: num("linear_value_head_dim"),
+        convKernel: num("linear_conv_kernel_dim")
+      }
+    : undefined
+  if (linear && linear.numKeyHeads !== linear.numValueHeads)
+    throw new Error(
+      "ONNX: Gated DeltaNet with more value heads than key heads isn't supported"
+    )
+
   return {
     format: "onnx",
     hiddenSize,
@@ -811,9 +968,15 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
     ropeThetaSliding: theta(slidingRope),
     ropeDimsFull: rotated(fullRope),
     ropeDimsSliding: rotated(slidingRope),
-    normEps: num("norm_eps", 1e-5),
-    convKernel: num("conv_L_cache"),
-    attentionGate: hasAttentionGate(model, layerTypes),
+    normEps: num("norm_eps", num("rms_norm_eps", 1e-5)),
+    convKernel: linear ? linear.convKernel : num("conv_L_cache"),
+    attentionGate: linear ? c.attn_output_gate === true : hasAttentionGate(model, layerTypes),
+    // Qwen3.5: its RoPE frequencies spread over the rotated dims, its gate per dim.
+    ...(linear && {
+      linear,
+      gatePerDim: c.attn_output_gate === true,
+      ropeFreqDims: rotated(fullRope)
+    }),
     bosTokenId: tokenId("bos_token_id"),
     eosTokenId: tokenId("eos_token_id"),
     padTokenId: tokenId("pad_token_id")

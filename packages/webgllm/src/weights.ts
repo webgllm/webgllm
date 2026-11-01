@@ -30,7 +30,12 @@
  * dequantize_row_q6_K.
  */
 
-export type LayerType = "conv" | "full_attention" | "sliding_attention"
+export type LayerType =
+  | "conv"
+  | "full_attention"
+  | "sliding_attention"
+  /** Qwen3.5's Gated DeltaNet (see LinearAttentionWeights). */
+  | "linear_attention"
 
 export type ModelConfig = {
   /** Where the weights came from. */
@@ -60,6 +65,12 @@ export type ModelConfig = {
    */
   ropeDimsFull: number
   ropeDimsSliding: number
+  /**
+   * The dims RoPE's frequencies spread over: theta^(-2j / ropeFreqDims).
+   * headDim when left out (LFM3); Qwen3.5 spreads them over its rotated
+   * dims (64 of 256).
+   */
+  ropeFreqDims?: number
   normEps: number
   /** Short convolution width (LFM3: 7, LFM2: 3). */
   convKernel: number
@@ -68,9 +79,26 @@ export type ModelConfig = {
    * follow v's in `qkvg`). LFM2 has none.
    */
   attentionGate: boolean
+  /**
+   * The gate has one value per query dim (Qwen3.5: numHeads · headDim
+   * rows after v's), not one per head (LFM3).
+   */
+  gatePerDim?: boolean
+  /** Gated DeltaNet layers' shapes (Qwen3.5), when the model has them. */
+  linear?: LinearConfig
   bosTokenId: number
   eosTokenId: number
   padTokenId: number
+}
+
+/** Gated DeltaNet's shapes (Qwen3.5 2B: 16 heads of 128 for keys and values). */
+export type LinearConfig = {
+  numKeyHeads: number
+  numValueHeads: number
+  keyHeadDim: number
+  valueHeadDim: number
+  /** The causal convolution's width (4). */
+  convKernel: number
 }
 
 export type QuantMatrix = {
@@ -109,12 +137,36 @@ export type AttentionWeights = {
   /**
    * q, k, v and the output gate in one matrix: rows numHeads * headDim of q,
    * then numKvHeads * headDim of k, the same of v, then numHeads of gate
-   * (when the model has one: config.attentionGate).
+   * (when the model has one: config.attentionGate; numHeads * headDim
+   * with config.gatePerDim).
    */
   qkvg: QuantMatrix
   o: QuantMatrix
   qNorm: Float32Array
   kNorm: Float32Array
+}
+
+/**
+ * A Gated DeltaNet layer (Qwen3.5). With K = keyHeads · keyHeadDim and
+ * V = valueHeads · valueHeadDim: qkv = conv(in_proj rows 0 .. 2K + V),
+ * then silu; q and k L2-normalized per head; beta = sigmoid(b), decay =
+ * exp(A · softplus(a + dtBias)); each value head keeps a keyHeadDim ×
+ * valueHeadDim state S: S = decay · S, S += k (beta (v - Sᵀk))ᵀ, o = Sᵀq
+ * (q scaled by 1/√keyHeadDim); out = out_proj(rms(o) · norm · silu(z)).
+ */
+export type LinearAttentionWeights = {
+  /** Rows q (K), k (K), v (V), then z (V). */
+  inProj: QuantMatrix
+  /** Rows b (valueHeads), then a (valueHeads). */
+  ba: QuantMatrix
+  outProj: QuantMatrix
+  /** Depthwise causal convolution over q|k|v, channel-major, oldest tap first (as ConvWeights.kernel). */
+  conv: Float32Array
+  /** A = -exp(A_log), one per value head. */
+  a: Float32Array
+  dtBias: Float32Array
+  /** The gated RMSNorm's weights (valueHeadDim, shared by the heads; not zero-centered). */
+  norm: Float32Array
 }
 
 export type LayerWeights = {
@@ -126,6 +178,7 @@ export type LayerWeights = {
   postFfnNorm?: Float32Array
   conv?: ConvWeights
   attention?: AttentionWeights
+  linear?: LinearAttentionWeights
   /** w1 (gate) rows, then w3 (up) rows: 2 × intermediateSize. */
   gateUp: QuantMatrix
   /** w2 (down). */

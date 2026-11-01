@@ -507,14 +507,15 @@ async function generate(request: GenerateRequest) {
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
   const draftsFor = (max: number) => {
-    if (request.speculative === false || max <= 0) return []
+    // (Gated DeltaNet models read one token at a time: see Engine.canDraft.)
+    if (request.speculative === false || max <= 0 || !engine.canDraft) return []
     const found = lookupDraft(history, max, TUNING.draftMatch)
     return found.slice(0, policy.choose(found))
   }
   // Whether a draft batch would follow (without changing what the policy
   // remembers).
   const draftsNext = () => {
-    if (request.speculative === false) return false
+    if (request.speculative === false || !engine.canDraft) return false
     const found = lookupDraft(history, DRAFTS, TUNING.draftMatch)
     return found.length > 0 && policy.peek(found) > 0
   }
@@ -579,9 +580,17 @@ async function generate(request: GenerateRequest) {
   }
 
   // When the template opens the thinking itself (LFM3 with thinking on ends
-  // the prompt with `<think>`), the reply starts inside it: say so first,
-  // as the model would have, so the thinking reads as thinking.
-  if (prompt[prompt.length - 1] === tokenizer.specialTokens.think) {
+  // the prompt with `<think>`, Qwen3.5 with `<think>\n`), the reply starts
+  // inside it: say so first, as the model would have, so the thinking
+  // reads as thinking.
+  const think = tokenizer.specialTokens.think
+  const last = prompt[prompt.length - 1]
+  if (
+    think !== null &&
+    (last === think ||
+      (prompt[prompt.length - 2] === think &&
+        tokenizer.decode([last]).trim() === ""))
+  ) {
     post({ type: "token", id, text: THINK_OPEN })
   }
 

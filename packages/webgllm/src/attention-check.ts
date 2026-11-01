@@ -63,11 +63,19 @@ export async function attentionError(
             const vo = j * kv.dims + kvDims + kh * hd
             for (let d = 0; d < hd; d++) want[d] += e * kv.data[vo + d]
           }
-          const gate = c.attentionGate
-            ? 1 / (1 + Math.exp(-qkvg.data[m * qkvg.dims + gateAt + h]))
-            : 1
+          // One gate per head (LFM3) or per dim (Qwen3.5).
+          const gate = (d: number) =>
+            c.attentionGate
+              ? 1 /
+                (1 +
+                  Math.exp(
+                    -qkvg.data[
+                      m * qkvg.dims + gateAt + (c.gatePerDim ? h * hd + d : h)
+                    ]
+                  ))
+              : 1
           for (let d = 0; d < hd; d++) {
-            const r = (want[d] / l) * gate
+            const r = (want[d] / l) * gate(d)
             const g = out.data[m * out.dims + h * hd + d]
             if (!Number.isFinite(g)) worst = Infinity
             err += (g - r) ** 2

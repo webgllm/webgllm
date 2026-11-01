@@ -1,6 +1,7 @@
 /**
  * Loads LFM3 weights from a GGUF file (llama.cpp's `lfm3` architecture),
- * such as Liquid AI's LFM3-1.7B-QAD-Q4_0.gguf.
+ * such as Liquid AI's LFM3-1.7B-QAD-Q4_0.gguf, or Qwen3.5's (`qwen35`),
+ * such as unsloth's Qwen3.5-2B-Q4_0.gguf.
  *
  * - Q4_0 matrices keep their blocks as they are (same nibble order); Q8_0
  *   stays 8-bit. A Q6_K embedding (Liquid AI's) is kept as it is, for the
@@ -14,6 +15,12 @@
  *   ropeDimsFull / 2), as the ONNX build has them: HF dims
  *   [0, R) [H/2, H/2 + R) [R, H/2) [H/2 + R, H) for R = ropeDimsFull / 2,
  *   H = headDim. Frequencies stay theta^(-2j / headDim).
+ * - Qwen3.5: llama.cpp's converter already stores the zero-centered norms
+ *   as 1 + w and A as -exp(A_log). attn_q holds each head's q then its
+ *   gate rows (per dim); the loader puts all q rows first and the gate's
+ *   after v. Its RoPE (NEOX, the first 64 dims, pairs j and j + 32) needs
+ *   no reordering. Q4_1 and Q5_K matrices (unsloth's quant has a few) are
+ *   dequantized and stored as 8-bit.
  */
 import { halfTable, bytesToFloats, halvesToFloats } from "./half.js"
 import {
@@ -25,6 +32,8 @@ import {
 } from "./gguf.js"
 import { ReadPlan } from "./read-plan.js"
 import {
+  dequantizeQ4_1,
+  dequantizeQ5_K,
   dequantizeQ6_K,
   newQuantMatrix,
   packQ4_0,
@@ -39,6 +48,7 @@ import type {
   ConvWeights,
   LayerType,
   LayerWeights,
+  LinearAttentionWeights,
   ModelConfig,
   QuantMatrix,
   WeightPiece
@@ -94,15 +104,34 @@ export async function* loadGguf(
       length: info.byteLength
     })
   }
+  const qwen = !!config.linear
   const layerTensors = (i: number): Array<string> => {
     const blk = `blk.${i}.`
-    const names = [
-      "attn_norm",
-      "post_attention_norm",
-      "ffn_norm",
-      "post_ffw_norm"
-    ]
-    if (config.layerTypes[i] === "conv") {
+    const names = qwen
+      ? ["attn_norm", "post_attention_norm"]
+      : ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"]
+    if (config.layerTypes[i] === "linear_attention") {
+      names.push(
+        "attn_qkv",
+        "attn_gate",
+        "ssm_beta",
+        "ssm_alpha",
+        "ssm_out",
+        "ssm_conv1d",
+        "ssm_a",
+        "ssm_dt.bias",
+        "ssm_norm"
+      )
+    } else if (qwen) {
+      names.push(
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_output",
+        "attn_q_norm",
+        "attn_k_norm"
+      )
+    } else if (config.layerTypes[i] === "conv") {
       names.push("shortconv.in_proj", "shortconv.out_proj", "shortconv.conv")
     } else {
       names.push(
@@ -116,7 +145,10 @@ export async function* loadGguf(
       )
     }
     names.push("ffn_gate", "ffn_up", "ffn_down")
-    return names.map((n) => `${blk}${n}.weight`)
+    // (ssm_a and ssm_dt.bias have no ".weight".)
+    return names.map((n) =>
+      n === "ssm_a" || n.endsWith(".bias") ? `${blk}${n}` : `${blk}${n}.weight`
+    )
   }
   for (let i = 0; i < config.numLayers; i++)
     for (const name of layerTensors(i)) want(name)
@@ -154,7 +186,13 @@ export async function* loadGguf(
   /** Rows of a matrix: tensors with [K, rows] dims, in order, into one QuantMatrix. */
   const matrix = async (
     K: number,
-    parts: Array<{ name: string; rows: number; perm?: Int32Array }>
+    parts: Array<{
+      name: string
+      rows: number
+      perm?: Int32Array
+      /** The tensor's rows, when the part takes only some of them (perm picks which). */
+      tensorRows?: number
+    }>
   ): Promise<QuantMatrix> => {
     const infos = parts.map((p) => tensor(p.name))
     const bits = bitsOf(infos[0])
@@ -171,19 +209,23 @@ export async function* loadGguf(
       false
     )
     let row0 = 0
+    // A tensor two parts read (Qwen3.5's q and gate) is taken once.
+    const taken = new Map<string, Uint8Array>()
     for (let p = 0; p < parts.length; p++) {
-      const { name, rows, perm } = parts[p]
+      const { name, rows, perm, tensorRows = rows } = parts[p]
       const info = infos[p]
       if (
         info.dims[0] !== K ||
-        info.dims[1] !== rows ||
+        info.dims[1] !== tensorRows ||
         info.dims.length !== 2
       ) {
         throw new Error(
-          `GGUF: ${name} is [${info.dims}], expected [${K}, ${rows}]`
+          `GGUF: ${name} is [${info.dims}], expected [${K}, ${tensorRows}]`
         )
       }
-      packRows(m, row0, info, await plan.take(name), rows, perm)
+      let bytes = taken.get(name)
+      if (!bytes) taken.set(name, (bytes = await plan.take(name)))
+      packRows(m, row0, info, bytes, rows, perm)
       row0 += rows
     }
     return m
@@ -194,12 +236,76 @@ export async function* loadGguf(
     const type = config.layerTypes[i]
     const full = type === "full_attention"
     const operatorNorm = await norm(`${blk}attn_norm.weight`)
-    const postOperatorNorm = await norm(`${blk}post_attention_norm.weight`)
-    const ffnNorm = await norm(`${blk}ffn_norm.weight`)
-    const postFfnNorm = await norm(`${blk}post_ffw_norm.weight`)
+    // Qwen3.5's post_attention_norm is the feed-forward block's norm.
+    const postOperatorNorm = qwen
+      ? undefined
+      : await norm(`${blk}post_attention_norm.weight`)
+    const ffnNorm = await norm(
+      qwen ? `${blk}post_attention_norm.weight` : `${blk}ffn_norm.weight`
+    )
+    const postFfnNorm = qwen
+      ? undefined
+      : await norm(`${blk}post_ffw_norm.weight`)
     let conv: ConvWeights | undefined
     let attention: AttentionWeights | undefined
-    if (type === "conv") {
+    let linear: LinearAttentionWeights | undefined
+    if (type === "linear_attention") {
+      const l = config.linear
+      if (!l) throw new Error("The model has no Gated DeltaNet shapes.")
+      const keyDim = l.numKeyHeads * l.keyHeadDim
+      const valueDim = l.numValueHeads * l.valueHeadDim
+      const channels = 2 * keyDim + valueDim
+      const inProj = await matrix(D, [
+        { name: `${blk}attn_qkv.weight`, rows: channels },
+        { name: `${blk}attn_gate.weight`, rows: valueDim }
+      ])
+      const ba = await matrix(D, [
+        { name: `${blk}ssm_beta.weight`, rows: l.numValueHeads },
+        { name: `${blk}ssm_alpha.weight`, rows: l.numValueHeads }
+      ])
+      const outProj = await matrix(valueDim, [
+        { name: `${blk}ssm_out.weight`, rows: D }
+      ])
+      const convInfo = tensor(`${blk}ssm_conv1d.weight`)
+      // ggml [width, channels]: each channel's taps contiguous, oldest first.
+      if (convInfo.dims[0] !== l.convKernel || convInfo.dims[1] !== channels)
+        throw new Error(`GGUF: ${convInfo.name} is [${convInfo.dims}]`)
+      const convKernel = toFloats(convInfo, await plan.take(convInfo.name))
+      linear = {
+        inProj,
+        ba,
+        outProj,
+        conv: convKernel,
+        a: await norm(`${blk}ssm_a`, l.numValueHeads),
+        dtBias: await norm(`${blk}ssm_dt.bias`, l.numValueHeads),
+        norm: await norm(`${blk}ssm_norm.weight`, l.valueHeadDim)
+      }
+    } else if (qwen) {
+      // attn_q: per head, headDim q rows then headDim gate rows.
+      const qRows = numHeads * headDim
+      const half = (gate: boolean) =>
+        Int32Array.from(
+          { length: qRows },
+          (_, r) =>
+            Math.floor(r / headDim) * 2 * headDim +
+            (gate ? headDim : 0) +
+            (r % headDim)
+        )
+      const kv = numKvHeads * headDim
+      const q = `${blk}attn_q.weight`
+      const qkvg = await matrix(D, [
+        { name: q, rows: qRows, perm: half(false), tensorRows: 2 * qRows },
+        { name: `${blk}attn_k.weight`, rows: kv },
+        { name: `${blk}attn_v.weight`, rows: kv },
+        { name: q, rows: qRows, perm: half(true), tensorRows: 2 * qRows }
+      ])
+      const o = await matrix(qRows, [
+        { name: `${blk}attn_output.weight`, rows: D }
+      ])
+      const qNorm = await norm(`${blk}attn_q_norm.weight`, headDim)
+      const kNorm = await norm(`${blk}attn_k_norm.weight`, headDim)
+      attention = { qkvg, o, qNorm, kNorm }
+    } else if (type === "conv") {
       const inProj = await matrix(D, [
         { name: `${blk}shortconv.in_proj.weight`, rows: 3 * D }
       ])
@@ -249,17 +355,12 @@ export async function* loadGguf(
       { name: `${blk}ffn_up.weight`, rows: F }
     ])
     const down = await matrix(F, [{ name: `${blk}ffn_down.weight`, rows: D }])
-    const value: LayerWeights = {
-      type,
-      operatorNorm,
-      postOperatorNorm,
-      ffnNorm,
-      postFfnNorm,
-      gateUp,
-      down
-    }
+    const value: LayerWeights = { type, operatorNorm, ffnNorm, gateUp, down }
+    if (postOperatorNorm) value.postOperatorNorm = postOperatorNorm
+    if (postFfnNorm) value.postFfnNorm = postFfnNorm
     if (conv) value.conv = conv
     if (attention) value.attention = attention
+    if (linear) value.linear = linear
     yield { kind: "layer", layer: i, value }
   }
 
@@ -293,13 +394,15 @@ function bitsOf(info: GgufTensorInfo): 4 | 8 {
     case GgmlType.Q4_0:
       return 4
     case GgmlType.Q8_0:
+    case GgmlType.Q4_1:
+    case GgmlType.Q5_K:
     case GgmlType.Q6_K:
     case GgmlType.F16:
     case GgmlType.F32:
       return 8
     default:
       throw new Error(
-        `GGUF: ${info.name} has tensor type ${info.type}, which this loader doesn't take (Q4_0, Q8_0, Q6_K, F16, F32 do)`
+        `GGUF: ${info.name} has tensor type ${info.type}, which this loader doesn't take (Q4_0, Q8_0, Q4_1, Q5_K, Q6_K, F16, F32 do)`
       )
   }
 }
@@ -324,7 +427,7 @@ function packRows(
   quantizeQ8(m, row0, values, rows)
 }
 
-/** F32, F16 or Q6_K rows as floats. */
+/** F32, F16, Q4_1, Q5_K or Q6_K rows as floats. */
 function rowsToFloats(
   info: GgufTensorInfo,
   bytes: Uint8Array,
@@ -333,6 +436,8 @@ function rowsToFloats(
 ): void {
   const K = info.dims[0]
   if (info.type === GgmlType.Q6_K) return dequantizeQ6_K(bytes, rows, K, out)
+  if (info.type === GgmlType.Q5_K) return dequantizeQ5_K(bytes, rows, K, out)
+  if (info.type === GgmlType.Q4_1) return dequantizeQ4_1(bytes, rows, K, out)
   if (info.type === GgmlType.F16) {
     const half = halfTable()
     for (let i = 0; i < rows * K; i++)
@@ -440,8 +545,20 @@ function ggufConfig(
   if (kvHeads.length !== numLayers)
     throw new Error("GGUF: head_count_kv doesn't have one entry per layer")
   const swa = list("attention.sliding_window_pattern")
+  const qwen = arch === "qwen35"
+  // Qwen3.5: full attention every full_attention_interval-th layer, Gated
+  // DeltaNet in the others.
+  const interval = qwen ? num("full_attention_interval", 4) : 0
   const layerTypes: Array<LayerType> = kvHeads.map((kv, i) =>
-    kv === 0 ? "conv" : swa?.[i] ? "sliding_attention" : "full_attention"
+    qwen
+      ? (i + 1) % interval === 0
+        ? "full_attention"
+        : "linear_attention"
+      : kv === 0
+        ? "conv"
+        : swa?.[i]
+          ? "sliding_attention"
+          : "full_attention"
   )
   const numKvHeads = Math.max(...kvHeads)
   if (kvHeads.some((kv) => kv !== 0 && kv !== numKvHeads)) {
@@ -487,6 +604,20 @@ function ggufConfig(
     )
   }
 
+  const linear = qwen
+    ? {
+        numKeyHeads: num("ssm.group_count"),
+        numValueHeads: num("ssm.time_step_rank"),
+        keyHeadDim: num("ssm.state_size"),
+        valueHeadDim: num("ssm.inner_size") / num("ssm.time_step_rank"),
+        convKernel: num("ssm.conv_kernel")
+      }
+    : undefined
+  if (linear && linear.numKeyHeads !== linear.numValueHeads)
+    throw new Error(
+      "GGUF: Gated DeltaNet with more value heads than key heads isn't supported"
+    )
+
   return {
     format: "gguf",
     hiddenSize,
@@ -506,11 +637,12 @@ function ggufConfig(
     ropeDimsFull,
     ropeDimsSliding,
     normEps: f32Decimal(num("attention.layer_norm_rms_epsilon")),
-    convKernel: num("shortconv.l_cache"),
+    convKernel: linear ? linear.convKernel : num("shortconv.l_cache"),
     bosTokenId: tokenId("bos_token_id", -1),
     eosTokenId: tokenId("eos_token_id", -1),
     padTokenId: tokenId("padding_token_id", -1),
-    // The GGUF loader reads LFM3 (its output gate and sandwich norms).
-    attentionGate: true
+    // LFM3 and Qwen3.5 both gate attention's output (Qwen3.5 per dim).
+    attentionGate: true,
+    ...(qwen && { gatePerDim: true, ropeFreqDims: ropeDimsSliding, linear })
   }
 }

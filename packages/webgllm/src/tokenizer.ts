@@ -27,6 +27,8 @@ export type ChatMessage = {
   thinking?: string
   /** Another name for the thinking (LFM3's template reads either). */
   reasoning?: string
+  /** The thinking as Qwen3.5's template reads it. */
+  reasoning_content?: string
   tool_calls?: Array<ChatToolCall>
   /** A tool result's call, and its tool's name. */
   tool_call_id?: string
@@ -52,8 +54,8 @@ export type ChatTemplateOptions = {
 }
 
 export type SpecialTokenIds = {
-  /** `<|startoftext|>`; the chat template writes it itself. */
-  bos: number
+  /** `<|startoftext|>`; the chat template writes it itself. Qwen3.5 has none. */
+  bos: number | null
   /** `<|im_end|>`, which ends every turn: the model's end token. */
   eos: number
   pad: number
@@ -177,7 +179,7 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     return id
   }
   const specialTokens: SpecialTokenIds = {
-    bos: required("bos_token"),
+    bos: idOf(named.bos_token),
     eos: required("eos_token"),
     pad: required("pad_token"),
     endOfText: idOf("<|endoftext|>"),

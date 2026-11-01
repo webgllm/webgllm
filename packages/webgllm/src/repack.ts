@@ -296,6 +296,78 @@ export function dequantizeQ6_K(
 }
 
 /**
+ * Dequantizes ggml Q4_1 rows (blocks of 32: fp16 d, fp16 m, 16 bytes of
+ * nibbles, weight j in byte j's low nibble and j + 16 in its high one;
+ * w = d · q + m, as dequantize_row_q4_1) into `out` (rows × K).
+ */
+export function dequantizeQ4_1(
+  src: Uint8Array,
+  rows: number,
+  K: number,
+  out: Float32Array
+): void {
+  const half = halfTable()
+  const blocks = (rows * K) / 32
+  for (let b = 0; b < blocks; b++) {
+    const p = b * 20
+    const d = half[src[p] | (src[p + 1] << 8)]
+    const m = half[src[p + 2] | (src[p + 3] << 8)]
+    const y = b * 32
+    for (let j = 0; j < 16; j++) {
+      const q = src[p + 4 + j]
+      out[y + j] = (q & 15) * d + m
+      out[y + j + 16] = (q >> 4) * d + m
+    }
+  }
+}
+
+/**
+ * Dequantizes ggml Q5_K rows (super-blocks of 256: fp16 d, fp16 dmin, 12
+ * bytes of 6-bit scales and mins, qh[32], qs[128]; as dequantize_row_q5_K)
+ * into `out` (rows × K).
+ */
+export function dequantizeQ5_K(
+  src: Uint8Array,
+  rows: number,
+  K: number,
+  out: Float32Array
+): void {
+  const half = halfTable()
+  const superBlocks = (rows * K) / 256
+  // get_scale_min_k4: sub-block j's 6-bit scale and min.
+  const scaleMin = (p: number, j: number): [number, number] =>
+    j < 4
+      ? [src[p + j] & 63, src[p + j + 4] & 63]
+      : [
+          (src[p + j + 4] & 15) | ((src[p + j - 4] >> 6) << 4),
+          (src[p + j + 4] >> 4) | ((src[p + j] >> 6) << 4)
+        ]
+  for (let s = 0; s < superBlocks; s++) {
+    const p = s * 176
+    const d = half[src[p] | (src[p + 1] << 8)]
+    const dmin = half[src[p + 2] | (src[p + 3] << 8)]
+    const sc = p + 4
+    const qh = p + 16
+    let y = s * 256
+    for (let is = 0; is < 8; is += 2) {
+      const ql = p + 48 + is * 16
+      const u1 = 1 << is
+      const u2 = 2 << is
+      const [s1, m1] = scaleMin(sc, is)
+      const [s2, m2] = scaleMin(sc, is + 1)
+      const d1 = d * s1
+      const min1 = dmin * m1
+      const d2 = d * s2
+      const min2 = dmin * m2
+      for (let l = 0; l < 32; l++)
+        out[y++] = d1 * ((src[ql + l] & 15) + (src[qh + l] & u1 ? 16 : 0)) - min1
+      for (let l = 0; l < 32; l++)
+        out[y++] = d2 * ((src[ql + l] >> 4) + (src[qh + l] & u2 ? 16 : 0)) - min2
+    }
+  }
+}
+
+/**
  * Quantizes float rows (rows × K) to 8 bits: per block of 32, scale =
  * max|w| / 127 rounded to fp16, q = round(w / scale) in -127..127 (ties
  * round up).

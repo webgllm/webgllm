@@ -1,8 +1,8 @@
 /**
  * The models this package runs: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
- * 4-bit ONNX builds) and the LFM2.5 / LFM2 ONNX builds the Transformers.js
- * package runs, each with its files pinned and the sampling from Liquid
- * AI's cards.
+ * 4-bit ONNX builds), the LFM2.5 / LFM2 ONNX builds the Transformers.js
+ * package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
+ * q4f16 ONNX), each with its files pinned and the sampling from its card.
  */
 import type { ModelReasoning } from "@tanstack/ai"
 import type { ModelReasoningCapability } from "@tanstack/ai/adapter-internals"
@@ -240,6 +240,72 @@ const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
   thinking: true
 })
 
+/** Qwen3.5's generation config: temperature 0.6, top-k 20, top-p 0.95. */
+const QWEN_3_5_SAMPLING = {
+  temperature: 0.6,
+  top_k: 20,
+  top_p: 0.95,
+  repetition_penalty: 1
+} as const satisfies Sampling
+
+const QWEN_3_5_2B_REPO = { repo: "Qwen/Qwen3.5-2B" }
+
+/**
+ * Qwen3.5 2B in unsloth's Q4_0 GGUF (1.21 GB): Gated DeltaNet layers with
+ * full attention every fourth. Its projections are Q4_0; a few matrices
+ * (Q4_1, Q5_K) load as 8-bit. Tokenizer and chat template from Qwen's own
+ * repository. Thinking is off unless turned on.
+ */
+const QWEN_3_5_2B_GGUF = {
+  name: "unsloth/Qwen3.5-2B-GGUF",
+  format: "gguf",
+  files: {
+    kind: "gguf",
+    model: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" }
+  },
+  tokenizer: {
+    tokenizer: { ...QWEN_3_5_2B_REPO, path: "tokenizer.json" },
+    config: { ...QWEN_3_5_2B_REPO, path: "tokenizer_config.json" },
+    chatTemplate: { ...QWEN_3_5_2B_REPO, path: "chat_template.jinja" }
+  },
+  supports: TOOLS_AND_THINKING,
+  size: "2b",
+  reasoning: THINKING_SWITCH,
+  sampling: QWEN_3_5_SAMPLING,
+  toolFormat: "qwen3.5"
+} as const satisfies WebGlModelMeta
+
+const QWEN_3_5_2B_ONNX_REPO = { repo: "onnx-community/Qwen3.5-2B-ONNX" }
+
+/**
+ * Qwen3.5 2B in onnx-community's q4f16 build, the one the Transformers.js
+ * package runs: only its decoder (1.09 GB), whose 4-bit lm_head is the
+ * embedding too (the separate embed_tokens file holds the same bytes).
+ */
+const QWEN_3_5_2B_ONNX = {
+  name: "onnx-community/Qwen3.5-2B-ONNX",
+  format: "onnx",
+  files: {
+    kind: "onnx",
+    graph: { ...QWEN_3_5_2B_ONNX_REPO, path: "onnx/decoder_model_merged_q4f16.onnx" },
+    data: {
+      ...QWEN_3_5_2B_ONNX_REPO,
+      path: "onnx/decoder_model_merged_q4f16.onnx_data"
+    },
+    config: { ...QWEN_3_5_2B_ONNX_REPO, path: "config.json" }
+  },
+  tokenizer: {
+    tokenizer: { ...QWEN_3_5_2B_ONNX_REPO, path: "tokenizer.json" },
+    config: { ...QWEN_3_5_2B_ONNX_REPO, path: "tokenizer_config.json" },
+    chatTemplate: { ...QWEN_3_5_2B_ONNX_REPO, path: "chat_template.jinja" }
+  },
+  supports: TOOLS_AND_THINKING,
+  size: "2b",
+  reasoning: THINKING_SWITCH,
+  sampling: QWEN_3_5_SAMPLING,
+  toolFormat: "qwen3.5"
+} as const satisfies WebGlModelMeta
+
 /** LFM2.5 350M: the smallest and quickest, for short answers and tool calls. */
 const LFM2_5_350M = lfm2Onnx({
   name: "LiquidAI/LFM2.5-350M-ONNX",
@@ -255,7 +321,9 @@ export const WEBGL_TEXT_MODELS = [
   LFM2_5_1_2B_THINKING.name,
   LFM2_5_1_2B_WEB.name,
   LFM2_5_1_2B_THINKING_WEB.name,
-  LFM2_5_350M.name
+  LFM2_5_350M.name,
+  QWEN_3_5_2B_GGUF.name,
+  QWEN_3_5_2B_ONNX.name
 ] as const
 
 /** A model this package runs. */
@@ -271,7 +339,9 @@ export const WEBGL_MODEL_META: Readonly<
   [LFM2_5_1_2B_THINKING.name]: LFM2_5_1_2B_THINKING,
   [LFM2_5_1_2B_WEB.name]: LFM2_5_1_2B_WEB,
   [LFM2_5_1_2B_THINKING_WEB.name]: LFM2_5_1_2B_THINKING_WEB,
-  [LFM2_5_350M.name]: LFM2_5_350M
+  [LFM2_5_350M.name]: LFM2_5_350M,
+  [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
+  [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX
 }
 
 const WEBGL_REASONING = {
@@ -279,7 +349,9 @@ const WEBGL_REASONING = {
   [LFM3_1_7B_WEB.name]: LFM3_1_7B_WEB.reasoning,
   [LFM3_1_7B_ONNX.name]: LFM3_1_7B_ONNX.reasoning,
   [LFM2_5_1_2B_THINKING.name]: ALWAYS_THINKS,
-  [LFM2_5_1_2B_THINKING_WEB.name]: ALWAYS_THINKS
+  [LFM2_5_1_2B_THINKING_WEB.name]: ALWAYS_THINKS,
+  [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF.reasoning,
+  [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX.reasoning
 } as const
 
 /** The reasoning levels of each model. */

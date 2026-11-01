@@ -1,14 +1,17 @@
 /**
- * Reading and writing tool calls in Liquid AI's formats:
+ * Reading and writing tool calls in Liquid AI's formats (and Qwen3.5's):
  *
  * - LFM2 and LFM2.5: `<|tool_call_start|>[get_weather(city="Tokyo")]<|tool_call_end|>`
- * - LFM3: `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
+ * - LFM3 and Qwen3.5: `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
  */
 
 export type ParsedToolCall = { name: string; args: Record<string, unknown> }
 
-/** How a model writes tool calls. */
-export type ToolFormat = "lfm2" | "lfm3"
+/**
+ * How a model writes tool calls. Qwen3.5 writes LFM3's XML; its template
+ * reads past thinking from `reasoning_content` (LFM3's from `thinking`).
+ */
+export type ToolFormat = "lfm2" | "lfm3" | "qwen3.5"
 
 /** Where a tool call starts, in either format. */
 const MARKERS = ["<|tool_call_start|>", "<tool_call>"]

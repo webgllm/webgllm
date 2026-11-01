@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
 import {
+  dequantizeQ4_1,
+  dequantizeQ5_K,
   newQuantMatrix,
   packMatMulNBits,
   packMatMulNBitsScales,
@@ -98,5 +100,41 @@ describe("MatMulNBits repacking", () => {
       assert.equal(zeros[0 * 4 + r], 2 * r + 1, `row ${r} block 0`)
       assert.equal(zeros[1 * 4 + r], 2 * r + 2, `row ${r} block 1`)
     }
+  })
+})
+
+describe("ggml dequantization", () => {
+  test("Q4_1: d · q + m, weight j in the low nibble, j + 16 in the high one", () => {
+    // d = 0.5 (half 0x3800), m = -1 (0xBC00), byte j = (j + 1) << 4 | j.
+    const block = new Uint8Array(20)
+    block.set([0x00, 0x38, 0x00, 0xbc])
+    for (let j = 0; j < 16; j++) block[4 + j] = ((j + 1) << 4) | j
+    const out = new Float32Array(32)
+    dequantizeQ4_1(block, 1, 32, out)
+    for (let j = 0; j < 16; j++) {
+      assert.equal(out[j], 0.5 * j - 1)
+      assert.equal(out[j + 16], 0.5 * ((j + 1) & 15) - 1)
+    }
+  })
+
+  test("Q5_K: 6-bit scales and mins (both packings), the fifth bit from qh", () => {
+    const block = new Uint8Array(176)
+    // d = 1, dmin = 0.5.
+    block.set([0x00, 0x3c, 0x00, 0x38])
+    const sc = 4
+    block[sc + 0] = 1 // sub-block 0: scale 1
+    block[sc + 4] = 3 // sub-block 0: min 3
+    block[sc + 8] = 0x52 // sub-block 4: scale 2, min 5 (high nibble)
+    block.fill(1, 16, 48) // qh: bit 0 set (sub-block 0 gets + 16)
+    block.fill(0x31, 48, 176) // qs: low nibble 1, high nibble 3
+    const out = new Float32Array(256)
+    dequantizeQ5_K(block, 1, 256, out)
+    // Sub-block 0: 1 · (1 + 16) - 0.5 · 3; sub-block 1 (scale and min 0): 0.
+    assert.equal(out[0], 15.5)
+    assert.equal(out[31], 15.5)
+    assert.equal(out[32], 0)
+    // Sub-block 4 (low nibbles of qs 64..95, no qh bit): 2 · 1 - 0.5 · 5.
+    assert.equal(out[128], -0.5)
+    assert.equal(out[159], -0.5)
   })
 })
