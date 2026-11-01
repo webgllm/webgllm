@@ -121,6 +121,53 @@ async function runWllamaPackage(text: string, gpu = true) {
       chat_template_kwargs: { enable_thinking: false }
     })
   await generate("Hi", 4)
+  // ?followup=tool: a reply that calls a tool, then the tool's result sent
+  // back, logging how much of the second prompt was reused from the cache.
+  if (params.get("followup") === "tool") {
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "The current weather in a city.",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" } },
+            required: ["city"]
+          }
+        }
+      }
+    ]
+    const first: Array<Record<string, unknown>> = [
+      { role: "user", content: `${text}\n\nNow, what's the weather in Paris? Use the tool.` }
+    ]
+    const ask = (messages: Array<Record<string, unknown>>) =>
+      wllama.createChatCompletion({
+        messages,
+        tools,
+        max_tokens: 64,
+        temperature: 0,
+        cache_prompt: true,
+        chat_template_kwargs: { enable_thinking: false }
+      }) as Promise<{
+        timings?: Record<string, number>
+        choices: Array<{ message: { content?: string; tool_calls?: Array<{ id?: string }> } }>
+      }>
+    const one = await ask(first)
+    const call = one.choices[0]?.message
+    const t1 = one.timings ?? {}
+    log(`FOLLOWUP turn 1: processed ${t1.prompt_n}, reused ${t1.cache_n}, ${t1.prompt_ms?.toFixed(0)} ms; tool calls: ${JSON.stringify(call?.tool_calls ?? call?.content)}`)
+    if (!call?.tool_calls?.length) return log("FOLLOWUP: no tool call")
+    const two = await ask([
+      ...first,
+      { role: "assistant", content: call.content ?? "", tool_calls: call.tool_calls },
+      { role: "tool", tool_call_id: call.tool_calls[0].id ?? "0", content: '{"temp_c": 18, "sky": "cloudy"}' }
+    ])
+    const t2 = two.timings ?? {}
+    log(`FOLLOWUP turn 2: processed ${t2.prompt_n}, reused ${t2.cache_n}, ${t2.prompt_ms?.toFixed(0)} ms; reply ${JSON.stringify((two.choices[0]?.message.content ?? "").slice(0, 120))}`)
+    await wllama.exit()
+    return
+  }
   const runs = []
   for (let i = 0; i < 3; i++) {
     const res = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
