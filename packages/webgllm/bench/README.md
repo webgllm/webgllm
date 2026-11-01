@@ -8,7 +8,7 @@ adb reverse tcp:8787 tcp:8787        # a phone over USB: localhost is a secure c
 ```
 
 - `MODELS_DIR`: `LFM3-1.7B-QAD-Q4_0.gguf` (and `LFM3-1.7B-Q4_K_M.gguf` for the CPU baseline)
-- `ONNX_DIR`: a copy of `daveycodez/LFM3-1.7B-Web` (config, tokenizer, `onnx/model_q4f16.onnx*`)
+- `ONNX_DIR`: a copy of `daveycodez/LFM3-1.7B-Web-ONNX` (config, tokenizer, `onnx/model_q4f16.onnx*`)
 - `HF_DIR`: `LiquidAI/LFM3-1.7B`'s `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`
 - `REF_DIR`, `REF_ONNX_DIR`: reference tensors from llama.cpp and onnxruntime (`manifest.json`, `tokens.json`, `logits.bin`, `gen_logits.bin`, `l_out-N.bin`, …)
 

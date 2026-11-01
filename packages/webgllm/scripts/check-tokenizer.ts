@@ -7,7 +7,7 @@
  *     --python /path/to/venv/bin/python NAME=DIR [NAME=DIR ...]
  *
  * DIR holds tokenizer.json, tokenizer_config.json and chat_template.jinja
- * (LiquidAI/LFM3-1.7B's for the GGUF build, daveycodez/LFM3-1.7B-Web's for
+ * (LiquidAI/LFM3-1.7B's for the GGUF build, daveycodez/LFM3-1.7B-Web-ONNX's for
  * the ONNX one). The Python needs `tokenizers`, `jinja2` and `transformers`.
  * Exits 1 on any mismatch.
  */

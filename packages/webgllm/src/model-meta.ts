@@ -118,7 +118,7 @@ const LFM3_1_7B_GGUF = {
 } as const satisfies WebGlModelMeta
 
 const LFM3_WEB_REPO = {
-  repo: "daveycodez/LFM3-1.7B-Web"
+  repo: "daveycodez/LFM3-1.7B-Web-ONNX"
 }
 
 /**
@@ -127,7 +127,7 @@ const LFM3_WEB_REPO = {
  * 128k-row output head.
  */
 const LFM3_1_7B_WEB = {
-  name: "daveycodez/LFM3-1.7B-Web",
+  name: "daveycodez/LFM3-1.7B-Web-ONNX",
   format: "onnx",
   files: {
     kind: "onnx",
@@ -229,13 +229,13 @@ const LFM2_5_1_2B_THINKING = lfm2Onnx({
 
 /** LFM2.5 1.2B re-exported to compute the prompt's last-token logits only (the WebGL engine does that anyway). */
 const LFM2_5_1_2B_WEB = lfm2Onnx({
-  name: "daveycodez/LFM2.5-1.2B-Web",
+  name: "daveycodez/LFM2.5-1.2B-Web-ONNX",
   size: "1.2b",
   thinking: false
 })
 
 const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
-  name: "daveycodez/LFM2.5-1.2B-Thinking-Web",
+  name: "daveycodez/LFM2.5-1.2B-Thinking-Web-ONNX",
   size: "1.2b",
   thinking: true
 })

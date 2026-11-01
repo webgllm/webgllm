@@ -23,10 +23,10 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 `WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (pinned revisions), context, capabilities, reasoning levels and the sampling from Liquid AI's card (temperature 0.1, top-k 50, repetition penalty 1.1).
 
-| Model                      | Weights                                                   | Download |
-| -------------------------- | --------------------------------------------------------- | -------- |
-| `LiquidAI/LFM3-1.7B-GGUF`  | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)    | 1.05 GB  |
-| `daveycodez/LFM3-1.7B-Web` | 4-bit ONNX build for the web, with a 49k-token vocabulary | 900 MB   |
+| Model                           | Weights                                                   | Download |
+| ------------------------------- | --------------------------------------------------------- | -------- |
+| `LiquidAI/LFM3-1.7B-GGUF`       | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)    | 1.05 GB  |
+| `daveycodez/LFM3-1.7B-Web-ONNX` | 4-bit ONNX build for the web, with a 49k-token vocabulary | 900 MB   |
 
 Both think by default; `chat({ reasoning: "off" })` turns it off through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
 
@@ -36,7 +36,7 @@ Pixel 10 Pro (PowerVR DXT-48-1536), Firefox 159, a 515-token prompt:
 
 |                                         | Prompt reading      | Writing       | First token |
 | --------------------------------------- | ------------------- | ------------- | ----------- |
-| `daveycodez/LFM3-1.7B-Web`              | 75.6 tokens/s       | 9.2 tokens/s  | 6.8 s       |
+| `daveycodez/LFM3-1.7B-Web-ONNX`         | 75.6 tokens/s       | 9.2 tokens/s  | 6.8 s       |
 | `LiquidAI/LFM3-1.7B-GGUF`               | 71.9 tokens/s       | 7.9 tokens/s  | 7.2 s       |
 | wllama (CPU, relaxed SIMD), LFM3 Q4_K_M | 24.5 to 30 tokens/s | 11.6 tokens/s | 18.2 s      |
 
@@ -68,7 +68,7 @@ GPU textures at load (phone-size batches, the 1,024-token cache), and the most J
 
 | Model                           | GPU textures | Peak JavaScript memory while loading |
 | ------------------------------- | ------------ | ------------------------------------ |
-| `daveycodez/LFM3-1.7B-Web`      | 932 MiB      | ~110 MiB                             |
+| `daveycodez/LFM3-1.7B-Web-ONNX` | 932 MiB      | ~110 MiB                             |
 | `onnx-community/LFM3-1.7B-ONNX` | 1,025 MiB    | ~110 MiB                             |
 | `LiquidAI/LFM3-1.7B-GGUF`       | 1,062 MiB    | ~110 MiB                             |
 

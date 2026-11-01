@@ -2,7 +2,7 @@
  * Loads LFM3 and LFM2/LFM2.5 weights from an onnxruntime-genai style ONNX
  * export with
  * 4-bit MatMulNBits projections and a GatherBlockQuantized embedding,
- * such as daveycodez/LFM3-1.7B-Web's onnx/model_q4f16.onnx (+ its
+ * such as daveycodez/LFM3-1.7B-Web-ONNX's onnx/model_q4f16.onnx (+ its
  * .onnx_data file).
  *
  * The graph is read to place the parts of fused matrices: the attention
