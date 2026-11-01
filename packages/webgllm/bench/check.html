@@ -109,7 +109,8 @@
         question: params.get("q") ?? undefined,
         length: params.get("len") ? Number(params.get("len")) : undefined,
         skip: params.get("skip") ? params.get("skip").split(",") : undefined,
-        attn: params.get("attn") === "1"
+        attn: params.get("attn") === "1",
+        formats: params.get("formats") ?? undefined
       })
     </script>
   </body>

@@ -6,6 +6,7 @@
 import { Engine, TUNING } from "../src/engine.js"
 import * as K from "../src/gpu/kernels.js"
 import type { LayerProbe } from "../src/engine.js"
+import type { Texture } from "../src/gpu/gl.js"
 import { httpSource } from "../src/byte-source.js"
 import { headPermutation, loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
@@ -597,6 +598,156 @@ async function attentionCheck(engine: Engine, prompt: Array<number>) {
 }
 
 /** Without reference tensors: a chat prompt, and a greedy reply decoded. */
+/** See ?formats in smoke. */
+async function formats(engine: Engine, headOnly: boolean) {
+  type Mat = {
+    N: number
+    K: number
+    bits: number
+    rgba4: boolean
+    packed: boolean
+    quants: Texture
+    scales: Texture
+    zeros: Texture | null
+    blocks: number
+    rowsPerColumn: number
+    rowTexels: number
+  }
+  type Internals = {
+    buffers: { normed: Texture; residual: Array<Texture> }
+    layers: Array<{ conv?: { inProj: Mat }; gateUp: Mat; down: Mat }>
+    embedding: Mat
+    allocateMatrix(N: number, K: number, bits: number, zeros: boolean, rgba4: boolean, layer: boolean): Mat
+    writeMatrix(gm: Mat, m: unknown, row0: number): void
+    splitPartials(a: Texture, w: Mat, rows: number): number
+    f16Scratch(): { w: Texture; hd: number } | false
+    scalesOf(w: Mat, source: string): string
+    headQ6K(e: Mat, rows: number, sum: boolean): unknown
+    headRgba4(e: Mat, rows: number, scaledRow0: undefined, sum: boolean): unknown
+  }
+  const e = engine as unknown as Internals
+  await engine.warmUp()
+  const gpu = engine.gpu
+  const made: Array<Texture> = []
+  const scratch = gpu.texture(WebGL2RenderingContext.RGBA32F, 1, 1)
+  made.push(scratch)
+  // Each timed pass then a 1-texel copy into another texture: every pass
+  // its own render pass (see the MATMUL profile).
+  const copy = () =>
+    gpu.run({
+      program: gpu.program(K.COPY),
+      inputs: { uX: e.buffers.residual[0] },
+      output: scratch,
+      rect: { x: 0, y: 0, width: 1, height: 1 }
+    })
+  /** Random 4-bit weights; zero points of 8 if `zeros` (as MatMulNBits'). */
+  const fake = (N: number, Kd: number, zeros: boolean) => {
+    let seed = 7
+    const quants = new Uint32Array(N * (Kd / 32) * 4)
+    for (let i = 0; i < quants.length; i++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0
+      quants[i] = seed
+    }
+    return {
+      N,
+      K: Kd,
+      bits: 4,
+      quants,
+      scales: new Uint16Array(N * (Kd / 32)).fill(0x2000),
+      zeros: zeros ? new Uint8Array(N * (Kd / 32)).fill(8) : null
+    }
+  }
+  /** An RGBA4 matrix: a layer's (scales and zero points packed if it has them) or the head's. */
+  const build = (N: number, Kd: number, zeros: boolean, layer = true) => {
+    const gm = e.allocateMatrix(N, Kd, 4, zeros, true, layer)
+    e.writeMatrix(gm, fake(N, Kd, zeros), 0)
+    for (const t of [gm.quants, gm.scales, gm.zeros]) if (t) made.push(t)
+    return gm
+  }
+  const f = e.f16Scratch()
+  const decode = (w: Mat) => () => {
+    e.splitPartials(e.buffers.normed, w, 1)
+    copy()
+  }
+  const dequant = (w: Mat) => () => {
+    if (!f) return
+    const kq = w.K / 4
+    gpu.run({
+      name: "dequant",
+      program: gpu.program(e.scalesOf(w, K.dequantRgba4({ zeros: !!w.zeros || w.packed }))),
+      inputs: { uW: w.quants, uS: w.scales, ...(w.zeros && { uZ: w.zeros }) },
+      uniforms: {
+        uKb: { int: w.blocks },
+        uH: { int: w.rowsPerColumn },
+        uRowTexels: { int: w.rowTexels },
+        uKq: { int: kq },
+        uHd: { int: f.hd },
+        uN: { int: w.N }
+      },
+      output: f.w,
+      rect: { x: 0, y: 0, width: Math.ceil(w.N / f.hd) * kq, height: Math.min(f.hd, w.N) }
+    })
+    copy()
+  }
+  /** Each case's median µs per pass: rounds of n passes, cases in rotating order. */
+  const race = async (label: string, cases: Array<[string, () => void]>, n: number, rounds = 7) => {
+    for (const [, run] of cases) run()
+    await gpu.finish()
+    const times = cases.map(() => [] as Array<number>)
+    for (let round = 0; round < rounds; round++) {
+      for (let j = 0; j < cases.length; j++) {
+        const i = (j + round) % cases.length
+        const t = performance.now()
+        for (let k = 0; k < n; k++) cases[i][1]()
+        await gpu.finish()
+        times[i].push(((performance.now() - t) / n) * 1000)
+      }
+    }
+    const med = (xs: Array<number>) => [...xs].sort((a, b) => a - b)[xs.length >> 1]
+    log(
+      `FORMATS ${label}: ` +
+        cases.map(([name], i) => `${name} ${med(times[i]).toFixed(0)}`).join(", ") +
+        " µs (median)"
+    )
+  }
+  const floorCase: [string, () => void] = ["copy only", copy]
+  const real = e.layers[0]
+  const shapes: Array<[string, Mat]> = [
+    ["gate_up", real.gateUp],
+    ["down", real.down],
+    ...(real.conv ? [["in_proj", real.conv.inProj] as [string, Mat]] : [])
+  ]
+  for (const [name, w] of headOnly ? [] : shapes) {
+    const kinds: Array<[string, Mat]> = [
+      [`real(${w.packed ? "packed" : w.zeros ? "zeros" : "no zeros"})`, w],
+      ["no zeros (Q4_0)", build(w.N, w.K, false)],
+      ["packed (MatMulNBits)", build(w.N, w.K, true)]
+    ]
+    await race(`${name} ${w.N}x${w.K} writing`, [floorCase, ...kinds.map(([k, m]) => [k, decode(m)] as [string, () => void])], 32)
+    if (f) await race(`${name} prompt dequant`, kinds.map(([k, m]) => [k, dequant(m)] as [string, () => void]), 8)
+  }
+  // The head: this model's (at each split) against a 4-bit RGBA4 one of
+  // the same shape (as the ONNX build's: zero points in their own texture).
+  const emb = e.embedding
+  const head = (m: Mat) => () => {
+    if (m.rgba4) e.headRgba4(m, 1, undefined, false)
+    else e.headQ6K(m, 1, false)
+    copy()
+  }
+  const heads: Array<[string, () => void]> = [floorCase]
+  for (const split of [1, 2, 4]) {
+    heads.push([`own (${emb.bits}-bit) split ${split}`, () => {
+      const saved = [TUNING.headSplit, TUNING.q6HeadSplit]
+      TUNING.headSplit = TUNING.q6HeadSplit = split
+      head(emb)()
+      ;[TUNING.headSplit, TUNING.q6HeadSplit] = saved
+    }])
+  }
+  if (!emb.rgba4) heads.push(["4-bit RGBA4", head(build(emb.N, emb.K, true, false))])
+  await race("head", heads, 8)
+  for (const t of made) gpu.delete(t)
+}
+
 async function smoke(params: {
   model: string
   format?: "gguf" | "onnx"
@@ -682,6 +833,18 @@ async function smoke(params: {
       log(`CHAIN worker way ${worker.toFixed(2)} ms/token; forward + head queued ${queued.toFixed(2)} ms/token`)
       row = 0
     }
+    return
+  }
+  // ?formats=1: how much each way of storing the weights costs on this
+  // GPU, timed in alternation (so a phone's heating hits all alike): layer
+  // matrices with Q4_0's scales (RGBA16F, no zero points) against
+  // MatMulNBits' (scales and zero points packed), random and real, for
+  // writing (the split matmul) and prompts (the dequantization); and the
+  // output head against a 4-bit RGBA4 one of the same shape (the ONNX
+  // build's). ?formats=head: the head only.
+  const formatsParam = (params as { formats?: string }).formats
+  if (formatsParam) {
+    await formats(engine, formatsParam === "head")
     return
   }
   if (params.programs) {
