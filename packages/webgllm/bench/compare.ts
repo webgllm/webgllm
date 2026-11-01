@@ -224,7 +224,7 @@ async function runWebgl(text: string) {
     const promptTps = (input / (s.promptMs ?? 1)) * 1000
     const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
     log(
-      `WebGL run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
+      `WebGL run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s${s.draftBatches ? `, ${s.draftBatches} draft batches, ${s.draftsKept} of ${s.draftsChecked} drafts kept` : ""}`
     )
     if (i === 0) log(`reply: ${JSON.stringify(reply.slice(0, 200))}`)
     runs.push({ promptTps, decodeTps, ttftMs: s.firstTokenMs ?? 0 })

@@ -16,6 +16,10 @@ export type RunTimings = {
   promptMs: number
   /** From the first generated token to the last, in ms. */
   decodeMs: number
+  /** Speculative decoding: batches with drafts, drafts checked, drafts kept. */
+  draftBatches?: number
+  draftsChecked?: number
+  draftsKept?: number
 }
 
 export type WorkerRequest =

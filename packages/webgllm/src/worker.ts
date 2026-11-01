@@ -251,6 +251,7 @@ async function load(
     lap("tune")
     timings.tunedSliceK = engine.tuned.sliceK ?? 0
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
+    for (const [k, v] of Object.entries(engine.tuneReport)) timings[`tune_${k}`] = v
     if (signal.aborted) throw new Superseded()
     // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
@@ -617,8 +618,12 @@ async function generate(request: GenerateRequest) {
     }
     const stepMs = performance.now() - stepStart
     // (A reply that ended mid-batch judged only the drafts it wrote.)
-    if (drafts.length)
+    if (drafts.length) {
       policy.checkedBatch(drafts.length, kept - 1, stepMs, going ? drafts.length : kept - 1)
+      stats.draftBatches = (stats.draftBatches ?? 0) + 1
+      stats.draftsChecked = (stats.draftsChecked ?? 0) + drafts.length
+      stats.draftsKept = (stats.draftsKept ?? 0) + kept - 1
+    }
     else policy.alone(stepMs)
     // A draft turned down: the guess (made for all drafts kept) goes first,
     // then the batch back to the tokens kept.

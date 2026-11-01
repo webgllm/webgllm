@@ -820,44 +820,70 @@ export class Engine {
    * remembered from an earlier load.
    */
   tuned: Tuned = { sliceK: null, shortSplit: null }
+  /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
+  tuneReport: Record<string, number> = {}
 
   /**
-   * Times the choices in `tuned` on this GPU (layer 0's gate|up and down
-   * matmuls, the prompt's largest, on the loaded weights) and keeps a
-   * choice only where it beats TUNING's by 5%: Apple GPUs differ from
+   * Times the choices in `tuned` on this GPU (a layer's worth of prompt
+   * matmuls on the loaded weights) and keeps a choice only where it beats
+   * TUNING's by 4% and by twice the spread between its own rounds (phones'
+   * timings drift with heat): Apple GPUs differ from
    * PowerVR, and big ones from small ones, in how many slices fill them.
-   * Each candidate in turn per round (drift from heat cancels), median of
-   * 3 rounds. Call after warmUp; returns what it picked.
+   * Each candidate in turn per round (drift from heat cancels), best of 2
+   * rounds. Call after warmUp; returns what it picked.
    */
   async tune(): Promise<Tuned> {
     const b = this.buffers
-    const layer = this.layers[0]
+    // A layer's prompt matmuls as the forward runs them: a conv block's,
+    // an attention block's (the first of each kind), one feed-forward's.
+    const conv = this.layers.find((l) => l.conv)?.conv
+    const attention = this.layers.find((l) => l.attention)?.attention
+    const ffn = this.layers[0]
     const run = (rows: number) => {
-      this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
-      this.matmul(b.act, layer.down, b.ffnOut, rows)
+      if (conv) {
+        this.matmul(b.normed, conv.inProj, b.bcx, rows)
+        this.matmul(b.convOut, conv.outProj, b.opOut, rows)
+      }
+      if (attention) {
+        this.matmul(b.normed, attention.qkvg, b.qkvg, rows)
+        this.matmul(b.attnOut, attention.o, b.opOut, rows)
+      }
+      this.matmul(b.normed, ffn.gateUp, b.gateUp, rows)
+      this.matmul(b.act, ffn.down, b.ffnOut, rows)
     }
     const choose = async (
       key: keyof Tuned,
       candidates: Array<number>,
       rows: number
     ): Promise<number | null> => {
-      const times = candidates.map((): Array<number> => [])
-      for (let round = -1; round < 3; round++) {
+      // The alternatives once untimed (first use costs more; the warm-up
+      // already ran TUNING's).
+      for (let c = 1; c < candidates.length; c++) {
+        this.tuned[key] = candidates[c]
+        run(rows)
+      }
+      const rounds = candidates.map((): Array<number> => [])
+      for (let round = 0; round < 2; round++) {
         for (let c = 0; c < candidates.length; c++) {
           this.tuned[key] = candidates[c]
           await this.gpu.finish()
           const t = performance.now()
           run(rows)
           await this.gpu.finish()
-          // (Round -1 untimed: programs and first-use costs.)
-          if (round >= 0) times[c].push(performance.now() - t)
+          rounds[c].push(performance.now() - t)
         }
       }
       this.tuned[key] = null
-      const med = times.map((xs) => [...xs].sort((x, y) => x - y)[1])
-      const best = med.indexOf(Math.min(...med))
+      const times = rounds.map((r) => Math.min(...r))
+      // How far a candidate's two rounds differ: the noise to beat.
+      const noise = Math.max(...rounds.map((r) => (Math.max(...r) - Math.min(...r)) / Math.min(...r)))
+      const best = times.indexOf(Math.min(...times))
+      this.tuneReport[`${key}Gain`] = Math.round((1 - times[1] / times[0]) * 1000) / 10
+      this.tuneReport[`${key}Noise`] = Math.round(noise * 1000) / 10
       // candidates[0] is TUNING's value.
-      return best > 0 && med[best] < 0.95 * med[0] ? candidates[best] : null
+      return best > 0 && times[best] < (1 - Math.max(0.04, 2 * noise)) * times[0]
+        ? candidates[best]
+        : null
     }
     const picked: Tuned = {
       shortSplit: await choose(
@@ -865,10 +891,12 @@ export class Engine {
         [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
         Math.min(40, this.capacity)
       ),
+      // (At a 512-token batch, a prompt's usual size: smaller models'
+      // batches can run to 2304 rows, where more slices matter less.)
       sliceK: await choose(
         "sliceK",
         [TUNING.quadSliceK, TUNING.quadSliceK === 256 ? 512 : 256],
-        this.capacity
+        Math.min(512, this.capacity)
       )
     }
     this.tuned = picked
