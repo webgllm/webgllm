@@ -11,6 +11,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
+import { readPrompt } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -437,20 +438,11 @@ async function generate(request: GenerateRequest) {
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
 
-  // Read the rest of the prompt, saving the convolutions' state after each
-  // batch so a later prompt can resume from there (and after the last, the
-  // last token's hidden row: see Engine.resume).
+  // Read the rest of the prompt (see readPrompt).
   const promptStart = performance.now()
-  let row = 0
-  let i = start
-  for (const size of engine.batchSizes(prompt.length - start)) {
-    const batch = prompt.slice(i, i + size)
-    i += size
-    row = await engine.forwardHidden(batch)
-    model.cached.push(...batch)
-    engine.snapshot(i === prompt.length ? row : undefined)
-    if (stopped.has(id)) break
-  }
+  let row = await readPrompt(engine, prompt, start, model.cached, () =>
+    stopped.has(id)
+  )
   const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
   const stats: RunTimings = {
     inputTokens: prompt.length,

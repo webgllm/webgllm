@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL memory over a chat</title>
+    <style>
+      body {
+        font:
+          12px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      #live {
+        position: sticky;
+        top: 0;
+        background: #eef;
+        padding: 6px 8px;
+        border-radius: 4px;
+        white-space: pre-wrap;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="live">starting…</div>
+    <pre id="out"></pre>
+    <script type="module">
+      // See bench/README.md (mem.html) for the parameters.
+      const params = new URLSearchParams(location.search)
+      const out = document.getElementById("out")
+      const live = document.getElementById("live")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+        console.log(text)
+        void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+      }
+      const MODELS = {
+        "qwen-onnx": "onnx-community/Qwen3.5-2B-ONNX",
+        "qwen-gguf": "unsloth/Qwen3.5-2B-GGUF",
+        "lfm-onnx": "daveycodez/LFM3-1.7B-Web-ONNX",
+        "lfm-gguf": "LiquidAI/LFM3-1.7B-GGUF"
+      }
+      const model = MODELS[params.get("model") ?? "qwen-gguf"] ?? params.get("model")
+      const state = { model }
+      const MiB = (b) => `${(b / 2 ** 20).toFixed(0)} MiB`
+      const show = () => {
+        const s = state
+        live.textContent =
+          `${s.model}${s.variant ? `, ${s.variant} (round ${s.round})` : ""}\n` +
+          `textures ${s.textures !== undefined ? MiB(s.textures) : "?"}, peak ${s.peak !== undefined ? MiB(s.peak) : "?"}` +
+          (s.position !== undefined ? `, cache ${s.position} tokens (turn ${s.turn})` : "") +
+          (s.promptTps !== undefined ? `\nlast prompt ${s.promptTps.toFixed(0)} tok/s${s.read !== undefined ? ` (${s.read} read)` : ""}, writing ${s.writeTps.toFixed(1)} tok/s` : "") +
+          (s.done ? "\nDONE" : "")
+      }
+      log(navigator.userAgent)
+      const worker = new Worker("/bundle/bench/mem-worker.js", { type: "module" })
+      window.__go = () => worker.postMessage({ type: "go" })
+      worker.onmessage = ({ data }) => {
+        if (data.type === "log") log(data.text)
+        else if (data.type === "status") {
+          Object.assign(state, data)
+          show()
+        } else if (data.type === "memwait") console.log(`MEMWAIT ${data.label}`)
+        else if (data.type === "error") {
+          log(`ERROR: ${data.message}\nALL DONE`)
+          live.textContent += "\nERROR (see below)"
+        } else if (data.type === "done") {
+          state.done = true
+          show()
+          log("ALL DONE")
+        }
+      }
+      worker.onerror = (e) => log(`ERROR: worker: ${e.message}\nALL DONE`)
+      const num = (name, fallback) => (params.get(name) ? Number(params.get(name)) : fallback)
+      worker.postMessage({
+        model,
+        mode: params.get("mode") ?? "chat",
+        batch: num("batch", 0),
+        length: num("len", 512),
+        followLength: num("follow", 0),
+        turns: num("turns", 3),
+        target: num("target", 0),
+        reply: num("reply", 128),
+        contextLength: num("ctx", undefined),
+        thinking: params.get("think") === "1",
+        tune: params.get("tune") ?? "",
+        variants: params.get("variants") ?? "default",
+        rounds: num("rounds", 2),
+        cdp: params.get("cdp") === "1",
+        detail: params.get("detail") === "1"
+      })
+    </script>
+  </body>
+</html>

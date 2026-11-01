@@ -27,6 +27,9 @@ const QUESTION =
       : "Describe the river scene above in a short paragraph."
 const FILLER =
   "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+/** ?followup=1's second message: about 80 tokens. */
+const FOLLOW_UP =
+  "Thank you. Now tell the same scene again, but from the point of view of the miller's daughter herself: what she sees from the window of the mill at dawn, what she hears from the river, how she feels about counting the sacks again, and what she hopes to buy at the market in the square once the morning's work is done. Keep it to one paragraph."
 
 /** The smoke test's prompt: the question after filler, about `length` tokens in all. */
 async function promptText(length: number) {
@@ -352,7 +355,10 @@ async function runWebgl(text: string) {
   const idle = Number(params.get("idle") ?? 0)
   if (idle > 0) await new Promise((r) => setTimeout(r, idle))
   let n = 0
-  const generate = (content: string, maxTokens: number) =>
+  const generate = (
+    content: string | Array<{ role: string; content: string }>,
+    maxTokens: number
+  ) =>
     new Promise<Record<string, number | null>>((resolve, reject) => {
       const id = `run${n++}`
       pending.set(id, { resolve, reject })
@@ -361,7 +367,7 @@ async function runWebgl(text: string) {
         type: "generate",
         id,
         model,
-        chat: [{ role: "user", content }],
+        chat: typeof content === "string" ? [{ role: "user", content }] : content,
         tools: [],
         thinking: false,
         sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
@@ -370,6 +376,32 @@ async function runWebgl(text: string) {
       })
     })
   await generate("Hi", 4)
+  // ?followup=1: each run a first message, its reply, then a follow-up
+  // question (the reply back in the chat, as the app sends it): how much
+  // of the follow-up's prompt is read again, and how long it takes.
+  if (params.get("followup") === "1") {
+    const runs = []
+    for (let i = 0; i < 3; i++) {
+      const first = [{ role: "user", content: `Run ${i + 1} of the benchmark.\n\n${text}` }]
+      await generate(first, 64)
+      const chat = [
+        ...first,
+        { role: "assistant", content: reply },
+        { role: "user", content: FOLLOW_UP }
+      ]
+      const s = await generate(chat, 64)
+      const read = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
+      log(
+        `FOLLOWUP run ${i + 1}: ${s.inputTokens} prompt tokens, ${read} read in ${(s.promptMs ?? 0).toFixed(0)} ms (${((read / (s.promptMs ?? 1)) * 1000).toFixed(1)} tokens/s), first token ${(s.firstTokenMs ?? 0).toFixed(0)} ms, ${s.outputTokens} tokens at ${((((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000).toFixed(1)} tokens/s`
+      )
+      runs.push({ read, promptMs: s.promptMs ?? 0, ttftMs: s.firstTokenMs ?? 0 })
+    }
+    log(
+      `RESULT FOLLOWUP ${model}: ${median(runs.map((r) => r.read))} prompt tokens read in ${median(runs.map((r) => r.promptMs)).toFixed(0)} ms, first token ${(median(runs.map((r) => r.ttftMs)) / 1000).toFixed(3)} s (median of 3)`
+    )
+    worker.terminate()
+    return
+  }
   const runs = []
   for (let i = 0; i < 3; i++) {
     const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)

@@ -1609,6 +1609,20 @@ async function smoke(params: {
         : `RESET CHECK: DIFFERENT after junk and a reset: ${JSON.stringify(tokenizer.decode(again))}`
     )
   }
+  {
+    // The bits of the prompt's logits and of 8 writing steps' (the reply's
+    // tokens), hashed: the same hash on two builds or settings means the
+    // same numbers, not just the same reply.
+    engine.reset()
+    let h = 0x811c9dc5
+    const mix = (logits: Float32Array) => {
+      const bytes = new Uint8Array(logits.buffer, logits.byteOffset, logits.byteLength)
+      for (let i = 0; i < bytes.length; i++) h = Math.imul(h ^ bytes[i], 0x01000193)
+    }
+    mix(await engine.forward(prompt))
+    for (const t of out.slice(0, 8)) mix(await engine.forward([t]))
+    log(`LOGITS HASH: ${(h >>> 0).toString(16)} (the prompt and ${Math.min(8, out.length)} writing steps)`)
+  }
   // How speculative decoding with prompt lookup would fare on this reply:
   // at each step, draft up to 3 tokens by matching the history's last
   // 3, 2 or 1 tokens earlier in the history, and count how many of the
