@@ -258,7 +258,13 @@ export const TUNING = {
    */
   linChunk: 32,
   /** ...for batches of at least this many tokens (fewer go a token at a time). */
-  linChunkMin: 4
+  linChunkMin: 4,
+  /**
+   * Resume points kept for a model with Gated DeltaNet layers (~20 MB each
+   * for Qwen3.5 2B; see snapshot): the anchor, where the next user turn's
+   * prompt stops sharing this chat's, and the end of the last reply.
+   */
+  linearSnapshots: 2
 }
 
 /**
@@ -277,6 +283,8 @@ type Snapshot = {
   /** Each Gated DeltaNet layer's conv state, then its recurrent state. */
   linear: Array<Texture>
   hidden?: Texture
+  /** The anchor: dropped for room only once a newer anchor is saved (see snapshot). */
+  anchor?: boolean
 }
 
 /**
@@ -343,10 +351,8 @@ export type LayerProbe = (
 ) => void | Promise<void>
 
 const OUT_WIDTH = 1024
-/** Resume points kept (see `snapshot`): ~3 MB each for LFM3. */
+/** Resume points kept (see `snapshot`): ~3 MB each for LFM3 (Qwen3.5: TUNING.linearSnapshots). */
 const MAX_SNAPSHOTS = 8
-/** ...or for a model with Gated DeltaNet layers, ~20 MB each (Qwen3.5 2B). */
-const MAX_LINEAR_SNAPSHOTS = 3
 /**
  * Queries of each head per attention slice (see attend), a quarter of a
  * batch in this range: more is fewer passes and more fragments per pass,
@@ -1528,23 +1534,43 @@ export class Engine {
     }
   }
 
+  /** Most snapshots kept: MAX_SNAPSHOTS, or TUNING.linearSnapshots for Gated DeltaNet models. */
+  get snapshotLimit() {
+    return this.canDraft ? MAX_SNAPSHOTS : Math.max(1, TUNING.linearSnapshots)
+  }
+
+  /** Frees the oldest snapshots but the anchor until at most `keep` are left. */
+  private dropSnapshots(keep: number) {
+    for (const [p, old] of this.snapshots) {
+      if (this.snapshots.size <= keep) break
+      if (old.anchor) continue
+      this.freeSnapshot(old)
+      this.snapshots.delete(p)
+    }
+  }
+
   /**
    * Saves what's needed to resume at the current position (see
    * `snapshots`), so a later prompt that shares the tokens so far reads only
-   * what's new. Keeps the latest MAX_SNAPSHOTS. With `hiddenRow` (the row
-   * of the last batch holding the last token), keeps that token's hidden
-   * state too, so `resume` can draw the next token's logits without
-   * reading it again.
+   * what's new. Keeps the latest snapshotLimit, the oldest freed before a
+   * new one is made (so no more than that are ever held), except the
+   * anchor: the latest snapshot saved with `anchor` (where the next user
+   * turn's prompt stops sharing this chat's: see readPrompt) stays until a
+   * newer anchor replaces it. With `hiddenRow` (the row of the last batch
+   * holding the last token), keeps that token's hidden state too, so
+   * `resume` can draw the next token's logits without reading it again.
    */
-  snapshot(hiddenRow?: number) {
+  snapshot(hiddenRow?: number, anchor = false) {
     if (this.guessAt !== null)
       throw new Error("Snapshot while a guessed token is pending.")
     const at = this.position
     const had = this.snapshots.get(at)
     if (had) {
       if (hiddenRow !== undefined && !had.hidden) had.hidden = this.copyHidden(hiddenRow)
+      if (anchor) this.keepSnapshot(at, had, true)
       return
     }
+    this.dropSnapshots(this.snapshotLimit - 1)
     const W = this.config.slidingWindow
     const saved: Snapshot = {
       conv: [] as Array<Texture>,
@@ -1581,16 +1607,38 @@ export class Engine {
         saved.windows.push(kv)
       }
     }
-    this.snapshots.set(at, saved)
-    const most = this.layers.some((l) => l.linear)
-      ? MAX_LINEAR_SNAPSHOTS
-      : MAX_SNAPSHOTS
-    for (const [p, old] of this.snapshots) {
-      if (this.snapshots.size <= most) break
-      this.freeSnapshot(old)
-      this.snapshots.delete(p)
-    }
+    this.keepSnapshot(at, saved, anchor)
   }
+
+  /** Adds `saved` as the snapshot at `at` (the anchor, with `anchor`), then drops the oldest past the limit. */
+  private keepSnapshot(at: number, saved: Snapshot, anchor: boolean) {
+    this.snapshots.set(at, saved)
+    if (anchor) {
+      for (const s of this.snapshots.values()) s.anchor = false
+      saved.anchor = true
+    }
+    // (An anchor kept past the limit goes once it's no longer the anchor.)
+    this.dropSnapshots(this.snapshotLimit)
+  }
+
+  /** A copy of an f32 texture. */
+  private copyOf(from: Texture) {
+    const copy = this.gpu.texture(GL.RGBA32F, from.width, from.height)
+    this.gpu.run({ program: this.gpu.program(K.COPY), inputs: { uX: from }, output: copy })
+    return copy
+  }
+
+  /**
+   * Whether a batch can save a snapshot partway (see forwardHidden's
+   * saveAt): only Gated DeltaNet layers' state is needed there (no short
+   * convolutions, no sliding windows: Qwen3.5).
+   */
+  get canSaveInside() {
+    return this.layers.every((l) => !l.conv && !l.attention?.ring)
+  }
+
+  /** What a batch saving a snapshot partway has copied so far (see forwardBatch). */
+  private saving: Array<Texture> | null = null
 
   /** Whether `resume(position)` would work: a snapshot there kept its last hidden row. */
   canResume(position: number) {
@@ -2831,7 +2879,9 @@ export class Engine {
     layer: NonNullable<GpuLayer["linear"]>,
     rows: number,
     input: MatIn,
-    paced: boolean
+    paced: boolean,
+    /** A row to save the state after (into `saving`: its conv state, then its recurrent state). */
+    saveAt?: number
   ) {
     const lin = this.linDims()
     const b = this.buffers
@@ -2890,14 +2940,21 @@ export class Engine {
       output: t.qkv,
       rect: { x: 0, y: 0, width: C4, height: rows }
     })
-    this.gpu.run({
-      name: "linear",
-      program: read(K.linConvState(width)),
-      inputs: { ...inInputs, uState: layer.convState[0] },
-      uniforms: { ...inUniforms, uM: { int: rows } },
-      output: layer.convState[1],
-      rect: { x: 0, y: 0, width: C4, height: width - 1 }
-    })
+    for (const [m, out] of [
+      [rows, layer.convState[1]],
+      // (The conv state after saveAt's rows, for a snapshot there.)
+      ...(saveAt ? [[saveAt, this.f32(lin.C, width - 1)] as const] : [])
+    ] as const) {
+      this.gpu.run({
+        name: "linear",
+        program: read(K.linConvState(width)),
+        inputs: { ...inInputs, uState: layer.convState[0] },
+        uniforms: { ...inUniforms, uM: { int: m } },
+        output: out,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 }
+      })
+      if (m === saveAt) this.saving?.push(out)
+    }
     layer.convState.reverse()
     this.gpu.run({
       name: "linear",
@@ -2910,7 +2967,7 @@ export class Engine {
     // The recurrence: in chunks, or a token at a time.
     const shape = { keyHeadDim: dk, valueHeadDim: dv }
     const common = { uK4: { int: K4 }, uH4: { int: H4 } }
-    if (chunked) await this.recurrenceChunks(layer, rows, chunk, paced)
+    if (chunked) await this.recurrenceChunks(layer, rows, chunk, paced, saveAt)
     else for (let r = 0; r < rows; r++) {
       const deltaIn = { uS: layer.state[0], uQK: t.qk, uQKV: t.qkv, uG: t.gates }
       const rect = { x: 0, y: r, width: V4, height: 1 }
@@ -2944,6 +3001,7 @@ export class Engine {
         rect: { x: 0, y: 0, width: V4, height: dk }
       })
       layer.state.reverse()
+      if (r + 1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
       // (Each token reads and writes the whole state: ~4 multiply-adds an element.)
       if (paced) await this.charge(4 * lin.V * dk)
     }
@@ -2969,7 +3027,9 @@ export class Engine {
     layer: NonNullable<GpuLayer["linear"]>,
     rows: number,
     chunk: number,
-    paced: boolean
+    paced: boolean,
+    /** A row where a chunk ends, the state after it copied into `saving` (see forwardBatch). */
+    saveAt?: number
   ) {
     const lin = this.linDims()
     const t = this.buffers.lin
@@ -2982,6 +3042,8 @@ export class Engine {
     const V4 = lin.V / 4
     const both = this.mrt.lin
     const wide = (lin.H * chunk) / 4
+    // The first chunk shorter, so that one ends at saveAt.
+    const first = saveAt ? saveAt % chunk || chunk : chunk
     const run = (
       program: string,
       inputs: Record<string, Texture>,
@@ -2995,7 +3057,7 @@ export class Engine {
         name: "recurrence",
         program: this.gpu.program(program),
         inputs,
-        uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, ...uniforms },
+        uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, uFirst: { int: first }, ...uniforms },
         output,
         rect: rect ?? { x: 0, y: 0, width, height: rows },
         work
@@ -3020,8 +3082,8 @@ export class Engine {
       run(K.linQO({ ...shape, out: "q" }), qo, c.qp, K4, {}, undefined, chunk)
     }
     const heads = { keyHeadDim: dk, valueHeadDim: dv }
-    for (let c0 = 0; c0 < rows; c0 += chunk) {
-      const c1 = Math.min(c0 + chunk, rows)
+    for (let c0 = 0; c0 < rows; c0 += c0 === 0 ? first : chunk) {
+      const c1 = Math.min(c0 + (c0 === 0 ? first : chunk), rows)
       const outIn = { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp }
       const rect = { x: 0, y: c0, width: V4, height: c1 - c0 }
       if (both)
@@ -3039,6 +3101,7 @@ export class Engine {
         c1 - c0
       )
       layer.state.reverse()
+      if (c1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
       // (Reading and writing the state: ~3 multiply-adds an element a token.)
       if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
     }
@@ -3100,7 +3163,15 @@ export class Engine {
    */
   async forwardHidden(
     tokens: ArrayLike<number>,
-    options: { draft?: boolean } = {}
+    options: {
+      draft?: boolean
+      /**
+       * Saves the anchor snapshot (see snapshot) after this many of the
+       * tokens, from inside the batch: no batch of its own (one batch at
+       * most; see canSaveInside).
+       */
+      saveAt?: number
+    } = {}
   ): Promise<number> {
     if (options.draft) return this.forwardDraft(Array.from(tokens))
     if (this.guessAt !== null)
@@ -3111,6 +3182,25 @@ export class Engine {
       throw new Error(
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
+    }
+    const { saveAt } = options
+    if (saveAt !== undefined) {
+      if (!this.canSaveInside || tokens.length > this.capacity || !(saveAt > 0 && saveAt < tokens.length))
+        throw new Error(`Can't save a snapshot after ${saveAt} of a ${tokens.length}-token batch.`)
+      // Room first, so no more than the limit are ever held.
+      this.dropSnapshots(this.snapshotLimit - 1)
+      const pos0 = this.position
+      this.saving = []
+      try {
+        const last = await this.forwardBatch(Array.from(tokens), undefined, false, saveAt)
+        this.keepSnapshot(pos0 + saveAt, { conv: [], windows: [], linear: this.saving }, true)
+        return last
+      } catch (error) {
+        for (const t of this.saving) this.gpu.delete(t)
+        throw error
+      } finally {
+        this.saving = null
+      }
     }
     let last = 0
     let start = 0
@@ -3745,7 +3835,9 @@ export class Engine {
   private async forwardBatch(
     batch: Array<number>,
     probe: LayerProbe | undefined,
-    idsOnGpu = false
+    idsOnGpu = false,
+    /** Gated DeltaNet layers copy their state after this many rows into `saving`. */
+    saveAt?: number
   ) {
     const c = this.config
     const b = this.buffers
@@ -3905,7 +3997,7 @@ export class Engine {
       }
       let opSplit = 0
       if (layer.linear) {
-        opSplit = await this.linearAttend(layer.linear, rows, opIn, paced)
+        opSplit = await this.linearAttend(layer.linear, rows, opIn, paced, saveAt)
         const lin = this.linDims()
         if (lin && b.lin) {
           await look(i, "lin_qkv", b.lin.qkv, lin.C)

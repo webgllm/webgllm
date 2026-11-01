@@ -1486,6 +1486,26 @@ async function smoke(params: {
     }
   }
   const checks = (params as { checks?: boolean }).checks !== false
+  if ((params as { anchor?: boolean }).anchor && engine.canSaveInside) {
+    // ?anchor=1: a snapshot saved from inside a batch (Engine.forwardHidden's
+    // saveAt, 7 tokens before the end, as a follow-up's anchor) against
+    // reading the prompt plainly: the batch's own logits (its chunks start
+    // shorter so one ends there), then the rest read again from it.
+    const p = prompt.slice(-Math.min(prompt.length, engine.capacity))
+    const at = p.length - 7
+    engine.reset()
+    const want = await engine.forward(p)
+    engine.reset()
+    const own = await engine.logits(await engine.forwardHidden(p, { saveAt: at }))
+    const back = engine.rewind(at)
+    const again = await engine.logits(await engine.forwardHidden(p.slice(back)))
+    const a = compareLogits(own, want)
+    const b = compareLogits(again, want)
+    log(
+      `ANCHOR CHECK (${p.length} tokens, saved after ${at}, resumed at ${back}): the batch itself KL ${a.kl.toExponential(2)}, top-1 ${a.top1 ? "same" : "DIFFERENT"}; resumed KL ${b.kl.toExponential(2)}, top-1 ${b.top1 ? "same" : "DIFFERENT"}`
+    )
+    engine.reset()
+  }
   const compare = (params as { compare?: string }).compare
   if (compare) {
     // ?compare=knob:a,b: the prompt and 16 writing steps with TUNING[knob]
@@ -1571,7 +1591,7 @@ async function smoke(params: {
       `SEGMENT CHECK: 512-key segments vs whole rows over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${whole.length}`
     )
   }
-  if (params.ab || params.abDecode || params.sweep || compare || (prompt.length > 1000 && checks)) {
+  if (params.ab || params.abDecode || params.sweep || compare || (params as { anchor?: boolean }).anchor || (prompt.length > 1000 && checks)) {
     // The A/B runs and checks left the cache elsewhere: read the prompt again.
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)

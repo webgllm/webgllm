@@ -1539,17 +1539,26 @@ void main() {
  * mediump GPU would get wrong first.
  */
 
+/**
+ * The first row of row t's chunk: chunks of `chunk` rows after a first one
+ * of uFirst rows (at most `chunk`: shorter, so that a chunk ends where a
+ * snapshot is taken; see Engine.recurrenceChunks).
+ */
+const chunkStart = (chunk: number) => `uniform int uFirst;
+int chunkStart(int t) { return t < uFirst ? 0 : uFirst + ((t - uFirst) / ${chunk}) * ${chunk}; }`
+
 /** G of row m's heads, cum texel i: the log-decays summed from the chunk's start. */
 function linCumSource(chunk: number) {
   return `${HEADER}
 uniform sampler2D uG;
 uniform int uH4;
+${chunkStart(chunk)}
 out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y);
   vec4 s = vec4(0.0);
-  for (int r = (m / ${chunk}) * ${chunk}; r <= m; r++) s += texelFetch(uG, ivec2(uH4 + x, r), 0);
+  for (int r = chunkStart(m); r <= m; r++) s += texelFetch(uG, ivec2(uH4 + x, r), 0);
   o = s;
 }`
 }
@@ -1582,13 +1591,14 @@ uniform sampler2D uQK;
 uniform sampler2D uG;
 uniform sampler2D uCum;
 uniform int uK4;
+${chunkStart(o.chunk)}
 ${outs}
 ${LIN_G}
 void main() {
   int x = int(gl_FragCoord.x);
   int t = int(gl_FragCoord.y);
   int h = x / ${C4};
-  int s0 = (t / ${o.chunk}) * ${o.chunk} + 4 * (x - h * ${C4});
+  int s0 = chunkStart(t) + 4 * (x - h * ${C4});
   int kb = h * ${DK4};
   ivec4 s = ivec4(s0, s0 + 1, s0 + 2, s0 + 3);
   // (Columns past t are masked out below; their rows are read as t's.)
@@ -1625,13 +1635,14 @@ function linSolveSource(chunk: number) {
   const C4 = chunk / 4
   return `${HEADER}
 uniform sampler2D uA;
+${chunkStart(chunk)}
 out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int t = int(gl_FragCoord.y);
   int h = x / ${C4};
   int j4 = x - h * ${C4};
-  int c0 = (t / ${chunk}) * ${chunk};
+  int c0 = chunkStart(t);
   int rt = t - c0;
   int j0 = 4 * j4;
   o = vec4(0.0);
@@ -1680,13 +1691,14 @@ uniform sampler2D uQKV;
 uniform sampler2D uG;
 uniform sampler2D uCum;
 uniform int uK4;
+${chunkStart(o.chunk)}
 ${outs}
 ${LIN_G}
 void main() {
   int x = int(gl_FragCoord.x);
   int t = int(gl_FragCoord.y);
   int h = x / ${D4};
-  int c0 = (t / ${o.chunk}) * ${o.chunk};
+  int c0 = chunkStart(t);
   vec4 u = vec4(0.0);
   vec4 w = vec4(0.0);
   for (int s = c0; s <= t; s++) {
@@ -1728,13 +1740,14 @@ uniform sampler2D uU;
 uniform sampler2D uW;
 uniform sampler2D uQK;
 uniform sampler2D uCum;
+${chunkStart(o.chunk)}
 ${outs}
 ${LIN_G}
 void main() {
   int x = int(gl_FragCoord.x);
   int t = int(gl_FragCoord.y);
   int h = x / ${D4};
-  int c0 = (t / ${o.chunk}) * ${o.chunk};
+  int c0 = chunkStart(t);
   vec4 oi = vec4(0.0);
   vec4 pw = vec4(0.0);
   for (int s = c0; s <= t; s++) {

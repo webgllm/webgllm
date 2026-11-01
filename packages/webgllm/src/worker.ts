@@ -11,7 +11,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
-import { readPrompt } from "./prompt.js"
+import { anchorFor, readPrompt } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -438,11 +438,19 @@ async function generate(request: GenerateRequest) {
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
 
-  // Read the rest of the prompt (see readPrompt).
+  // Read the rest of the prompt (see readPrompt), with the anchor snapshot
+  // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
-  let row = await readPrompt(engine, prompt, start, model.cached, () =>
-    stopped.has(id)
-  )
+  let row = await readPrompt(engine, prompt, start, model.cached, {
+    stop: () => stopped.has(id),
+    anchor: anchorFor(
+      tokenizer,
+      prompt,
+      request.chat,
+      request.thinking,
+      request.tools.length ? request.tools : undefined
+    )
+  })
   const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
   const stats: RunTimings = {
     inputTokens: prompt.length,

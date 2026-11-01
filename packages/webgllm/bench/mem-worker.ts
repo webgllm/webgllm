@@ -15,7 +15,7 @@ import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
 import { modelMeta, type WebGlTextModel } from "../src/model-meta.js"
-import { readPrompt } from "../src/prompt.js"
+import { anchorFor, readPrompt } from "../src/prompt.js"
 import { download } from "../src/storage.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
 
@@ -362,7 +362,9 @@ async function turn(engine: Engine, tokenizer: Tokenizer, messages: Array<ChatMe
       ? engine.resume(common)
       : engine.rewind(Math.min(common, prompt.length - 1))
   cached.length = start
-  let row = await readPrompt(engine, prompt, start, cached)
+  let row = await readPrompt(engine, prompt, start, cached, {
+    anchor: anchorFor(tokenizer, prompt, messages, params.thinking)
+  })
   engine.setSeen(prompt, tokenizer.vocabSize)
   const k = Math.max(1, Math.min(topK, 64))
   const top = (d: { ids: Int32Array; logits: Float32Array }) => {

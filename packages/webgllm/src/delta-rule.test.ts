@@ -109,6 +109,30 @@ describe("chunked gated delta rule", () => {
     assert.ok(relError(chunked.state, seq.state) < 1e-10)
   })
 
+  for (const [tokens, saveAt] of [
+    [50, 7],
+    [50, 39],
+    [64, 1],
+    [37, 31],
+    [5, 3]
+  ]) {
+    // As Engine.recurrenceChunks: a shorter first chunk, so one ends at saveAt.
+    const first = saveAt % 16 || 16
+    test(`chunks ending at token ${saveAt} of ${tokens} (the first ${first}, then 16): the same outputs, and the state there`, () => {
+      const x = inputs(tokens * 7 + saveAt, { dk: 16, dv: 12, tokens })
+      const s0 = randomState(tokens + saveAt, 16, 12)
+      const seq = deltaSequential(x, s0)
+      let at: Float64Array | null = null
+      const chunked = deltaChunked(x, s0, 16, first, (end, state) => {
+        if (end === saveAt) at = state
+      })
+      assert.ok(relError(chunked.o, seq.o) < 1e-10, `outputs ${relError(chunked.o, seq.o)}`)
+      assert.ok(relError(chunked.state, seq.state) < 1e-10)
+      const prefix = deltaSequential({ ...x, tokens: saveAt }, s0)
+      assert.ok(at && relError(at, prefix.state) < 1e-10, "the state where the chunk ends")
+    })
+  }
+
   test("a chunked batch then token steps continue the same state", () => {
     const x = inputs(11, { dk: 16, dv: 16, tokens: 40 })
     const s0 = randomState(12, 16, 16)

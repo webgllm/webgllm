@@ -64,12 +64,22 @@ export function deltaSequential(x: DeltaInputs, state: Float64Array) {
 /**
  * In chunks of `chunk` tokens (the last may be shorter), as the chunked
  * passes do it: the state-free steps over every chunk first, then two
- * steps a chunk that read and write the state.
+ * steps a chunk that read and write the state. With `first`, the first
+ * chunk has that many tokens (at most `chunk`), the rest `chunk` from
+ * there: so a chunk ends at token `first` (where a snapshot is taken:
+ * see Engine.recurrenceChunks), and `onState` sees the state after each
+ * chunk.
  */
-export function deltaChunked(x: DeltaInputs, state: Float64Array, chunk: number) {
+export function deltaChunked(
+  x: DeltaInputs,
+  state: Float64Array,
+  chunk: number,
+  first = chunk,
+  onState?: (end: number, state: Float64Array) => void
+) {
   const { dk, dv, tokens: R } = x
   const C = chunk
-  const start = (t: number) => Math.floor(t / C) * C
+  const start = (t: number) => (t < first ? 0 : first + Math.floor((t - first) / C) * C)
   // linCum: G, the chunk's running sum of g.
   const G = new Float64Array(R)
   for (let t = 0; t < R; t++) G[t] = (t === start(t) ? 0 : G[t - 1]) + x.g[t]
@@ -129,8 +139,8 @@ export function deltaChunked(x: DeltaInputs, state: Float64Array, chunk: number)
   let S = Float64Array.from(state)
   const D = new Float64Array(R * dv)
   const o = new Float64Array(R * dv)
-  for (let c0 = 0; c0 < R; c0 += C) {
-    const c1 = Math.min(c0 + C, R)
+  for (let c0 = 0; c0 < R; c0 += c0 === 0 ? first : C) {
+    const c1 = Math.min(c0 + (c0 === 0 ? first : C), R)
     for (let t = c0; t < c1; t++) {
       for (let j = 0; j < dv; j++) {
         let ws = 0
@@ -154,6 +164,7 @@ export function deltaChunked(x: DeltaInputs, state: Float64Array, chunk: number)
       }
     }
     S = next
+    onState?.(c1, S)
   }
   return { o, state: S }
 }
