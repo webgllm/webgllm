@@ -53,3 +53,11 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 - Slab reads (`bandwidth.html`, each step of all fragments reading one contiguous block, like a blit): no faster on the iPhone (RGBA8 53 vs 49 GB/s, RGBA4 slower) and far slower on the M3. What does matter on Apple is fragments per pass: 4k fragments stream ~35 GB/s on the iPhone, 16k ~44, 64k+ ~49.
 - One or two weight rows per fragment (4× or 2× the fragments, each streaming a quarter or half of a row group; `rowKernel` in mm2.ts): slower than four rows on both (each fragment still fetches every activation), e.g. the 350M down 0.067 vs 0.053 ms on the iPhone.
 - The 350M's zero points aren't all 8 (73% differ), so the kernels without zero points don't apply to it.
+
+## Review follow-ups that didn't pay (Nov 1)
+
+- Short prompt batches on byte texels (the Pixel's layout) without f16 dequantization: the direct 2-token byte kernel read a 59-token 350M prompt in 390 ms against 174 ms through f16; a 4-token byte kernel (`mm2.html?batch=64`, gate|up 9216×1024 on the Pixel) takes 6.3 ms against RGBA4's 5.3 and plain f16's 3.2 (plus one dequant per matrix). Unpacking bytes in the shader costs more than the fetches it saves.
+- Attention's softmax shared across a head's value fragments: at 8,192 prompt tokens on an M3 the value pass is 12% of the prompt (scores 4%, matmuls 70%); sharing would save about a fifth of that pass's fetches.
+- Keeping dequantized f16 weights across prompt batches: dequantization is 5% of a 2,048-token LFM3 prompt on an M3, for hundreds of MB more per layer kept.
+- Ranking chunks only up to k, or scattering chunk ranks with points: the four pick passes take ~0.2 ms a token on an iPhone (of ~2.3 ms for head, pick and readback); the head and the sync are the rest.
+- JS-side pass state caching: issuing a 350M token takes 0.34 ms of JS on an iPhone, under 6.5 ms of GPU work it overlaps.

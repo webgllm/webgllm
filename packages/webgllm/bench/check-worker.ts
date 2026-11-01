@@ -945,6 +945,7 @@ async function smoke(params: {
   const gl = engine.gpu.gl
   const tq = gl.getExtension("EXT_disjoint_timer_query_webgl2") as {
     TIME_ELAPSED_EXT: number
+    GPU_DISJOINT_EXT: number
   } | null
   const times: Array<number> = []
   const gpuTimes: Array<number> = []
@@ -964,7 +965,10 @@ async function smoke(params: {
     if (tq && query) {
       while (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE))
         await new Promise((r) => setTimeout(r, 2))
-      gpuTimes.push((gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6)
+      // A disjoint (the GPU's clock jumped: power state, another context)
+      // makes the result meaningless: left out.
+      if (!gl.getParameter(tq.GPU_DISJOINT_EXT))
+        gpuTimes.push((gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6)
       gl.deleteQuery(query)
     }
   }

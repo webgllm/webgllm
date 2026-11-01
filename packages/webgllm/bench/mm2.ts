@@ -900,6 +900,7 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
     // Timer queries: GPU time of 200 chained passes.
     const tq = gl.getExtension("EXT_disjoint_timer_query_webgl2") as {
       TIME_ELAPSED_EXT: number
+      GPU_DISJOINT_EXT: number
     } | null
     log(`timer query extension: ${tq ? "yes" : "no"}`)
     if (tq) {
@@ -916,7 +917,8 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
         await new Promise((r) => setTimeout(r, 5))
       }
       const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number
-      log(`TIMER 200 chained passes: GPU ${(ns / 1e3 / 200).toFixed(1)} µs per pass, wall ${((wall * 1000) / 200).toFixed(1)} µs per pass`)
+      if (gl.getParameter(tq.GPU_DISJOINT_EXT)) log("TIMER disjoint: result dropped")
+      else log(`TIMER 200 chained passes: GPU ${(ns / 1e3 / 200).toFixed(1)} µs per pass, wall ${((wall * 1000) / 200).toFixed(1)} µs per pass`)
     }
     // CPU side alone: issue 1000 passes without waiting.
     const t1 = performance.now()
@@ -1136,6 +1138,8 @@ void main() { o = ${read}; }`)
               )
             ]
           : [
+              { weights: "unorm8", acts: "h2", tokens: 4 },
+              { weights: "bytes", acts: "h2", tokens: 4 },
               { weights: "rgba4", acts: "h2", tokens: 4 },
               { weights: "rgba4", acts: "f16", tokens: 4 },
               { weights: "rgba4", acts: "h2", tokens: 4, half: true },
