@@ -1873,6 +1873,10 @@ export class Engine {
         TUNING.attendChunkTexelsDecode = savedDecode
       }
     }
+    // The probes' scratch isn't read again (~29 MB for Qwen3.5 2B at a
+    // 512-token batch).
+    for (const t of [this.debug, this.kvDebug]) if (t) this.gpu.delete(t)
+    this.debug = this.kvDebug = null
     return worst
   }
 
