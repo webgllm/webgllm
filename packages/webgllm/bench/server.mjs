@@ -33,11 +33,12 @@ const port = Number(process.argv[2] ?? 8787)
 const resultsFile = process.env.RESULTS_FILE ?? join(here, "results.jsonl")
 
 const roots = {
-  "/wllama/": join(
-    repo,
-    "node_modules/.pnpm/@wllama+wllama@3.8.1/node_modules/@wllama/wllama/esm/"
-  ),
+  // The wllama package's own wllama JavaScript, from the same build as its
+  // wasm/ (npm's @wllama/wllama doesn't match those builds).
+  "/wllama/": join(repo, "packages/wllama/vendor/wllama/"),
   "/wasm/": join(repo, "packages/wllama/wasm/"),
+  // The wllama package's builds, next to its bundled client (/bundle-wllama/).
+  "/bundle-wllama/wasm/": join(repo, "packages/wllama/wasm/"),
   "/models/": process.env.MODELS_DIR ?? join(here, "models/"),
   "/ref/": process.env.REF_DIR ?? join(here, "ref/"),
   "/ref-onnx/": process.env.REF_ONNX_DIR ?? join(here, "ref-onnx/"),
@@ -85,13 +86,16 @@ function resolve(url) {
 
 /** `/bundle/src/worker.js` → packages/webgl/src/worker.ts, bundled. */
 async function bundle(path, res) {
-  // /bundle-tjs/… is the transformers-js package's source, for comparisons.
+  // /bundle-tjs/… and /bundle-wllama/… are the transformers-js and wllama
+  // packages' sources, for comparisons.
   const base = path.startsWith("/bundle-tjs/")
     ? join(repo, "packages/transformers-js")
-    : pkg
+    : path.startsWith("/bundle-wllama/")
+      ? join(repo, "packages/wllama")
+      : pkg
   const entry = resolvePath(
     base,
-    `./${path.replace(/^\/bundle(-tjs)?\//, "").replace(/\.js$/, ".ts")}`
+    `./${path.replace(/^\/bundle(-tjs|-wllama)?\//, "").replace(/\.js$/, ".ts")}`
   )
   if (!inside(base, entry)) return res.writeHead(404, isolation).end()
   try {
@@ -117,7 +121,10 @@ createServer((req, res) => {
   const path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)
   if (
     req.method === "GET" &&
-    (path.startsWith("/bundle/") || path.startsWith("/bundle-tjs/"))
+    path.endsWith(".js") &&
+    (path.startsWith("/bundle/") ||
+      path.startsWith("/bundle-tjs/") ||
+      path.startsWith("/bundle-wllama/"))
   )
     return void bundle(path, res)
   if (req.method === "POST") {

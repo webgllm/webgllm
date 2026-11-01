@@ -14,11 +14,17 @@ const log = (text: string) => {
   void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
 }
 
-/** ?q=quote asks for a reply that copies the prompt (where drafts help). */
+/**
+ * ?q=quote asks for a reply that copies the prompt (where drafts help);
+ * ?q=capital asks the check page's question (a fact the filler doesn't
+ * hold, to see whether a long prompt drowns it out).
+ */
 const QUESTION =
   params.get("q") === "quote"
     ? "Copy the first three sentences above word for word, then describe the scene in a short paragraph."
-    : "Describe the river scene above in a short paragraph."
+    : params.get("q") === "capital"
+      ? "What is the capital of France? Answer in one sentence."
+      : "Describe the river scene above in a short paragraph."
 const FILLER =
   "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
 
@@ -36,14 +42,16 @@ async function promptText(length: number) {
     tokenizerConfig,
     chatTemplate
   })
-  let pad = ""
-  while (
+  // Repeats of the filler from its token count (re-encoding the whole
+  // prompt per repeat is quadratic), then a few more to reach the length.
+  const count = (pad: string) =>
     tokenizer.encodeChat([{ role: "user", content: pad + QUESTION }], {
       addGenerationPrompt: true
-    }).length < length
-  ) {
-    pad += FILLER
-  }
+    }).length
+  const base = count("")
+  const per = count(FILLER) - base
+  let pad = FILLER.repeat(Math.max(0, Math.floor((length - base) / per)))
+  while (count(pad) < length) pad += FILLER
   return `${pad}\n\n${QUESTION}`
 }
 
@@ -61,6 +69,56 @@ function summarize(
   )
 }
 
+/**
+ * wllama through the wllama package's own client, as the app runs it: its
+ * llama.cpp builds (the compat build where the browser needs it, as Safari
+ * does), its model files from Hugging Face, WebGPU or (`gpu` false) the CPU.
+ */
+async function runWllamaPackage(text: string, gpu = true) {
+  const url = "/bundle-wllama/src/client.js"
+  const client = (await import(/* @vite-ignore */ url)) as {
+    configureRuntime: (options: Record<string, unknown>) => void
+    loadModel: (model: string) => Promise<{
+      createChatCompletion: (
+        options: Record<string, unknown>
+      ) => Promise<{
+        timings?: Record<string, number>
+        choices: Array<{ message: { content?: string } }>
+      }>
+      exit: () => Promise<void>
+    }>
+  }
+  const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+  client.configureRuntime({ gpu })
+  const t0 = performance.now()
+  const wllama = await client.loadModel(model)
+  log(`wllama (package) loaded ${model} ${gpu ? "on WebGPU where it can" : "on the CPU"} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
+  const generate = (content: string, maxTokens: number) =>
+    wllama.createChatCompletion({
+      messages: [{ role: "user", content }],
+      max_tokens: maxTokens,
+      temperature: 0,
+      cache_prompt: false,
+      chat_template_kwargs: { enable_thinking: false }
+    })
+  await generate("Hi", 4)
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    const res = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const t = res.timings ?? {}
+    const promptTps = (t.prompt_n / t.prompt_ms) * 1000
+    const decodeTps = (t.predicted_n / t.predicted_ms) * 1000
+    log(
+      `wllama ${gpu ? "WebGPU" : "WASM"} run ${i + 1}: ${t.prompt_n} prompt tokens in ${t.prompt_ms?.toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${t.predicted_n} tokens at ${decodeTps.toFixed(1)} tokens/s`
+    )
+    if (i === 0)
+      log(`reply: ${JSON.stringify((res.choices[0]?.message.content ?? "").slice(0, 160))}`)
+    runs.push({ promptTps, decodeTps, ttftMs: t.prompt_ms })
+  }
+  summarize(`wllama ${gpu ? "WebGPU" : "WASM (CPU)"}, ${model}`, runs)
+  await wllama.exit()
+}
+
 /** Transformers.js on WebGPU, through the transformers-js package's worker. */
 async function runTjs(text: string, cpu = false) {
   const worker = new Worker(
@@ -72,10 +130,13 @@ async function runTjs(text: string, cpu = false) {
     string,
     {
       tokens: number
+      text: string
       resolve: (stats: Record<string, number | null>) => void
       reject: (e: Error) => void
     }
   >()
+  /** Each finished request's reply text. */
+  const replies = new Map<string, string>()
   let ready: () => void = () => undefined
   let failed: (e: Error) => void = () => undefined
   worker.onmessage = ({ data }) => {
@@ -90,8 +151,15 @@ async function runTjs(text: string, cpu = false) {
     else if (data.type === "log") log(`[worker] ${data.text}`)
     else if (data.type === "token") {
       const p = pending.get(data.id)
-      if (p) p.tokens++
-    } else if (data.type === "done") pending.get(data.id)?.resolve(data.stats)
+      if (p) {
+        p.tokens++
+        p.text += data.text
+      }
+    } else if (data.type === "done") {
+      const p = pending.get(data.id)
+      if (p) replies.set(data.id, p.text)
+      p?.resolve(data.stats)
+    }
     else if (data.type === "error")
       pending.get(data.id)?.reject(new Error(data.message))
   }
@@ -109,7 +177,7 @@ async function runTjs(text: string, cpu = false) {
   const generate = (content: string, maxTokens: number) =>
     new Promise<Record<string, number | null>>((resolve, reject) => {
       const id = `run${n++}`
-      pending.set(id, { tokens: 0, resolve, reject })
+      pending.set(id, { tokens: 0, text: "", resolve, reject })
       worker.postMessage({
         type: "generate",
         id,
@@ -118,7 +186,8 @@ async function runTjs(text: string, cpu = false) {
         thinking: false,
         sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
         maxTokens,
-        contextLength: 8192,
+        // (?ctx= for longer prompts.)
+        contextLength: Number(params.get("ctx") ?? 8192),
         thinkingOpen: "<think>"
       })
     })
@@ -128,6 +197,7 @@ async function runTjs(text: string, cpu = false) {
     // A different first line each time, so no run reuses another's cache.
     const wall0 = performance.now()
     const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const lastText = replies.get(`run${n - 1}`) ?? ""
     const wall = performance.now() - wall0
     const input = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
     const promptTps = (input / (s.promptMs ?? 1)) * 1000
@@ -135,6 +205,7 @@ async function runTjs(text: string, cpu = false) {
     log(
       `  stopwatch: whole reply ${wall.toFixed(0)} ms for ${s.outputTokens} tokens; minus the prompt, ${(((s.outputTokens ?? 1) - 1) / ((wall - (s.promptMs ?? 0)) / 1000)).toFixed(1)} tokens/s`
     )
+    if (i === 0) log(`reply: ${JSON.stringify(lastText.slice(0, 200))}`)
     log(
       `Transformers.js ${cpu ? "WASM" : "WebGPU"} run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
     )
@@ -381,6 +452,8 @@ async function main() {
   else if (run === "tjs-cpu") await runTjs(text, true)
   else if (run === "wllama") await runWllama(text)
   else if (run === "wllama-cpu") await runWllama(text, false)
+  else if (run === "wllama-pkg") await runWllamaPackage(text)
+  else if (run === "wllama-pkg-cpu") await runWllamaPackage(text, false)
   else if (run === "webgl") await runWebgl(text)
   else if (run === "switch") await runSwitch()
   else log("Pass ?run=tjs, tjs-cpu, wllama or wllama-cpu.")

@@ -28,14 +28,16 @@
     <iframe id="frame" title="bench page"></iframe>
     <script type="module">
       // One tab for many bench runs, driven from the computer: polls
-      // /models/job.json ({id, url}) and loads each new job in the frame,
-      // which unloads the last one (its GPU memory goes with it).
+      // /models/job.json ({id, url}; ?job=name for /models/name.json, so
+      // two devices can take different jobs) and loads each new job in the
+      // frame, which unloads the last one (its GPU memory goes with it).
       const frame = document.getElementById("frame")
       const status = document.getElementById("status")
+      const file = new URLSearchParams(location.search).get("job") ?? "job"
       let current = null
       const poll = async () => {
         try {
-          const job = await fetch(`/models/job.json?t=${Date.now()}`, {
+          const job = await fetch(`/models/${file}.json?t=${Date.now()}`, {
             cache: "no-store"
           }).then((r) => (r.ok ? r.json() : null))
           if (job && job.id !== current) {
