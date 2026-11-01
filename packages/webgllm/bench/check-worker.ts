@@ -789,6 +789,8 @@ async function smoke(params: {
   ab?: string
   abDecode?: string
   sweep?: string
+  /** abDecode's and sweep's rounds, times this (a busy GPU: more rounds). */
+  rounds?: number
   programs?: boolean
   chain?: boolean
 }) {
@@ -1478,7 +1480,8 @@ async function smoke(params: {
     const original = (TUNING as Record<string, number>)[knob]
     engine.reset()
     let next = await pick(await engine.forwardHidden(prompt))
-    for (let i = 0; i < 8; i++) {
+    const reps = Math.max(1, params.rounds ?? 1)
+    for (let i = 0; i < 8 * reps; i++) {
       const v = i % 2 === 0 ? a : b
       ;(TUNING as Record<string, number>)[knob] = v
       const t = performance.now()
@@ -1493,7 +1496,7 @@ async function smoke(params: {
     // GPU throughput: 16 single-token forwards queued with no readback in
     // between, one wait at the end (CPU timing noise mostly drops out).
     const gpuTok: Record<string, Array<number>> = { [a]: [], [b]: [] }
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 12 * reps; i++) {
       const v = i % 2 === 0 ? a : b
       ;(TUNING as Record<string, number>)[knob] = v
       await engine.gpu.finish()
@@ -1545,7 +1548,9 @@ async function smoke(params: {
       }
       // An untimed round first: new settings may compile programs.
       for (const v of values) await once(v, false)
-      for (let round = 0; round < 5; round++) for (const v of values) await once(v, true)
+      const rounds = 5 * Math.max(1, params.rounds ?? 1)
+      for (let round = 0; round < rounds; round++)
+        for (const v of round % 2 ? [...values].reverse() : values) await once(v, true)
       T[knob] = original
       for (const v of values)
         log(

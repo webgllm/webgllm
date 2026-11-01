@@ -103,6 +103,7 @@
         ab: params.get("ab") ?? undefined,
         abDecode: params.get("abDecode") ?? undefined,
         sweep: params.get("sweep") ?? undefined,
+        rounds: params.get("rounds") ? Number(params.get("rounds")) : undefined,
         programs: params.get("programs") === "1",
         chain: params.get("chain") === "1",
         tune: params.get("tune") ?? undefined,
