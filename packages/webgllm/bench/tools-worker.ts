@@ -156,6 +156,16 @@ function asFloat32(t: Tensor): Float32Array {
   throw new Error(`logits of type ${t.type}`)
 }
 
+type ModelClass = {
+  from_pretrained(
+    id: string,
+    options: Record<string, unknown>
+  ): Promise<{
+    (inputs: Record<string, unknown>): Promise<{ logits: Tensor }>
+    generate(options: Record<string, unknown>): Promise<Tensor>
+  }>
+}
+
 async function tjs(params: Params): Promise<Runner> {
   const [transformers, ort] = await Promise.all(
     [TRANSFORMERS, ORT].map(async (url) => (await fetch(url)).text())
@@ -168,24 +178,34 @@ async function tjs(params: Params): Promise<Runner> {
       transformers.replace(/from\s*"onnxruntime-(?:web\/webgpu|common)"/g, `from"${ortModule}"`)
     )
   )) as {
-    env: { allowLocalModels: boolean; allowRemoteModels: boolean; localModelPath: string }
-    Tensor: new (type: string, data: unknown, dims: Array<number>) => Tensor
-    AutoModelForCausalLM: {
-      from_pretrained(
-        id: string,
-        options: Record<string, unknown>
-      ): Promise<{
-        (inputs: Record<string, unknown>): Promise<{ logits: Tensor }>
-        generate(options: Record<string, unknown>): Promise<Tensor>
-      }>
+    env: {
+      allowLocalModels: boolean
+      allowRemoteModels: boolean
+      localModelPath: string
+      useBrowserCache: boolean
     }
-  }
+    Tensor: new (type: string, data: unknown, dims: Array<number>) => Tensor
+  } & Record<string, ModelClass>
   tf.env.allowLocalModels = true
   tf.env.allowRemoteModels = false
   tf.env.localModelPath = `${location.origin}/`
+  // Read what the server serves now: Transformers.js keeps fetched files in
+  // Cache Storage by URL, and /onnx-web/ serves different models from run to run.
+  tf.env.useBrowserCache = false
   const dir = params.onnx ?? "onnx-community"
+  // As the app's worker: a multimodal build (Qwen3_5ForConditionalGeneration)
+  // loads with its family's causal-LM class, which reads the embedding and
+  // decoder only.
+  const config = (await (await fetch(`/${dir}/config.json`)).json()) as {
+    architectures?: Array<string>
+  }
+  const arch = config.architectures?.[0] ?? ""
+  const Model =
+    (arch.endsWith("ForConditionalGeneration") &&
+      tf[arch.replace(/ForConditionalGeneration$/, "ForCausalLM")]) ||
+    tf.AutoModelForCausalLM
   const t0 = performance.now()
-  const model = await tf.AutoModelForCausalLM.from_pretrained(dir, {
+  const model = await Model.from_pretrained(dir, {
     device: "webgpu",
     dtype: "q4f16",
     use_external_data_format: true

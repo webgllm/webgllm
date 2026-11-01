@@ -28,7 +28,7 @@ Prompts that need a tool (weather, web search, calendar, run Python), with think
 - `?set=lfm3&runtime=webgl&format=gguf&model=LFM3-1.7B-QAD-Q4_0.gguf`: this engine on a GGUF in `MODELS_DIR`.
 - `?set=lfm3&runtime=tjs&onnx=onnx-community`: Transformers.js 4.3.2 on WebGPU (q4f16), with the app's ONNX Runtime.
 
-`tool-ref/` makes the sets: `make_lfm3_ref.py` (prompts and onnxruntime CPU logits), `add_lfm3_ref.py` (another CPU reference, such as exact 4-bit math) and `llama_ref.py` (a running llama-server's first-token probabilities and replies, for GGUFs).
+`tool-ref/` makes the sets: `make_lfm3_ref.py` (prompts and onnxruntime CPU logits), `add_lfm3_ref.py` (another CPU reference, such as exact 4-bit math), `make_qwen_ref.py` (the same prompts in Qwen3.5's template, no logits) and `llama_ref.py` (a running llama-server's first-token probabilities and replies, for GGUFs).
 
 LFM3 1.7B, 20 prompts, Apple M3 Ultra (Nov 1):
 
@@ -43,6 +43,16 @@ LFM3 1.7B, 20 prompts, Apple M3 Ultra (Nov 1):
 | the same, Transformers.js (WebGPU) | 0.576 | 14/20 | 4 |
 
 The engine matches exact math (mean KL 1.1e-4, same top token at 20 of 20) and llama.cpp; Transformers.js is 200× further from exact math (KL 2.1e-2). onnx-community's graph sets `accuracy_level` 4 on its 4-bit matmuls, so onnxruntime's CPU quantizes their activations to 8 bits: an exact-math reference needs a copy with 0. The q4f16 build's misses are in its weights: on three calendar prompts and one weather prompt it reasons in text (it doesn't know today's date) where fp16 and the GGUF call the tool.
+
+Qwen3.5 2B, the same prompts with thinking off, 96-token replies (`?set=qwen&steps=96`; its template allows reasoning before a call):
+
+| | Starts with a tool call | Greedy calls first | No call in 96 tokens |
+|---|---|---|---|
+| unsloth's Q4_0 GGUF, this engine | 0.967 | 20/20 | 0 |
+| the same GGUF, llama.cpp CPU | 0.969 | 20/20 | 0 |
+| onnx-community's q4f16, this engine (`&graph=onnx/decoder_model_merged_q4f16.onnx`) | 0.741 | 18/20 | 1 |
+
+The q4f16 build talks before one call, and answers "sort [5, 3, 9, 1] with Python" with a code block (that doesn't sort) instead of a call.
 
 ## index.html: the go/no-go benchmark
 
