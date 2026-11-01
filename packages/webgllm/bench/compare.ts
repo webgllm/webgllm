@@ -89,7 +89,19 @@ async function runWllamaPackage(text: string, gpu = true) {
     }>
   }
   const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
-  client.configureRuntime({ gpu })
+  // llama.cpp's own load log says where the model runs (layers offloaded,
+  // the WebGPU device): its lines about that go to this page's log.
+  const relevant = /offload|webgpu|WebGPU|ggml_wgpu|backend|CPU_REPACK|compat/i
+  let forwarded = 0
+  for (const level of ["log", "info", "warn", "debug"] as const) {
+    const original = console[level].bind(console)
+    console[level] = (...args: Array<unknown>) => {
+      const line = args.map(String).join(" ")
+      if (relevant.test(line) && forwarded++ < 40) log(`[llama.cpp] ${line.slice(0, 200)}`)
+      original(...args)
+    }
+  }
+  client.configureRuntime({ gpu, debug: true })
   const t0 = performance.now()
   const wllama = await client.loadModel(model)
   log(`wllama (package) loaded ${model} ${gpu ? "on WebGPU where it can" : "on the CPU"} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
@@ -446,6 +458,11 @@ async function runWllama(text: string, gpu = true) {
 
 async function main() {
   log(navigator.userAgent)
+  // Multithreaded WebAssembly (wllama, onnxruntime on the CPU) needs the
+  // page cross-origin isolated (COOP same-origin + COEP require-corp).
+  log(
+    `cross-origin isolated: ${String(globalThis.crossOriginIsolated)}, ${navigator.hardwareConcurrency} logical cores`
+  )
   const text = await promptText(Number(params.get("len") ?? 512))
   const run = params.get("run")
   if (run === "tjs") await runTjs(text)
