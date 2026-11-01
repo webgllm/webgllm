@@ -13,11 +13,18 @@ import type { ModelFile } from "./model-meta.js"
 const DIR = "webgl-models"
 const ATTEMPTS = 6
 
-/** The file's name on disk: its repository, commit and path. */
-const diskName = (file: ModelFile) =>
-  `${file.repo}@${file.revision}/${file.path}`.replace(/[^\w.@-]+/g, "_")
+const safe = (name: string) => name.replace(/[^\w.@-]+/g, "_")
+
+/**
+ * The file's name on disk: its repository and path, at main (files saved
+ * by earlier versions of this package carry a pinned commit instead).
+ */
+const diskName = (file: ModelFile) => safe(`${file.repo}@main/${file.path}`)
 
 const marker = (file: ModelFile) => `${diskName(file)}.done`
+
+/** The version (ETag) of a download in progress, to resume only from it. */
+const etagName = (file: ModelFile) => `${diskName(file)}.etag`
 
 type SyncAccessHandle = {
   getSize: () => number
@@ -37,10 +44,7 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
   try {
     const folder = await dir()
     await folder.getFileHandle(marker(file))
-    const stored = await (await folder.getFileHandle(diskName(file))).getFile()
-    return file.bytes === undefined || stored.size === file.bytes
-      ? stored
-      : null
+    return await (await folder.getFileHandle(diskName(file))).getFile()
   } catch {
     return null
   }
@@ -151,11 +155,65 @@ async function openAccess(
   }
 }
 
+/** A small text file's contents, or "" if there's none. */
+async function readText(folder: FileSystemDirectoryHandle, name: string) {
+  try {
+    return await (await (await folder.getFileHandle(name)).getFile()).text()
+  } catch {
+    return ""
+  }
+}
+
+async function writeText(
+  folder: FileSystemDirectoryHandle,
+  name: string,
+  text: string,
+  signal?: AbortSignal
+) {
+  const access = await openAccess(
+    await folder.getFileHandle(name, { create: true }),
+    signal
+  )
+  try {
+    access.truncate(0)
+    access.write(new TextEncoder().encode(text), { at: 0 })
+    access.flush()
+  } finally {
+    access.close()
+  }
+}
+
+/**
+ * Removes the files earlier versions of this package saved for `file` at a
+ * pinned commit ("repo@commit/path"), once it's downloaded at main.
+ */
+async function removeOldVersions(
+  folder: FileSystemDirectoryHandle,
+  file: ModelFile
+) {
+  const prefix = safe(`${file.repo}@`)
+  const own = safe(`/${file.path}`)
+  const current = diskName(file)
+  const old: Array<string> = []
+  for await (const name of (
+    folder as unknown as { keys: () => AsyncIterable<string> }
+  ).keys()) {
+    const base = name.replace(/\.(done|etag)$/, "")
+    if (base !== current && base.startsWith(prefix) && base.endsWith(own)) {
+      old.push(name)
+    }
+  }
+  for (const name of old) await folder.removeEntry(name).catch(() => undefined)
+}
+
 /**
  * Downloads `file` to disk unless it's there, reporting bytes as they come,
  * and returns it. Survives dropped connections (resuming with a range
  * request) and a closed access handle (browsers close them, iOS Safari
- * for a page it suspends): a new handle, from the bytes on disk.
+ * for a page it suspends): a new handle, from the bytes on disk. Files are
+ * at main, so one can change between tries: a resume asks for the rest only
+ * of the same version (If-Range with its ETag), and gets the whole new file
+ * otherwise.
  */
 export async function download(
   file: ModelFile,
@@ -183,35 +241,53 @@ export async function download(
   }
   try {
     let loaded = await size()
-    if (file.bytes !== undefined && loaded > file.bytes) {
-      access.truncate(0)
-      loaded = 0
-    }
-    let total = file.bytes ?? 0
+    let etag = loaded > 0 ? await readText(folder, etagName(file)) : ""
+    // The file's size, from the server once it answers.
+    let total = 0
     // Failures in a row with no bytes gained: an interruption that made
     // progress (iOS suspending the page, a dropped connection) starts over.
     let attempt = 0
     for (;;) {
-      // Already whole (the marker was all that was missing).
-      if (file.bytes !== undefined && loaded === file.bytes) break
       const start = loaded
       try {
+        const headers: Record<string, string> = {}
+        if (loaded > 0) {
+          headers.Range = `bytes=${loaded}-`
+          if (etag) headers["If-Range"] = etag
+        }
         const response = await fetch(fileUrl(file), {
           signal,
-          headers: loaded > 0 ? { Range: `bytes=${loaded}-` } : {},
+          headers,
           referrerPolicy: "no-referrer"
         })
-        // Nothing past the end: the file was whole (its size wasn't known).
+        // Nothing past the end: the file was whole already.
         if (response.status === 416 && loaded > 0) break
-        if (response.status === 200 && loaded > 0) {
-          // The server sent the whole file instead of the rest.
-          access.truncate(0)
-          loaded = 0
-        } else if (!response.ok) {
+        if (!response.ok) {
           throw new Error(`HTTP ${response.status} for ${file.path}`)
         }
-        const length = Number(response.headers.get("Content-Length") ?? 0)
-        if (!total) total = loaded + length
+        if (response.status === 206) {
+          // "bytes start-end/total": the rest, from where the file stops,
+          // or start over (a range from anywhere else would misplace it).
+          const range = /^bytes (\d+)-\d+\/(\d+)/.exec(
+            response.headers.get("Content-Range") ?? ""
+          )
+          if (range && Number(range[1]) !== loaded) {
+            void response.body?.cancel().catch(() => undefined)
+            access.truncate(0)
+            loaded = 0
+            etag = ""
+            continue
+          }
+          if (range) total = Number(range[2])
+        } else {
+          // The whole file: a first download, a server that ignores
+          // ranges, or a file that changed since the last try.
+          if (loaded > 0) access.truncate(0)
+          loaded = 0
+          etag = response.headers.get("ETag") ?? ""
+          await writeText(folder, etagName(file), etag, signal)
+          total = Number(response.headers.get("Content-Length") ?? 0)
+        }
         const reader = response.body?.getReader()
         if (!reader) throw new Error("No response body.")
         try {
@@ -238,10 +314,10 @@ export async function download(
       }
     }
     const final = await size()
-    if (file.bytes !== undefined && final !== file.bytes) {
+    if (total && final !== total) {
       access.truncate(0)
       throw new Error(
-        `${file.path} downloaded as ${final} bytes, expected ${file.bytes}.`
+        `${file.path} downloaded as ${final} bytes, expected ${total}.`
       )
     }
   } finally {
@@ -252,5 +328,7 @@ export async function download(
     }
   }
   await folder.getFileHandle(marker(file), { create: true })
+  await folder.removeEntry(etagName(file)).catch(() => undefined)
+  await removeOldVersions(folder, file)
   return handle.getFile()
 }

@@ -10,12 +10,10 @@ import type { ModelReasoningCapability } from "@tanstack/ai/adapter-internals"
 import type { Sampling } from "./sampler.js"
 import type { ToolFormat } from "./tool-calls.js"
 
-/** A file of a model: its repository, pinned commit and path. */
+/** A file of a model: its repository and path, at its latest version (main). */
 export type ModelFile = {
   repo: string
-  revision: string
   path: string
-  bytes?: number
 }
 
 export type WebGlModelMeta = {
@@ -88,8 +86,7 @@ const LFM3_SAMPLING = {
 } as const satisfies Sampling
 
 const LFM3_REPO = {
-  repo: "LiquidAI/LFM3-1.7B",
-  revision: "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7"
+  repo: "LiquidAI/LFM3-1.7B"
 }
 
 /**
@@ -105,9 +102,7 @@ const LFM3_1_7B_GGUF = {
     kind: "gguf",
     model: {
       repo: "LiquidAI/LFM3-1.7B-GGUF",
-      revision: "bad5729bba61d076fff20d2548e62526665af215",
-      path: "LFM3-1.7B-QAD-Q4_0.gguf",
-      bytes: 1_049_615_680
+      path: "LFM3-1.7B-QAD-Q4_0.gguf"
     }
   },
   tokenizer: {
@@ -123,8 +118,7 @@ const LFM3_1_7B_GGUF = {
 } as const satisfies WebGlModelMeta
 
 const LFM3_WEB_REPO = {
-  repo: "daveycodez/LFM3-1.7B-Web",
-  revision: "9cda8fa27706d239b9c58f53a867d398e313b961"
+  repo: "daveycodez/LFM3-1.7B-Web"
 }
 
 /**
@@ -140,8 +134,7 @@ const LFM3_1_7B_WEB = {
     graph: { ...LFM3_WEB_REPO, path: "onnx/model_q4f16.onnx" },
     data: {
       ...LFM3_WEB_REPO,
-      path: "onnx/model_q4f16.onnx_data",
-      bytes: 900_061_184
+      path: "onnx/model_q4f16.onnx_data"
     },
     config: { ...LFM3_WEB_REPO, path: "config.json" }
   },
@@ -158,8 +151,7 @@ const LFM3_1_7B_WEB = {
 } as const satisfies WebGlModelMeta
 
 const LFM3_ONNX_REPO = {
-  repo: "onnx-community/LFM3-1.7B-ONNX",
-  revision: "ab9fec4c681a25bec3b48b0b97a62fc2660a2985"
+  repo: "onnx-community/LFM3-1.7B-ONNX"
 }
 
 /**
@@ -175,8 +167,7 @@ const LFM3_1_7B_ONNX = {
     graph: { ...LFM3_ONNX_REPO, path: "onnx/model_q4f16.onnx" },
     data: {
       ...LFM3_ONNX_REPO,
-      path: "onnx/model_q4f16.onnx_data",
-      bytes: 1_087_789_056
+      path: "onnx/model_q4f16.onnx_data"
     },
     config: { ...LFM3_ONNX_REPO, path: "config.json" }
   },
@@ -194,23 +185,21 @@ const LFM3_1_7B_ONNX = {
 /**
  * An LFM2.5 ONNX build in Liquid AI's export (4-bit MatMulNBits projections,
  * a 4-bit GatherBlockQuantized embedding that is also the output head),
- * with its files at one pinned commit.
+ * at its latest version (main).
  */
 function lfm2Onnx(o: {
   name: string
-  revision: string
-  dataBytes: number
   size: string
   thinking: boolean
 }) {
-  const repo = { repo: o.name, revision: o.revision }
+  const repo = { repo: o.name }
   return {
     name: o.name,
     format: "onnx",
     files: {
       kind: "onnx",
       graph: { ...repo, path: "onnx/model_q4f16.onnx" },
-      data: { ...repo, path: "onnx/model_q4f16.onnx_data", bytes: o.dataBytes },
+      data: { ...repo, path: "onnx/model_q4f16.onnx_data" },
       config: { ...repo, path: "config.json" }
     },
     tokenizer: {
@@ -228,16 +217,12 @@ function lfm2Onnx(o: {
 
 const LFM2_5_1_2B = lfm2Onnx({
   name: "LiquidAI/LFM2.5-1.2B-Instruct-ONNX",
-  revision: "10f72e70abf67ac0fd7ebf15bc5854726891d864",
-  dataBytes: 760_279_040,
   size: "1.2b",
   thinking: false
 })
 
 const LFM2_5_1_2B_THINKING = lfm2Onnx({
   name: "LiquidAI/LFM2.5-1.2B-Thinking-ONNX",
-  revision: "e7fe61974e3a167dff77c5722db9a1cb7b57140f",
-  dataBytes: 760_279_040,
   size: "1.2b",
   thinking: true
 })
@@ -245,16 +230,12 @@ const LFM2_5_1_2B_THINKING = lfm2Onnx({
 /** LFM2.5 1.2B re-exported to compute the prompt's last-token logits only (the WebGL engine does that anyway). */
 const LFM2_5_1_2B_WEB = lfm2Onnx({
   name: "daveycodez/LFM2.5-1.2B-Web",
-  revision: "f8df717df1ee01ccb899484d7f25cddfa78dd49f",
-  dataBytes: 760_279_040,
   size: "1.2b",
   thinking: false
 })
 
 const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
   name: "daveycodez/LFM2.5-1.2B-Thinking-Web",
-  revision: "db6d0161174b69db3bd4ed789e9a1cb888344f32",
-  dataBytes: 760_279_040,
   size: "1.2b",
   thinking: true
 })
@@ -262,8 +243,6 @@ const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
 /** LFM2.5 350M: the smallest and quickest, for short answers and tool calls. */
 const LFM2_5_350M = lfm2Onnx({
   name: "LiquidAI/LFM2.5-350M-ONNX",
-  revision: "d11593fd9eb408e322667926656598896c2d5ff9",
-  dataBytes: 254_965_760,
   size: "350m",
   thinking: false
 })
@@ -317,6 +296,6 @@ export const WEBGL_MODEL_REASONING: Readonly<Record<string, ModelReasoning>> =
 export const modelMeta = (model: WebGlTextModel): WebGlModelMeta =>
   WEBGL_MODEL_META[model]
 
-/** Where a file downloads from: its pinned commit on Hugging Face. */
+/** Where a file downloads from: its latest version (main) on Hugging Face. */
 export const fileUrl = (file: ModelFile) =>
-  `https://huggingface.co/${file.repo}/resolve/${file.revision}/${file.path}`
+  `https://huggingface.co/${file.repo}/resolve/main/${file.path}`

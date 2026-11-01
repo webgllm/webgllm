@@ -111,7 +111,7 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
   const stored = await Promise.all(all.map(storedFile))
   const cached = stored.every(Boolean)
   // Sizes of the files not known up front count as 0 until they're fetched.
-  const totals = all.map((f) => f.bytes ?? 0)
+  const totals = all.map(() => 0)
   const loaded = all.map(() => 0)
   const total = () => totals.reduce((a, b) => a + b, 0)
   const report = () => {
