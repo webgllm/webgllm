@@ -20,6 +20,29 @@ Results print in the server's terminal.
 - `?smoke=1&len=512&format=…&q=…`: a chat prompt padded to about `len` tokens, read and answered as the worker does it (no reference needed); prints the reply and the speed.
 - `&skip=matmul,norm,…`: times the prompt and single-token steps with each kind of pass left out, to see where the time goes.
 - `&linstate=16,32` (smoke): each Gated DeltaNet layer's recurrent state after a prompt batch and after the whole prompt, the recurrence in chunks of each size against a token at a time (max abs and relative error, by layer). `&small=1`: short batches after a 64-token prefix both ways, where chunks start to pay. `&compare=linChunk:0,32` compares the logits; `&abwrite=1` times writing after a prompt read each way, rounds alternating.
+- `&anchor=1` (smoke, Qwen3.5): a snapshot saved from inside a prompt batch, 7 tokens before its end (a follow-up's anchor: see prompt.ts), against reading the prompt plainly: the batch's own logits, then the rest read again from the snapshot (KL and top token for each).
+- Every smoke run ends with `LOGITS HASH`: the bits of the prompt's logits and of 8 writing steps', hashed. Two builds or settings with the same hash computed the same numbers. Fix the weight layout (`&tune=layerRgba4:1`) when comparing: an M3's timing probe picks RGBA4 or bytes from load to load, and they round differently.
+
+## compare.html
+
+`?run=webgl&model=…&len=512&speculative=0&tune=knob:v,…`: the worker as the app runs it (downloading the model to the page's storage the first time): a short warm-up reply, then three runs of a `len`-token chat prompt (each with its own first line, so none reuses the last), 64 greedy tokens each; prints each run and the median prompt reading, writing and first-token time, then a retry of the last prompt. `tune` sets TUNING knobs in the worker before the load (`promptBatch:256` for another prompt batch, `layerRgba4:1` to fix the weight layout). `&followup=1` instead times a follow-up: each run a first message, its reply, then an ~80-token question with the reply in the chat, as the app sends it; prints how many of the follow-up's prompt tokens were read again and how long that took.
+
+## mem.html: memory and speed over a chat (and the iPhone page)
+
+Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
+
+- `model=qwen-onnx|qwen-gguf|lfm-onnx|lfm-gguf` (or a model's full name).
+- `len=512`: the first message's length in tokens; `follow=0`: what each follow-up adds (0: a short question); `reply=128`: tokens per reply; `turns=3`, or `target=8192`: turns until the cache holds that many tokens; `ctx`: the context length (the model's own when left out); `think=1`: thinking on.
+- `batch`: the prompt batch (left out: the worker's, 512); `tune=knob:v,…`: TUNING knobs; `detail=1`: every texture group at each checkpoint, not just the categories.
+- `mode=ab&variants=default|f16Matmul:0|packZeros:0|batch:256|batch:128&rounds=2`: each variant in a load of its own (TUNING knobs as `knob:v,…`, `batch:N` for the prompt batch), timed on a `len`-token first message and its reply, rounds in alternating order; prints each run, then the medians: prompt reading, first token, writing, textures at load and at the peak.
+- `cdp=1` waits at each checkpoint for a driver to measure the JS heaps and the GPU process over the DevTools protocol.
+
+On an iPhone: start the server on the Mac (`node packages/webgl/bench/server.mjs 8787`; the page needs none of the model directories), then either
+
+- tunnel it over HTTPS (`cloudflared tunnel --url http://localhost:8787`, or `ngrok http 8787`) and open `https://<tunnel>/mem.html?…` in Safari: a secure context, so the model downloads once (about 1.1 GB) and loads from the page's storage after that, and the log also prints in the server's terminal; or
+- serve the network (`HOST=0.0.0.0 node packages/webgl/bench/server.mjs 8787`) and open `http://<the Mac's address>:8787/mem.html?…` on the same Wi-Fi: no storage there, so each load streams the model from Hugging Face again.
+
+For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html?model=qwen-gguf&len=2048&follow=1024&reply=128&target=8192&ctx=8192` (`&batch=128` for the smallest batch's memory). The timings a phone's defaults would need: `mem.html?model=qwen-gguf&mode=ab&len=535&reply=64&rounds=3&variants=default|f16Matmul:0|packZeros:0|batch:512|batch:256|batch:128|batch:128,quadMinBatch:128` (`packZeros` only matters for the ONNX builds; run it on each build). A tab that reloads by itself ran out of memory.
 
 ## tools.html: does the reply start with a tool call?
 

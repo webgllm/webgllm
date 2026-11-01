@@ -9,12 +9,12 @@
  * each, rounds alternating. With ?cdp=1 it waits at each checkpoint for a
  * driver to measure the JS heaps and the GPU process.
  */
-import { blobSource } from "../src/byte-source.js"
+import { blobSource, httpSource } from "../src/byte-source.js"
 import { Engine, TUNING } from "../src/engine.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
-import { modelMeta, type WebGlTextModel } from "../src/model-meta.js"
+import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
 import { anchorFor, readPrompt } from "../src/prompt.js"
 import { download } from "../src/storage.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
@@ -23,7 +23,7 @@ type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
   mode: "chat" | "ab"
-  /** Prompt batch (0: the worker's). */
+  /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
   length: number
@@ -52,8 +52,6 @@ const log = (text: string) => postMessage({ type: "log", text })
 /** Live numbers for the page's header. */
 const status = (s: Record<string, unknown>) => postMessage({ type: "status", ...s })
 
-/** Same as worker.ts's PROMPT_BATCH where the page doesn't say. */
-const WORKER_BATCH = 512
 
 let peak = 0
 let peakLabel = ""
@@ -253,31 +251,43 @@ async function files(model: WebGlTextModel) {
   const weights =
     meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data]
   const all = [t.tokenizer, t.config, ...(t.chatTemplate ? [t.chatTemplate] : []), ...weights]
+  // Without the Origin Private File System (a page that isn't a secure
+  // context: a phone on http://<the Mac's address>), the files stream
+  // from Hugging Face on every load instead.
+  const opfs = typeof navigator.storage?.getDirectory === "function"
+  if (!opfs) log("no Origin Private File System here: the weights stream from Hugging Face on every load")
   let last = -10
   const loaded = all.map(() => 0)
   const totals = all.map(() => 0)
-  const got = await Promise.all(
+  const got: Array<Weight> = await Promise.all(
     all.map((f, i) =>
-      download(f, (bytes, size) => {
-        loaded[i] = bytes
-        totals[i] = size
-        const pct = Math.floor((loaded.reduce((a, b) => a + b, 0) / Math.max(1, totals.reduce((a, b) => a + b, 0))) * 100)
-        if (pct >= last + 10) {
-          last = pct
-          log(`downloading ${model}: ${pct}%`)
-        }
-      })
+      opfs
+        ? download(f, (bytes, size) => {
+            loaded[i] = bytes
+            totals[i] = size
+            const pct = Math.floor((loaded.reduce((a, b) => a + b, 0) / Math.max(1, totals.reduce((a, b) => a + b, 0))) * 100)
+            if (pct >= last + 10) {
+              last = pct
+              log(`downloading ${model}: ${pct}%`)
+            }
+          })
+        : Promise.resolve(fileUrl(f))
     )
   )
+  const text = (w: Weight) => (typeof w === "string" ? fetch(w).then((r) => r.text()) : w.text())
   const [tokenizerFile, configFile, ...rest] = got
   const templateFile = t.chatTemplate ? rest.shift() : undefined
   const tokenizer = loadTokenizer({
-    tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
-    tokenizerConfig: JSON.parse(await configFile.text()) as Record<string, unknown>,
-    ...(templateFile && { chatTemplate: await templateFile.text() })
+    tokenizerJson: JSON.parse(await text(tokenizerFile)) as object,
+    tokenizerConfig: JSON.parse(await text(configFile)) as Record<string, unknown>,
+    ...(templateFile && { chatTemplate: await text(templateFile) })
   })
-  return { meta, tokenizer, weightFiles: rest }
+  return { meta, tokenizer, weightFiles: rest, text }
 }
+
+/** A model file: from the Origin Private File System, or its URL. */
+type Weight = File | string
+const source = (w: Weight) => (typeof w === "string" ? httpSource(w) : Promise.resolve(blobSource(w)))
 
 /** Applies "knob:value,…" to TUNING; returns the batch if one says "batch:N". */
 function applyTune(spec: string) {
@@ -294,18 +304,18 @@ function applyTune(spec: string) {
 
 async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>, batch: number) {
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    batchSize: batch || params.batch || (TUNING.promptBatch > 0 ? TUNING.promptBatch : WORKER_BATCH),
+    batchSize: batch || params.batch || (TUNING.promptBatch > 0 ? TUNING.promptBatch : 512),
     ...(params.contextLength && { contextLength: params.contextLength })
   })
   instrument(engine)
-  const { meta, weightFiles } = got
+  const { meta, weightFiles, text } = got
   const pieces =
     meta.files.kind === "gguf"
-      ? loadGguf(blobSource(weightFiles[0]))
+      ? loadGguf(await source(weightFiles[0]))
       : loadOnnx({
-          config: JSON.parse(await weightFiles[0].text()) as Record<string, unknown>,
-          graph: blobSource(weightFiles[1]),
-          data: blobSource(weightFiles[2])
+          config: JSON.parse(await text(weightFiles[0])) as Record<string, unknown>,
+          graph: await source(weightFiles[1]),
+          data: await source(weightFiles[2])
         })
   const t0 = performance.now()
   await engine.load(pieces)
