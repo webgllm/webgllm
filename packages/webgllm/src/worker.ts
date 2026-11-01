@@ -14,7 +14,7 @@ import { modelMeta } from "./model-meta.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { lookupDraft } from "./draft.js"
+import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, verify } from "./sampler.js"
 import { download, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
@@ -54,12 +54,6 @@ const DRAFTS = 7
  */
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
-/**
- * After a second draft batch in a row with none kept, the next 1 batch's
- * drafts are skipped, then 2, 4, ... up to this many (a draft batch gives
- * up guessing, so failed drafts cost a stall); a kept draft resets it.
- */
-const DRAFT_BACKOFF_MAX = 16
 
 /** Most tokens a reply may have, unless the caller says otherwise. */
 const DEFAULT_MAX_TOKENS = 4096
@@ -429,26 +423,33 @@ async function generate(request: GenerateRequest) {
       guesses.filter(Boolean).length >= GUESS_MIN_HITS * guesses.length)
   // The token guessed with the last distribution, or -1.
   let guessed = -1
-  // Backing off drafts (see DRAFT_BACKOFF_MAX): rejected batches in a
-  // row, draft batches still to skip, and how many the next backoff skips.
-  let rejected = 0
-  let skipDrafts = 0
-  let backoff = 1
-  // Drafts for the reply so far, at most `max`, unless backing off.
+  // While guessing is off, what it would have guessed (the likeliest
+  // token) is still scored against the token drawn, so it comes back on
+  // when guesses would hit again.
+  const scoreGuess = (d: { ids: Int32Array; p: Float32Array }, drawn: number) => {
+    if (!onGpu || guessing()) return
+    let best = 0
+    for (let j = 1; j < d.p.length; j++) if (d.p[j] > d.p[best]) best = j
+    guesses.push(d.ids[best] === drawn)
+    if (guesses.length > GUESS_WINDOW) guesses.shift()
+  }
+  // How many drafts to check with each token, by what they've cost and
+  // earned (see DraftPolicy).
+  const policy = new DraftPolicy(DRAFTS)
+  // Drafts for the reply so far, at most `max`: as many of those found as
+  // the policy expects to pay.
   const draftsFor = (max: number) => {
     if (request.speculative === false || max <= 0) return []
-    const drafts = lookupDraft(history, max, TUNING.draftMatch)
-    if (drafts.length && skipDrafts > 0) {
-      skipDrafts--
-      return []
-    }
-    return drafts
+    const found = lookupDraft(history, max, TUNING.draftMatch)
+    return found.slice(0, policy.choose(found))
   }
-  // Whether a draft batch would follow (without counting it as skipped).
-  const draftsNext = () =>
-    request.speculative !== false &&
-    skipDrafts === 0 &&
-    lookupDraft(history, 1, TUNING.draftMatch).length > 0
+  // Whether a draft batch would follow (without changing what the policy
+  // remembers).
+  const draftsNext = () => {
+    if (request.speculative === false) return false
+    const found = lookupDraft(history, DRAFTS, TUNING.draftMatch)
+    return found.length > 0 && policy.peek(found) > 0
+  }
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
@@ -530,6 +531,7 @@ async function generate(request: GenerateRequest) {
     if (t === eos) return false
     if (onGpu) engine.markSeen(t)
     else sampler.see([t])
+    policy.drawn(t)
     history.push(t)
     const text = decoder.push(t)
     if (text) post({ type: "token", id, text })
@@ -537,6 +539,7 @@ async function generate(request: GenerateRequest) {
   }
   let going = emit(token)
   while (going && !stopped.has(id)) {
+    const stepStart = performance.now()
     if (engine.guessing) {
       const hit = guessed === token
       guesses.push(hit)
@@ -551,7 +554,11 @@ async function generate(request: GenerateRequest) {
           stats.outputTokens < maxTokens - 1 &&
           engine.position < engine.contextLength - 1 &&
           !draftsNext()
-        token = draw(await distribution(0, more && guessing()))
+        const guess = more && guessing()
+        const d = await distribution(0, guess)
+        token = draw(d)
+        if (!guess) scoreGuess(d, token)
+        policy.alone(performance.now() - stepStart)
         going = emit(token)
         continue
       }
@@ -586,6 +593,7 @@ async function generate(request: GenerateRequest) {
       const d = all ? all[i] : await distribution(i, last && guessLast)
       if (last) {
         next = draw(d)
+        if (!guessLast) scoreGuess(d, next)
         break
       }
       const check = verify(d, batch[i + 1])
@@ -596,18 +604,16 @@ async function generate(request: GenerateRequest) {
       kept++
       going = emit(batch[i + 1]) && !stopped.has(id)
     }
+    const stepMs = performance.now() - stepStart
+    // (A reply that ended mid-batch judged only the drafts it wrote.)
+    if (drafts.length)
+      policy.checkedBatch(drafts.length, kept - 1, stepMs, going ? drafts.length : kept - 1)
+    else policy.alone(stepMs)
     // A draft turned down: the guess (made for all drafts kept) goes first,
     // then the batch back to the tokens kept.
     if (drafts.length) {
       if (engine.guessing && kept < batch.length) engine.dropGuess()
       engine.accept(kept)
-      if (kept > 1) {
-        rejected = 0
-        backoff = 1
-      } else if (++rejected >= 2) {
-        skipDrafts = backoff
-        backoff = Math.min(DRAFT_BACKOFF_MAX, backoff * 2)
-      }
     }
     model.cached.push(...batch.slice(0, kept))
     if (!going || next < 0) break

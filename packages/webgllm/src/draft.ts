@@ -38,3 +38,138 @@ export function lookupDraft(
   }
   return []
 }
+
+/**
+ * How many drafts to check with each written token, from what they've
+ * cost and earned so far in this reply: the count that writes the most
+ * tokens per millisecond, expected tokens 1 + a₁ + a₁a₂ + … over the
+ * measured time of a batch that size, against the measured time of a
+ * token alone (0 drafts). aᵢ is how often draft i was right given the
+ * ones before it were. Drafts not checked are still scored against the
+ * tokens then drawn (a draft is kept with exactly the probability the
+ * sampler draws it), so a policy that stopped drafting can start again.
+ */
+export class DraftPolicy {
+  /** Decayed counts per draft position: kept, and checked. */
+  private kept: Array<number>
+  private checked: Array<number>
+  /** Decayed average ms of a token alone, and of a batch per draft count. */
+  private single: number | null = null
+  private batch: Array<number | null>
+  /** Drafts proposed but not checked, scored as tokens are drawn. */
+  private shadow: { drafts: Array<number>; at: number } | null = null
+
+  constructor(
+    readonly max: number,
+    /** Before any outcome: how often a draft is taken to be right. */
+    private prior = 0.5,
+    /** Weight of the prior, in outcomes. */
+    private priorWeight = 0.5,
+    /** Each outcome counts this much less with each newer one (~1 / (1 − decay) remembered). */
+    private decay = 0.95,
+    /** The same for times. */
+    private timeDecay = 0.8
+  ) {
+    this.kept = new Array(max + 1).fill(0)
+    this.checked = new Array(max + 1).fill(0)
+    this.batch = new Array(max + 1).fill(null)
+  }
+
+  /**
+   * How often draft i (1-based) is right when drafts before it were: its
+   * own outcomes, leaning on draft i − 1's rate (the prior for draft 1)
+   * while it has few.
+   */
+  rate(i: number): number {
+    const lean = i === 1 ? this.prior : this.rate(i - 1)
+    return (
+      (this.kept[i] + lean * this.priorWeight) /
+      (this.checked[i] + this.priorWeight)
+    )
+  }
+
+  /** Expected ms of a batch of a token and d drafts (d ≥ 1). */
+  private batchMs(d: number): number {
+    const own = this.batch[d]
+    if (own !== null) return own
+    // Unmeasured: the nearest measured count's time, 3% more per draft
+    // further; with none measured, a token alone's (so drafts get tried).
+    for (let k = 1; k <= this.max; k++) {
+      for (const j of [d - k, d + k]) {
+        const t = j >= 1 && j <= this.max ? this.batch[j] : null
+        if (t !== null) return t * (1 + 0.03 * (d - j))
+      }
+    }
+    return this.single ?? 0
+  }
+
+  /**
+   * Of `available` drafts (from lookupDraft), how many to check now.
+   * Unchecked ones are remembered and scored against the next tokens.
+   */
+  choose(available: Array<number>): number {
+    const best = this.peek(available)
+    this.shadow =
+      best === 0 && available.length
+        ? { drafts: available.slice(0, this.max), at: 0 }
+        : null
+    return best
+  }
+
+  /** What `choose` would answer, remembering nothing. */
+  peek(available: Array<number>): number {
+    const n = Math.min(available.length, this.max)
+    if (n === 0) return 0
+    // A token alone first, to have its time to beat.
+    if (this.single === null) return 0
+    let best = 0
+    let bestRate = 1 / this.single
+    let expect = 1
+    let run = 1
+    for (let d = 1; d <= n; d++) {
+      run *= this.rate(d)
+      expect += run
+      const ms = this.batchMs(d)
+      const rate = ms > 0 ? expect / ms : Infinity
+      if (rate > bestRate) {
+        best = d
+        bestRate = rate
+      }
+    }
+    return best
+  }
+
+  /** A token was written (any way): scores remembered unchecked drafts. */
+  drawn(token: number) {
+    const s = this.shadow
+    if (!s) return
+    const i = s.at + 1
+    const right = s.drafts[s.at] === token
+    this.outcome(i, right)
+    s.at++
+    if (!right || s.at >= s.drafts.length) this.shadow = null
+  }
+
+  /**
+   * A batch of a token and `drafts` drafts took `ms`, and its first
+   * `kept` drafts were kept, of the first `judged` checked (fewer than
+   * `drafts` if the reply ended first).
+   */
+  checkedBatch(drafts: number, kept: number, ms: number, judged = drafts) {
+    this.shadow = null
+    for (let i = 1; i <= Math.min(judged, kept + 1); i++) this.outcome(i, i <= kept)
+    const old = this.batch[drafts]
+    this.batch[drafts] = old === null ? ms : this.timeDecay * old + (1 - this.timeDecay) * ms
+  }
+
+  /** A token alone (no drafts) took `ms`, waits it overlapped included. */
+  alone(ms: number) {
+    this.single =
+      this.single === null ? ms : this.timeDecay * this.single + (1 - this.timeDecay) * ms
+  }
+
+  private outcome(i: number, right: boolean) {
+    this.kept[i] = this.decay * this.kept[i] + (right ? 1 : 0)
+    this.checked[i] = this.decay * this.checked[i] + 1
+  }
+}

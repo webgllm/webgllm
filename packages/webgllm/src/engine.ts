@@ -217,7 +217,13 @@ export const TUNING = {
    * Writing flushes queued passes every this many layers (0: only at the
    * readback), so the GPU starts on a token while the rest is still issued.
    */
-  flushLayers: 1
+  flushLayers: 1,
+  /**
+   * 1: a prompt batch's last layer runs its feed-forward block for the
+   * last row only (no later layer reads the others, and only the last
+   * row's logits are asked for).
+   */
+  lastRowOnly: 1
 }
 
 /**
@@ -1197,6 +1203,17 @@ export class Engine {
     saved.conv.forEach((t) => this.gpu.delete(t))
     saved.windows.forEach((kv) => this.gpu.delete(kv))
     if (saved.hidden) this.gpu.delete(saved.hidden)
+  }
+
+  /** Row `row` of residual-shaped texture `from` into row 0 of `to` (whole rows). */
+  private copyRow(from: Texture, row: number, to: Texture) {
+    this.gpu.run({
+      program: this.gpu.program(K.COPY_ROWS),
+      inputs: { uX: from },
+      uniforms: { uOff: { int: row } },
+      output: to,
+      rect: { x: 0, y: 0, width: from.width, height: 1 }
+    })
   }
 
   /** A copy of row `row` of the last batch's hidden state (its whole residual row). */
@@ -3129,6 +3146,8 @@ export class Engine {
     await look(-1, "embedding", b.residual[0], c.hiddenSize)
 
     const paced = rows > SPLIT_ROWS
+    // Only the last row's logits are asked for (see lastRowOnly).
+    const lastRowOnly = TUNING.lastRowOnly > 0 && rows > SPLIT_ROWS && !probe
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       // (From layer 0: batches follow each other with no wait between.)
@@ -3204,8 +3223,16 @@ export class Engine {
         fold && prescaled ? layer.ffnNorm : undefined
       )
       await look(i, "after_op", next, c.hiddenSize)
-      if (!fold) this.normToH2(next, layer.ffnNorm, b.normed, rows)
-      if (rows <= SPLIT_ROWS) {
+      // A prompt batch's last layer: only the last row goes on (its hidden
+      // row moves to row 0 of h, the feed-forward block runs on it into
+      // row 0 of next, and back to h for the head; see lastRowOnly).
+      const tail = lastRowOnly && i === this.layers.length - 1
+      const fr = tail ? 1 : rows
+      const base = tail ? h : next
+      const dest = tail ? next : h
+      if (tail) this.copyRow(next, rows - 1, h)
+      if (!fold) this.normToH2(base, layer.ffnNorm, b.normed, fr)
+      if (fr <= SPLIT_ROWS) {
         // A few rows: the split matmul's slices are summed and through
         // SwiGLU in one pass.
         const slices = fold
@@ -3215,7 +3242,7 @@ export class Engine {
               rows,
               prescaled ? "prescaled" : layer.ffnNorm
             )
-          : this.splitPartials(b.normed, layer.gateUp, rows)
+          : this.splitPartials(b.normed, layer.gateUp, fr)
         this.gpu.run({
           name: "swiglu",
           program: this.gpu.program(K.withSplit(K.REDUCE_SWIGLU, slices)),
@@ -3225,7 +3252,7 @@ export class Engine {
             uHalf: { int: c.intermediateSize / 4 }
           },
           output: b.act,
-          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: fr }
         })
       } else {
         this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
@@ -3241,14 +3268,14 @@ export class Engine {
           rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
         })
       }
-      const downSplit = this.project(b.act, layer.down, b.ffnOut, rows)
+      const downSplit = this.project(b.act, layer.down, b.ffnOut, fr)
       await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
       this.addNormed(
-        next,
+        base,
         downSplit ? this.partials() : b.ffnOut,
         layer.postFfnNorm,
-        h,
-        rows,
+        dest,
+        fr,
         downSplit,
         !prescaled
           ? undefined
@@ -3260,11 +3287,12 @@ export class Engine {
               ? this.finalNorm
               : undefined
       )
+      if (tail) this.copyRow(next, 0, h)
       await look(i, "l_out", h, c.hiddenSize)
       if (paced) this.unpaced += rows * this.layerWork(i)
     }
     this.position += rows
-    return rows - 1
+    return lastRowOnly ? 0 : rows - 1
   }
 
   /** Work queued on the GPU since the last pace (multiply-adds, roughly). */
