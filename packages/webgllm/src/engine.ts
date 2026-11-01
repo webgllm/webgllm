@@ -250,7 +250,15 @@ export const TUNING = {
    */
   lastRowOnly: 1,
   /** 1: the warm-up reads through one layer of each kind (see warmUp); 0: all. */
-  warmSubset: 1
+  warmSubset: 1,
+  /**
+   * Gated DeltaNet prompt batches run the recurrence in chunks of this
+   * many tokens (a multiple of 4; see delta-rule.ts), two dependent passes
+   * a chunk rather than two a token; 0: a token at a time.
+   */
+  linChunk: 32,
+  /** ...for batches of at least this many tokens (fewer go a token at a time). */
+  linChunkMin: 4
 }
 
 /**
@@ -305,6 +313,11 @@ export type EngineOptions = {
   batchSize?: number
   /** Multi-target draws to treat as unsupported, for testing the fallbacks. */
   noMrt?: Array<"scaled" | "quad" | "conv" | "chunks" | "lin">
+  /**
+   * false: Gated DeltaNet prompt batches run the recurrence a token at a
+   * time, never in chunks (see TUNING.linChunk; the worker's plain retry).
+   */
+  chunkedRecurrence?: boolean
   /**
    * Rows per block of a full-attention cache (a power of two): the texture
    * height when left out. Smaller exercises the cache's wrapping, for tests.
@@ -397,6 +410,8 @@ export class Engine {
    */
   private mrt = { scaled: true, quad: true, conv: true, chunks: true, lin: true }
   private readonly noMrt: Set<string>
+  /** See EngineOptions.chunkedRecurrence. */
+  private readonly chunkedRecurrence: boolean
   private readonly scaleBatch: boolean
   /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
   private quads = new Map<number, Texture>()
@@ -414,6 +429,7 @@ export class Engine {
     this.gpu = new Gpu(canvas)
     this.contextCap = options.contextLength ?? Infinity
     this.noMrt = new Set(options.noMrt ?? [])
+    this.chunkedRecurrence = options.chunkedRecurrence ?? true
     this.kvBlockRows = options.kvBlockRows ?? Infinity
     this.baseBatch = options.batchSize ?? 128
     this.batchSize = this.baseBatch
@@ -521,6 +537,8 @@ export class Engine {
       this.contextLength = Math.min(this.contextLength, 4 * TUNING.scoreTexels)
     }
     this.buffers = this.allocate()
+    if (this.linDims() && this.chunkedRecurrence && TUNING.linChunk > 0)
+      this.linChunkBuffers(TUNING.linChunk)
     if (this.quadMatmuls) {
       const b = this.buffers
       for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj])
@@ -592,6 +610,33 @@ export class Engine {
     const K = l.numKeyHeads * l.keyHeadDim
     const V = l.numValueHeads * l.valueHeadDim
     return { K, V, C: 2 * K + V, H: l.numValueHeads, l }
+  }
+
+  /** The chunked recurrence's tensors (see linGram in kernels.ts), for chunks of `chunk`. */
+  private linChunks: {
+    chunk: number
+    textures: { cum: Texture; a: Texture; t: Texture; p: Texture; u: Texture; w: Texture; oi: Texture; qp: Texture }
+  } | null = null
+
+  /** The chunked recurrence's tensors for chunks of `chunk`, made at load or when the chunk size changes. */
+  private linChunkBuffers(chunk: number) {
+    const lin = this.linDims()
+    if (!lin) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    if (this.linChunks?.chunk === chunk) return this.linChunks.textures
+    for (const tex of Object.values(this.linChunks?.textures ?? {})) this.gpu.delete(tex)
+    const M = this.capacity
+    const textures = {
+      cum: this.f32(lin.H, M),
+      a: this.f32(lin.H * chunk, M),
+      t: this.f32(lin.H * chunk, M),
+      p: this.f32(lin.H * chunk, M),
+      u: this.f32(lin.V, M),
+      w: this.f32(lin.K, M),
+      oi: this.f32(lin.V, M),
+      qp: this.f32(lin.K, M)
+    }
+    this.linChunks = { chunk, textures }
+    return textures
   }
 
   private allocate() {
@@ -1766,9 +1811,48 @@ export class Engine {
   }
 
   /**
+   * The chunked recurrence against a token at a time on this GPU (its
+   * compiler could get the solve's per-fragment array wrong): the first
+   * Gated DeltaNet layer's state after `tokens` (one batch, read both ways
+   * from the same inputs), as max |difference| over max |state| (right:
+   * ~1e-6; Infinity if any value isn't finite). 0 without such layers or
+   * chunks. Leaves the cache empty.
+   */
+  private async recurrenceError(tokens: Array<number>) {
+    const first = this.layers.findIndex((l) => l.linear)
+    const chunk = TUNING.linChunk
+    if (first < 0 || !this.chunkedRecurrence || chunk <= 0) return 0
+    const state = async (c: number) => {
+      TUNING.linChunk = c
+      try {
+        this.reset()
+        await this.forward(tokens)
+        const layer = this.layers[first].linear
+        if (!layer) throw new Error("The model's config has no Gated DeltaNet shapes.")
+        return this.gpu.readNow(layer.state[0])
+      } finally {
+        TUNING.linChunk = chunk
+      }
+    }
+    const want = await state(0)
+    const got = await state(chunk)
+    this.reset()
+    let diff = 0
+    let scale = 0
+    for (let i = 0; i < want.length; i++) {
+      if (!Number.isFinite(got[i])) return Infinity
+      diff = Math.max(diff, Math.abs(got[i] - want[i]))
+      scale = Math.max(scale, Math.abs(want[i]))
+    }
+    return scale > 0 ? diff / scale : diff
+  }
+
+  /**
    * Attention on this GPU against the CPU's (see attentionError): a short
-   * prompt read as usual, then with chunked attention forced on. Returns
-   * the largest relative error (about 2e-4 where the GPU gets it right).
+   * prompt read as usual, then with chunked attention forced on; and the
+   * chunked Gated DeltaNet recurrence against a token at a time (see
+   * recurrenceError). Returns the largest relative error (about 2e-4
+   * where the GPU gets it right).
    */
   async selfCheck() {
     const tokens = Array.from(
@@ -1776,6 +1860,7 @@ export class Engine {
       (_, i) => (i * 7919 + 13) % this.config.vocabSize
     )
     let worst = await attentionError(this, tokens)
+    worst = Math.max(worst, await this.recurrenceError(tokens))
     if (TUNING.attendChunkTexels > 0) {
       const saved = TUNING.attendChunkTexels
       const savedDecode = TUNING.attendChunkTexelsDecode
@@ -2723,9 +2808,10 @@ export class Engine {
 
   /**
    * A Gated DeltaNet block (Qwen3.5; see LinearAttentionWeights): the
-   * gates, in_proj, the convolution, q̂ and k̂, then the recurrence a token
-   * at a time (two passes each), the gated norm. Returns out_proj's split
-   * (see `project`).
+   * gates, in_proj, the convolution, q̂ and k̂, then the recurrence (a
+   * prompt batch in chunks, see recurrenceChunks; otherwise a token at a
+   * time, two passes each), the gated norm. Returns out_proj's split (see
+   * `project`).
    */
   private async linearAttend(
     layer: NonNullable<GpuLayer["linear"]>,
@@ -2753,12 +2839,20 @@ export class Engine {
       [name]: tex,
       ...(!split && this.quadInputs(name, tex))
     })
-    // beta and decay.
+    // Prompt batches run the recurrence in chunks (see recurrenceChunks).
+    const chunk = TUNING.linChunk
+    const chunked =
+      this.chunkedRecurrence &&
+      chunk > 0 &&
+      chunk % 4 === 0 &&
+      rows >= Math.max(2, TUNING.linChunkMin) &&
+      lin.l.numKeyHeads === lin.l.numValueHeads
+    // beta and decay (its log, for chunks).
     const baSplit = this.project(input.a, layer.ba, t.ba, rows, input.norm)
     const baIn = baSplit ? this.partials() : t.ba
     this.gpu.run({
       name: "linear",
-      program: reader("uBA", baIn, baSplit)(K.linGates(H4)),
+      program: reader("uBA", baIn, baSplit)(K.linGates(H4, chunked)),
       inputs: {
         ...pairInputs("uBA", baIn, baSplit),
         uA: layer.a,
@@ -2799,10 +2893,11 @@ export class Engine {
       output: t.qk,
       rect: { x: 0, y: 0, width: 2 * K4, height: rows }
     })
-    // The recurrence, a token at a time.
+    // The recurrence: in chunks, or a token at a time.
     const shape = { keyHeadDim: dk, valueHeadDim: dv }
     const common = { uK4: { int: K4 }, uH4: { int: H4 } }
-    for (let r = 0; r < rows; r++) {
+    if (chunked) await this.recurrenceChunks(layer, rows, chunk, paced)
+    else for (let r = 0; r < rows; r++) {
       const deltaIn = { uS: layer.state[0], uQK: t.qk, uQKV: t.qkv, uG: t.gates }
       const rect = { x: 0, y: r, width: V4, height: 1 }
       if (this.mrt.lin) {
@@ -2847,6 +2942,92 @@ export class Engine {
       rect: { x: 0, y: 0, width: V4 / 2, height: rows }
     })
     return this.project(t.out, layer.outProj, b.opOut, rows)
+  }
+
+  /**
+   * The recurrence over a prompt batch in chunks of `chunk` tokens from
+   * row 0 (see delta-rule.ts, which these passes follow step for step):
+   * the chunks' decays, Gram matrices, triangular solve and the tensors
+   * that don't read the state, for every chunk at once, then two passes a
+   * chunk that do (its delta and output, then the state after it).
+   */
+  private async recurrenceChunks(
+    layer: NonNullable<GpuLayer["linear"]>,
+    rows: number,
+    chunk: number,
+    paced: boolean
+  ) {
+    const lin = this.linDims()
+    const t = this.buffers.lin
+    if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    const c = this.linChunkBuffers(chunk)
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const both = this.mrt.lin
+    const wide = (lin.H * chunk) / 4
+    const run = (
+      program: string,
+      inputs: Record<string, Texture>,
+      output: Texture | Array<Texture>,
+      width: number,
+      uniforms: Record<string, { int: number }> = {},
+      rect?: { x: number; y: number; width: number; height: number },
+      work = 1
+    ) =>
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.program(program),
+        inputs,
+        uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, ...uniforms },
+        output,
+        rect: rect ?? { x: 0, y: 0, width, height: rows },
+        work
+      })
+    run(K.linCum(chunk), { uG: t.gates }, c.cum, H4)
+    const gram = { uQK: t.qk, uG: t.gates, uCum: c.cum }
+    if (both) run(K.linGram({ keyHeadDim: dk, chunk, out: "both" }), gram, [c.a, c.p], wide)
+    else
+      for (const [out, tex] of [["a", c.a], ["p", c.p]] as const)
+        run(K.linGram({ keyHeadDim: dk, chunk, out }), gram, tex, wide)
+    run(K.linSolve(chunk), { uA: c.a }, c.t, wide, {}, undefined, chunk)
+    const shape = { keyHeadDim: dk, valueHeadDim: dv, chunk }
+    const uw = { uT: c.t, uQK: t.qk, uQKV: t.qkv, uG: t.gates, uCum: c.cum }
+    const qo = { uP: c.p, uU: c.u, uW: c.w, uQK: t.qk, uCum: c.cum }
+    if (both && dk === dv) {
+      run(K.linUW({ ...shape, out: "both" }), uw, [c.u, c.w], V4, {}, undefined, chunk)
+      run(K.linQO({ ...shape, out: "both" }), qo, [c.oi, c.qp], V4, {}, undefined, chunk)
+    } else {
+      run(K.linUW({ ...shape, out: "u" }), uw, c.u, V4, {}, undefined, chunk)
+      run(K.linUW({ ...shape, out: "w" }), uw, c.w, K4, {}, undefined, chunk)
+      run(K.linQO({ ...shape, out: "oi" }), qo, c.oi, V4, {}, undefined, chunk)
+      run(K.linQO({ ...shape, out: "q" }), qo, c.qp, K4, {}, undefined, chunk)
+    }
+    const heads = { keyHeadDim: dk, valueHeadDim: dv }
+    for (let c0 = 0; c0 < rows; c0 += chunk) {
+      const c1 = Math.min(c0 + chunk, rows)
+      const outIn = { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp }
+      const rect = { x: 0, y: c0, width: V4, height: c1 - c0 }
+      if (both)
+        run(K.linChunkOut({ ...heads, out: "both" }), outIn, [t.delta, t.o], V4, {}, rect, dk)
+      else
+        for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const)
+          run(K.linChunkOut({ ...heads, out }), outIn, tex, V4, {}, rect, dk)
+      run(
+        K.linChunkState(heads),
+        { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
+        layer.state[1],
+        V4,
+        { uC0: { int: c0 }, uC1: { int: c1 } },
+        { x: 0, y: 0, width: V4, height: dk },
+        c1 - c0
+      )
+      layer.state.reverse()
+      // (Reading and writing the state: ~3 multiply-adds an element a token.)
+      if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
+    }
   }
 
   /**

@@ -48,10 +48,12 @@ Qwen3.5 2B on a Mac (M3 Ultra, Chrome), a 535-token prompt, median of 3:
 
 |                                                | Prompt reading | Writing       | First token |
 | ---------------------------------------------- | -------------- | ------------- | ----------- |
-| `onnx-community/Qwen3.5-2B-ONNX` (WebGL)       | 628 tokens/s   | 74.4 tokens/s | 0.90 s      |
-| `unsloth/Qwen3.5-2B-GGUF` Q4_0 (WebGL)         | 576 tokens/s   | 60.6 tokens/s | 0.99 s      |
+| `onnx-community/Qwen3.5-2B-ONNX` (WebGL)       | 2,700 tokens/s | 80.1 tokens/s | 0.20 s      |
+| `unsloth/Qwen3.5-2B-GGUF` Q4_0 (WebGL)         | 2,078 tokens/s | 70.4 tokens/s | 0.27 s      |
 | Transformers.js (WebGPU), the same ONNX        | 17.7 tokens/s  | 19.7 tokens/s | 30.3 s      |
 | wllama (WebGPU), unsloth's Q4_K_M              | 595 tokens/s   | 20.4 tokens/s | 0.90 s      |
+
+The WebGL rows read prompts with the Gated DeltaNet recurrence in chunks (see How it runs); a token at a time they read 651 and 604 tokens/s, writing the same. The other rows are from an earlier run.
 
 ### Correctness
 
@@ -71,7 +73,7 @@ Both builds were checked tensor by tensor against a reference:
 - **Kernels:** fragment shaders, one output texel per fragment (`gpu/kernels.ts`). Matmuls read weights from byte textures and activations as packed halves, eight per texel. A one-token matmul splits its rows' blocks across fragments, so the GPU has enough work. Every op of LFM3's graph is a pass: RMSNorm, the gated short convolution with its state, QK-norm and RoPE, attention over a half-precision KV cache (sliding-window layers see their last 256 tokens), the sigmoid output gate, SwiGLU, and the sandwich norms.
 - **Prompts** are read 128 tokens at a time; big passes are split into bands of rows, under mobile GPUs' watchdogs.
 - **Sampling:** with top-k (LFM3's 50), the GPU applies the repetition penalty and picks the 50 chunks of 256 logits with the largest logits, which hold the top 50 tokens for sure, so writing a token reads back ~50 KB rather than every logit. Readbacks go through a pixel buffer and a fence.
-- **Qwen3.5's Gated DeltaNet** (18 of its 24 layers) is a pass each for the gates (beta, decay), the causal convolution with its state, and q and k's L2 norms, then two passes a token over each head's 128×128 fp32 state (the delta and output, then the update), and the gated RMSNorm. Prompts run the recurrence a token at a time. Its full-attention layers gate their output per dim.
+- **Qwen3.5's Gated DeltaNet** (18 of its 24 layers) is a pass each for the gates (beta, decay), the causal convolution with its state, and q and k's L2 norms, then the recurrence over each head's 128×128 fp32 state, and the gated RMSNorm. Writing runs the recurrence as two passes a token (the delta and output, then the update). Prompt batches run it in chunks of 32 tokens, as llama.cpp and flash-linear-attention do (`delta-rule.ts` has the math): the decays summed within a chunk, the chunk's Gram matrices, a triangular solve and the products that don't read the state, for every chunk at once, then two passes a chunk that do (its deltas and outputs, then the state after it). Its full-attention layers gate their output per dim.
 - **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state, Qwen3.5's recurrent state and the sliding-window layers' last window are saved after each prompt batch and reply (the latest 8; 3 for Qwen3.5, ~20 MB each), to resume from. Qwen3.5 writes without speculative drafts (keeping only part of a draft batch would need the recurrent state after each of its tokens).
 - **Context:** the model's own (LFM3: 262,144 tokens; LFM2.5: 128,000). Full-attention caches start at 1,024 tokens and double as a chat grows, wrapping into side-by-side blocks past the GPU's texture height; sliding-window layers keep only their window plus a batch, in a ring. Past 8,192 keys, attention reads them in segments and combines them.
 
@@ -85,7 +87,7 @@ GPU textures at load (phone-size batches, the 1,024-token cache), and the most J
 | `onnx-community/LFM3-1.7B-ONNX` | 1,025 MiB    | ~110 MiB                             |
 | `LiquidAI/LFM3-1.7B-GGUF`       | 1,062 MiB    | ~110 MiB                             |
 
-Qwen3.5 2B takes 1,269 MiB of textures (ONNX) and 1,352 MiB (GGUF) at desktop batches, more than an iPhone page has room for.
+Qwen3.5 2B takes 1,275 MiB of textures (ONNX) and 1,357 MiB (GGUF) at desktop batches, more than an iPhone page has room for.
 
 That's for iPhone Safari's ~2 GB limit on a page, which the tokenizer and the page itself also count against. The cache grows from there with the chat; if the GPU runs out of memory growing it, the reply stops with an error asking for a new session.
 

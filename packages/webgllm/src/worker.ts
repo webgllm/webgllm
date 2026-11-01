@@ -172,7 +172,7 @@ async function load(
   signal: AbortSignal,
   /** Most tokens a chat may hold: the model's own context length when undefined. */
   contextLength: number | undefined,
-  /** Without multiple render targets: after a failed self-check. */
+  /** Without multiple render targets or the chunked recurrence: after a failed self-check. */
   plain = false
 ): Promise<Loaded> {
   const meta = modelMeta(model)
@@ -192,7 +192,7 @@ async function load(
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     batchSize: PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
-    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
+    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"], chunkedRecurrence: false })
   })
   lap("context")
   try {
@@ -287,7 +287,8 @@ async function load(
     for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
-    // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
+    // Attention against the CPU's (and Qwen3.5's chunked recurrence against
+    // a token at a time): a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
     // A pass is remembered (same GPU, browser, model and code).
     const error =

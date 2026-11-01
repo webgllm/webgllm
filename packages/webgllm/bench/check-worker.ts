@@ -1217,6 +1217,65 @@ async function smoke(params: {
     const error = await engine.selfCheck()
     log(`SELF CHECK: attention relative error ${error.toExponential(2)} in ${(performance.now() - t).toFixed(0)} ms`)
   }
+  // ?linstate=16,32: each Gated DeltaNet layer's recurrent state after a
+  // prompt batch and after the whole prompt, the recurrence run in chunks
+  // of each size against a token at a time.
+  const linstate = (params as { linstate?: string }).linstate
+  if (linstate) {
+    type Layers = { layers: Array<{ linear?: { state: Array<Parameters<typeof engine.gpu.readNow>[0]> } }> }
+    const states = async (chunk: number, tokens: Array<number>) => {
+      const saved = TUNING.linChunk
+      TUNING.linChunk = chunk
+      try {
+        engine.reset()
+        await engine.forward(tokens)
+        await engine.gpu.finish()
+        return (engine as unknown as Layers).layers.map((l) =>
+          l.linear ? engine.gpu.readNow(l.linear.state[0]) : null
+        )
+      } finally {
+        TUNING.linChunk = saved
+      }
+    }
+    for (const [label, tokens] of [
+      [`one batch (${Math.min(engine.batchSize, prompt.length)} tokens)`, prompt.slice(0, engine.batchSize)],
+      [`whole prompt (${prompt.length} tokens)`, prompt]
+    ] as const) {
+      const ref = await states(0, [...tokens])
+      for (const chunk of linstate.split(",").map(Number)) {
+        const got = await states(chunk, [...tokens])
+        let worstAbs = 0
+        let worstRel = 0
+        let worstLayer = -1
+        const rels: Array<number> = []
+        const byLayer: Array<string> = []
+        ref.forEach((r, i) => {
+          const g = got[i]
+          if (!r || !g) return
+          let diff = 0
+          let scale = 0
+          for (let j = 0; j < r.length; j++) {
+            if (!Number.isFinite(g[j])) diff = Infinity
+            diff = Math.max(diff, Math.abs(g[j] - r[j]))
+            scale = Math.max(scale, Math.abs(r[j]))
+          }
+          const rel = diff / scale
+          rels.push(rel)
+          byLayer.push(`${i}:${rel.toExponential(1)}`)
+          worstAbs = Math.max(worstAbs, diff)
+          if (rel > worstRel) {
+            worstRel = rel
+            worstLayer = i
+          }
+        })
+        rels.sort((a, b) => a - b)
+        log(
+          `LINSTATE ${label}, chunks of ${chunk} vs a token at a time: max abs error ${worstAbs.toExponential(2)}, max relative (over the layer's max |S|) ${worstRel.toExponential(2)} at layer ${worstLayer}, median layer ${rels[rels.length >> 1].toExponential(2)}; by layer ${byLayer.join(" ")}`
+        )
+      }
+    }
+    engine.reset()
+  }
   // As the worker does it: candidates picked on the GPU (top 50, penalty
   // 1.1), the likeliest drawn (greedy, for a repeatable reply).
   const pick = async (row: number) => {
@@ -1254,6 +1313,60 @@ async function smoke(params: {
         gpuTimes.push((gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6)
       gl.deleteQuery(query)
     }
+  }
+  // ?small=1: short batches after a 64-token prefix (follow-ups, tool
+  // results), the recurrence a token at a time against in chunks, rounds
+  // interleaved: where chunks start to pay (TUNING.linChunkMin).
+  if ((params as { small?: boolean }).small) {
+    const sizes = [2, 3, 4, 6, 8, 12, 16, 24]
+    const chunk = TUNING.linChunk
+    const savedMin = TUNING.linChunkMin
+    TUNING.linChunkMin = 2
+    const times: Record<string, Array<number>> = {}
+    const once = async (n: number, c: number) => {
+      TUNING.linChunk = c
+      engine.reset()
+      await engine.forward(prompt.slice(0, 64))
+      await engine.gpu.finish()
+      const t = performance.now()
+      await pick(await engine.forwardHidden(prompt.slice(64, 64 + n)))
+      return performance.now() - t
+    }
+    for (const n of sizes) for (const c of [0, chunk]) await once(n, c)
+    for (let round = 0; round < 7; round++)
+      for (const n of sizes)
+        for (const c of [0, chunk]) (times[`${n},${c}`] ??= []).push(await once(n, c))
+    TUNING.linChunk = chunk
+    TUNING.linChunkMin = savedMin
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[xs.length >> 1]
+    for (const n of sizes)
+      log(
+        `SMALL ${n} tokens: a token at a time ${med(times[`${n},0`]).toFixed(2)} ms, chunks of ${chunk} ${med(times[`${n},${chunk}`]).toFixed(2)} ms`
+      )
+  }
+  // ?abwrite=1: writing after the prompt read with the recurrence a token
+  // at a time, then in chunks, rounds alternating (writing itself runs the
+  // same passes either way; this checks nothing the prompt left behind
+  // slows it).
+  if ((params as { abwrite?: boolean }).abwrite) {
+    const chunk = TUNING.linChunk
+    const perToken: Record<number, Array<number>> = { 0: [], [chunk]: [] }
+    for (let round = 0; round < 10; round++) {
+      const c = round % 2 === 0 ? 0 : chunk
+      TUNING.linChunk = c
+      engine.reset()
+      engine.setSeen(prompt, tokenizer.vocabSize)
+      let next = await pick(await engine.forwardHidden(prompt))
+      TUNING.linChunk = chunk
+      const t = performance.now()
+      for (let i = 0; i < 32; i++) next = await pick(await engine.forwardHidden([next]))
+      perToken[c].push((performance.now() - t) / 32)
+    }
+    TUNING.linChunk = chunk
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[xs.length >> 1]
+    log(
+      `ABWRITE after a token-at-a-time prompt ${med(perToken[0]).toFixed(2)} ms/token (${perToken[0].map((t) => t.toFixed(1)).join(" ")}); after a chunked prompt ${med(perToken[chunk]).toFixed(2)} ms/token (${perToken[chunk].map((t) => t.toFixed(1)).join(" ")})`
+    )
   }
   postMessage({
     type: "jank",

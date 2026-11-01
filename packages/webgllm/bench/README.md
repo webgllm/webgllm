@@ -19,6 +19,7 @@ Results print in the server's terminal.
 - `?format=gguf|onnx&batch=128&precision=highp|mediump&layers=1`: runs the reference prompt and compares every layer and the logits with the reference, then the reference's greedy continuation one token at a time (the decode path, and the GPU's candidate pick against the full logits), then times the prompt.
 - `?smoke=1&len=512&format=…&q=…`: a chat prompt padded to about `len` tokens, read and answered as the worker does it (no reference needed); prints the reply and the speed.
 - `&skip=matmul,norm,…`: times the prompt and single-token steps with each kind of pass left out, to see where the time goes.
+- `&linstate=16,32` (smoke): each Gated DeltaNet layer's recurrent state after a prompt batch and after the whole prompt, the recurrence in chunks of each size against a token at a time (max abs and relative error, by layer). `&small=1`: short batches after a 64-token prefix both ways, where chunks start to pay. `&compare=linChunk:0,32` compares the logits; `&abwrite=1` times writing after a prompt read each way, rounds alternating.
 
 ## tools.html: does the reply start with a tool call?
 
@@ -107,3 +108,14 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 ## Greedy tokens chained on the GPU: nothing to gain (Nov 1)
 
 `check.html?…&chain=1` times greedy writing the worker's way (each token read back while the next is read forward from the GPU's own pick) against the same forwards and output heads queued with no readback at all: 350M 7.8–8.3 vs 8.0–9.4 ms a token on the iPhone, 20.0 vs 19.8 on the Pixel, 5.5 vs 5.5 on an M3; LFM3 33–36 vs 31–33 (iPhone, heat-noisy) and 55.1 vs 55.0 (Pixel). The one-token lookahead already keeps the GPU busy, so chaining several tokens between readbacks (the review's item 10) isn't built.
+
+## Qwen3.5's recurrence in chunks (Nov 1)
+
+Where a Qwen3.5 2B prompt's time went (`skip=recurrence`, ONNX, M3 Ultra, Chrome): with the Gated DeltaNet recurrence run a token at a time (two dependent passes a token in each of 18 layers), 627 of 964 ms on a 512-token prompt (65%) and 2,543 of 3,935 ms on 2,048 tokens (65%), at 128-token batches. Prompt batches now run it in chunks (`TUNING.linChunk`; `delta-rule.ts` has the math and a CPU reference the tests check against the token-at-a-time rule): six passes over the whole batch (the chunks' decays summed, the Gram matrices, the triangular solve, U|W and Oi|Q'), then two passes a chunk. The same profile: 382 ms in all, the recurrence ~6 ms.
+
+- Chunk size (`sweep=linChunk:…`, a 529-token prompt): at 512-token batches (the worker's), 0 (a token at a time) 896 ms, 16: 201, 24: 193, 32: 195, 48: 203; on 2,069 tokens 3,635 against 789, 760, 770, 800. At 128-token batches 8 is 2% slower than 16–32 and 64 is 29% slower (545 vs 424 ms): the solve keeps a chunk's column of T in a per-fragment array, 64 vec4s at 64. 32 is kept: within 1.5% of 24 here, and fewer dependent passes where each costs more (phones).
+- Short batches (`small=1`, after a 64-token prefix): a token at a time wins at 2 tokens (17.9 vs 20.0 ms), ties at 3, and chunks win from 4 (21.2 vs 21.7; 8: 24.7 vs 28.6; 24: 43.9 vs 58.4), so batches of 4 or more go in chunks (`TUNING.linChunkMin`).
+- Accuracy (`linstate=…`): the first Gated DeltaNet layer's state, read both ways from the same inputs, agrees to 2e-6–1.5e-5 of its largest value; deeper layers to 1e-4–1.6e-3, as the layers before them differ slightly too. Logits over 2,069 tokens and 16 writing steps: worst KL 6e-6, the same top token throughout. The reference checks (both builds, 512-, 128- and 48-token batches, without two render targets, with mediump matmuls) match the token-at-a-time numbers.
+- The worker's self-check compares the two ways on its 40-token prompt (the first layer's state) and, past 1e-2, reloads plain, which runs the recurrence a token at a time: ~0.2 s more on a first load on the M3.
+- The chunk tensors take 22 MiB at 512-token batches (5.4 MiB at 128).
+

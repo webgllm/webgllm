@@ -111,6 +111,9 @@
         length: params.get("len") ? Number(params.get("len")) : undefined,
         skip: params.get("skip") ? params.get("skip").split(",") : undefined,
         attn: params.get("attn") === "1",
+        linstate: params.get("linstate") ?? undefined,
+        small: params.get("small") === "1",
+        abwrite: params.get("abwrite") === "1",
         formats: params.get("formats") ?? undefined
       })
     </script>

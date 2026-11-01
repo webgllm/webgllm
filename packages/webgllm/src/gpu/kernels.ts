@@ -1316,8 +1316,12 @@ void main() {
  * - delta, o: per row, V4 texels.
  */
 
-/** beta = sigmoid(b), decay = exp(A · softplus(a + dtBias)) from the b|a projection. */
-function linGatesSource(heads4: number) {
+/**
+ * beta = sigmoid(b), decay = exp(A · softplus(a + dtBias)) from the b|a
+ * projection; with `log`, the decay's log (A · softplus, for the chunked
+ * recurrence).
+ */
+function linGatesSource(heads4: number, log = false) {
   return `${HEADER}
 uniform usampler2D uBA;
 uniform sampler2D uA;
@@ -1332,7 +1336,7 @@ void main() {
     int i = x - ${heads4};
     vec4 t = pf(uBA, x, m) + texelFetch(uDt, ivec2(i, 0), 0);
     vec4 softplus = max(t, 0.0) + log(1.0 + exp(-abs(t)));
-    o = exp(texelFetch(uA, ivec2(i, 0), 0) * softplus);
+    o = ${log ? "" : "exp"}(texelFetch(uA, ivec2(i, 0), 0) * softplus);
   }
 }`
 }
@@ -1518,6 +1522,310 @@ void main() {
   }
   float inv = inversesqrt(dot(s, vec4(1.0)) / ${valueHeadDim}.0 + uEps);
   o = packH2(gated(2 * x, m, base, inv), gated(2 * x + 1, m, base, inv));
+}`
+}
+
+/*
+ * The chunked recurrence for prompt batches (see delta-rule.ts for the
+ * math, which these passes follow step for step): tokens in chunks of C
+ * from the batch's row 0 (the last chunk may be shorter). Besides the
+ * tensors above (gates holding log-decays, from linGates' `log`):
+ * - cum: per row, G (the chunk's running sum of log-decays) of heads
+ *   4i..4i+3 at texel i.
+ * - A, T, P: per row t, head h's C columns s (the chunk's tokens) at
+ *   texels h·C/4 + s/4.
+ * - U and Oi (V4 texels a row), W and Q' (K4).
+ * Everything is f32 and highp: the solve and the state chain are what a
+ * mediump GPU would get wrong first.
+ */
+
+/** G of row m's heads, cum texel i: the log-decays summed from the chunk's start. */
+function linCumSource(chunk: number) {
+  return `${HEADER}
+uniform sampler2D uG;
+uniform int uH4;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 s = vec4(0.0);
+  for (int r = (m / ${chunk}) * ${chunk}; r <= m; r++) s += texelFetch(uG, ivec2(uH4 + x, r), 0);
+  o = s;
+}`
+}
+
+/** The decay G of head h at row r (the cum tensor). */
+const LIN_G = `float linG(highp sampler2D cum, int h, int r) {
+  return comp(texelFetch(cum, ivec2(h >> 2, r), 0), h & 3);
+}`
+
+/**
+ * A[t][s] = beta_t exp(G_t - G_s) k̂_t·k̂_s for s < t, and P[t][s] =
+ * exp(G_t - G_s) q̂_t·k̂_s for s ≤ t (0 elsewhere): four columns a
+ * fragment. `out`: which this draw writes (both: two render targets).
+ */
+function linGramSource(o: { keyHeadDim: number; chunk: number; out: "both" | "a" | "p" }) {
+  const DK4 = o.keyHeadDim / 4
+  const C4 = o.chunk / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oA;\nlayout(location = 1) out vec4 oP;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oA = a;\n  oP = p;"
+      : o.out === "a"
+        ? "oResult = a;"
+        : "oResult = p;"
+  return `${HEADER}
+uniform sampler2D uQK;
+uniform sampler2D uG;
+uniform sampler2D uCum;
+uniform int uK4;
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${C4};
+  int s0 = (t / ${o.chunk}) * ${o.chunk} + 4 * (x - h * ${C4});
+  int kb = h * ${DK4};
+  ivec4 s = ivec4(s0, s0 + 1, s0 + 2, s0 + 3);
+  // (Columns past t are masked out below; their rows are read as t's.)
+  ivec4 r = min(s, ivec4(t));
+  vec4 kk = vec4(0.0);
+  vec4 qk = vec4(0.0);
+  if (s0 <= t) {
+    for (int i = 0; i < ${DK4}; i++) {
+      vec4 q = texelFetch(uQK, ivec2(kb + i, t), 0);
+      vec4 k = texelFetch(uQK, ivec2(uK4 + kb + i, t), 0);
+      vec4 k0 = texelFetch(uQK, ivec2(uK4 + kb + i, r.x), 0);
+      vec4 k1 = texelFetch(uQK, ivec2(uK4 + kb + i, r.y), 0);
+      vec4 k2 = texelFetch(uQK, ivec2(uK4 + kb + i, r.z), 0);
+      vec4 k3 = texelFetch(uQK, ivec2(uK4 + kb + i, r.w), 0);
+      kk += vec4(dot(k, k0), dot(k, k1), dot(k, k2), dot(k, k3));
+      qk += vec4(dot(q, k0), dot(q, k1), dot(q, k2), dot(q, k3));
+    }
+  }
+  float gt = linG(uCum, h, t);
+  vec4 gs = vec4(linG(uCum, h, r.x), linG(uCum, h, r.y), linG(uCum, h, r.z), linG(uCum, h, r.w));
+  vec4 decay = exp(min(gt - gs, 0.0));
+  float beta = comp(texelFetch(uG, ivec2(h >> 2, t), 0), h & 3);
+  vec4 a = beta * decay * kk * vec4(lessThan(s, ivec4(t)));
+  vec4 p = decay * qk * vec4(lessThanEqual(s, ivec4(t)));
+  ${write}
+}`
+}
+
+/**
+ * T = (I + A)⁻¹, lower triangular, by forward substitution: a fragment
+ * holds four of T's columns (as a vec4) down the chunk's rows to its own.
+ */
+function linSolveSource(chunk: number) {
+  const C4 = chunk / 4
+  return `${HEADER}
+uniform sampler2D uA;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${C4};
+  int j4 = x - h * ${C4};
+  int c0 = (t / ${chunk}) * ${chunk};
+  int rt = t - c0;
+  int j0 = 4 * j4;
+  o = vec4(0.0);
+  if (j0 > rt) return;
+  vec4 X[${chunk}];
+  for (int i = 0; i < ${chunk}; i++) X[i] = vec4(0.0);
+  ivec4 cols = ivec4(j0, j0 + 1, j0 + 2, j0 + 3);
+  for (int r = j0; r <= rt; r++) {
+    vec4 acc = vec4(equal(cols, ivec4(r)));
+    // (A is 0 from column r on, and X is still 0 there.)
+    for (int s4 = j4; 4 * s4 < r; s4++) {
+      vec4 a = texelFetch(uA, ivec2(h * ${C4} + s4, c0 + r), 0);
+      int s = 4 * s4;
+      acc -= a.x * X[s] + a.y * X[s + 1] + a.z * X[s + 2] + a.w * X[s + 3];
+    }
+    X[r] = acc;
+  }
+  o = X[rt];
+}`
+}
+
+/**
+ * U = T diag(beta) V and W = T diag(beta exp(G)) K over the chunk's rows
+ * up to t. `out` both needs dk = dv (one texel index for both).
+ */
+function linUWSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  chunk: number
+  out: "both" | "u" | "w"
+}) {
+  const C4 = o.chunk / 4
+  const D4 = (o.out === "w" ? o.keyHeadDim : o.valueHeadDim) / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oU;\nlayout(location = 1) out vec4 oW;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both" ? "oU = u;\n  oW = w;" : o.out === "u" ? "oResult = u;" : "oResult = w;"
+  const wantU = o.out !== "w"
+  const wantW = o.out !== "u"
+  return `${HEADER}
+uniform sampler2D uT;
+uniform sampler2D uQK;
+uniform sampler2D uQKV;
+uniform sampler2D uG;
+uniform sampler2D uCum;
+uniform int uK4;
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${D4};
+  int c0 = (t / ${o.chunk}) * ${o.chunk};
+  vec4 u = vec4(0.0);
+  vec4 w = vec4(0.0);
+  for (int s = c0; s <= t; s++) {
+    int j = s - c0;
+    float tau = comp(texelFetch(uT, ivec2(h * ${C4} + (j >> 2), t), 0), j & 3)
+      * comp(texelFetch(uG, ivec2(h >> 2, s), 0), h & 3);
+    ${wantU ? "u += tau * texelFetch(uQKV, ivec2(2 * uK4 + x, s), 0);" : ""}
+    ${wantW ? "w += tau * exp(linG(uCum, h, s)) * texelFetch(uQK, ivec2(uK4 + x, s), 0);" : ""}
+  }
+  ${write}
+}`
+}
+
+/**
+ * Oi = P U and Q' = diag(exp(G)) Q - P W over the chunk's rows up to t
+ * (the chunk's output, less what its starting state adds: Q' S0).
+ */
+function linQOSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  chunk: number
+  out: "both" | "oi" | "q"
+}) {
+  const C4 = o.chunk / 4
+  const D4 = (o.out === "q" ? o.keyHeadDim : o.valueHeadDim) / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oI;\nlayout(location = 1) out vec4 oQ;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oI = oi;\n  oQ = q;"
+      : o.out === "oi"
+        ? "oResult = oi;"
+        : "oResult = q;"
+  return `${HEADER}
+uniform sampler2D uP;
+uniform sampler2D uU;
+uniform sampler2D uW;
+uniform sampler2D uQK;
+uniform sampler2D uCum;
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${D4};
+  int c0 = (t / ${o.chunk}) * ${o.chunk};
+  vec4 oi = vec4(0.0);
+  vec4 pw = vec4(0.0);
+  for (int s = c0; s <= t; s++) {
+    int j = s - c0;
+    float p = comp(texelFetch(uP, ivec2(h * ${C4} + (j >> 2), t), 0), j & 3);
+    ${o.out !== "q" ? "oi += p * texelFetch(uU, ivec2(x, s), 0);" : ""}
+    ${o.out !== "oi" ? "pw += p * texelFetch(uW, ivec2(x, s), 0);" : ""}
+  }
+  vec4 q = ${o.out !== "oi" ? "exp(linG(uCum, h, t)) * texelFetch(uQK, ivec2(x, t), 0) - pw" : "vec4(0.0)"};
+  ${write}
+}`
+}
+
+/**
+ * A chunk's first state-reading pass, rows uC0.. of it: delta D = U - W S0
+ * and the output O = Oi + Q' S0, per value texel over the head's keys.
+ * `out`: which this draw writes (both: two render targets).
+ */
+function linChunkOutSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  out: "both" | "delta" | "o"
+}) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oDelta;\nlayout(location = 1) out vec4 oOut;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oDelta = texelFetch(uU, ivec2(x, t), 0) - ws;\n  oOut = texelFetch(uOi, ivec2(x, t), 0) + qs;"
+      : o.out === "delta"
+        ? "oResult = texelFetch(uU, ivec2(x, t), 0) - ws;"
+        : "oResult = texelFetch(uOi, ivec2(x, t), 0) + qs;"
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uU;
+uniform sampler2D uW;
+uniform sampler2D uOi;
+uniform sampler2D uQp;
+${outs}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int kb = (x / ${DV4}) * ${DK4};
+  vec4 ws = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 w = texelFetch(uW, ivec2(kb + i, t), 0);
+    vec4 q = texelFetch(uQp, ivec2(kb + i, t), 0);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    ws += s0 * w.x + s1 * w.y + s2 * w.z + s3 * w.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  ${write}
+}`
+}
+
+/**
+ * A chunk's state update, its rows [uC0, uC1): S = exp(G_last) S0 +
+ * Σ_s exp(G_last - G_s) k̂_s D_sᵀ.
+ */
+function linChunkStateSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+  const DV4 = o.valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uDelta;
+uniform sampler2D uCum;
+uniform int uK4;
+uniform int uC0;
+uniform int uC1;
+out vec4 o;
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int k = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kc = h * ${o.keyHeadDim} + k;
+  float last = linG(uCum, h, uC1 - 1);
+  vec4 acc = exp(last) * texelFetch(uS, ivec2(x, k), 0);
+  for (int s = uC0; s < uC1; s++) {
+    float kk = comp(texelFetch(uQK, ivec2(uK4 + (kc >> 2), s), 0), kc & 3);
+    acc += exp(last - linG(uCum, h, s)) * kk * texelFetch(uDelta, ivec2(x, s), 0);
+  }
+  o = acc;
 }`
 }
 
@@ -2731,6 +3039,13 @@ export const linPrep = memo(linPrepSource)
 export const linDelta = memo(linDeltaSource)
 export const linState = memo(linStateSource)
 export const linNorm = memo(linNormSource)
+export const linCum = memo(linCumSource)
+export const linGram = memo(linGramSource)
+export const linSolve = memo(linSolveSource)
+export const linUW = memo(linUWSource)
+export const linQO = memo(linQOSource)
+export const linChunkOut = memo(linChunkOutSource)
+export const linChunkState = memo(linChunkStateSource)
 const partialsCache = new Map<string, Map<string, string>>()
 /** fromPartialsSource, memoized (sources are memoized, so lookups are cheap). */
 export function fromPartials(source: string, names: Array<string>) {
