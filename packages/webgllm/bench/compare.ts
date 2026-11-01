@@ -187,6 +187,7 @@ async function runWebgl(text: string) {
       if (data.timings) log(`LOAD PHASES (ms): ${JSON.stringify(data.timings)}`)
       ready()
     } else if (data.type === "load-error") failed(new Error(data.message))
+    else if (data.type === "log") log(`[worker] ${data.text}`)
     else if (data.type === "token") reply += data.text
     else if (data.type === "done") pending.get(data.id)?.resolve(data.stats)
     else if (data.type === "error") pending.get(data.id)?.reject(new Error(data.message))
@@ -198,6 +199,10 @@ async function runWebgl(text: string) {
     worker.postMessage({ type: "load", model })
   })
   log(`WebGL loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
+  // ?idle=ms: wait that long before the first request (the worker tunes
+  // when idle; see tuneWhenIdle).
+  const idle = Number(params.get("idle") ?? 0)
+  if (idle > 0) await new Promise((r) => setTimeout(r, idle))
   let n = 0
   const generate = (content: string, maxTokens: number) =>
     new Promise<Record<string, number | null>>((resolve, reject) => {

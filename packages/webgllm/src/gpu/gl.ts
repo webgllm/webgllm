@@ -221,7 +221,18 @@ export class Gpu {
   }
 
   /** Programs compiled, and the slowest ones' milliseconds by a source prefix (load profiling). */
-  compiled = { count: 0, ms: 0, slowest: [] as Array<[number, string]> }
+  compiled = {
+    count: 0,
+    ms: 0,
+    slowest: [] as Array<[number, string]>,
+    /** Each source's milliseconds. */
+    times: new Map<string, number>()
+  }
+  /**
+   * Appended to every fragment shader compiled (profiling: a fresh salt
+   * keeps the browser from reusing compiles from an earlier load).
+   */
+  salt = ""
 
   /** A fragment shader's program, compiled once per source. */
   program(source: string): Program {
@@ -234,6 +245,7 @@ export class Gpu {
       const ms = performance.now() - started
       this.compiled.count++
       this.compiled.ms += ms
+      this.compiled.times.set(source, ms)
       // A source's first line after the header, to tell kernels apart.
       const tag = source.split("\n").find((l) => l.startsWith("uniform")) ?? ""
       this.compiled.slowest.push([Math.round(ms), `${tag.slice(0, 40)} ${source.length}`])
@@ -247,7 +259,7 @@ export class Gpu {
     const program = gl.createProgram()
     if (!program) throw new GpuError("Couldn't create a program.")
     gl.attachShader(program, this.vertexShader)
-    const fragment = this.shader(gl.FRAGMENT_SHADER, source)
+    const fragment = this.shader(gl.FRAGMENT_SHADER, source + this.salt)
     gl.attachShader(program, fragment)
     gl.linkProgram(program)
     // (Flagged for deletion: freed with the program.)

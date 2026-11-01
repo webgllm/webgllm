@@ -69,9 +69,21 @@ export async function readGpuNotes(): Promise<Record<string, GpuNote>> {
   }
 }
 
-export async function writeGpuNote(key: string, note: GpuNote) {
+/** Note writes, one at a time (a file's sync access handle is exclusive). */
+let noteWrites: Promise<void> = Promise.resolve()
+
+export function writeGpuNote(key: string, note: GpuNote): Promise<void> {
+  noteWrites = noteWrites.then(() => writeNote(key, note))
+  return noteWrites
+}
+
+async function writeNote(key: string, note: GpuNote) {
   try {
     const notes = await readGpuNotes()
+    // Notes for this GPU, browser and model from older engine code (the
+    // key's last part) are stale: dropped.
+    const prefix = key.slice(0, key.lastIndexOf("|") + 1)
+    for (const k of Object.keys(notes)) if (k.startsWith(prefix)) delete notes[k]
     notes[key] = note
     const handle = await (await dir()).getFileHandle(NOTES, { create: true })
     const access = await openAccess(handle)

@@ -609,6 +609,7 @@ async function smoke(params: {
   ab?: string
   abDecode?: string
   sweep?: string
+  programs?: boolean
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -637,8 +638,60 @@ async function smoke(params: {
   log(
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
   )
+  // ?programs=1: what a load compiles, cold (salted sources), grouped by
+  // source with its numbers blanked (variants of one kernel).
+  if (params.programs) engine.gpu.salt = `\n// ${Math.random()}`
   const t0 = performance.now()
   await engine.load(await modelPieces(params))
+  if (params.programs) {
+    const loadMs = performance.now() - t0
+    const marks: Array<[string, number]> = []
+    let t = performance.now()
+    await engine.warmUp()
+    marks.push(["warmUp", performance.now() - t])
+    t = performance.now()
+    await engine.tune()
+    marks.push(["tune", performance.now() - t])
+    t = performance.now()
+    await engine.selfCheck()
+    marks.push(["selfCheck", performance.now() - t])
+    // The tuner again, to see how steady its measurements are.
+    for (let i = 0; i < 4; i++) {
+      const picked = await engine.tune()
+      log(`TUNE again ${i + 1}: ${JSON.stringify({ ...picked, ...engine.tuneReport })}`)
+    }
+    const c = engine.gpu.compiled
+    log(
+      `PROGRAMS ${c.count} in ${c.ms.toFixed(0)} ms; load ${loadMs.toFixed(0)} ms, ${marks.map(([n, ms]) => `${n} ${ms.toFixed(0)} ms`).join(", ")}; warm-up steps ${JSON.stringify(engine.warmCounts)}`
+    )
+    const groups = new Map<string, { n: number; ms: number; head: string; len: number }>()
+    for (const [source, ms] of c.times) {
+      const key = source.replace(/\d+(\.\d+)?/g, "N")
+      const head = source
+        .split("\n")
+        .filter((l) => l.startsWith("uniform") || l.startsWith("out ") || l.startsWith("layout"))
+        .map((l) => l.replace(/^uniform \w+ /, "").replace(/;$/, ""))
+        .join(" ")
+        .slice(0, 110)
+      const g = groups.get(key) ?? { n: 0, ms: 0, head, len: source.length }
+      g.n++
+      g.ms += ms
+      groups.set(key, g)
+    }
+    for (const g of [...groups.values()].sort((a, b) => b.ms - a.ms))
+      log(`PROGRAM GROUP ${g.n}× ${g.ms.toFixed(0)} ms (${g.len} chars): ${g.head}`)
+    // The slowest again on an idle GPU, freshly salted: compile alone, or
+    // a wait for earlier GPU work counted in?
+    const slowest = [...c.times].sort((x, y) => y[1] - x[1]).slice(0, 4)
+    for (const [source, ms] of slowest) {
+      await engine.gpu.finish()
+      engine.gpu.salt = `\n// ${Math.random()}`
+      const t2 = performance.now()
+      engine.gpu.program(`${source}\n// again`)
+      log(`RECOMPILE idle: ${(performance.now() - t2).toFixed(0)} ms (was ${ms.toFixed(0)} ms): ${source.split("\n").filter((l) => l.startsWith("uniform")).map((l) => l.split(" ")[2]).join(" ").slice(0, 80)}`)
+    }
+    return
+  }
   {
     const c = engine.layoutChoice
     if (c)

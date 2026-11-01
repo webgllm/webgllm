@@ -17,6 +17,7 @@ import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, verify } from "./sampler.js"
 import { download, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
+import type { GpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -31,6 +32,11 @@ type Loaded = {
   cached: Array<number>
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
+  /**
+   * Engine.tune not run yet on this GPU: it runs when the worker is idle
+   * (see tuneWhenIdle), then its picks join this note.
+   */
+  untuned?: { key: string; note: GpuNote }
 }
 
 let current: Loaded | null = null
@@ -239,20 +245,17 @@ async function load(
     timings.repackOnnx = Math.round(repackTime.ms)
     repackTime.ms = 0
     if (engine.layoutChoice?.ms) timings.layoutProbe = Math.round(engine.layoutChoice.ms)
+    // How this GPU splits prompt matmuls, if timed on an earlier load (else
+    // timed when the worker is next idle: see tuneWhenIdle); before the
+    // warm-up, which compiles the programs those splits read with.
+    if (note?.tuned) engine.tuned = note.tuned
     await engine.warmUp()
     lap("warmUp")
     timings.programs = engine.gpu.compiled.count
     timings.compileMs = Math.round(engine.gpu.compiled.ms)
     for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
-    // How this GPU splits prompt matmuls: remembered, or timed once.
-    if (note?.tuned) engine.tuned = note.tuned
-    else await engine.tune()
-    lap("tune")
-    timings.tunedSliceK = engine.tuned.sliceK ?? 0
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
-    for (const [k, v] of Object.entries(engine.tuneReport)) timings[`tune_${k}`] = v
-    if (signal.aborted) throw new Superseded()
     // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
     // A pass is remembered (same GPU, browser, model and code).
@@ -261,12 +264,11 @@ async function load(
         ? note.selfCheck
         : await engine.selfCheck()
     lap("selfCheck")
-    if ((!note || !note.tuned) && engine.layoutChoice && error <= SELF_CHECK_MAX)
-      void writeGpuNote(noteKey, {
-        layout: engine.layoutChoice.layout,
-        selfCheck: error,
-        tuned: engine.tuned
-      })
+    const fresh =
+      !note && engine.layoutChoice && error <= SELF_CHECK_MAX
+        ? { layout: engine.layoutChoice.layout, selfCheck: error }
+        : null
+    if (fresh) void writeGpuNote(noteKey, fresh)
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
@@ -278,7 +280,15 @@ async function load(
       release(engine)
       return await load(model, signal, true)
     }
-    return { model, engine, tokenizer, cached: [], timings }
+    const base = fresh ?? (note?.tuned ? null : note)
+    return {
+      model,
+      engine,
+      tokenizer,
+      cached: [],
+      timings,
+      ...(base && { untuned: { key: noteKey, note: base } })
+    }
   } catch (error) {
     // A failed or superseded load frees its textures now.
     release(engine)
@@ -312,6 +322,7 @@ function startLoad(model: string): Promise<Loaded> {
       loading = null
       current = loaded
       post({ type: "ready", model, timings: loaded.timings })
+      tuneWhenIdle()
     },
     (error: unknown) => {
       if (loading !== entry) return
@@ -350,6 +361,7 @@ async function generate(request: GenerateRequest) {
   const model = await startLoad(request.model)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
   const { engine, tokenizer } = model
+  const compiledBefore = engine.gpu.compiled.count
   const prompt = tokenizer.encodeChat(request.chat, {
     tools: request.tools.length ? request.tools : undefined,
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
@@ -642,6 +654,24 @@ async function generate(request: GenerateRequest) {
   if (rest) post({ type: "token", id, text: rest })
   engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
+  // Programs the warm-up missed compile mid-request: worth knowing.
+  const compiled = engine.gpu.compiled.count - compiledBefore
+  if (compiled > 0) {
+    const sources = [...engine.gpu.compiled.times.keys()].slice(-compiled)
+    const names = sources.map((s) =>
+      s
+        .split("\n")
+        .filter((l) => l.startsWith("uniform"))
+        .map((l) => l.split(" ")[2]?.replace(";", ""))
+        .filter((n) => n && !/^u(PairSplit|SliceStride|SplitIn)$/.test(n))
+        .slice(0, 4)
+        .join(",")
+    )
+    post({
+      type: "log",
+      text: `${compiled} programs compiled during request ${id}: ${names.join(" | ")}`
+    })
+  }
   post({ type: "done", id, stats })
 }
 
@@ -650,6 +680,36 @@ async function generate(request: GenerateRequest) {
  * so one must finish (or stop) before the next reads its prompt.
  */
 let queue: Promise<void> = Promise.resolve()
+/** Generations queued or running. */
+let pending = 0
+/** A background Engine.tune, while it runs. */
+let tuning: Promise<void> | null = null
+
+/**
+ * Times how this GPU splits prompt matmuls (Engine.tune) while nothing
+ * waits on the worker, not during the load: it gives way to the first
+ * generation that arrives (and runs again once the queue is empty), and
+ * its picks are remembered with the GPU's note.
+ */
+function tuneWhenIdle() {
+  const loaded = current
+  const untuned = loaded?.untuned
+  if (!loaded || !untuned || tuning || pending > 0) return
+  tuning = (async () => {
+    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded)
+    post({
+      type: "log",
+      text: `tuned in the background: ${picked ? JSON.stringify({ ...picked, ...loaded.engine.tuneReport }) : "stopped for a request"}`
+    })
+    if (!picked || current !== loaded) return
+    loaded.untuned = undefined
+    await writeGpuNote(untuned.key, { ...untuned.note, tuned: picked })
+  })()
+    .catch(() => undefined)
+    .finally(() => {
+      tuning = null
+    })
+}
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   if (data.type === "tune") {
@@ -659,7 +719,10 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else {
+    pending++
     queue = queue
+      // (A background tune stops at its next step.)
+      .then(() => tuning)
       .then(() => generate(data))
       .catch((error: unknown) => {
         // A lost GPU context can't be used again: the next generation
@@ -676,6 +739,10 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
         }
         post({ type: "error", id: data.id, message: errorMessage(error) })
       })
-      .finally(() => stopped.delete(data.id))
+      .finally(() => {
+        stopped.delete(data.id)
+        pending--
+        tuneWhenIdle()
+      })
   }
 }

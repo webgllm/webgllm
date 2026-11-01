@@ -223,7 +223,9 @@ export const TUNING = {
    * last row only (no later layer reads the others, and only the last
    * row's logits are asked for).
    */
-  lastRowOnly: 1
+  lastRowOnly: 1,
+  /** 1: the warm-up reads through one layer of each kind (see warmUp); 0: all. */
+  warmSubset: 1
 }
 
 /**
@@ -233,7 +235,7 @@ export const TUNING = {
 type HeadOut = { logits: Texture; split: number; stride: number }
 
 /** See Engine.tuned. */
-export type Tuned = { sliceK: number | null; shortSplit: number | null }
+export type Tuned = { shortSplit: number | null }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
 type Snapshot = {
@@ -814,12 +816,14 @@ export class Engine {
   })()
   /**
    * How this GPU splits prompt matmuls along K, where it differs from
-   * TUNING's (null: TUNING's): `sliceK`, values per K-slice for full
-   * batches (TUNING.quadSliceK); `shortSplit`, the most slices for
-   * batches under TUNING.f16MinRows (TUNING.quadMaxSplit). From tune, or
-   * remembered from an earlier load.
+   * TUNING's (null: TUNING's): `shortSplit`, the most slices for batches
+   * under TUNING.f16MinRows (TUNING.quadMaxSplit; an iPhone reads short
+   * prompts 11% faster in 2, an M3 30% slower). From tune, or remembered
+   * from an earlier load. (Full batches' slice size isn't tuned: timed
+   * alone, their matmuls show no steady difference, though a whole prompt
+   * on an M3 does; timing whole prompts would take seconds on a phone.)
    */
-  tuned: Tuned = { sliceK: null, shortSplit: null }
+  tuned: Tuned = { shortSplit: null }
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -829,10 +833,13 @@ export class Engine {
    * TUNING's by 4% and by twice the spread between its own rounds (phones'
    * timings drift with heat): Apple GPUs differ from
    * PowerVR, and big ones from small ones, in how many slices fill them.
-   * Each candidate in turn per round (drift from heat cancels), best of 2
-   * rounds. Call after warmUp; returns what it picked.
+   * After ~100 ms of work (an idle GPU clocks down), each candidate in
+   * turn, the order reversed in the second round, best of 2. Call after warmUp; returns what it picked, or null (choices
+   * unchanged) if `stop` said to stop first.
    */
-  async tune(): Promise<Tuned> {
+  async tune(stop: () => boolean = () => false): Promise<Tuned | null> {
+    const before = { ...this.tuned }
+    this.tuned = { shortSplit: null }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
     // an attention block's (the first of each kind), one feed-forward's.
@@ -851,24 +858,42 @@ export class Engine {
       this.matmul(b.normed, ffn.gateUp, b.gateUp, rows)
       this.matmul(b.act, ffn.down, b.ffnOut, rows)
     }
+    class Stopped extends Error {}
     const choose = async (
       key: keyof Tuned,
       candidates: Array<number>,
       rows: number
     ): Promise<number | null> => {
       // The alternatives once untimed (first use costs more; the warm-up
-      // already ran TUNING's).
+      // already ran TUNING's), and TUNING's timed once: each sample repeats
+      // the matmuls to about 25 ms, so a fast GPU's few milliseconds
+      // aren't lost in the wait for it.
       for (let c = 1; c < candidates.length; c++) {
         this.tuned[key] = candidates[c]
         run(rows)
       }
+      this.tuned[key] = candidates[0]
+      await this.gpu.finish()
+      const t0 = performance.now()
+      run(rows)
+      await this.gpu.finish()
+      const reps = Math.max(1, Math.min(16, Math.ceil(25 / (performance.now() - t0))))
+      // An idle GPU clocks down: busy it ~100 ms first, so the clock has
+      // come up before anything is timed.
+      for (const start = performance.now(); performance.now() - start < 100; ) {
+        for (let r = 0; r < reps; r++) run(rows)
+        await this.gpu.finish()
+      }
       const rounds = candidates.map((): Array<number> => [])
       for (let round = 0; round < 2; round++) {
-        for (let c = 0; c < candidates.length; c++) {
+        // Order reversed in the second round: steady drift cancels.
+        for (let i = 0; i < candidates.length; i++) {
+          const c = round === 0 ? i : candidates.length - 1 - i
+          if (stop()) throw new Stopped()
           this.tuned[key] = candidates[c]
           await this.gpu.finish()
           const t = performance.now()
-          run(rows)
+          for (let r = 0; r < reps; r++) run(rows)
           await this.gpu.finish()
           rounds[c].push(performance.now() - t)
         }
@@ -885,19 +910,19 @@ export class Engine {
         ? candidates[best]
         : null
     }
-    const picked: Tuned = {
-      shortSplit: await choose(
-        "shortSplit",
-        [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
-        Math.min(40, this.capacity)
-      ),
-      // (At a 512-token batch, a prompt's usual size: smaller models'
-      // batches can run to 2304 rows, where more slices matter less.)
-      sliceK: await choose(
-        "sliceK",
-        [TUNING.quadSliceK, TUNING.quadSliceK === 256 ? 512 : 256],
-        Math.min(512, this.capacity)
-      )
+    let picked: Tuned
+    try {
+      picked = {
+        shortSplit: await choose(
+          "shortSplit",
+          [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
+          Math.min(40, this.capacity)
+        )
+      }
+    } catch (error) {
+      this.tuned = before
+      if (error instanceof Stopped) return null
+      throw error
     }
     this.tuned = picked
     return picked
@@ -1522,6 +1547,29 @@ export class Engine {
   /** Programs each warm-up step compiled (load profiling). */
   warmCounts: Record<string, number> = {}
   async warmUp() {
+    // Every program a layer compiles is shared by the layers of its kind:
+    // the warm-up reads through the first and last layers (their own
+    // variants: folded embedding, last-row tail) and one of each other
+    // kind only, a fraction of the GPU work of the whole model.
+    const all = this.layers
+    const kinds = new Set<string>()
+    if (TUNING.warmSubset > 0) this.layers = all.filter((l, i) => {
+      const kind = l.conv ? "conv" : `${l.type}:${l.attention?.ring ? "ring" : ""}`
+      const keep = i === 0 || i === all.length - 1 || !kinds.has(kind)
+      kinds.add(kind)
+      return keep
+    })
+    try {
+      await this.warmUpLayers()
+    } finally {
+      this.layers = all
+      // (Per-layer work for pacing, counted over the subset.)
+      this.work = null
+      this.reset()
+    }
+  }
+
+  private async warmUpLayers() {
     let seen = this.gpu.compiled.count
     const step = (name: string) => {
       this.warmCounts[name] = this.gpu.compiled.count - seen
@@ -1534,6 +1582,13 @@ export class Engine {
     this.dropGuess()
     await this.logits(row)
     step("logits")
+    await this.argmax(row, 1, 1, [])
+    step("argmax")
+    // A batch past f16MinRows: the f16 matmul path full prompts take.
+    if (TUNING.f16MinRows <= this.capacity) {
+      await this.forwardHidden(new Array(Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1)).fill(0))
+      step("batchF16")
+    }
     await this.forwardHidden([0, 0], { draft: true })
     step("draft")
     this.accept(1)
@@ -1715,10 +1770,9 @@ export class Engine {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
       const quadRows = Math.ceil(rows / 4)
-      // (This GPU's own choices where tune made any.)
+      // (This GPU's own choice for short batches, if tune made one.)
       const short = rows < TUNING.f16MinRows
-      const sliceK =
-        (this.tuned.sliceK ?? TUNING.quadSliceK) * (w.groups > 2048 ? 2 : 1)
+      const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
       // The most slices the output holds at a full batch: the same for
       // every batch, so the warm-up compiles the programs prompts use.
       const most = Math.min(
