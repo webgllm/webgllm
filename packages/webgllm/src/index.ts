@@ -9,7 +9,8 @@ export type {
   WebGlProviderUsageDetails,
   WebGlTextProviderOptions
 } from "./adapter.js"
-export { hasWebGl2, loadModel, modelStatus } from "./client.js"
+export { hasWebGl2, loadModel, modelStatus, unloadModel } from "./client.js"
+export { setMemoryBudget } from "./model-memory.js"
 export type { ModelStatus } from "./client.js"
 export {
   WEBGL_MODEL_META,

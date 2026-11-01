@@ -20,7 +20,7 @@ import type {
   StructuredOutputResult
 } from "@tanstack/ai/adapters"
 
-import { generate, loadModel } from "./client.js"
+import { generate, loadModel, setKeepLoaded } from "./client.js"
 import { modelMeta } from "./model-meta.js"
 import type { WebGlModelReasoningByName, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings } from "./protocol.js"
@@ -241,6 +241,12 @@ export type WebGlTextConfig = {
    * refuses longer chats sooner. Changing it loads the model again.
    */
   contextLength?: number
+  /**
+   * Keeps the model loaded when another runtime (Transformers.js, wllama)
+   * loads one past the page's memory budget (see `setMemoryBudget`); by
+   * default the least recently used model is unloaded to make room.
+   */
+  keepLoaded?: boolean
 }
 
 export class WebGlTextAdapter<
@@ -265,6 +271,7 @@ export class WebGlTextAdapter<
   constructor(model: TModel, config: WebGlTextConfig = {}) {
     super({}, model)
     this.contextLength = config.contextLength
+    setKeepLoaded(model, config.keepLoaded ?? false)
   }
 
   /** How the model writes tool calls. */

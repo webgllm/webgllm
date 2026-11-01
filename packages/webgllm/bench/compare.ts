@@ -207,6 +207,8 @@ async function runTjs(text: string, cpu = false) {
   let ready: () => void = () => undefined
   let failed: (e: Error) => void = () => undefined
   worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
     if (data.type === "progress") {
       const pct = Math.floor(data.progress * 100)
       if (pct >= lastPct + 10) {
@@ -321,6 +323,8 @@ async function runWebgl(text: string) {
   >()
   let reply = ""
   worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
     if (data.type === "progress") {
       const pct = Math.floor(data.progress * 100)
       if (pct >= lastPct + 10) {
@@ -407,6 +411,8 @@ async function runSwitch() {
   let awaiting = ""
   let reply = ""
   worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
     if (data.type === "token") reply += data.text
     else if (data.type === "ready" && data.model === awaiting) settle?.resolve()
     else if (data.type === "done" && data.id === awaiting) settle?.resolve()

@@ -24,6 +24,17 @@ import { THINK_OPEN } from "./reply.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
+/** Resolves when the page answers a "claim" (see claimMemory). */
+let claimed: (() => void) | null = null
+
+/** Asks the page to make room for the model, and waits until it has. */
+function claimMemory(model: string, bytes: number) {
+  return new Promise<void>((resolve) => {
+    claimed = resolve
+    post({ type: "claim", model, bytes: Math.round(bytes) })
+  })
+}
+
 type Loaded = {
   model: string
   /** The contextLength it was loaded for (the model's own when undefined). */
@@ -201,6 +212,11 @@ async function load(
     } = await fetchFiles(model, signal)
     lap("files")
     post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
+    // Room for it first: the page unloads other runtimes' models past the
+    // memory budget. The weights take about their size in textures, plus
+    // the cache and working textures.
+    const weightBytes = weightFiles.reduce((sum, f) => sum + f.size, 0)
+    await claimMemory(model, weightBytes * 1.1)
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
       tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
@@ -753,7 +769,10 @@ function tuneWhenIdle() {
 }
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type === "tune") {
+  if (data.type === "claimed") {
+    claimed?.()
+    claimed = null
+  } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
     void startLoad(data.model, data.contextLength).catch(() => undefined)

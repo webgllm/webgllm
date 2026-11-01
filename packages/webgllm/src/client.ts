@@ -5,6 +5,7 @@
  */
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import type { WebGlTextModel } from "./model-meta.js"
+import { claimMemory, releaseMemory, touchMemory } from "./model-memory.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import type { Sampling } from "./sampler.js"
 import { createStore } from "./store.js"
@@ -55,6 +56,41 @@ let loaded: {
 } | null = null
 let worker: Worker | null = null
 
+/** This runtime's name in the shared memory registry. */
+const OWNER = "webgl"
+
+/** Models never unloaded to make room for another runtime's (see setKeepLoaded). */
+const keepLoaded = new Set<string>()
+
+/**
+ * Keeps `model` loaded when another runtime (Transformers.js, wllama) loads
+ * a model past the memory budget; by default the least recently used goes.
+ */
+export function setKeepLoaded(model: WebGlTextModel, keep: boolean) {
+  if (keep) keepLoaded.add(model)
+  else keepLoaded.delete(model)
+}
+
+/**
+ * Frees the loaded model, all its GPU memory with it, by ending the worker
+ * (the next load starts a new one). Another runtime loading a model past the
+ * memory budget calls it too.
+ */
+export function unloadModel() {
+  worker?.terminate()
+  worker = null
+  releaseMemory(OWNER)
+  if (loaded) {
+    modelStatus(loaded.model as WebGlTextModel).set({ state: "idle" })
+    loaded.load.reject(new Error("The model was unloaded."))
+    loaded = null
+  }
+  for (const [id, generation] of generations) {
+    generations.delete(id)
+    generation.onEnd("The model was unloaded.")
+  }
+}
+
 function handleMessage({ data }: MessageEvent<WorkerResponse>) {
   if (data.type === "progress") {
     // A download (not a load from storage): worth keeping.
@@ -68,6 +104,15 @@ function handleMessage({ data }: MessageEvent<WorkerResponse>) {
         totalBytes: data.totalBytes
       })
     })
+  } else if (data.type === "claim") {
+    const { model, bytes } = data
+    void claimMemory({
+      owner: OWNER,
+      model,
+      bytes,
+      keepLoaded: keepLoaded.has(model),
+      unload: unloadModel
+    }).then(() => post({ type: "claimed" }))
   } else if (data.type === "ready") {
     modelStatus(data.model as WebGlTextModel).set({ state: "ready" })
     if (loaded?.model === data.model) loaded.load.resolve()
@@ -79,6 +124,7 @@ function handleMessage({ data }: MessageEvent<WorkerResponse>) {
     if (loaded?.model === data.model) {
       loaded.load.reject(new Error(data.message))
       loaded = null
+      releaseMemory(OWNER)
     }
   } else if (data.type === "token") {
     generations.get(data.id)?.onToken(data.text)
@@ -112,6 +158,7 @@ function post(message: WorkerRequest) {
 function failWorker(message: string) {
   worker?.terminate()
   worker = null
+  releaseMemory(OWNER)
   if (loaded) {
     modelStatus(loaded.model as WebGlTextModel).set({ state: "error", message })
     loaded.load.reject(new Error(message))
@@ -231,6 +278,7 @@ export async function* generate(request: {
   })
   const onAbort = () => post({ type: "stop", id })
   signal?.addEventListener("abort", onAbort)
+  touchMemory(OWNER)
   post({
     type: "generate",
     id,

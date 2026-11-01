@@ -56,6 +56,8 @@ export type WorkerRequest =
       pipeline?: boolean
     }
   | { type: "stop"; id: string }
+  /** The page made room for the model (see "claim"): the worker loads it. */
+  | { type: "claimed" }
   /** For benchmarks: engine tuning knobs (see TUNING in engine.ts). */
   | { type: "tune"; values: Record<string, number> }
 
@@ -75,6 +77,12 @@ export type WorkerResponse =
       timings?: Record<string, number>
     }
   | { type: "load-error"; model: string; message: string }
+  /**
+   * The model takes about `bytes` once loaded: the page makes room for it
+   * (unloading other runtimes' models past the memory budget, see
+   * model-memory.ts) and answers "claimed".
+   */
+  | { type: "claim"; model: string; bytes: number }
   | { type: "token"; id: string; text: string }
   | { type: "done"; id: string; stats: RunTimings }
   | { type: "error"; id: string; message: string }
