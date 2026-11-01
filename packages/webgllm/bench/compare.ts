@@ -135,7 +135,8 @@ async function runWllamaPackage(text: string, gpu = true) {
 async function runTjs(text: string, cpu = false) {
   const worker = new Worker(
     cpu ? "/bundle/bench/tjs-cpu-worker.js" : "/bundle-tjs/src/worker.js",
-    { type: "module", name: "transformers-js" }
+    // "…:debug" turns on the worker's memory logs (?debug=1).
+    { type: "module", name: params.get("debug") ? "transformers-js:debug" : "transformers-js" }
   )
   let lastPct = -10
   const pending = new Map<
@@ -463,6 +464,10 @@ async function main() {
   log(
     `cross-origin isolated: ${String(globalThis.crossOriginIsolated)}, ${navigator.hardwareConcurrency} logical cores`
   )
+  // How full the site's storage is: Safari closes a file mid-download when
+  // the site runs out of room.
+  const { usage = 0, quota = 0 } = await navigator.storage.estimate()
+  log(`storage: ${Math.round(usage / 1e6)} of ${Math.round(quota / 1e6)} MB used`)
   const text = await promptText(Number(params.get("len") ?? 512))
   const run = params.get("run")
   if (run === "tjs") await runTjs(text)
