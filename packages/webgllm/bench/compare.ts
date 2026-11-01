@@ -181,7 +181,13 @@ async function runTjs(text: string, cpu = false) {
   await new Promise<void>((resolve, reject) => {
     ready = resolve
     failed = reject
-    worker.postMessage({ type: "load", modelId: model, dtype: cpu ? "q4" : "q4f16" })
+    // The context the chats use (?ctx=, 8,192 by default, as on an iPhone).
+    worker.postMessage({
+      type: "load",
+      modelId: model,
+      dtype: cpu ? "q4" : "q4f16",
+      contextLength: Number(params.get("ctx") ?? 8192)
+    })
   })
   log(
     `Transformers.js loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`
