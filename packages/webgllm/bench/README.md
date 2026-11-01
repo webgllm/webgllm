@@ -20,6 +20,30 @@ Results print in the server's terminal.
 - `?smoke=1&len=512&format=…&q=…`: a chat prompt padded to about `len` tokens, read and answered as the worker does it (no reference needed); prints the reply and the speed.
 - `&skip=matmul,norm,…`: times the prompt and single-token steps with each kind of pass left out, to see where the time goes.
 
+## tools.html: does the reply start with a tool call?
+
+Prompts that need a tool (weather, web search, calendar, run Python), with thinking off, as token ids from `REF_DIR/<set>/tool_prompts.json`. For each prompt it prints the probability that the reply starts with `<tool_call>`, the top token, and KL against each CPU reference in the set at that position, then writes a 48-token greedy reply to `RESULTS_FILE`.
+
+- `?set=lfm3&runtime=webgl&format=onnx&onnx=onnx-community`: this engine on the ONNX build in `ONNX_COMMUNITY_DIR` (`&graph=` for another graph path).
+- `?set=lfm3&runtime=webgl&format=gguf&model=LFM3-1.7B-QAD-Q4_0.gguf`: this engine on a GGUF in `MODELS_DIR`.
+- `?set=lfm3&runtime=tjs&onnx=onnx-community`: Transformers.js 4.3.2 on WebGPU (q4f16), with the app's ONNX Runtime.
+
+`tool-ref/` makes the sets: `make_lfm3_ref.py` (prompts and onnxruntime CPU logits), `add_lfm3_ref.py` (another CPU reference, such as exact 4-bit math) and `llama_ref.py` (a running llama-server's first-token probabilities and replies, for GGUFs).
+
+LFM3 1.7B, 20 prompts, Apple M3 Ultra (Nov 1):
+
+| | Starts with a tool call | Greedy calls first | No call in 48 tokens |
+|---|---|---|---|
+| fp16 (onnxruntime CPU) | 0.966 | 20/20 | |
+| LiquidAI's QAD Q4_0 GGUF, this engine | 0.960 | 20/20 | 0 |
+| the same GGUF, llama.cpp CPU | 0.965 | 20/20 | 0 |
+| onnx-community's q4f16, this engine | 0.634 | 16/20 | 4 |
+| the same, onnxruntime CPU, exact 4-bit math | 0.634 | 16/20 | 4 |
+| the same, onnxruntime CPU as shipped | 0.607 | 13/20 | 5 |
+| the same, Transformers.js (WebGPU) | 0.576 | 14/20 | 4 |
+
+The engine matches exact math (mean KL 1.1e-4, same top token at 20 of 20) and llama.cpp; Transformers.js is 200× further from exact math (KL 2.1e-2). onnx-community's graph sets `accuracy_level` 4 on its 4-bit matmuls, so onnxruntime's CPU quantizes their activations to 8 bits: an exact-math reference needs a copy with 0. The q4f16 build's misses are in its weights: on three calendar prompts and one weather prompt it reasons in text (it doesn't know today's date) where fp16 and the GGUF call the tool.
+
 ## index.html: the go/no-go benchmark
 
 The first step, before the engine: one Q4_0 matmul kernel on every LFM3 projection shape at 128 tokens (`?run=gpu`), against wllama's relaxed-SIMD build reading the same number of tokens (`?run=cpu`). On a Pixel 10 Pro in Firefox, LFM3's matmuls for 128 tokens took 1.49 s (86 tokens/s) against 24.5 prompt tokens/s for wllama's whole model, so the engine was built.

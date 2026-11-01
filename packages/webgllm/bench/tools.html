@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tool-call check</title>
+    <style>
+      body {
+        font:
+          12px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      const out = document.getElementById("out")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+        void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+      }
+      log(navigator.userAgent)
+      const q = new URLSearchParams(location.search)
+      const params = {
+        set: q.get("set") ?? "lfm3",
+        runtime: q.get("runtime") ?? "webgl",
+        format: q.get("format") ?? "onnx",
+        onnx: q.get("onnx") ?? "onnx-community",
+        model: q.get("model") ?? undefined,
+        graph: q.get("graph") ?? undefined,
+        steps: q.has("steps") ? Number(q.get("steps")) : undefined
+      }
+      log(`params ${JSON.stringify(params)}`)
+      const worker = new Worker("/bundle/bench/tools-worker.js", { type: "module" })
+      worker.onmessage = ({ data }) => {
+        if (data.type === "log") log(data.text)
+        else if (data.type === "result")
+          void fetch("/result", { method: "POST", body: JSON.stringify(data.value) })
+        else if (data.type === "error") log(`ERROR: ${data.message}\nALL DONE`)
+        else if (data.type === "done") log("ALL DONE")
+      }
+      worker.onerror = (e) => log(`worker error: ${e.message}\nALL DONE`)
+      worker.postMessage(params)
+    </script>
+  </body>
+</html>
