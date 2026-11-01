@@ -6,12 +6,22 @@
  *
  *   node bench/server.mjs [port]     MODELS_DIR=… for model files, REF_DIR=… for reference tensors
  *
+ * Listens on localhost only (HOST=0.0.0.0 to serve the network; phones reach
+ * it through `adb reverse` or a tunnel to localhost).
+ *
  * On a phone over USB: `adb reverse tcp:8787 tcp:8787`, then open
  * http://localhost:8787/?run=gpu (localhost counts as a secure context).
  */
 import { createReadStream, appendFileSync, statSync } from "node:fs"
 import { createServer } from "node:http"
-import { dirname, extname, join, normalize } from "node:path"
+import {
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve as resolvePath
+} from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { build } from "esbuild"
@@ -54,15 +64,21 @@ const isolation = {
   "Cache-Control": "no-store"
 }
 
+/**
+ * Whether `file` is `root` or inside it: a path boundary, not a string
+ * prefix (`/a/bench-private` starts with `/a/bench` but isn't in it).
+ */
+function inside(root, file) {
+  const rel = relative(resolvePath(root), resolvePath(file))
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
 function resolve(url) {
   const path = decodeURIComponent(new URL(url, "http://x").pathname)
   for (const [prefix, root] of Object.entries(roots)) {
     if (!path.startsWith(prefix)) continue
-    const file = normalize(
-      join(root, path.slice(prefix.length) || "index.html")
-    )
-    if (!file.startsWith(normalize(root))) return null
-    return file
+    const file = resolvePath(root, `./${path.slice(prefix.length) || "index.html"}`)
+    return inside(root, file) ? file : null
   }
   return null
 }
@@ -73,10 +89,11 @@ async function bundle(path, res) {
   const base = path.startsWith("/bundle-tjs/")
     ? join(repo, "packages/transformers-js")
     : pkg
-  const entry = normalize(
-    join(base, path.replace(/^\/bundle(-tjs)?\//, "").replace(/\.js$/, ".ts"))
+  const entry = resolvePath(
+    base,
+    `./${path.replace(/^\/bundle(-tjs)?\//, "").replace(/\.js$/, ".ts")}`
   )
-  if (!entry.startsWith(base)) return res.writeHead(404, isolation).end()
+  if (!inside(base, entry)) return res.writeHead(404, isolation).end()
   try {
     const out = await build({
       entryPoints: [entry],
@@ -147,4 +164,6 @@ createServer((req, res) => {
   res.writeHead(200, { ...headers, "Content-Length": stat.size })
   if (req.method === "HEAD") return res.end()
   createReadStream(file).pipe(res)
-}).listen(port, () => console.log(`http://localhost:${port}/`))
+}).listen(port, process.env.HOST ?? "127.0.0.1", () =>
+  console.log(`http://localhost:${port}/`)
+)

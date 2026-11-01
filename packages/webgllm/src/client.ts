@@ -53,6 +53,8 @@ let worker: Worker | null = null
 
 function handleMessage({ data }: MessageEvent<WorkerResponse>) {
   if (data.type === "progress") {
+    // A download (not a load from storage): worth keeping.
+    if (!data.cached) keepDownloads()
     modelStatus(data.model as WebGlTextModel).set({
       state: "loading",
       progress: data.progress,
@@ -120,11 +122,14 @@ function failWorker(message: string) {
 let askedToKeep = false
 /**
  * Asks the browser to keep this site's storage, so a downloaded model isn't
- * deleted to free space. Browsers may say no; only pages can ask.
+ * deleted to free space: once, when a model first downloads (not for one
+ * loaded from storage). Not in Firefox, which asks the user with a
+ * permission prompt. Browsers may say no; only pages can ask.
  */
 function keepDownloads() {
   if (askedToKeep || typeof navigator === "undefined") return
   askedToKeep = true
+  if (/Firefox\//.test(navigator.userAgent)) return
   navigator.storage?.persist?.().catch(() => undefined)
 }
 
@@ -162,7 +167,6 @@ export function loadModel(model: WebGlTextModel): Promise<void> {
   })
   promise.catch(() => undefined)
   loaded = { model, load: { promise, resolve, reject } }
-  keepDownloads()
   modelStatus(model).set({ state: "loading", progress: 0, cached: true })
   post({ type: "load", model })
   return promise

@@ -105,7 +105,11 @@ function half(h: number): number {
   return s * (1 + m / 1024) * 2 ** (e - 15)
 }
 
-/** A QuantMatrix row, decoded from the layout described in weights.ts. */
+/**
+ * A QuantMatrix row, decoded from the layout described in weights.ts (or,
+ * for 4-bit weights left raw, from `raw`: MatMulNBits rows, element e of a
+ * block in nibble e & 1, low first, of byte e >> 1).
+ */
 function decodeRow(m: QuantMatrix, n: number): Float64Array {
   const blocks = m.K / 32
   const out = new Float64Array(m.K)
@@ -114,7 +118,13 @@ function decodeRow(m: QuantMatrix, n: number): Float64Array {
   for (let b = 0; b < blocks; b++) {
     const idx = (g * blocks + b) * 4 + r
     const scale = half(m.scales[idx])
-    if (m.bits === 4) {
+    if (m.bits === 4 && m.raw) {
+      const zero = m.zeros ? m.zeros[idx] : 8
+      for (let e = 0; e < 32; e++) {
+        const byte = m.raw[(n * blocks + b) * 16 + (e >> 1)]
+        out[b * 32 + e] = scale * ((e & 1 ? byte >> 4 : byte & 15) - zero)
+      }
+    } else if (m.bits === 4) {
       const zero = m.zeros ? m.zeros[idx] : 8
       for (let w = 0; w < 4; w++) {
         const word = m.quants[idx * 4 + w]
@@ -259,10 +269,18 @@ function checkMatrix(
     m.N === N && m.K === K && m.bits === bits,
     `${label}: ${m.N}x${m.K} ${m.bits}-bit, expected ${N}x${K} ${bits}-bit`
   )
-  expect(
-    m.quants.length === blocks * (bits === 4 ? 4 : 8),
-    `${label}: quants length ${m.quants.length}`
-  )
+  if (m.raw) {
+    // 4-bit rows left raw (ONNX): 16 bytes a block, `quants` empty.
+    expect(
+      bits === 4 && m.raw.length === blocks * 16 && m.quants.length === 0,
+      `${label}: raw length ${m.raw.length}, quants length ${m.quants.length}`
+    )
+  } else {
+    expect(
+      m.quants.length === blocks * (bits === 4 ? 4 : 8),
+      `${label}: quants length ${m.quants.length}`
+    )
+  }
   expect(
     m.scales.length === blocks,
     `${label}: scales length ${m.scales.length}`
@@ -345,7 +363,8 @@ function checkConfig(c: ModelConfig): void {
   for (const [key, value] of Object.entries(c)) {
     if (key === "format" || key === "layerTypes") continue
     expect(
-      typeof value === "number" && Number.isFinite(value),
+      typeof value === "boolean" ||
+        (typeof value === "number" && Number.isFinite(value)),
       `config.${key} = ${String(value)}`
     )
   }

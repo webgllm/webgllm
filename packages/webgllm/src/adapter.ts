@@ -410,10 +410,16 @@ export class WebGlTextAdapter<
       signal
     })
     let next = await stream.next()
-    while (!next.done) {
-      addPieces(thinkingSplitter.push(next.value))
-      yield* events.splice(0)
-      next = await stream.next()
+    try {
+      while (!next.done) {
+        addPieces(thinkingSplitter.push(next.value))
+        yield* events.splice(0)
+        next = await stream.next()
+      }
+    } finally {
+      // Stopped reading early (a break, or return() on this stream): close
+      // the generation, which tells the worker to stop.
+      if (!next.done) await stream.return({})
     }
     const { failure, stats } = next.value
     addPieces(thinkingSplitter.flush())
