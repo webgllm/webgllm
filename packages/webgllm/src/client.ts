@@ -147,8 +147,26 @@ function post(message: WorkerRequest) {
     worker.onmessage = handleMessage
     worker.onerror = (event) =>
       failWorker(event.message || "The model's worker stopped.")
+    if (promptBatch !== undefined)
+      worker.postMessage({ type: "tune", values: { promptBatch } } satisfies WorkerRequest)
   }
   worker.postMessage(message)
+}
+
+/** See setPromptBatch. */
+let promptBatch: number | undefined
+
+/**
+ * Prompt tokens per forward batch from the next model load on (undefined:
+ * the default, 512 on every device). Smaller batches take less memory and
+ * read prompts slower: 128 holds Qwen3.5 2B's 8k-token chats in ~270 MiB
+ * less (an iPhone page has ~2 GB), at about half the prompt speed (still
+ * about twice what it read before its recurrence ran in chunks). A loaded
+ * model keeps its batch until it loads again (unloadModel, then load).
+ */
+export function setPromptBatch(tokens: number | undefined) {
+  promptBatch = tokens
+  worker?.postMessage({ type: "tune", values: { promptBatch: tokens ?? 0 } } satisfies WorkerRequest)
 }
 
 /**

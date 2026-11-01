@@ -294,7 +294,7 @@ function applyTune(spec: string) {
 
 async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>, batch: number) {
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    batchSize: batch || params.batch || WORKER_BATCH,
+    batchSize: batch || params.batch || (TUNING.promptBatch > 0 ? TUNING.promptBatch : WORKER_BATCH),
     ...(params.contextLength && { contextLength: params.contextLength })
   })
   instrument(engine)

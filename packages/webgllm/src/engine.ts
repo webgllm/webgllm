@@ -265,6 +265,10 @@ export const TUNING = {
    * step's worth unused, not up to half the cache.
    */
   kvStep: 512,
+  /** The worker's prompt batch, for benchmarks (0: its PROMPT_BATCH). */
+  promptBatch: 0,
+  /** Prompt matmuls take four tokens per fragment from batches this big (EngineOptions.quadMatmuls). */
+  quadMinBatch: 256,
   /**
    * Resume points kept for a model with Gated DeltaNet layers (~20 MB each
    * for Qwen3.5 2B; see snapshot): the anchor, where the next user turn's
@@ -451,7 +455,7 @@ export class Engine {
     this.gpu.hints = TUNING.renderHints
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
-    this.quadMatmuls = options.quadMatmuls ?? this.baseBatch >= 256
+    this.quadMatmuls = options.quadMatmuls ?? this.baseBatch >= TUNING.quadMinBatch
     for (const name of options.skip ?? []) this.gpu.skip.add(name)
   }
 
@@ -499,8 +503,9 @@ export class Engine {
     ) {
       throw new Error("The model's weights are incomplete.")
     }
-    // The f16 prompt matmul's scratch now, not in the middle of a prompt.
-    if (TUNING.f16Matmul > 0) this.f16Scratch()
+    // The f16 prompt matmul's scratch now, not in the middle of a prompt
+    // (only 4-token matmuls run it: none, no scratch).
+    if (TUNING.f16Matmul > 0 && this.quadMatmuls) this.f16Scratch()
     await this.gpu.finish()
   }
 

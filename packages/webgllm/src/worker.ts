@@ -92,10 +92,13 @@ function hash(text: string) {
 const release = (engine: Engine) => engine.gpu.dispose()
 
 /**
- * Prompt tokens per forward batch, the same on every device (the engine
- * scales it up for smaller models): bigger batches read prompts faster on
- * every GPU tried (2.4× on a Mac, 15% on a Pixel than 128), for ~170 MiB
- * more buffers with LFM3.
+ * Prompt tokens per forward batch, the same on every device and model (the
+ * engine scales it up for smaller models; TUNING.promptBatch overrides it
+ * for benchmarks): bigger batches read prompts faster on every GPU tried
+ * (2.4× on a Mac, 15% on a Pixel than 128). 256 or 128 would save 120 or
+ * 270 MiB of Qwen3.5 2B's buffers, but LFM3 then reads prompts 32% and 56%
+ * slower on an M3, and nothing the GPU reports tells where the room is
+ * short (an M3 and an iPhone report the same limits).
  */
 const PROMPT_BATCH = 512
 
@@ -191,7 +194,7 @@ async function load(
     mark = now
   }
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    batchSize: PROMPT_BATCH,
+    batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
     ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"], chunkedRecurrence: false })
   })
