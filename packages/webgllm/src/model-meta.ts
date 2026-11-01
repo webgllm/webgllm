@@ -2,7 +2,8 @@
  * The models this package runs: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
  * 4-bit ONNX builds), the LFM2.5 / LFM2 ONNX builds the Transformers.js
  * package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
- * q4f16 ONNX), each with its files pinned and the sampling from its card.
+ * q4f16 ONNX), each with its files (at their latest version) and the
+ * sampling from its card.
  */
 import type { ModelReasoning } from "@tanstack/ai"
 import type { ModelReasoningCapability } from "@tanstack/ai/adapter-internals"

@@ -1,6 +1,6 @@
 # @tanstack-ai-browser/webgl
 
-A [TanStack AI](https://tanstack.com/ai) adapter for LFM3 1.7B, LFM2.5 and Qwen3.5 2B running in the browser on its own WebGL 2 inference engine, in a Web Worker on an OffscreenCanvas. It's for browsers without WebGPU, Firefox on Android among them: there, it reads prompts on the GPU about three times as fast as llama.cpp on the CPU.
+A [TanStack AI](https://tanstack.com/ai) adapter for LFM3 1.7B, LFM2.5 and Qwen3.5 2B running in the browser on its own WebGL 2 inference engine, in a Web Worker on an OffscreenCanvas. It runs with or without WebGPU (the demo app starts on it everywhere, iPhone Safari included); where there's no WebGPU, Firefox on Android among them, it reads prompts on the GPU about three times as fast as llama.cpp on the CPU.
 
 ```sh
 npm install @tanstack-ai-browser/webgl @tanstack/ai
@@ -21,7 +21,7 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 ## Models
 
-`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (pinned revisions), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; Qwen3.5: temperature 0.6, top-k 20, top-p 0.95).
+`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; Qwen3.5: temperature 0.6, top-k 20, top-p 0.95).
 
 | Model                            | Weights                                                       | Download |
 | -------------------------------- | ------------------------------------------------------------- | -------- |
