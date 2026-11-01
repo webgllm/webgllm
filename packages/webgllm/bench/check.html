@@ -110,6 +110,8 @@
         question: params.get("q") ?? undefined,
         length: params.get("len") ? Number(params.get("len")) : undefined,
         skip: params.get("skip") ? params.get("skip").split(",") : undefined,
+        decodeAt: params.get("decodeAt") ? Number(params.get("decodeAt")) : undefined,
+        alternate: params.get("alternate") === "1",
         attn: params.get("attn") === "1",
         linstate: params.get("linstate") ?? undefined,
         small: params.get("small") === "1",

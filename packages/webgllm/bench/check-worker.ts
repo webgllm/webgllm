@@ -781,6 +781,10 @@ async function smoke(params: {
   /** Pad the question to about this many prompt tokens, to time prompt reading. */
   length?: number
   skip?: Array<string>
+  /** With skip: time writing steps from a cache of this many tokens (and leave out the prompt profile). */
+  decodeAt?: number
+  /** With skip: the prompt profile in alternated rounds (heat-fair). */
+  alternate?: boolean
   texels?: "bytes" | "words"
   ab?: string
   abDecode?: string
@@ -931,11 +935,12 @@ async function smoke(params: {
       `textures: ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB (batch ${params.batch})`
     )
     const tokens = Array.from(
-      { length: params.length ?? 512 },
+      { length: Math.max(params.length ?? 512, params.decodeAt ?? 0) },
       (_, i) => 1000 + (i % 5000)
     )
     engine.reset()
     await engine.forward(tokens.slice(0, 8))
+    const decodeAt = params.decodeAt
     const time = async (label: string, skip: Array<string>) => {
       engine.gpu.skip = new Set(skip)
       // Best of 5 (the first also compiles anything new).
@@ -950,14 +955,53 @@ async function smoke(params: {
       log(`PROFILE ${label.padEnd(16)} ${ms.toFixed(0)} ms`)
       return ms
     }
-    const all = await time("everything", [])
-    for (const name of params.skip) {
-      const ms = await time(`without ${name}`, [name])
+    if (!decodeAt && params.alternate) {
+      // Alternated rounds, one prompt each, best of each: heat slows every
+      // configuration alike.
+      const configs: Array<[string, Array<string>]> = [
+        ["everything", []],
+        ...params.skip.map((n): [string, Array<string>] => [`without ${n}`, [n]])
+      ]
+      const best = new Map<string, number>()
+      for (let round = 0; round < 3; round++)
+        for (const [label, skip] of configs) {
+          engine.gpu.skip = new Set(skip)
+          engine.reset()
+          await engine.gpu.finish()
+          const t = performance.now()
+          await engine.forward(tokens)
+          const ms = performance.now() - t
+          log(`PROFILE ${label} (round ${round + 1}) ${ms.toFixed(0)} ms`)
+          best.set(label, Math.min(best.get(label) ?? Infinity, ms))
+        }
+      engine.gpu.skip = new Set()
+      const all = best.get("everything") ?? Infinity
       log(
-        `  ${name}: ${(all - ms).toFixed(0)} ms (${(((all - ms) / all) * 100).toFixed(0)}%)`
+        `PROMPT OF ${tokens.length}, best ms over 3 alternated rounds: everything ${all.toFixed(0)} (${((tokens.length / all) * 1000).toFixed(0)} tok/s); ` +
+          params.skip
+            .map((n) => {
+              const d = all - (best.get(`without ${n}`) ?? all)
+              return `${n} ${d.toFixed(0)} (${((d / all) * 100).toFixed(0)}%)`
+            })
+            .join(", ")
       )
+    } else if (!decodeAt) {
+      const all = await time("everything", [])
+      for (const name of params.skip) {
+        const ms = await time(`without ${name}`, [name])
+        log(
+          `  ${name}: ${(all - ms).toFixed(0)} ms (${(((all - ms) / all) * 100).toFixed(0)}%)`
+        )
+      }
+      await time("everything again", [])
+    } else {
+      // The long cache once, kept as a snapshot each writing timing rewinds to.
+      engine.reset()
+      const t = performance.now()
+      await engine.forward(tokens.slice(0, decodeAt))
+      engine.snapshot()
+      log(`DECODE cache of ${decodeAt} tokens read in ${(performance.now() - t).toFixed(0)} ms`)
     }
-    await time("everything again", [])
     // Writing: single-token steps, each with its logits read back.
     const step = async (
       label: string,
@@ -965,8 +1009,11 @@ async function smoke(params: {
       readLogits = true
     ) => {
       engine.gpu.skip = new Set(skip)
-      engine.reset()
-      await engine.forward(tokens.slice(0, 64))
+      if (decodeAt) engine.rewind(decodeAt)
+      else {
+        engine.reset()
+        await engine.forward(tokens.slice(0, 64))
+      }
       const draws = engine.gpu.draws
       const t = performance.now()
       for (let i = 0; i < 16; i++) {
@@ -1110,10 +1157,31 @@ async function smoke(params: {
       )
     }
     await step("no logits readback", [], false)
-    for (const name of params.skip) {
-      const ms = await step(`without ${name}`, [name])
-      log(`  ${name}: ${(full - ms).toFixed(1)} ms`)
-    }
+    if (decodeAt) {
+      // Alternated rounds, best of each: a phone that heats up slows every
+      // configuration alike instead of the ones timed last.
+      const configs: Array<[string, Array<string>]> = [
+        ["everything", []],
+        ...params.skip.map((n): [string, Array<string>] => [`without ${n}`, [n]])
+      ]
+      const best = new Map<string, number>()
+      for (let round = 0; round < 4; round++)
+        for (const [label, skip] of configs) {
+          const ms = await step(`${label} (round ${round + 1})`, skip)
+          best.set(label, Math.min(best.get(label) ?? Infinity, ms))
+        }
+      const all = best.get("everything") ?? Infinity
+      log(
+        `DECODE AT ${decodeAt}, best GPU ms/token over 4 alternated rounds: everything ${all.toFixed(2)}; ` +
+          params.skip
+            .map((n) => `${n} ${(all - (best.get(`without ${n}`) ?? all)).toFixed(2)}`)
+            .join(", ")
+      )
+    } else
+      for (const name of params.skip) {
+        const ms = await step(`without ${name}`, [name])
+        log(`  ${name}: ${(full - ms).toFixed(1)} ms`)
+      }
     engine.gpu.skip = new Set()
     const t = performance.now()
     for (let i = 0; i < 16; i++) await engine.logits(0)
