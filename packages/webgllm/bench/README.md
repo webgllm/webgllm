@@ -61,3 +61,7 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 - Keeping dequantized f16 weights across prompt batches: dequantization is 5% of a 2,048-token LFM3 prompt on an M3, for hundreds of MB more per layer kept.
 - Ranking chunks only up to k, or scattering chunk ranks with points: the four pick passes take ~0.2 ms a token on an iPhone (of ~2.3 ms for head, pick and readback); the head and the sync are the rest.
 - JS-side pass state caching: issuing a 350M token takes 0.34 ms of JS on an iPhone, under 6.5 ms of GPU work it overlaps.
+
+## Load-time tuning (Nov 1)
+
+`check.html?…&sweep=knob:v1,v2;knob2:…` times each value on the prompt, its first 40 tokens and writing, rounds interleaved. On the 350M and LFM3 the writing knobs (splitFragments, maxSplit, headSplit) and f16Half were flat on an M3, an iPhone 16 Pro Max and the Pixel (within noise; the phones heat up during a sweep, so only values of one knob compare). How prompt matmuls split K wasn't: 4 slices for short batches on the M3 (LFM3 40 tokens 55 vs 62 ms with 2) but 2 on the iPhone (241 vs 276 ms; 350M 52 vs 61); K-slices of 256 values for full batches on the M3's 350M (44.6 vs 51.1 ms for 516 tokens), the same as 512 elsewhere, 1024 never better. Engine.tune times those two choices on layer 0's gate|up and down after the warm-up (73 ms on the M3, 0.3–0.6 s on the iPhone), keeps a choice only 5% faster than TUNING's, and the worker remembers it in gpu-notes with the layout.

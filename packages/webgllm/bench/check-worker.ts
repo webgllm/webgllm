@@ -608,6 +608,7 @@ async function smoke(params: {
   texels?: "bytes" | "words"
   ab?: string
   abDecode?: string
+  sweep?: string
 }) {
   if (params.onnx) onnxDir = `/${params.onnx}`
   const dir = params.format === "onnx" ? onnxDir : "/hf"
@@ -1043,6 +1044,52 @@ async function smoke(params: {
       `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
   }
+  // Sweeps: ?sweep=knob:v1,v2,…;knob2:… times each value of each knob
+  // (others at their defaults) on the prompt, its first 40 tokens, and
+  // writing (GPU time of 16 queued steps), rounds interleaved, medians.
+  if (params.sweep) {
+    const T = TUNING as Record<string, number>
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
+    for (const spec of params.sweep.split(";")) {
+      const [knob, list] = spec.split(":")
+      const values = list.split(",").map(Number)
+      const original = T[knob]
+      const long: Record<number, Array<number>> = {}
+      const short: Record<number, Array<number>> = {}
+      const write: Record<number, Array<number>> = {}
+      for (const v of values) {
+        long[v] = []
+        short[v] = []
+        write[v] = []
+      }
+      const once = async (v: number, timed: boolean) => {
+        T[knob] = v
+        engine.reset()
+        await engine.gpu.finish()
+        let t = performance.now()
+        await pick(await engine.forwardHidden(prompt.slice(0, 40)))
+        if (timed) short[v].push(performance.now() - t)
+        engine.reset()
+        await engine.gpu.finish()
+        t = performance.now()
+        const next = await pick(await engine.forwardHidden(prompt))
+        if (timed) long[v].push(performance.now() - t)
+        await engine.gpu.finish()
+        t = performance.now()
+        for (let s2 = 0; s2 < 16; s2++) await engine.forwardNoLogits([next])
+        await engine.gpu.finish()
+        if (timed) write[v].push((performance.now() - t) / 16)
+      }
+      // An untimed round first: new settings may compile programs.
+      for (const v of values) await once(v, false)
+      for (let round = 0; round < 5; round++) for (const v of values) await once(v, true)
+      T[knob] = original
+      for (const v of values)
+        log(
+          `SWEEP ${knob}=${v}${v === original ? " (default)" : ""}: prompt ${prompt.length} ${med(long[v]).toFixed(1)} ms, prompt 40 ${med(short[v]).toFixed(1)} ms, writing GPU ${med(write[v]).toFixed(2)} ms/token`
+        )
+    }
+  }
   const checks = (params as { checks?: boolean }).checks !== false
   const compare = (params as { compare?: string }).compare
   if (compare) {
@@ -1129,7 +1176,7 @@ async function smoke(params: {
       `SEGMENT CHECK: 512-key segments vs whole rows over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${whole.length}`
     )
   }
-  if (params.ab || params.abDecode || compare || (prompt.length > 1000 && checks)) {
+  if (params.ab || params.abDecode || params.sweep || compare || (prompt.length > 1000 && checks)) {
     // The A/B runs and checks left the cache elsewhere: read the prompt again.
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)

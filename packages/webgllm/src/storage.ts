@@ -6,6 +6,7 @@
  * `createWritable`). A file counts as downloaded once its `.done` marker
  * exists, so an interrupted download is never mistaken for a whole one.
  */
+import type { Tuned } from "./engine.js"
 import { fileUrl } from "./model-meta.js"
 import type { ModelFile } from "./model-meta.js"
 
@@ -50,7 +51,12 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
  * measure again (see worker.ts), keyed by GPU, browser, model and engine
  * code. Best effort: no storage means measuring each time.
  */
-export type GpuNote = { layout: "rgba4" | "bytes"; selfCheck: number }
+export type GpuNote = {
+  layout: "rgba4" | "bytes"
+  selfCheck: number
+  /** Engine.tune's picks (older notes have none: tuned again). */
+  tuned?: Tuned
+}
 
 const NOTES = "gpu-notes.json"
 

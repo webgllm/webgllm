@@ -245,6 +245,13 @@ async function load(
     timings.compileMs = Math.round(engine.gpu.compiled.ms)
     for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
+    // How this GPU splits prompt matmuls: remembered, or timed once.
+    if (note?.tuned) engine.tuned = note.tuned
+    else await engine.tune()
+    lap("tune")
+    timings.tunedSliceK = engine.tuned.sliceK ?? 0
+    timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
+    if (signal.aborted) throw new Superseded()
     // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
     // A pass is remembered (same GPU, browser, model and code).
@@ -253,8 +260,12 @@ async function load(
         ? note.selfCheck
         : await engine.selfCheck()
     lap("selfCheck")
-    if (!note && engine.layoutChoice && error <= SELF_CHECK_MAX)
-      void writeGpuNote(noteKey, { layout: engine.layoutChoice.layout, selfCheck: error })
+    if ((!note || !note.tuned) && engine.layoutChoice && error <= SELF_CHECK_MAX)
+      void writeGpuNote(noteKey, {
+        layout: engine.layoutChoice.layout,
+        selfCheck: error,
+        tuned: engine.tuned
+      })
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {

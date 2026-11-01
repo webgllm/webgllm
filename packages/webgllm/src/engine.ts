@@ -193,8 +193,8 @@ export const TUNING = {
   segmentGroup: 0,
   /**
    * The worker's speculative decoding (see worker.ts): drafts follow an
-   * earlier occurrence of at least draftMatch last tokens; they're used
-   * unless backing off after rejected batches (see worker.ts); with
+   * earlier occurrence of at least draftMatch last tokens, as many as
+   * pay by measured cost (see DraftPolicy); with
    * guessDrafts, a draft batch also guesses the token after its last row.
    */
   draftMatch: 2,
@@ -231,6 +231,9 @@ export const TUNING = {
  * token, or `split` K-slices of it, `stride` rows apart, to be added up.
  */
 type HeadOut = { logits: Texture; split: number; stride: number }
+
+/** See Engine.tuned. */
+export type Tuned = { sliceK: number | null; shortSplit: number | null }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
 type Snapshot = {
@@ -809,6 +812,69 @@ export class Engine {
     }
     return (h >>> 0).toString(16)
   })()
+  /**
+   * How this GPU splits prompt matmuls along K, where it differs from
+   * TUNING's (null: TUNING's): `sliceK`, values per K-slice for full
+   * batches (TUNING.quadSliceK); `shortSplit`, the most slices for
+   * batches under TUNING.f16MinRows (TUNING.quadMaxSplit). From tune, or
+   * remembered from an earlier load.
+   */
+  tuned: Tuned = { sliceK: null, shortSplit: null }
+
+  /**
+   * Times the choices in `tuned` on this GPU (layer 0's gate|up and down
+   * matmuls, the prompt's largest, on the loaded weights) and keeps a
+   * choice only where it beats TUNING's by 5%: Apple GPUs differ from
+   * PowerVR, and big ones from small ones, in how many slices fill them.
+   * Each candidate in turn per round (drift from heat cancels), median of
+   * 3 rounds. Call after warmUp; returns what it picked.
+   */
+  async tune(): Promise<Tuned> {
+    const b = this.buffers
+    const layer = this.layers[0]
+    const run = (rows: number) => {
+      this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
+      this.matmul(b.act, layer.down, b.ffnOut, rows)
+    }
+    const choose = async (
+      key: keyof Tuned,
+      candidates: Array<number>,
+      rows: number
+    ): Promise<number | null> => {
+      const times = candidates.map((): Array<number> => [])
+      for (let round = -1; round < 3; round++) {
+        for (let c = 0; c < candidates.length; c++) {
+          this.tuned[key] = candidates[c]
+          await this.gpu.finish()
+          const t = performance.now()
+          run(rows)
+          await this.gpu.finish()
+          // (Round -1 untimed: programs and first-use costs.)
+          if (round >= 0) times[c].push(performance.now() - t)
+        }
+      }
+      this.tuned[key] = null
+      const med = times.map((xs) => [...xs].sort((x, y) => x - y)[1])
+      const best = med.indexOf(Math.min(...med))
+      // candidates[0] is TUNING's value.
+      return best > 0 && med[best] < 0.95 * med[0] ? candidates[best] : null
+    }
+    const picked: Tuned = {
+      shortSplit: await choose(
+        "shortSplit",
+        [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
+        Math.min(40, this.capacity)
+      ),
+      sliceK: await choose(
+        "sliceK",
+        [TUNING.quadSliceK, TUNING.quadSliceK === 256 ? 512 : 256],
+        this.capacity
+      )
+    }
+    this.tuned = picked
+    return picked
+  }
+
   /** The weight layout to use without timing (a remembered choice; see chooseLayout). */
   preferLayout: "rgba4" | "bytes" | null = null
   /**
@@ -1621,11 +1687,14 @@ export class Engine {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
       const quadRows = Math.ceil(rows / 4)
-      const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
+      // (This GPU's own choices where tune made any.)
+      const short = rows < TUNING.f16MinRows
+      const sliceK =
+        (this.tuned.sliceK ?? TUNING.quadSliceK) * (w.groups > 2048 ? 2 : 1)
       // The most slices the output holds at a full batch: the same for
       // every batch, so the warm-up compiles the programs prompts use.
       const most = Math.min(
-        TUNING.quadMaxSplit,
+        short ? (this.tuned.shortSplit ?? TUNING.quadMaxSplit) : TUNING.quadMaxSplit,
         Math.floor(out.height / Math.ceil(this.capacity / 4))
       )
       const kbSlice = Math.ceil(
