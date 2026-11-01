@@ -149,7 +149,8 @@ export type MatmulOptions = {
  * out = A · Wᵀ for h2 activations A (rows × K) and quantized W (N × K).
  * Uniforms: uKb (blocks per row), uH (row groups per weight column),
  * uRowTexels (quant texels per row group per column), uG (row groups);
- * with `wrap`, uOutW (output texels per row) and uRow (the input row).
+ * with `wrap`, uOutW (output texels per row) and uLogitRows (output rows
+ * per input row: rows of the input are stacked that many output rows apart).
  */
 function matmulSource(o: MatmulOptions) {
   const P = o.precision === "mediump" ? "mediump " : ""
@@ -236,8 +237,9 @@ function matmulSource(o: MatmulOptions) {
     }
   }
   const index = o.wrap
-    ? `int g = y * uOutW + x;
-  int m = uRow;
+    ? `int m = y / uLogitRows;
+  y -= m * uLogitRows;
+  int g = y * uOutW + x;
   if (g >= uG) { o = vec4(0.0); return; }
   int kb0 = 0;
   int kb1 = uKb;`
@@ -263,7 +265,7 @@ uniform int uH;
 uniform int uRowTexels;
 uniform int uG;
 uniform int uOutW;
-uniform int uRow;
+uniform int uLogitRows;
 uniform int uSplit;
 uniform int uKbSlice;
 out ${o.pair ? "uvec4" : "vec4"} o;
@@ -2010,6 +2012,18 @@ void main() {
   o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
 }`
 
+/**
+ * CHUNK_ARGMAX_AT for every row at once (fragment y: row y), as floats:
+ * x the token id, y its penalized logit. For greedy decoding, which needs
+ * nothing else read back.
+ */
+export const CHUNK_ARGMAX_ROWS = CHUNK_ARGMAX_AT.replace("uniform int uRow;", "")
+  .replace("out uvec4 o;\nvoid main() {", "out vec4 o;\nvoid main() {\n  int uRow = int(gl_FragCoord.y);")
+  .replace(
+    "o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);",
+    "o = vec4(float(best * 256 + at), top, 0.0, 0.0);"
+  )
+
 const chunksCache = new Map<string, Map<number, string>>()
 /** `source` with its chunk count fixed at `n`, so its loops have a constant bound. */
 export function withChunks(source: string, n: number) {
@@ -2229,13 +2243,14 @@ uniform int uH;
 uniform int uRowTexels;
 uniform int uG;
 uniform int uOutW;
-uniform int uRow;
+uniform int uLogitRows;
 out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
+  int m = y / uLogitRows;
+  y -= m * uLogitRows;
   int g = y * uOutW + x;
-  int m = uRow;
   if (g >= uG) { o = vec4(0.0); return; }
   int col = g / uH;
   int gr = g - col * uH;

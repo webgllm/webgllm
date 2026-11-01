@@ -356,20 +356,27 @@ async function generate(request: GenerateRequest) {
     )
   }
 
-  // Reuse the cache for the longest prefix this prompt shares with it.
+  // Reuse the cache for the longest prefix this prompt shares with it. The
+  // whole prompt only if its end was saved with its last hidden row (the
+  // same prompt again: a retry); else the last token is read again, for
+  // the logits after it.
   let common = 0
   while (
     common < model.cached.length &&
-    common < prompt.length - 1 &&
+    common < prompt.length &&
     model.cached[common] === prompt[common]
   ) {
     common++
   }
-  const start = engine.rewind(common)
+  const whole = common === prompt.length && engine.canResume(common)
+  const start = whole
+    ? engine.resume(common)
+    : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
 
   // Read the rest of the prompt, saving the convolutions' state after each
-  // batch so a later prompt can resume from there.
+  // batch so a later prompt can resume from there (and after the last, the
+  // last token's hidden row: see Engine.resume).
   const promptStart = performance.now()
   let row = 0
   let i = start
@@ -378,7 +385,7 @@ async function generate(request: GenerateRequest) {
     i += size
     row = await engine.forwardHidden(batch)
     model.cached.push(...batch)
-    engine.snapshot()
+    engine.snapshot(i === prompt.length ? row : undefined)
     if (stopped.has(id)) break
   }
   const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
@@ -403,7 +410,10 @@ async function generate(request: GenerateRequest) {
   // penalty and picks the candidates, and only those are read back. Ids
   // past the tokenizer's vocabulary are padding rows, never drawn.
   const vocab = tokenizer.vocabSize
-  const onGpu = sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS
+  // Greedy (temperature 0, or top_k 1): the GPU picks the token itself and
+  // only its id is read back (see Engine.argmax).
+  const greedy = sampling.temperature <= 0 || sampling.top_k === 1
+  const onGpu = greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS)
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1 } : sampling
   )
@@ -443,6 +453,11 @@ async function generate(request: GenerateRequest) {
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
   const distribution = async (r: number, guess = false) => {
+    if (greedy) {
+      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess)
+      if (guess && engine.guessing) guessed = engine.guessedToken
+      return { ids: Int32Array.of(token), p: Float32Array.of(1) }
+    }
     if (onGpu) {
       const { ids, logits } = await engine.candidates(
         r,
@@ -465,6 +480,20 @@ async function generate(request: GenerateRequest) {
     drafts: Array<number>,
     guess: boolean
   ) => {
+    if (greedy) {
+      const tokens = await engine.argmax(
+        0,
+        rows,
+        sampling.repetition_penalty,
+        drafts,
+        guess
+      )
+      if (guess && engine.guessing) guessed = engine.guessedToken
+      return Array.from(tokens, (token) => ({
+        ids: Int32Array.of(token),
+        p: Float32Array.of(1)
+      }))
+    }
     const picked = await engine.pick(
       0,
       rows,

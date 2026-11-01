@@ -230,6 +230,17 @@ async function runWebgl(text: string) {
     runs.push({ promptTps, decodeTps, ttftMs: s.firstTokenMs ?? 0 })
   }
   summarize(`WebGL${speculative ? " (speculative)" : ""}, ${model}`, runs)
+  {
+    // The last prompt again (a retry): resumed from its saved end, it
+    // should read no prompt tokens and give the same reply.
+    const last = `Run 3 of the benchmark.\n\n${text}`
+    await generate(last, 64)
+    const first = reply
+    const s = await generate(last, 64)
+    log(
+      `RETRY: ${s.cachedTokens} of ${s.inputTokens} prompt tokens cached, prompt ${(s.promptMs ?? 0).toFixed(0)} ms, first token ${(s.firstTokenMs ?? 0).toFixed(0)} ms, ${reply === first ? "same reply" : `DIFFERENT reply: ${JSON.stringify(reply.slice(0, 120))} vs ${JSON.stringify(first.slice(0, 120))}`}`
+    )
+  }
   worker.terminate()
 }
 

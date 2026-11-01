@@ -226,6 +226,13 @@ export const TUNING = {
  */
 type HeadOut = { logits: Texture; split: number; stride: number }
 
+/** What resuming at a cache position needs (see Engine.snapshots). */
+type Snapshot = {
+  conv: Array<Texture>
+  windows: Array<Texture>
+  hidden?: Texture
+}
+
 /**
  * A matmul's input: h2 activations, or the f32 residual and the norm to
  * apply (its weights, or "prescaled": already applied by the add).
@@ -1180,19 +1187,29 @@ export class Engine {
    * What a later prompt needs to resume at a cache position: the
    * convolutions' state, and the sliding-window layers' last window of keys
    * and values (their ring may have moved on since). Full-attention layers
-   * keep every position, so they need nothing saved.
+   * keep every position, so they need nothing saved. At the end of a
+   * prompt, also the last token's hidden row: the same prompt again then
+   * needs only the output head (see resume).
    */
-  private snapshots = new Map<
-    number,
-    { conv: Array<Texture>; windows: Array<Texture> }
-  >()
+  private snapshots = new Map<number, Snapshot>()
 
-  private freeSnapshot(saved: {
-    conv: Array<Texture>
-    windows: Array<Texture>
-  }) {
+  private freeSnapshot(saved: Snapshot) {
     saved.conv.forEach((t) => this.gpu.delete(t))
     saved.windows.forEach((kv) => this.gpu.delete(kv))
+    if (saved.hidden) this.gpu.delete(saved.hidden)
+  }
+
+  /** A copy of row `row` of the last batch's hidden state (its whole residual row). */
+  private copyHidden(row: number) {
+    const r = this.buffers.residual[0]
+    const copy = this.gpu.texture(GL.RGBA32F, r.width, 1)
+    this.gpu.run({
+      program: this.gpu.program(K.COPY_ROWS),
+      inputs: { uX: r },
+      uniforms: { uOff: { int: row } },
+      output: copy
+    })
+    return copy
   }
 
   /**
@@ -1229,17 +1246,25 @@ export class Engine {
   /**
    * Saves what's needed to resume at the current position (see
    * `snapshots`), so a later prompt that shares the tokens so far reads only
-   * what's new. Keeps the latest MAX_SNAPSHOTS.
+   * what's new. Keeps the latest MAX_SNAPSHOTS. With `hiddenRow` (the row
+   * of the last batch holding the last token), keeps that token's hidden
+   * state too, so `resume` can draw the next token's logits without
+   * reading it again.
    */
-  snapshot() {
+  snapshot(hiddenRow?: number) {
     if (this.guessAt !== null)
       throw new Error("Snapshot while a guessed token is pending.")
     const at = this.position
-    if (this.snapshots.has(at)) return
+    const had = this.snapshots.get(at)
+    if (had) {
+      if (hiddenRow !== undefined && !had.hidden) had.hidden = this.copyHidden(hiddenRow)
+      return
+    }
     const W = this.config.slidingWindow
-    const saved = {
+    const saved: Snapshot = {
       conv: [] as Array<Texture>,
-      windows: [] as Array<Texture>
+      windows: [] as Array<Texture>,
+      ...(hiddenRow !== undefined && { hidden: this.copyHidden(hiddenRow) })
     }
     for (const layer of this.layers) {
       if (layer.conv) {
@@ -1265,6 +1290,34 @@ export class Engine {
       this.freeSnapshot(old)
       this.snapshots.delete(p)
     }
+  }
+
+  /** Whether `resume(position)` would work: a snapshot there kept its last hidden row. */
+  canResume(position: number) {
+    return !!this.snapshots.get(position)?.hidden
+  }
+
+  /**
+   * Rewinds to the snapshot at `position` (see canResume) and puts its last
+   * token's hidden state back as row 0 of the last batch, so `candidates`,
+   * `pick` and `logits` on row 0 give the next token's logits, as after the
+   * prompt that saved it.
+   */
+  resume(position: number): number {
+    const at = this.rewind(position)
+    const hidden = this.snapshots.get(at)?.hidden
+    if (at !== position || !hidden)
+      throw new Error(`No snapshot to resume at ${position}.`)
+    this.gpu.run({
+      program: this.gpu.program(K.COPY_ROWS),
+      inputs: { uX: hidden },
+      uniforms: { uOff: { int: 0 } },
+      output: this.buffers.residual[0],
+      rect: { x: 0, y: 0, width: hidden.width, height: 1 }
+    })
+    // The head normalizes the residual itself (the copy has its sums of squares).
+    this.headScaled = false
+    return at
   }
 
   /**
@@ -2585,6 +2638,77 @@ export class Engine {
     return (await this.pick(row, 1, chunks, penalty, [], guess))[0]
   }
 
+  private greedyOut: Texture | null = null
+
+  /**
+   * Greedy decoding's `pick`: the likeliest token (penalized as `pick`
+   * penalizes) after each of rows [row0, row0 + rows) of the last batch,
+   * reading back only the token ids. Ties go to the lower id. With
+   * `guess`, the last row's token is read forward meanwhile (and is the
+   * token: keepGuess).
+   */
+  async argmax(
+    row0: number,
+    rows: number,
+    penalty: number,
+    drafts: Array<number>,
+    guess = false
+  ): Promise<Int32Array> {
+    const c = this.config
+    const b = this.buffers
+    const head = this.head(row0, rows, false)
+    const total = Math.ceil(c.vocabSize / CHUNK)
+    type Ivec4 = [number, number, number, number]
+    const picking = {
+      uOutW: { int: OUT_WIDTH },
+      uPenalty: penalty,
+      uLogitRows: { int: this.logitRows },
+      uHeadSplit: { int: head.split },
+      uHeadStride: { int: head.stride },
+      uExtra: { ivec4: [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4 },
+      uExtra2: { ivec4: [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4 },
+      uPenaltyRow0: { int: 0 }
+    }
+    this.gpu.run({
+      name: "pick",
+      program: this.gpu.program(K.CHUNK_MAX_AT),
+      inputs: { uLogits: head.logits, uMask: b.mask },
+      uniforms: picking,
+      output: b.chunkMax,
+      rect: { x: 0, y: 0, width: total, height: rows }
+    })
+    if (guess) {
+      this.gpu.run({
+        name: "pick",
+        program: this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_AT, total)),
+        inputs: { uMax: b.chunkMax },
+        uniforms: { uRow: { int: rows - 1 } },
+        output: b.ids,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+    }
+    this.greedyOut ??= this.gpu.texture(GL.RGBA32F, 1, SPLIT_ROWS)
+    this.gpu.run({
+      name: "pick",
+      program: this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_ROWS, total)),
+      inputs: { uMax: b.chunkMax },
+      output: this.greedyOut,
+      rect: { x: 0, y: 0, width: 1, height: rows }
+    })
+    const rect = { x: 0, y: 0, width: 1, height: rows }
+    let data: Float32Array
+    if (guess || TUNING.blockingReads <= 0) {
+      const pending = this.gpu.readStart(this.greedyOut, rect)
+      if (guess) await this.forwardGuess()
+      data = await pending()
+    } else {
+      data = this.gpu.readNow(this.greedyOut, rect)
+    }
+    const ids = Int32Array.from({ length: rows }, (_, r) => Math.round(data[r * 4]))
+    this.guessedToken = guess ? ids[rows - 1] : -1
+    return ids
+  }
+
   /** Rows of logits per token in the logits texture. */
   private get logitRows() {
     return Math.ceil(this.config.vocabSize / 4 / OUT_WIDTH)
@@ -2609,25 +2733,6 @@ export class Engine {
   ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
-    if (rows > 1 && !this.embedding.rgba4) {
-      // The other output heads take one row at a time (each still
-      // penalizing the drafts before its row).
-      const out = []
-      for (let r = 0; r < rows; r++) {
-        out.push(
-          ...(await this.pick(
-            row0 + r,
-            1,
-            chunks,
-            penalty,
-            drafts,
-            guess && r === rows - 1,
-            penaltyRow0 + r
-          ))
-        )
-      }
-      return out
-    }
     const head = this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
@@ -2775,9 +2880,11 @@ export class Engine {
         uRowTexels: { int: e.rowTexels },
         uG: { int: e.groups },
         uOutW: { int: OUT_WIDTH },
-        uRow: { int: 0 }
+        uLogitRows: { int: this.logitRows }
       },
-      output: b.logits
+      output: b.logits,
+      // Row r's logits from logits row r · logitRows (as headRgba4's).
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height: rows * this.logitRows }
     })
     return { logits: b.logits, split: 1, stride: 0 }
   }
