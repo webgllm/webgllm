@@ -1250,6 +1250,18 @@ async function smoke(params: {
   log(
     `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
   )
+  // The most texture bytes alive at once from here on (TEXTURES line).
+  const loadedBytes = engine.gpu.bytes
+  let peakBytes = loadedBytes
+  {
+    const gpu = engine.gpu as unknown as { texture: (...a: Array<unknown>) => unknown; bytes: number }
+    const make = gpu.texture.bind(gpu)
+    gpu.texture = (...args: Array<unknown>) => {
+      const t = make(...args)
+      peakBytes = Math.max(peakBytes, gpu.bytes)
+      return t
+    }
+  }
   let question =
     params.question ?? "What is the capital of France? Answer in one sentence."
   const filler =
@@ -1684,6 +1696,9 @@ async function smoke(params: {
   }
   const promptMs = [...times].sort((x, y) => x - y)[1]
   log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms; GPU ${gpuTimes.map((t) => t.toFixed(0)).join(", ")} ms`)
+  log(
+    `TEXTURES at load ${(loadedBytes / 2 ** 20).toFixed(0)} MiB, now ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB, peak ${(peakBytes / 2 ** 20).toFixed(0)} MiB (sweeps and checks keep extra scratch)`
+  )
   const out: Array<number> = []
   const t2 = performance.now()
   for (let i = 0; i < (params.length ? 64 : 48); i++) {

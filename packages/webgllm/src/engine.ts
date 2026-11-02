@@ -157,8 +157,10 @@ export const TUNING = {
    * How those matmuls read 4-bit weights. 1: byte-texel weights are
    * dequantized to f16 first, then multiplied by a matmul of nothing but
    * dots (see MATMUL_F16), and RGBA4 weights are read in place (their own
-   * 4-token kernel: on Apple GPUs, where chooseLayout picks RGBA4, as fast
-   * or faster, and no f16 scratch); 2: RGBA4 weights through f16 too; 0:
+   * 4-token kernel); 2: RGBA4 weights through f16 too, in chunks of
+   * f16ScratchMiB (with f16Pack's h2 reads: 14% faster prompts on an
+   * iPhone 16 Pro Max, the same as in place on an M3 once chunked).
+   * Engine.tune times 2 against 1 and keeps it where it's faster. 0:
    * every 4-bit matmul reads in place.
    */
   f16Matmul: 1,
@@ -196,6 +198,29 @@ export const TUNING = {
    * precision, less exact); options.matmulPrecision "mediump" turns it on.
    */
   f16Half: 0,
+  /**
+   * How the f16 matmul reads (see matmulF16's `packed`), as bits: 1 the
+   * activations straight from their h2 tensor, 8 halves a fetch, with no
+   * RGBA16F copy (one pass and its scratch fewer); 2 the dequantized
+   * weights as h2 too (the same bytes in half the fetches); 0: both as
+   * RGBA16F, 4 values a fetch. Engine.tune times 0 against 3 on a GPU
+   * whose prompts take the f16 matmul, and keeps it where it's faster.
+   */
+  f16Pack: 3,
+  /**
+   * RGBA4 weights' f16 matmul (f16Matmul 2) dequantizes at most this many
+   * MiB at a time: a bigger matrix goes in chunks of K-slices (or of rows,
+   * if one slice doesn't fit), each dequantized then multiplied, each
+   * chunk two passes more (0: the whole matrix, the scratch sized for the
+   * biggest: 64 MiB for LFM3). It's an alternative to their in-place
+   * kernel, so its memory is bounded.
+   */
+  f16ScratchMiB: 32,
+  /**
+   * The same for byte weights, whose prompts have no in-place kernel:
+   * 0, the whole matrix, as they always had.
+   */
+  f16ScratchBytesMiB: 0,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
   /** ...and at most this many (readers add them up). */
@@ -313,7 +338,11 @@ export const TUNING = {
 type HeadOut = { logits: Texture; split: number; stride: number }
 
 /** See Engine.tuned. */
-export type Tuned = { shortSplit: number | null }
+export type Tuned = {
+  shortSplit: number | null
+  f16Matmul?: number | null
+  f16Pack?: number | null
+}
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
 type Snapshot = {
@@ -419,6 +448,29 @@ const HALF_INT = Uint16Array.from({ length: 256 }, (_, n) => {
 const SPLIT_ROWS = 8
 
 export class Engine {
+  /**
+   * How a matrix of N rows, K in `slices` slices of kbSlice blocks, goes
+   * through an f16 scratch of `width` texels (4 K values each) by columns of
+   * hd rows: `group` whole slices of every row at a time if one fits, else
+   * one slice at a time, `rows` (a multiple of 4) at a time; chunks evened out.
+   */
+  static f16Plan(
+    f: { hd: number; width: number },
+    N: number,
+    kbSlice: number,
+    slices: number
+  ) {
+    const sliceKq = kbSlice * 8
+    const fit = Math.floor(f.width / (Math.ceil(N / f.hd) * sliceKq))
+    if (fit >= 1) {
+      const groups = Math.ceil(slices / Math.min(fit, slices))
+      return { group: Math.ceil(slices / groups), rows: N }
+    }
+    const most = Math.max(4, Math.floor(f.width / sliceKq) * f.hd)
+    const chunks = Math.ceil(N / most)
+    return { group: 1, rows: Math.min(most, Math.ceil(N / chunks / 4) * 4) }
+  }
+
   readonly gpu: Gpu
   config!: ModelConfig
   /** Most tokens the cache holds: the model's, or options.contextLength (see configure). */
@@ -542,7 +594,7 @@ export class Engine {
     // The f16 prompt matmul's scratch now, not in the middle of a prompt
     // (only 4-token matmuls on weights that take it run it: none, no
     // scratch).
-    if (this.quadMatmuls && this.f16Mats().length > 0) this.f16Scratch()
+    if (this.quadMatmuls && this.usesF16()) this.f16Scratch()
     await this.gpu.finish()
   }
 
@@ -1010,8 +1062,12 @@ export class Engine {
    * from an earlier load. (Full batches' slice size isn't tuned: timed
    * alone, their matmuls show no steady difference, though a whole prompt
    * on an M3 does; timing whole prompts would take seconds on a phone.)
+   * `f16Matmul`: whether RGBA4 weights' full prompt batches go through
+   * the f16 matmul or the in-place kernel (TUNING.f16Matmul 2 or 1).
+   * `f16Pack`: how the f16 matmul reads (TUNING.f16Pack), wherever
+   * prompts take it.
    */
-  tuned: Tuned = { shortSplit: null }
+  tuned: Tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -1027,7 +1083,7 @@ export class Engine {
    */
   async tune(stop: () => boolean = () => false): Promise<Tuned | null> {
     const before = { ...this.tuned }
-    this.tuned = { shortSplit: null }
+    this.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
     // an attention block's (the first of each kind), one feed-forward's.
@@ -1103,19 +1159,44 @@ export class Engine {
     }
     let picked: Tuned
     try {
-      picked = {
-        shortSplit: await choose(
-          "shortSplit",
-          [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
-          Math.min(40, this.capacity)
-        )
-      }
+      const shortSplit = await choose(
+        "shortSplit",
+        [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
+        Math.min(40, this.capacity)
+      )
+      // Then, each on a full batch (the f16 matmul dequantizes each matrix
+      // once a batch, so a shorter one would weigh that more than prompts
+      // do), the picks so far in place: RGBA4 weights through the f16
+      // matmul or in place, then how the f16 matmul reads, wherever
+      // prompts take it.
+      this.tuned.shortSplit = shortSplit
+      const quad = this.quadMatmuls && TUNING.quad > 0
+      const batch = Math.min(this.batchSize, this.capacity)
+      const f16Matmul =
+        quad &&
+        TUNING.f16Matmul > 0 &&
+        this.f16Mats().some((m) => m.rgba4) &&
+        this.f16Sized()
+          ? await choose("f16Matmul", [TUNING.f16Matmul, TUNING.f16Matmul > 1 ? 1 : 2], batch)
+          : null
+      this.tuned.f16Matmul = f16Matmul
+      const f16Pack =
+        quad && this.usesF16() && this.f16Scratch()
+          ? await choose(
+              "f16Pack",
+              [TUNING.f16Pack & 3, (TUNING.f16Pack & 3) === 3 ? 0 : 3],
+              batch
+            )
+          : null
+      picked = { shortSplit, f16Matmul, f16Pack }
     } catch (error) {
       this.tuned = before
+      this.f16Trim()
       if (error instanceof Stopped) return null
       throw error
     }
     this.tuned = picked
+    this.f16Trim()
     return picked
   }
 
@@ -1862,6 +1943,10 @@ export class Engine {
   async warmUp(options: { shortOnly?: boolean } = {}) {
     // (`shortOnly`: just a short batch, for programs a new Engine.tune pick
     // reads with; it resets the cache like the rest.)
+    // The f16 scratch as a remembered tuned f16Pack reads it (the load made
+    // TUNING's).
+    if (this.quadMatmuls && this.usesF16()) this.f16Scratch()
+    this.f16Trim()
     // Every program a layer compiles is shared by the layers of its kind:
     // the warm-up reads through the first and last layers (their own
     // variants: folded embedding, last-row tail) and one of each other
@@ -2065,27 +2150,42 @@ export class Engine {
 
   /**
    * The f16 prompt matmul's scratch: one matrix's dequantized weights (rows
-   * wrapped into columns uHd tall) and the activations as RGBA16F, in two
-   * textures used in turn (a matmul's conversion needn't wait for the last
-   * matmul's reads). Null until made; false where RGBA16F can't be drawn
-   * into.
+   * wrapped into columns uHd tall: RGBA16F, or h2 with TUNING.f16Pack's
+   * bit 2) and, unless it reads them as h2 (bit 1), the activations as
+   * RGBA16F, in two textures used in turn (a matmul's conversion needn't
+   * wait for the last matmul's reads). Each texture is made when first
+   * needed (a sweep can change f16Pack). Null until sized; false where
+   * there are no such matrices or no column height fits.
    */
   private f16:
-    | { w: Texture; a: [Texture, Texture]; hd: number; next: number }
+      | {
+        hd: number
+        /** The weights' width in RGBA16F texels (h2: half). */
+        width: number
+        kMax: number
+        /** The budget it was sized for (TUNING.f16ScratchMiB or f16ScratchBytesMiB). */
+        mib: number
+        w?: Texture
+        wh2?: Texture
+        a?: [Texture, Texture]
+        /** Whether RGBA16F can be drawn into (asked when first needed). */
+        halfRenders?: boolean
+        next: number
+      }
     | null
     | false = null
 
+  /** Scratch made for another budget (sweeps only). */
+  private f16Kept = new Map<number, NonNullable<Exclude<Engine["f16"], false>>>()
+
   /** Whether 4-bit matrix `w` goes through the f16 prompt matmul (see TUNING.f16Matmul). */
   private takesF16(w: GpuMatrix) {
-    return (
-      w.bits === 4 &&
-      TUNING.f16Matmul > 0 &&
-      (!w.rgba4 || TUNING.f16Matmul > 1)
-    )
+    const mode = this.tuned.f16Matmul ?? TUNING.f16Matmul
+    return w.bits === 4 && mode > 0 && (!w.rgba4 || mode > 1)
   }
 
-  /** The layer matrices that go through the f16 prompt matmul. */
-  private f16Mats() {
+  /** The layer matrices prompt matmuls read. */
+  private layerMats() {
     return this.layers
       .flatMap((l) => [
         l.conv?.inProj,
@@ -2098,33 +2198,131 @@ export class Engine {
         l.gateUp,
         l.down
       ])
-      .filter((m): m is GpuMatrix => !!m && this.takesF16(m))
+      .filter((m): m is GpuMatrix => !!m)
   }
 
+  /**
+   * The matrices the f16 scratch is sized for: every 4-bit layer matrix,
+   * so a tuned f16Matmul can switch RGBA4 weights to it.
+   */
+  private f16Mats() {
+    return this.layerMats().filter((m) => m.bits === 4)
+  }
+
+  /** Whether any prompt matmul goes through the f16 matmul. */
+  private usesF16() {
+    return this.layerMats().some((m) => this.takesF16(m))
+  }
+
+  /** How the f16 matmul reads: this GPU's tuned choice, else TUNING.f16Pack. */
+  private f16Pack() {
+    return (this.tuned.f16Pack ?? TUNING.f16Pack) & 3
+  }
+
+  /** Frees the f16 scratch textures the current f16Matmul and f16Pack don't use. */
+  private f16Trim() {
+    const f = this.f16
+    if (!f) return
+    // (None of it where nothing takes the f16 matmul.)
+    const none = !this.usesF16()
+    const pack = this.f16Pack()
+    if (f.w && (none || pack & 2)) {
+      this.gpu.delete(f.w)
+      f.w = undefined
+    }
+    if (f.wh2 && (none || !(pack & 2))) {
+      this.gpu.delete(f.wh2)
+      f.wh2 = undefined
+    }
+    if (f.a && (none || pack & 1)) {
+      for (const t of f.a) this.gpu.delete(t)
+      f.a = undefined
+    }
+  }
+
+  /**
+   * The f16 scratch, its textures for f16Pack made; false if it needs
+   * RGBA16F where that can't be drawn into.
+   */
   private f16Scratch() {
+    const f = this.f16Sized()
+    if (!f) return false
+    const pack = this.f16Pack()
+    // (canRender draws and reads back: asked once, not every matmul.)
+    if ((pack & 3) !== 3 && !(f.halfRenders ??= this.gpu.canRender([GL.RGBA16F])))
+      return false
+    if (pack & 2) f.wh2 ??= this.gpu.texture(GL.RGBA32UI, f.width / 2, f.hd)
+    else f.w ??= this.gpu.texture(GL.RGBA16F, f.width, f.hd)
+    if (!(pack & 1))
+      f.a ??= [0, 1].map(() =>
+        this.gpu.texture(GL.RGBA16F, f.kMax / 4, this.capacity)
+      ) as [Texture, Texture]
+    return f
+  }
+
+  private f16Sized() {
+    const mib = Math.max(
+      0,
+      this.rgba4Layers ? TUNING.f16ScratchMiB : TUNING.f16ScratchBytesMiB
+    )
+    if (this.f16 && this.f16.mib !== mib) {
+      // (A sweep changed the size: the other size's scratch kept for when
+      // it comes back, so no timed prompt pays for making it again.)
+      this.f16Kept.set(this.f16.mib, this.f16)
+      this.f16 = this.f16Kept.get(mib) ?? null
+      this.f16Kept.delete(mib)
+    }
     if (this.f16 !== null) return this.f16
-    if (!this.gpu.canRender([GL.RGBA16F])) return (this.f16 = false)
     const mats = this.f16Mats()
     if (mats.length === 0) return (this.f16 = false)
     const max = this.gpu.limits.maxTextureSize
-    // The column height that fits every matrix in the least texture.
+    const kMax = Math.max(...mats.map((m) => m.K))
     let best: { hd: number; width: number } | null = null
-    for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
-      const width = Math.max(...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4)))
-      if (width <= max && (!best || width * hd < best.width * best.hd))
-        best = { hd, width }
+    if (mib > 0) {
+      // The budget's texels in the shape that splits the layer matrices
+      // into the fewest chunks at a full batch (each chunk costs a
+      // dequantization and a matmul pass, each waiting on the last; see
+      // f16Plan), at least as wide as the widest K.
+      const texels = (mib * 2 ** 20) / 8
+      let fewest = Infinity
+      for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
+        const width = Math.min(max, Math.floor(texels / hd)) & ~1
+        if (width < kMax / 4) continue
+        const chunks = mats.reduce((n, m) => {
+          const { kbSlice, slices } = this.quadSlices(m, TUNING.quadMaxSplit)
+          const plan = Engine.f16Plan({ hd, width }, m.N, kbSlice, slices)
+          return n + Math.ceil(slices / plan.group) * Math.ceil(m.N / plan.rows)
+        }, 0)
+        if (chunks < fewest) {
+          fewest = chunks
+          best = { hd, width }
+        }
+      }
+    } else {
+      // The column height that fits every matrix in the least texture.
+      for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
+        const width = Math.max(...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4)))
+        if (width <= max && (!best || width * hd < best.width * best.hd))
+          best = { hd, width }
+      }
     }
     if (!best) return (this.f16 = false)
-    const kMax = Math.max(...mats.map((m) => m.K))
-    this.f16 = {
-      w: this.gpu.texture(GL.RGBA16F, best.width, best.hd),
-      a: [0, 1].map(() =>
-        this.gpu.texture(GL.RGBA16F, kMax / 4, this.capacity)
-      ) as [Texture, Texture],
-      hd: best.hd,
-      next: 0
-    }
+    // (Every K is whole blocks, so widths are even: h2 halves them exactly.)
+    this.f16 = { hd: best.hd, width: best.width, kMax, mib, next: 0 }
     return this.f16
+  }
+
+  /**
+   * How a 4-token matmul splits `w`'s K: slices of kbSlice blocks, at
+   * most `most` of them (TUNING.quadSliceK's size, twice for wide
+   * matrices).
+   */
+  private quadSlices(w: GpuMatrix, most: number) {
+    const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
+    const kbSlice = Math.ceil(
+      w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
+    )
+    return { kbSlice, slices: Math.ceil(w.blocks / kbSlice) }
   }
 
   /** out (a pair tensor) = a · wᵀ for `rows` tokens of h2 activations. */
@@ -2151,17 +2349,13 @@ export class Engine {
       const quadRows = Math.ceil(rows / 4)
       // (This GPU's own choice for short batches, if tune made one.)
       const short = rows < TUNING.f16MinRows
-      const sliceK = TUNING.quadSliceK * (w.groups > 2048 ? 2 : 1)
       // The most slices the output holds at a full batch: the same for
       // every batch, so the warm-up compiles the programs prompts use.
       const most = Math.min(
         short ? (this.tuned.shortSplit ?? TUNING.quadMaxSplit) : TUNING.quadMaxSplit,
         Math.floor(out.height / Math.ceil(this.capacity / 4))
       )
-      const kbSlice = Math.ceil(
-        w.blocks / Math.max(1, Math.min(most, Math.round(w.K / sliceK)))
-      )
-      const slices = Math.ceil(w.blocks / kbSlice)
+      const { kbSlice, slices } = this.quadSlices(w, most)
       // (Byte texels have no matmulQuad: the f16 path at any size. RGBA4
       // takes it only with f16Matmul 2, and not for short batches.)
       const f =
@@ -2170,74 +2364,113 @@ export class Engine {
           : false
       if (f) {
         const kq = w.K / 4
-        const fa = f.a[f.next]
-        f.next ^= 1
-        this.gpu.run({
-          name: "dequant",
-          program: this.gpu.program(
-            w.rgba4
-              ? this.scalesOf(w, K.dequantRgba4({ zeros: !!w.zeros || w.packed }))
-              : K.dequantBytes({
-                  zeros: !!w.zeros,
-                  words: !w.bytes,
-                  unorm: w.unorm,
-                  packed: w.packed
-                })
-          ),
-          inputs: {
-            uW: w.quants,
-            uS: w.scales,
-            ...(w.zeros && { uZ: w.zeros })
-          },
-          uniforms: {
-            uKb: { int: w.blocks },
-            uH: { int: w.rowsPerColumn },
-            uRowTexels: { int: w.rowTexels },
-            uKq: { int: kq },
-            uHd: { int: f.hd },
-            uN: { int: w.N }
-          },
-          output: f.w,
-          rect: {
-            x: 0,
-            y: 0,
-            width: Math.ceil(w.N / f.hd) * kq,
-            height: Math.min(f.hd, w.N)
-          },
-          work: 3
-        })
-        this.gpu.run({
-          name: "dequant",
-          program: this.gpu.program(K.H2_TO_F16),
-          inputs: { uA: a },
-          output: fa,
-          rect: {
-            x: 0,
-            y: 0,
-            width: kq,
-            height: Math.min(quadRows * 4, fa.height)
-          }
-        })
+        const pack = this.f16Pack()
+        const h2W = (pack & 2) !== 0
+        const wOut = h2W ? f.wh2 : f.w
+        if (!wOut) throw new GpuError("The f16 matmul's scratch is missing.")
+        // The activations as RGBA16F, unless the matmul reads their h2.
+        let fa = a
+        if (!(pack & 1)) {
+          if (!f.a) throw new GpuError("The f16 matmul's scratch is missing.")
+          fa = f.a[f.next]
+          f.next ^= 1
+          this.gpu.run({
+            name: "dequant",
+            program: this.gpu.program(K.H2_TO_F16),
+            inputs: { uA: a },
+            output: fa,
+            rect: {
+              x: 0,
+              y: 0,
+              width: kq,
+              height: Math.min(quadRows * 4, fa.height)
+            }
+          })
+        }
+        const dequant = this.gpu.program(
+          w.rgba4
+            ? this.scalesOf(
+                w,
+                K.dequantRgba4({ zeros: !!w.zeros || w.packed, h2: h2W })
+              )
+            : K.dequantBytes({
+                zeros: !!w.zeros,
+                words: !w.bytes,
+                unorm: w.unorm,
+                packed: w.packed,
+                h2: h2W
+              })
+        )
+        const multiply = this.gpu.program(
+          K.matmulF16({
+            half: TUNING.f16Half > 0 || this.precision === "mediump",
+            packed: pack
+          })
+        )
         const kqSlice = kbSlice * 8
-        this.gpu.run({
-          name: "matmul",
-          program: this.gpu.program(
-            K.matmulF16({
-              half: TUNING.f16Half > 0 || this.precision === "mediump"
+        // The matrix through the scratch in chunks (the whole of it if it
+        // fits): `group` K-slices at a time, and within those, rows r0 ..
+        // r0 + n at a time; each chunk dequantized, then multiplied into
+        // its slices' output rows.
+        const plan = Engine.f16Plan(f, w.N, kbSlice, slices)
+        for (let s0 = 0; s0 < slices; s0 += plan.group) {
+          const s1 = Math.min(slices, s0 + plan.group)
+          const kq0 = s0 * kqSlice
+          const kqW = Math.min(kq, s1 * kqSlice) - kq0
+          for (let r0 = 0; r0 < w.N; r0 += plan.rows) {
+            const n = Math.min(plan.rows, w.N - r0)
+            this.gpu.run({
+              name: "dequant",
+              program: dequant,
+              inputs: {
+                uW: w.quants,
+                uS: w.scales,
+                ...(w.zeros && { uZ: w.zeros })
+              },
+              uniforms: {
+                uKb: { int: w.blocks },
+                uH: { int: w.rowsPerColumn },
+                uRowTexels: { int: w.rowTexels },
+                uKq: { int: kqW },
+                uKq0: { int: kq0 },
+                uHd: { int: f.hd },
+                uN: { int: n },
+                uRow0: { int: r0 }
+              },
+              output: wOut,
+              rect: {
+                x: 0,
+                y: 0,
+                width: (Math.ceil(n / f.hd) * kqW) / (h2W ? 2 : 1),
+                height: Math.min(f.hd, n)
+              },
+              work: h2W ? 6 : 3
             })
-          ),
-          inputs: { uW: f.w, uA: fa },
-          uniforms: {
-            uKq: { int: kq },
-            uHd: { int: f.hd },
-            uSliceRows: { int: quadRows },
-            uKqSlice: { int: kqSlice }
-          },
-          output: [out, partner],
-          rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
-          // (Per K texel: 4 rows' weights and 4 tokens' activations.)
-          work: kqSlice * 8
-        })
+            this.gpu.run({
+              name: "matmul",
+              program: multiply,
+              inputs: { uW: wOut, uA: fa },
+              uniforms: {
+                uKq: { int: kq },
+                uKqW: { int: kqW },
+                uKq0: { int: kq0 },
+                uHd: { int: f.hd },
+                uSliceRows: { int: quadRows },
+                uKqSlice: { int: kqSlice },
+                uRow0: { int: r0 }
+              },
+              output: [out, partner],
+              rect: {
+                x: r0 / 4,
+                y: s0 * quadRows,
+                width: Math.ceil(n / 4),
+                height: quadRows * (s1 - s0)
+              },
+              // (Per K texel: 4 rows' weights and 4 tokens' activations.)
+              work: kqSlice * 8
+            })
+          }
+        }
         this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
         return
       }
