@@ -240,6 +240,13 @@ export const TUNING = {
   /** 1: few-row conv blocks draw their output and new state in one pass. */
   fuseConv: 1,
   /**
+   * 1: writing's Gated DeltaNet block in 6 render passes, not 10: beta|alpha's
+   * and in_proj's split matmuls into one target, the convolution with its
+   * new state (two targets), and the gates and q̂|k̂ computed by the
+   * recurrence's first pass (see linDeltaFused).
+   */
+  fuseLinear: 1,
+  /**
    * Prompt batches run at most paceAhead chunks ahead of the GPU, each
    * about this many full-batch layers of matmul work (attention counted
    * by paceAttention; 0: unpaced), so the browser's GPU process never
@@ -435,7 +442,14 @@ export class Engine {
    * Draws into several textures at once that this GPU can do (asked of it
    * at load, see Gpu.canRender); the engine falls back where it can't.
    */
-  private mrt = { scaled: true, quad: true, conv: true, chunks: true, lin: true }
+  private mrt = {
+    scaled: true,
+    quad: true,
+    conv: true,
+    chunks: true,
+    lin: true,
+    linFused: true
+  }
   private readonly noMrt: Set<string>
   /** See EngineOptions.chunkedRecurrence. */
   private readonly chunkedRecurrence: boolean
@@ -557,7 +571,9 @@ export class Engine {
       // Chunked attention, one head a fragment (headGroup tries more).
       chunks: can("chunks", [GL.RGBA32F, GL.RGBA32F, GL.RGBA32F]),
       // Gated DeltaNet's delta and output in one pass.
-      lin: can("lin", [GL.RGBA32F, GL.RGBA32F])
+      lin: can("lin", [GL.RGBA32F, GL.RGBA32F]),
+      // ...and writing's fused block (see fuseLinear).
+      linFused: can("lin", [GL.RGBA32F, GL.RGBA32F, GL.RGBA32F, GL.RGBA32F])
     }
     this.quadMatmuls &&= this.mrt.quad
     if (!this.mrt.chunks) {
@@ -784,7 +800,19 @@ export class Engine {
         qk: this.f32(2 * lin.K, M),
         delta: this.f32(lin.V, M),
         o: this.f32(lin.V, M),
-        out: this.h2(lin.V, M)
+        out: this.h2(lin.V, M),
+        /**
+         * Writing's fused block (see fuseLinear): the conv output (the conv
+         * state's size: drawn with it), then delta, the output, k̂ and the
+         * decay (drawn together).
+         */
+        small: {
+          qkv: this.f32(lin.C, lin.l.convKernel - 1),
+          delta: this.f32(lin.V, lin.l.convKernel - 1),
+          o: this.f32(lin.V, lin.l.convKernel - 1),
+          k: this.f32(lin.V, lin.l.convKernel - 1),
+          decay: this.f32(lin.V, lin.l.convKernel - 1)
+        }
       }
     }
   }
@@ -2929,12 +2957,16 @@ export class Engine {
     input: MatIn,
     paced: boolean,
     /** A row to save the state after (into `saving`: its conv state, then its recurrent state). */
-    saveAt?: number
+    saveAt?: number,
+    /** Whether writing's fused block may run (see fuseLinear; not while probing). */
+    fusable = false
   ) {
     const lin = this.linDims()
     const b = this.buffers
     const t = b.lin
     if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    if (fusable && saveAt === undefined && this.fusesLinear(layer, rows))
+      return this.linearFused(layer, rows, input)
     const dk = lin.l.keyHeadDim
     const dv = lin.l.valueHeadDim
     const width = lin.l.convKernel
@@ -3057,6 +3089,100 @@ export class Engine {
       name: "linear",
       program: read(K.linNorm(dv)),
       inputs: { ...inInputs, uO: t.o, uNorm: layer.norm },
+      uniforms: { ...inUniforms, uZ: { int: C4 }, uEps: this.config.normEps },
+      output: t.out,
+      rect: { x: 0, y: 0, width: V4 / 2, height: rows }
+    })
+    return this.project(t.out, layer.outProj, b.opOut, rows)
+  }
+
+  /** Whether a `rows`-row batch runs writing's fused Gated DeltaNet block (see fuseLinear). */
+  private fusesLinear(layer: NonNullable<GpuLayer["linear"]>, rows: number) {
+    const lin = this.linDims()
+    if (!lin || TUNING.fuseLinear <= 0 || !this.mrt.linFused) return false
+    const l = lin.l
+    return (
+      rows === 1 &&
+      l.keyHeadDim === l.valueHeadDim &&
+      l.numKeyHeads === l.numValueHeads &&
+      // beta|alpha's slices beside in_proj's in the partial buffer.
+      layer.inProj.groups + layer.ba.groups <= this.buffers.partial.width
+    )
+  }
+
+  /**
+   * Writing's Gated DeltaNet block (see fuseLinear): the same math as
+   * linearAttend's token at a time, in 6 render passes: beta|alpha and
+   * in_proj (one target), the convolution and its state, delta, the output,
+   * k-hat and the decay (linDeltaFused), the state, the gated norm, out_proj.
+   */
+  private linearFused(
+    layer: NonNullable<GpuLayer["linear"]>,
+    rows: number,
+    input: MatIn
+  ) {
+    const lin = this.linDims()
+    const b = this.buffers
+    const t = b.lin
+    if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    const small = t.small
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const width = lin.l.convKernel
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const C4 = lin.C / 4
+    const partial = this.partials()
+    // beta|alpha beside in_proj, drawn first: one render pass for both.
+    const baX = layer.inProj.groups
+    const baSplit = this.splitPartials(input.a, layer.ba, rows, input.norm, baX)
+    const split = this.splitPartials(input.a, layer.inProj, rows, input.norm)
+    const inUniforms = { uSplitIn: { int: split }, ...this.pairIn(partial) }
+    const read = (source: string) =>
+      this.gpu.program(this.fromSplit(source, ["uIn"], split))
+    this.gpu.run({
+      name: "linear",
+      program: read(K.linConvFused(width)),
+      inputs: { uIn: partial, uState: layer.convState[0], uConv: layer.kernel },
+      uniforms: { ...inUniforms, uM: { int: rows } },
+      output: [small.qkv, layer.convState[1]],
+      rect: { x: 0, y: 0, width: C4, height: width - 1 }
+    })
+    layer.convState.reverse()
+    const shape = { keyHeadDim: dk, valueHeadDim: dv }
+    this.gpu.run({
+      name: "recurrence",
+      program: this.gpu.program(K.linDeltaFused(shape)),
+      inputs: {
+        uS: layer.state[0],
+        uQKV: small.qkv,
+        uBA: partial,
+        uA: layer.a,
+        uDt: layer.dtBias
+      },
+      uniforms: {
+        uK4: { int: K4 },
+        uH4: { int: H4 },
+        uBAx: { int: baX },
+        uSplitIn: { int: baSplit }
+      },
+      output: [small.delta, small.o, small.k, small.decay],
+      rect: { x: 0, y: 0, width: V4, height: rows }
+    })
+    this.gpu.run({
+      name: "recurrence",
+      program: this.gpu.program(K.linState({ ...shape, texelDecay: true })),
+      inputs: { uS: layer.state[0], uQK: small.k, uDelta: small.delta, uG: small.decay },
+      uniforms: { uK4: { int: 0 }, uH4: { int: H4 }, uRow: { int: 0 } },
+      output: layer.state[1],
+      rect: { x: 0, y: 0, width: V4, height: dk }
+    })
+    layer.state.reverse()
+    this.gpu.run({
+      name: "linear",
+      program: read(K.linNorm(dv)),
+      inputs: { uIn: partial, uO: small.o, uNorm: layer.norm },
       uniforms: { ...inUniforms, uZ: { int: C4 }, uEps: this.config.normEps },
       output: t.out,
       rect: { x: 0, y: 0, width: V4 / 2, height: rows }
@@ -4052,7 +4178,14 @@ export class Engine {
       }
       let opSplit = 0
       if (layer.linear) {
-        opSplit = await this.linearAttend(layer.linear, rows, opIn, paced, saveAt)
+        opSplit = await this.linearAttend(
+          layer.linear,
+          rows,
+          opIn,
+          paced,
+          saveAt,
+          rows <= SPLIT_ROWS && !probe
+        )
         const lin = this.linDims()
         if (lin && b.lin) {
           await look(i, "lin_qkv", b.lin.qkv, lin.C)

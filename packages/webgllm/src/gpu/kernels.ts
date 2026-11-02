@@ -1359,9 +1359,9 @@ void main() {
  * holds tap k of channels 4x..4x+3, oldest first), earlier tokens' inputs
  * from the state (width - 1 rows, oldest first).
  */
-function linConvSource(width: number) {
+function linConvTaps(width: number) {
   const w = width - 1
-  const taps = Array.from({ length: width }, (_, k) => k)
+  return Array.from({ length: width }, (_, k) => k)
     .map(
       (k) => `  {
     int t = m - ${w - k};
@@ -1372,6 +1372,9 @@ function linConvSource(width: number) {
   }`
     )
     .join("\n")
+}
+
+function linConvSource(width: number) {
   return `${HEADER}
 uniform usampler2D uIn;
 uniform sampler2D uState;
@@ -1381,8 +1384,34 @@ void main() {
   int x = int(gl_FragCoord.x);
   int m = int(gl_FragCoord.y);
   vec4 acc = vec4(0.0);
-${taps}
+${linConvTaps(width)}
   o = acc / (1.0 + exp(-acc));
+}`
+}
+
+/**
+ * LIN_CONV and LIN_CONV_STATE in one pass, for at most width - 1 rows
+ * (writing): row y's output into the first target, state row y after uM
+ * tokens into the second (both width - 1 rows tall; rows past uM of the
+ * first are left over).
+ */
+function linConvFusedSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+uniform int uM;
+layout(location = 0) out vec4 o;
+layout(location = 1) out vec4 oState;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 acc = vec4(0.0);
+${linConvTaps(width)}
+  o = acc / (1.0 + exp(-acc));
+  int ts = uM - ${width - 1} + m;
+  if (ts >= 0) oState = pf(uIn, x, ts);
+  else oState = texelFetch(uState, ivec2(x, uM + m), 0);
 }`
 }
 
@@ -1483,8 +1512,86 @@ void main() {
 }`
 }
 
+/**
+ * LIN_GATES, LIN_PREP and LIN_DELTA in one pass, for writing (heads with
+ * as many key as value dims, as many key heads as value heads): each
+ * fragment takes its head's q and k from the conv output (uQKV) over
+ * their L2 norms, and its beta and decay from the b|a projection's split
+ * partial sums (uBA from texel uBAx), the same math as those passes.
+ * Writes delta, the output, k̂ (texel x: the head's key texels line up
+ * with its value texels) and the decay (in x), for LIN_STATE's texelDecay.
+ */
+function linDeltaFusedSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  if (DK4 !== DV4) throw new Error("The fused recurrence needs as many key dims as value dims.")
+  const scale = (1 / Math.sqrt(o.keyHeadDim)).toFixed(9)
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQKV;
+uniform sampler2D uBA;
+uniform sampler2D uA;
+uniform sampler2D uDt;
+uniform int uK4;
+uniform int uH4;
+uniform int uBAx;
+layout(location = 0) out vec4 oDelta;
+layout(location = 1) out vec4 oOut;
+layout(location = 2) out vec4 oK;
+layout(location = 3) out vec4 oDecay;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kb = h * ${DK4};
+  vec4 sq = vec4(0.0);
+  vec4 sk = vec4(0.0);
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(kb + i, m), 0);
+    sq += v * v;
+  }
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(uK4 + kb + i, m), 0);
+    sk += v * v;
+  }
+  float invq = inversesqrt(dot(sq, vec4(1.0)) + 1e-6);
+  float invk = inversesqrt(dot(sk, vec4(1.0)) + 1e-6);
+  vec4 kv = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  float qk = 0.0;
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 q = texelFetch(uQKV, ivec2(kb + i, m), 0) * invq * ${scale};
+    vec4 k = texelFetch(uQKV, ivec2(uK4 + kb + i, m), 0) * invk * 1.0;
+    qk += dot(q, k);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    kv += s0 * k.x + s1 * k.y + s2 * k.z + s3 * k.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  int g = h >> 2;
+  float beta = comp(1.0 / (1.0 + exp(-pf(uBA, uBAx + g, m))), h & 3);
+  vec4 t = pf(uBA, uBAx + uH4 + g, m) + texelFetch(uDt, ivec2(g, 0), 0);
+  vec4 softplus = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+  float decay = comp(exp(texelFetch(uA, ivec2(g, 0), 0) * softplus), h & 3);
+  vec4 v = texelFetch(uQKV, ivec2(2 * uK4 + x, m), 0);
+  vec4 d = beta * (v - decay * kv);
+  oDelta = d;
+  oOut = decay * qs + qk * d;
+  oK = texelFetch(uQKV, ivec2(uK4 + x, m), 0) * invk * 1.0;
+  oDecay = vec4(decay, 0.0, 0.0, 0.0);
+}`
+}
+
 /** The recurrence's second pass: S = decay·S + k̂ deltaᵀ, for token row uRow. */
-function linStateSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+function linStateSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  /** Decay at uG's texel (x, uRow).x (LIN_DELTA_FUSED's), not the gates'. */
+  texelDecay?: boolean
+}) {
   const DV4 = o.valueHeadDim / 4
   return `${HEADER}
 uniform sampler2D uS;
@@ -1499,7 +1606,7 @@ void main() {
   int x = int(gl_FragCoord.x);
   int k = int(gl_FragCoord.y);
   int h = x / ${DV4};
-  float decay = comp(texelFetch(uG, ivec2(uH4 + (h >> 2), uRow), 0), h & 3);
+  float decay = ${o.texelDecay ? "texelFetch(uG, ivec2(x, uRow), 0).x" : "comp(texelFetch(uG, ivec2(uH4 + (h >> 2), uRow), 0), h & 3)"};
   int kc = h * ${o.keyHeadDim} + k;
   float kk = comp(texelFetch(uQK, ivec2(uK4 + (kc >> 2), uRow), 0), kc & 3);
   o = decay * texelFetch(uS, ivec2(x, k), 0) + kk * texelFetch(uDelta, ivec2(x, uRow), 0);
@@ -3063,6 +3170,8 @@ export const linConv = memo(linConvSource)
 export const linConvState = memo(linConvStateSource)
 export const linPrep = memo(linPrepSource)
 export const linDelta = memo(linDeltaSource)
+export const linDeltaFused = memo(linDeltaFusedSource)
+export const linConvFused = memo(linConvFusedSource)
 export const linState = memo(linStateSource)
 export const linNorm = memo(linNormSource)
 export const linCum = memo(linCumSource)
