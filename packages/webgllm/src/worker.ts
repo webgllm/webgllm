@@ -11,6 +11,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
+import { anchorFor, readPrompt } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -24,16 +25,29 @@ import { THINK_OPEN } from "./reply.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
-/** Resolves when the page answers a "claim" (see claimMemory). */
-let claimed: (() => void) | null = null
+/** Claims the page hasn't answered yet, oldest first (it answers in order). */
+const claims: Array<() => void> = []
 
-/** Asks the page to make room for the model, and waits until it has. */
+/**
+ * Asks the page to make room for the model's `bytes` (in place of what it
+ * claimed before), and waits until it has.
+ */
 function claimMemory(model: string, bytes: number) {
   return new Promise<void>((resolve) => {
-    claimed = resolve
+    claims.push(resolve)
     post({ type: "claim", model, bytes: Math.round(bytes) })
   })
 }
+
+/** A claim again once the textures grow this much past the last one (see generate). */
+const RECLAIM_BYTES = 32 * 2 ** 20
+
+/**
+ * The textures a model takes loaded, per byte of its weight files: what's
+ * claimed before a load (then the textures' bytes, measured). Qwen3.5 2B
+ * and LFM3 1.7B take 1.3–1.4× at 512-token batches.
+ */
+const TEXTURES_PER_FILE_BYTE = 1.4
 
 type Loaded = {
   model: string
@@ -45,11 +59,15 @@ type Loaded = {
   cached: Array<number>
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
+  /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
+  claimed: number
   /**
    * Engine.tune not run yet on this GPU: it runs when the worker is idle
    * (see tuneWhenIdle), then its picks join this note.
    */
   untuned?: { key: string; note: GpuNote }
+  /** The last tuning left choices for an empty cache (tried again once it's empty). */
+  tunedPartly?: boolean
 }
 
 let current: Loaded | null = null
@@ -91,10 +109,13 @@ function hash(text: string) {
 const release = (engine: Engine) => engine.gpu.dispose()
 
 /**
- * Prompt tokens per forward batch, the same on every device (the engine
- * scales it up for smaller models): bigger batches read prompts faster on
- * every GPU tried (2.4× on a Mac, 15% on a Pixel than 128), for ~170 MiB
- * more buffers with LFM3.
+ * Prompt tokens per forward batch, the same on every device and model (the
+ * engine scales it up for smaller models; TUNING.promptBatch overrides it
+ * for benchmarks): bigger batches read prompts faster on every GPU tried
+ * (2.4× on a Mac, 15% on a Pixel than 128). 256 or 128 would save 120 or
+ * 270 MiB of Qwen3.5 2B's buffers, but LFM3 then reads prompts 32% and 56%
+ * slower on an M3, and nothing the GPU reports tells where the room is
+ * short (an M3 and an iPhone report the same limits).
  */
 const PROMPT_BATCH = 512
 
@@ -172,7 +193,7 @@ async function load(
   signal: AbortSignal,
   /** Most tokens a chat may hold: the model's own context length when undefined. */
   contextLength: number | undefined,
-  /** Without multiple render targets: after a failed self-check. */
+  /** Without multiple render targets or the chunked recurrence: after a failed self-check. */
   plain = false
 ): Promise<Loaded> {
   const meta = modelMeta(model)
@@ -190,9 +211,9 @@ async function load(
     mark = now
   }
   const engine = new Engine(new OffscreenCanvas(1, 1), {
-    batchSize: PROMPT_BATCH,
+    batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
-    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"] })
+    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"], chunkedRecurrence: false })
   })
   lap("context")
   try {
@@ -213,10 +234,10 @@ async function load(
     lap("files")
     post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
     // Room for it first: the page unloads other runtimes' models past the
-    // memory budget. The weights take about their size in textures, plus
-    // the cache and working textures.
+    // memory budget. An estimate until it's loaded (then the textures it
+    // took): the weights, the cache and the working textures.
     const weightBytes = weightFiles.reduce((sum, f) => sum + f.size, 0)
-    await claimMemory(model, weightBytes * 1.1)
+    await claimMemory(model, weightBytes * TEXTURES_PER_FILE_BYTE)
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
       tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
@@ -287,7 +308,11 @@ async function load(
     for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
-    // Attention against the CPU's: a GPU whose compiler gets a kernel wrong
+    timings.tunedF16Matmul = engine.tuned.f16Matmul ?? -1
+    timings.tunedF16Pack = engine.tuned.f16Pack ?? -1
+    timings.tunedFlashDecode = engine.tuned.flashDecode ?? -1
+    // Attention against the CPU's (and Qwen3.5's chunked recurrence against
+    // a token at a time): a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).
     // A pass is remembered (same GPU, browser, model and code).
     const error =
@@ -311,13 +336,19 @@ async function load(
       release(engine)
       return await load(model, signal, contextLength, true)
     }
-    const base = fresh ?? (note?.tuned ? null : note)
+    // (A note whose tuning left choices for later is tuned again.)
+    const tunedAll = note?.tuned && "f16Matmul" in note.tuned && "f16Pack" in note.tuned
+    const base = fresh ?? (tunedAll ? null : note)
+    // What it took, in place of the estimate.
+    await claimMemory(model, engine.gpu.bytes)
+    if (signal.aborted) throw new Superseded()
     return {
       model,
       contextLength,
       engine,
       tokenizer,
       cached: [],
+      claimed: engine.gpu.bytes,
       timings,
       ...(base && { untuned: { key: noteKey, note: base } })
     }
@@ -436,20 +467,19 @@ async function generate(request: GenerateRequest) {
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
 
-  // Read the rest of the prompt, saving the convolutions' state after each
-  // batch so a later prompt can resume from there (and after the last, the
-  // last token's hidden row: see Engine.resume).
+  // Read the rest of the prompt (see readPrompt), with the anchor snapshot
+  // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
-  let row = 0
-  let i = start
-  for (const size of engine.batchSizes(prompt.length - start)) {
-    const batch = prompt.slice(i, i + size)
-    i += size
-    row = await engine.forwardHidden(batch)
-    model.cached.push(...batch)
-    engine.snapshot(i === prompt.length ? row : undefined)
-    if (stopped.has(id)) break
-  }
+  let row = await readPrompt(engine, prompt, start, model.cached, {
+    stop: () => stopped.has(id),
+    anchor: anchorFor(
+      tokenizer,
+      prompt,
+      request.chat,
+      request.thinking,
+      request.tools.length ? request.tools : undefined
+    )
+  })
   const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
   const stats: RunTimings = {
     inputTokens: prompt.length,
@@ -726,6 +756,12 @@ async function generate(request: GenerateRequest) {
       text: `${compiled} programs compiled during request ${id}: ${names.join(" | ")}`
     })
   }
+  // The cache grew with the chat: claim what the textures take now (the
+  // page may unload other runtimes' models; the reply needn't wait).
+  if (engine.gpu.bytes > model.claimed + RECLAIM_BYTES) {
+    model.claimed = engine.gpu.bytes
+    void claimMemory(model.model, model.claimed)
+  }
   post({ type: "done", id, stats })
 }
 
@@ -749,14 +785,21 @@ function tuneWhenIdle() {
   const loaded = current
   const untuned = loaded?.untuned
   if (!loaded || !untuned || tuning || pending > 0) return
+  if (loaded.tunedPartly && loaded.cached.length > 0) return
   tuning = (async () => {
-    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded)
+    // (Its prompt-batch timings reset the cache: not while it holds a chat.)
+    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded, {
+      keepCache: loaded.cached.length > 0
+    })
     post({
       type: "log",
       text: `tuned in the background: ${picked ? JSON.stringify({ ...picked, ...loaded.engine.tuneReport }) : "stopped for a request"}`
     })
     if (!picked || current !== loaded) return
-    loaded.untuned = undefined
+    // Choices left for an empty cache (undefined) are tried again then.
+    const complete = picked.f16Matmul !== undefined && picked.f16Pack !== undefined
+    if (complete) loaded.untuned = undefined
+    else loaded.tunedPartly = true
     // A new pick reads short batches' results with programs the warm-up
     // didn't compile: compiled now while the cache is empty (else on the
     // first short prompt).
@@ -779,8 +822,7 @@ function tuneWhenIdle() {
 
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   if (data.type === "claimed") {
-    claimed?.()
-    claimed = null
+    claims.shift()?.()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {

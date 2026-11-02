@@ -781,10 +781,18 @@ async function smoke(params: {
   /** Pad the question to about this many prompt tokens, to time prompt reading. */
   length?: number
   skip?: Array<string>
+  /** With skip: time writing steps from a cache of this many tokens (and leave out the prompt profile). */
+  decodeAt?: number
+  /** With skip: the prompt profile in alternated rounds (heat-fair). */
+  alternate?: boolean
   texels?: "bytes" | "words"
   ab?: string
   abDecode?: string
+  /** knob:a,b: attention's passes alone from a cache of decodeAt tokens, values alternating. */
+  attnab?: string
   sweep?: string
+  /** abDecode's and sweep's rounds, times this (a busy GPU: more rounds). */
+  rounds?: number
   programs?: boolean
   chain?: boolean
 }) {
@@ -925,17 +933,86 @@ async function smoke(params: {
         `LAYOUT ${c.layout} (writing matmul: RGBA4 ${c.rgba4Ms.toFixed(3)} ms, bytes ${c.bytesMs.toFixed(3)} ms)`
       )
   }
+  // Attention alone: ?attnab=knob:a,b,…&decodeAt=N reads N tokens, then
+  // times one writing token's attention passes (every attention layer's)
+  // at 64, 512, 2,048 and N cached tokens, values alternating. Variants of
+  // several knobs: attnab=default|knob:v,knob2:v|…; skip:name leaves out
+  // passes of that name.
+  if (params.attnab) {
+    const spec = params.attnab
+    const variants: Array<Array<[string, string]>> = spec.includes("|")
+      ? spec.split("|").map((v) =>
+          v === "default" ? [] : v.split(",").map((kv) => kv.split(":") as [string, string])
+        )
+      : (() => {
+          const [knob, list] = spec.split(":")
+          return list.split(",").map((v): Array<[string, string]> => [[knob, v]])
+        })()
+    const labels = variants.map((v) => v.map(([k, x]) => `${k}=${x}`).join(",") || "default")
+    const T = TUNING as Record<string, number>
+    const saved = { ...T }
+    const at = params.decodeAt ?? 2048
+    const tokens = Array.from({ length: at }, (_, i) => 1000 + (i % 5000))
+    engine.reset()
+    await engine.forward(tokens)
+    engine.snapshot()
+    type Internals = {
+      layers: Array<{ type: string; attention?: unknown }>
+      buffers: { qkvg: unknown }
+      attention(layer: unknown, type: string, rows: number, pos0: number, split: number, qkvgIn: unknown): Promise<void>
+    }
+    const e = engine as unknown as Internals
+    const attn = e.layers.filter((l) => l.attention)
+    // One token's attention in every attention layer (nothing else of the
+    // step: no matmuls, no heads), `reps` times queued, one wait.
+    const reps = 32
+    const timeOne = async (n: number, pos: number) => {
+      Object.assign(T, saved)
+      engine.gpu.skip = new Set()
+      for (const [k, x] of variants[n]) {
+        if (k === "skip") engine.gpu.skip = new Set([x])
+        else T[k] = Number(x)
+      }
+      await engine.gpu.finish()
+      const t = performance.now()
+      for (let r = 0; r < reps; r++)
+        for (const l of attn) await e.attention(l.attention, l.type, 1, pos, 0, e.buffers.qkvg)
+      await engine.gpu.finish()
+      return (performance.now() - t) / reps
+    }
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
+    const attnAt = (params as { attnAt?: string }).attnAt
+    const positions = attnAt
+      ? attnAt.split(",").map(Number).filter((p) => p <= at)
+      : [...new Set([64, 512, 1024, 2048, at].filter((p) => p <= at))]
+    const rounds = Number((params as { rounds?: string }).rounds ?? 12)
+    const order = variants.map((_, n) => n)
+    for (const pos of positions) {
+      const runs = variants.map(() => [] as Array<number>)
+      for (const n of order) await timeOne(n, pos)
+      for (let round = 0; round < rounds; round++)
+        for (const n of round % 2 ? [...order].reverse() : order) runs[n].push(await timeOne(n, pos))
+      log(
+        `ATTN at ${pos}, ms per token (all ${attn.length} attention layers; median, min of ${rounds}): ` +
+          order.map((n) => `${labels[n]} ${med(runs[n]).toFixed(3)} ${Math.min(...runs[n]).toFixed(3)}`).join("; ")
+      )
+    }
+    Object.assign(T, saved)
+    engine.gpu.skip = new Set()
+    return
+  }
   // Profile: the prompt with each kind of pass left out in turn.
   if (params.skip) {
     log(
       `textures: ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB (batch ${params.batch})`
     )
     const tokens = Array.from(
-      { length: params.length ?? 512 },
+      { length: Math.max(params.length ?? 512, params.decodeAt ?? 0) },
       (_, i) => 1000 + (i % 5000)
     )
     engine.reset()
     await engine.forward(tokens.slice(0, 8))
+    const decodeAt = params.decodeAt
     const time = async (label: string, skip: Array<string>) => {
       engine.gpu.skip = new Set(skip)
       // Best of 5 (the first also compiles anything new).
@@ -950,14 +1027,53 @@ async function smoke(params: {
       log(`PROFILE ${label.padEnd(16)} ${ms.toFixed(0)} ms`)
       return ms
     }
-    const all = await time("everything", [])
-    for (const name of params.skip) {
-      const ms = await time(`without ${name}`, [name])
+    if (!decodeAt && params.alternate) {
+      // Alternated rounds, one prompt each, best of each: heat slows every
+      // configuration alike.
+      const configs: Array<[string, Array<string>]> = [
+        ["everything", []],
+        ...params.skip.map((n): [string, Array<string>] => [`without ${n}`, [n]])
+      ]
+      const best = new Map<string, number>()
+      for (let round = 0; round < 3; round++)
+        for (const [label, skip] of configs) {
+          engine.gpu.skip = new Set(skip)
+          engine.reset()
+          await engine.gpu.finish()
+          const t = performance.now()
+          await engine.forward(tokens)
+          const ms = performance.now() - t
+          log(`PROFILE ${label} (round ${round + 1}) ${ms.toFixed(0)} ms`)
+          best.set(label, Math.min(best.get(label) ?? Infinity, ms))
+        }
+      engine.gpu.skip = new Set()
+      const all = best.get("everything") ?? Infinity
       log(
-        `  ${name}: ${(all - ms).toFixed(0)} ms (${(((all - ms) / all) * 100).toFixed(0)}%)`
+        `PROMPT OF ${tokens.length}, best ms over 3 alternated rounds: everything ${all.toFixed(0)} (${((tokens.length / all) * 1000).toFixed(0)} tok/s); ` +
+          params.skip
+            .map((n) => {
+              const d = all - (best.get(`without ${n}`) ?? all)
+              return `${n} ${d.toFixed(0)} (${((d / all) * 100).toFixed(0)}%)`
+            })
+            .join(", ")
       )
+    } else if (!decodeAt) {
+      const all = await time("everything", [])
+      for (const name of params.skip) {
+        const ms = await time(`without ${name}`, [name])
+        log(
+          `  ${name}: ${(all - ms).toFixed(0)} ms (${(((all - ms) / all) * 100).toFixed(0)}%)`
+        )
+      }
+      await time("everything again", [])
+    } else {
+      // The long cache once, kept as a snapshot each writing timing rewinds to.
+      engine.reset()
+      const t = performance.now()
+      await engine.forward(tokens.slice(0, decodeAt))
+      engine.snapshot()
+      log(`DECODE cache of ${decodeAt} tokens read in ${(performance.now() - t).toFixed(0)} ms`)
     }
-    await time("everything again", [])
     // Writing: single-token steps, each with its logits read back.
     const step = async (
       label: string,
@@ -965,8 +1081,11 @@ async function smoke(params: {
       readLogits = true
     ) => {
       engine.gpu.skip = new Set(skip)
-      engine.reset()
-      await engine.forward(tokens.slice(0, 64))
+      if (decodeAt) engine.rewind(decodeAt)
+      else {
+        engine.reset()
+        await engine.forward(tokens.slice(0, 64))
+      }
       const draws = engine.gpu.draws
       const t = performance.now()
       for (let i = 0; i < 16; i++) {
@@ -1110,10 +1229,31 @@ async function smoke(params: {
       )
     }
     await step("no logits readback", [], false)
-    for (const name of params.skip) {
-      const ms = await step(`without ${name}`, [name])
-      log(`  ${name}: ${(full - ms).toFixed(1)} ms`)
-    }
+    if (decodeAt) {
+      // Alternated rounds, best of each: a phone that heats up slows every
+      // configuration alike instead of the ones timed last.
+      const configs: Array<[string, Array<string>]> = [
+        ["everything", []],
+        ...params.skip.map((n): [string, Array<string>] => [`without ${n}`, [n]])
+      ]
+      const best = new Map<string, number>()
+      for (let round = 0; round < 4; round++)
+        for (const [label, skip] of configs) {
+          const ms = await step(`${label} (round ${round + 1})`, skip)
+          best.set(label, Math.min(best.get(label) ?? Infinity, ms))
+        }
+      const all = best.get("everything") ?? Infinity
+      log(
+        `DECODE AT ${decodeAt}, best GPU ms/token over 4 alternated rounds: everything ${all.toFixed(2)}; ` +
+          params.skip
+            .map((n) => `${n} ${(all - (best.get(`without ${n}`) ?? all)).toFixed(2)}`)
+            .join(", ")
+      )
+    } else
+      for (const name of params.skip) {
+        const ms = await step(`without ${name}`, [name])
+        log(`  ${name}: ${(full - ms).toFixed(1)} ms`)
+      }
     engine.gpu.skip = new Set()
     const t = performance.now()
     for (let i = 0; i < 16; i++) await engine.logits(0)
@@ -1180,6 +1320,18 @@ async function smoke(params: {
   log(
     `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s, ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB of textures`
   )
+  // The most texture bytes alive at once from here on (TEXTURES line).
+  const loadedBytes = engine.gpu.bytes
+  let peakBytes = loadedBytes
+  {
+    const gpu = engine.gpu as unknown as { texture: (...a: Array<unknown>) => unknown; bytes: number }
+    const make = gpu.texture.bind(gpu)
+    gpu.texture = (...args: Array<unknown>) => {
+      const t = make(...args)
+      peakBytes = Math.max(peakBytes, gpu.bytes)
+      return t
+    }
+  }
   let question =
     params.question ?? "What is the capital of France? Answer in one sentence."
   const filler =
@@ -1216,6 +1368,65 @@ async function smoke(params: {
     const t = performance.now()
     const error = await engine.selfCheck()
     log(`SELF CHECK: attention relative error ${error.toExponential(2)} in ${(performance.now() - t).toFixed(0)} ms`)
+  }
+  // ?linstate=16,32: each Gated DeltaNet layer's recurrent state after a
+  // prompt batch and after the whole prompt, the recurrence run in chunks
+  // of each size against a token at a time.
+  const linstate = (params as { linstate?: string }).linstate
+  if (linstate) {
+    type Layers = { layers: Array<{ linear?: { state: Array<Parameters<typeof engine.gpu.readNow>[0]> } }> }
+    const states = async (chunk: number, tokens: Array<number>) => {
+      const saved = TUNING.linChunk
+      TUNING.linChunk = chunk
+      try {
+        engine.reset()
+        await engine.forward(tokens)
+        await engine.gpu.finish()
+        return (engine as unknown as Layers).layers.map((l) =>
+          l.linear ? engine.gpu.readNow(l.linear.state[0]) : null
+        )
+      } finally {
+        TUNING.linChunk = saved
+      }
+    }
+    for (const [label, tokens] of [
+      [`one batch (${Math.min(engine.batchSize, prompt.length)} tokens)`, prompt.slice(0, engine.batchSize)],
+      [`whole prompt (${prompt.length} tokens)`, prompt]
+    ] as const) {
+      const ref = await states(0, [...tokens])
+      for (const chunk of linstate.split(",").map(Number)) {
+        const got = await states(chunk, [...tokens])
+        let worstAbs = 0
+        let worstRel = 0
+        let worstLayer = -1
+        const rels: Array<number> = []
+        const byLayer: Array<string> = []
+        ref.forEach((r, i) => {
+          const g = got[i]
+          if (!r || !g) return
+          let diff = 0
+          let scale = 0
+          for (let j = 0; j < r.length; j++) {
+            if (!Number.isFinite(g[j])) diff = Infinity
+            diff = Math.max(diff, Math.abs(g[j] - r[j]))
+            scale = Math.max(scale, Math.abs(r[j]))
+          }
+          const rel = diff / scale
+          rels.push(rel)
+          byLayer.push(`${i}:${rel.toExponential(1)}`)
+          worstAbs = Math.max(worstAbs, diff)
+          if (rel > worstRel) {
+            worstRel = rel
+            worstLayer = i
+          }
+        })
+        rels.sort((a, b) => a - b)
+        log(
+          `LINSTATE ${label}, chunks of ${chunk} vs a token at a time: max abs error ${worstAbs.toExponential(2)}, max relative (over the layer's max |S|) ${worstRel.toExponential(2)} at layer ${worstLayer}, median layer ${rels[rels.length >> 1].toExponential(2)}; by layer ${byLayer.join(" ")}`
+        )
+      }
+    }
+    engine.reset()
   }
   // As the worker does it: candidates picked on the GPU (top 50, penalty
   // 1.1), the likeliest drawn (greedy, for a repeatable reply).
@@ -1254,6 +1465,60 @@ async function smoke(params: {
         gpuTimes.push((gl.getQueryParameter(query, gl.QUERY_RESULT) as number) / 1e6)
       gl.deleteQuery(query)
     }
+  }
+  // ?small=1: short batches after a 64-token prefix (follow-ups, tool
+  // results), the recurrence a token at a time against in chunks, rounds
+  // interleaved: where chunks start to pay (TUNING.linChunkMin).
+  if ((params as { small?: boolean }).small) {
+    const sizes = [2, 3, 4, 6, 8, 12, 16, 24]
+    const chunk = TUNING.linChunk
+    const savedMin = TUNING.linChunkMin
+    TUNING.linChunkMin = 2
+    const times: Record<string, Array<number>> = {}
+    const once = async (n: number, c: number) => {
+      TUNING.linChunk = c
+      engine.reset()
+      await engine.forward(prompt.slice(0, 64))
+      await engine.gpu.finish()
+      const t = performance.now()
+      await pick(await engine.forwardHidden(prompt.slice(64, 64 + n)))
+      return performance.now() - t
+    }
+    for (const n of sizes) for (const c of [0, chunk]) await once(n, c)
+    for (let round = 0; round < 7; round++)
+      for (const n of sizes)
+        for (const c of [0, chunk]) (times[`${n},${c}`] ??= []).push(await once(n, c))
+    TUNING.linChunk = chunk
+    TUNING.linChunkMin = savedMin
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[xs.length >> 1]
+    for (const n of sizes)
+      log(
+        `SMALL ${n} tokens: a token at a time ${med(times[`${n},0`]).toFixed(2)} ms, chunks of ${chunk} ${med(times[`${n},${chunk}`]).toFixed(2)} ms`
+      )
+  }
+  // ?abwrite=1: writing after the prompt read with the recurrence a token
+  // at a time, then in chunks, rounds alternating (writing itself runs the
+  // same passes either way; this checks nothing the prompt left behind
+  // slows it).
+  if ((params as { abwrite?: boolean }).abwrite) {
+    const chunk = TUNING.linChunk
+    const perToken: Record<number, Array<number>> = { 0: [], [chunk]: [] }
+    for (let round = 0; round < 10; round++) {
+      const c = round % 2 === 0 ? 0 : chunk
+      TUNING.linChunk = c
+      engine.reset()
+      engine.setSeen(prompt, tokenizer.vocabSize)
+      let next = await pick(await engine.forwardHidden(prompt))
+      TUNING.linChunk = chunk
+      const t = performance.now()
+      for (let i = 0; i < 32; i++) next = await pick(await engine.forwardHidden([next]))
+      perToken[c].push((performance.now() - t) / 32)
+    }
+    TUNING.linChunk = chunk
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[xs.length >> 1]
+    log(
+      `ABWRITE after a token-at-a-time prompt ${med(perToken[0]).toFixed(2)} ms/token (${perToken[0].map((t) => t.toFixed(1)).join(" ")}); after a chunked prompt ${med(perToken[chunk]).toFixed(2)} ms/token (${perToken[chunk].map((t) => t.toFixed(1)).join(" ")})`
+    )
   }
   postMessage({
     type: "jank",
@@ -1297,7 +1562,8 @@ async function smoke(params: {
     const original = (TUNING as Record<string, number>)[knob]
     engine.reset()
     let next = await pick(await engine.forwardHidden(prompt))
-    for (let i = 0; i < 8; i++) {
+    const reps = Math.max(1, params.rounds ?? 1)
+    for (let i = 0; i < 8 * reps; i++) {
       const v = i % 2 === 0 ? a : b
       ;(TUNING as Record<string, number>)[knob] = v
       const t = performance.now()
@@ -1312,7 +1578,7 @@ async function smoke(params: {
     // GPU throughput: 16 single-token forwards queued with no readback in
     // between, one wait at the end (CPU timing noise mostly drops out).
     const gpuTok: Record<string, Array<number>> = { [a]: [], [b]: [] }
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 12 * reps; i++) {
       const v = i % 2 === 0 ? a : b
       ;(TUNING as Record<string, number>)[knob] = v
       await engine.gpu.finish()
@@ -1323,12 +1589,43 @@ async function smoke(params: {
     }
     ;(TUNING as Record<string, number>)[knob] = original
     log(
-      `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
+      `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token, best ${Math.min(...gpuTok[a]).toFixed(2)} (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token, best ${Math.min(...gpuTok[b]).toFixed(2)} (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
+    // Render passes a writing step starts with each value.
+    const passes = async (v: number) => {
+      ;(TUNING as Record<string, number>)[knob] = v
+      const before = engine.gpu.passes
+      await engine.forwardNoLogits([next])
+      return engine.gpu.passes - before
+    }
+    const pa = await passes(a)
+    const pb = await passes(b)
+    ;(TUNING as Record<string, number>)[knob] = original
+    await engine.gpu.finish()
+    log(`AB PASSES per writing step ${knob}=${a}: ${pa}; ${knob}=${b}: ${pb}`)
   }
   // Sweeps: ?sweep=knob:v1,v2,…;knob2:… times each value of each knob
   // (others at their defaults) on the prompt, its first 40 tokens, and
   // writing (GPU time of 16 queued steps), rounds interleaved, medians.
+  // ?tuneab=knob:a,b: Engine.tune run with each value of a TUNING knob in
+  // turn, 3 rounds, printing what it picked and measured each time.
+  const tuneab = (params as { tuneab?: string }).tuneab
+  if (tuneab) {
+    const T = TUNING as Record<string, number>
+    const [knob, list] = tuneab.split(":")
+    const original = T[knob]
+    for (let round = 0; round < 3; round++)
+      for (const v of list.split(",").map(Number)) {
+        T[knob] = v
+        const t = performance.now()
+        const picked = await engine.tune()
+        log(
+          `TUNEAB ${knob}=${v} (round ${round + 1}, ${(performance.now() - t).toFixed(0)} ms): ${JSON.stringify({ ...picked, ...engine.tuneReport })}`
+        )
+      }
+    T[knob] = original
+    engine.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
+  }
   if (params.sweep) {
     const T = TUNING as Record<string, number>
     const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
@@ -1364,15 +1661,37 @@ async function smoke(params: {
       }
       // An untimed round first: new settings may compile programs.
       for (const v of values) await once(v, false)
-      for (let round = 0; round < 5; round++) for (const v of values) await once(v, true)
+      const rounds = 5 * Math.max(1, params.rounds ?? 1)
+      for (let round = 0; round < rounds; round++)
+        for (const v of round % 2 ? [...values].reverse() : values) await once(v, true)
       T[knob] = original
       for (const v of values)
         log(
-          `SWEEP ${knob}=${v}${v === original ? " (default)" : ""}: prompt ${prompt.length} ${med(long[v]).toFixed(1)} ms, prompt 40 ${med(short[v]).toFixed(1)} ms, writing GPU ${med(write[v]).toFixed(2)} ms/token`
+          `SWEEP ${knob}=${v}${v === original ? " (default)" : ""}: prompt ${prompt.length} ${med(long[v]).toFixed(1)} ms (best ${Math.min(...long[v]).toFixed(1)}), prompt 40 ${med(short[v]).toFixed(1)} ms (best ${Math.min(...short[v]).toFixed(1)}), writing GPU ${med(write[v]).toFixed(2)} ms/token (best ${Math.min(...write[v]).toFixed(2)})`
         )
     }
   }
   const checks = (params as { checks?: boolean }).checks !== false
+  if ((params as { anchor?: boolean }).anchor && engine.canSaveInside) {
+    // ?anchor=1: a snapshot saved from inside a batch (Engine.forwardHidden's
+    // saveAt, 7 tokens before the end, as a follow-up's anchor) against
+    // reading the prompt plainly: the batch's own logits (its chunks start
+    // shorter so one ends there), then the rest read again from it.
+    const p = prompt.slice(-Math.min(prompt.length, engine.capacity))
+    const at = p.length - 7
+    engine.reset()
+    const want = await engine.forward(p)
+    engine.reset()
+    const own = await engine.logits(await engine.forwardHidden(p, { saveAt: at }))
+    const back = engine.rewind(at)
+    const again = await engine.logits(await engine.forwardHidden(p.slice(back)))
+    const a = compareLogits(own, want)
+    const b = compareLogits(again, want)
+    log(
+      `ANCHOR CHECK (${p.length} tokens, saved after ${at}, resumed at ${back}): the batch itself KL ${a.kl.toExponential(2)}, top-1 ${a.top1 ? "same" : "DIFFERENT"}; resumed KL ${b.kl.toExponential(2)}, top-1 ${b.top1 ? "same" : "DIFFERENT"}`
+    )
+    engine.reset()
+  }
   const compare = (params as { compare?: string }).compare
   if (compare) {
     // ?compare=knob:a,b: the prompt and 16 writing steps with TUNING[knob]
@@ -1386,6 +1705,11 @@ async function smoke(params: {
         engine.reset()
         const out: Array<Float32Array> = [await engine.forward(prompt)]
         for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+        // Draft-sized batches too (a few rows: writing's path), row by row.
+        for (const n of [3, 8]) {
+          const last = await engine.forwardHidden(Array.from({ length: n }, (_, i) => 2000 + i))
+          for (let r = last - n + 1; r <= last; r++) out.push((await engine.logits(r)).slice())
+        }
         return out
       } finally {
         ;(TUNING as Record<string, number>)[knob] = saved
@@ -1401,7 +1725,7 @@ async function smoke(params: {
       if (r.top1) same++
     }
     log(
-      `COMPARE ${knob}=${a} vs ${b} over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${ra.length}`
+      `COMPARE ${knob}=${a} vs ${b} over ${prompt.length} tokens + 16 steps + batches of 3 and 8: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${ra.length}`
     )
     engine.reset()
   }
@@ -1458,7 +1782,7 @@ async function smoke(params: {
       `SEGMENT CHECK: 512-key segments vs whole rows over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${whole.length}`
     )
   }
-  if (params.ab || params.abDecode || params.sweep || compare || (prompt.length > 1000 && checks)) {
+  if (params.ab || params.abDecode || params.sweep || compare || (params as { anchor?: boolean }).anchor || (prompt.length > 1000 && checks)) {
     // The A/B runs and checks left the cache elsewhere: read the prompt again.
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)
@@ -1466,6 +1790,9 @@ async function smoke(params: {
   }
   const promptMs = [...times].sort((x, y) => x - y)[1]
   log(`prompt runs: ${times.map((t) => t.toFixed(0)).join(", ")} ms; GPU ${gpuTimes.map((t) => t.toFixed(0)).join(", ")} ms`)
+  log(
+    `TEXTURES at load ${(loadedBytes / 2 ** 20).toFixed(0)} MiB, now ${(engine.gpu.bytes / 2 ** 20).toFixed(0)} MiB, peak ${(peakBytes / 2 ** 20).toFixed(0)} MiB (sweeps and checks keep extra scratch)`
+  )
   const out: Array<number> = []
   const t2 = performance.now()
   for (let i = 0; i < (params.length ? 64 : 48); i++) {
@@ -1495,6 +1822,20 @@ async function smoke(params: {
         ? "RESET CHECK: same reply after junk and a reset"
         : `RESET CHECK: DIFFERENT after junk and a reset: ${JSON.stringify(tokenizer.decode(again))}`
     )
+  }
+  {
+    // The bits of the prompt's logits and of 8 writing steps' (the reply's
+    // tokens), hashed: the same hash on two builds or settings means the
+    // same numbers, not just the same reply.
+    engine.reset()
+    let h = 0x811c9dc5
+    const mix = (logits: Float32Array) => {
+      const bytes = new Uint8Array(logits.buffer, logits.byteOffset, logits.byteLength)
+      for (let i = 0; i < bytes.length; i++) h = Math.imul(h ^ bytes[i], 0x01000193)
+    }
+    mix(await engine.forward(prompt))
+    for (const t of out.slice(0, 8)) mix(await engine.forward([t]))
+    log(`LOGITS HASH: ${(h >>> 0).toString(16)} (the prompt and ${Math.min(8, out.length)} writing steps)`)
   }
   // How speculative decoding with prompt lookup would fare on this reply:
   // at each step, draft up to 3 tokens by matching the history's last

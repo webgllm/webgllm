@@ -102,7 +102,12 @@
         compare: params.get("compare") ?? undefined,
         ab: params.get("ab") ?? undefined,
         abDecode: params.get("abDecode") ?? undefined,
+        attnab: params.get("attnab") ?? undefined,
+        attnAt: params.get("attnAt") ?? undefined,
+        rounds: params.get("rounds") ?? undefined,
         sweep: params.get("sweep") ?? undefined,
+        tuneab: params.get("tuneab") ?? undefined,
+        rounds: params.get("rounds") ? Number(params.get("rounds")) : undefined,
         programs: params.get("programs") === "1",
         chain: params.get("chain") === "1",
         tune: params.get("tune") ?? undefined,
@@ -110,7 +115,13 @@
         question: params.get("q") ?? undefined,
         length: params.get("len") ? Number(params.get("len")) : undefined,
         skip: params.get("skip") ? params.get("skip").split(",") : undefined,
+        decodeAt: params.get("decodeAt") ? Number(params.get("decodeAt")) : undefined,
+        alternate: params.get("alternate") === "1",
         attn: params.get("attn") === "1",
+        linstate: params.get("linstate") ?? undefined,
+        small: params.get("small") === "1",
+        abwrite: params.get("abwrite") === "1",
+        anchor: params.get("anchor") === "1",
         formats: params.get("formats") ?? undefined
       })
     </script>
