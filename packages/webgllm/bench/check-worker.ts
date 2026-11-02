@@ -1566,7 +1566,7 @@ async function smoke(params: {
       T[knob] = original
       for (const v of values)
         log(
-          `SWEEP ${knob}=${v}${v === original ? " (default)" : ""}: prompt ${prompt.length} ${med(long[v]).toFixed(1)} ms, prompt 40 ${med(short[v]).toFixed(1)} ms, writing GPU ${med(write[v]).toFixed(2)} ms/token`
+          `SWEEP ${knob}=${v}${v === original ? " (default)" : ""}: prompt ${prompt.length} ${med(long[v]).toFixed(1)} ms (best ${Math.min(...long[v]).toFixed(1)}), prompt 40 ${med(short[v]).toFixed(1)} ms (best ${Math.min(...short[v]).toFixed(1)}), writing GPU ${med(write[v]).toFixed(2)} ms/token (best ${Math.min(...write[v]).toFixed(2)})`
         )
     }
   }
