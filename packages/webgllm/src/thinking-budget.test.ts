@@ -124,3 +124,30 @@ describe("LFM3 thinking budget", () => {
     }
   })
 })
+
+
+test("an exhausted budget allows its closing marker once, then masks both control tokens", () => {
+  const b = createThinkingBudget(2, { think: 31, thinkEnd: 32 }, true)!
+  b.observe(10)
+  b.observe(11)
+  assert.equal(b.forcedToken, 32)
+  assert.equal(b.closedControlMask(64), undefined, "forced close must remain available")
+  b.observe(32)
+  const mask = b.closedControlMask(64)!
+  assert.equal((mask[0] & (1 << 31)) >>> 0, 0)
+  assert.equal(mask[1] & 1, 0)
+  assert.equal(mask[0] & 1, 1, "ordinary answer tokens stay allowed")
+  assert.equal(b.closedControlMask(64), mask, "the stable mask needs no per-token GPU upload")
+})
+
+test("natural early closing and omitted budgets preserve normal control-token behavior", () => {
+  const b = createThinkingBudget(10, { think: 31, thinkEnd: 32 }, true)!
+  b.observe(10)
+  b.observe(32)
+  assert.equal(b.closedControlMask(64), undefined)
+  assert.equal(createThinkingBudget(undefined, { think: 31, thinkEnd: 32 }, true), null)
+  const zero = createThinkingBudget(0, { think: 31, thinkEnd: 32 }, true)!
+  assert.equal(zero.closedControlMask(64), undefined)
+  zero.observe(32)
+  assert.ok(zero.closedControlMask(64))
+})

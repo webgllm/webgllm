@@ -4093,6 +4093,37 @@ export class Engine {
     this.guessAt = null
   }
 
+  private allowedTokens: Texture | null = null
+  private allowedEnabled = false
+  private allowedRows = 0
+  private allowedStride = 0
+
+  /** One allowed-token bitset broadcast across all rows of GPU selection. */
+  setAllowedTokens(mask: Uint32Array | null) {
+    this.setAllowedTokenRows(mask === null ? null : [mask])
+  }
+
+  /** Allowed masks after each speculative prefix, before GPU ranking/top-k. */
+  setAllowedTokenRows(masks: readonly Uint32Array[] | null) {
+    this.allowedEnabled = masks !== null
+    this.allowedRows = masks?.length ?? 0
+    if (masks === null) return
+    if (masks.length === 0) throw new Error("GPU schema masks must have at least one row.")
+    const words = Math.ceil(this.config.vocabSize / 32)
+    const width = Math.min(256, words)
+    this.allowedStride = Math.ceil(words / width)
+    const height = this.allowedStride * masks.length
+    if (!this.allowedTokens || this.allowedTokens.width !== width || this.allowedTokens.height < height) {
+      if (this.allowedTokens) this.gpu.delete(this.allowedTokens)
+      this.allowedTokens = this.gpu.texture(GL.R32UI, width, height)
+    }
+    const padded = new Uint32Array(width * height)
+    for (let row = 0; row < masks.length; row++) padded.set(masks[row].subarray(0, words), row * width * this.allowedStride)
+    this.gpu.write(this.allowedTokens, { x: 0, y: 0, width, height }, {
+      format: GL.RED_INTEGER, type: GL.UNSIGNED_INT, pixels: padded
+    })
+  }
+
   /** The penalty mask on the CPU side, mirrored to the GPU's. */
   private maskData: Uint8Array | null = null
 
@@ -4176,6 +4207,10 @@ export class Engine {
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uAllowedEnabled: { int: this.allowedEnabled ? 1 : 0 },
+      uAllowedWidth: { int: this.allowedTokens?.width ?? 1 },
+      uAllowedRows: { int: this.allowedRows },
+      uAllowedStride: { int: this.allowedStride },
       uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
@@ -4187,7 +4222,7 @@ export class Engine {
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_MAX_AT),
-      inputs: { uLogits: head.logits, uMask: b.mask },
+      inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
@@ -4259,6 +4294,10 @@ export class Engine {
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uAllowedEnabled: { int: this.allowedEnabled ? 1 : 0 },
+      uAllowedWidth: { int: this.allowedTokens?.width ?? 1 },
+      uAllowedRows: { int: this.allowedRows },
+      uAllowedStride: { int: this.allowedStride },
       uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
@@ -4270,7 +4309,7 @@ export class Engine {
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(fast ? K.CHUNK_MAX_AT : K.CHUNK_MAX),
-      inputs: { uLogits: head.logits, uMask: b.mask },
+      inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
@@ -4283,7 +4322,7 @@ export class Engine {
         program: this.gpu.program(
           fast ? K.withChunks(K.CHUNK_ARGMAX_AT, total) : K.CHUNK_ARGMAX
         ),
-        inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask },
+        inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
         uniforms: {
           ...picking,
           uChunks: { int: total },
@@ -4319,6 +4358,7 @@ export class Engine {
       inputs: {
         uLogits: head.logits,
         uMask: b.mask,
+        uAllowed: this.allowedTokens ?? b.mask,
         uByRank: b.chunkByRank,
         uIds: b.ids
       },

@@ -34,6 +34,16 @@ LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it throu
 
 Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. The supported models declare no default output cap in their generation configs. When neither `modelOptions.maxTokens` nor its legacy alias `max_new_tokens` is supplied, generation continues until EOS or the remaining configured model context is exhausted. An explicit value is honored in both streaming and structured-output calls and bounded by remaining context; `maxTokens` wins if both names are supplied. Thinking budgets are separate from this total output limit.
 
+### Structured output
+
+`chat({ outputSchema })` forwards the schema to the worker, where a generation-local matcher constrains answer tokens. The allowed-token bitset is applied before GPU candidate selection, argmax and top-k, and before sampling on the CPU-logits path. Model inference remains on WebGL. Unsupported schema features and constraint dead ends fail explicitly; exhausting the caller's output/context allowance before a valid answer reports truncation.
+
+Thinking and answer generation have separate states. Thinking uses its normal pipeline/speculative optimizations and caller budget, with EOS suppressed until an answer can be produced. Natural or budget-forced thinking completion activates the schema mask. Models that emit their own opening thinking marker receive that marker before constrained generation when thinking is requested. The constrained answer phase supports pipeline guesses and speculative drafts. Each proposed answer prefix uses a cloned grammar state and its own GPU mask; invalid suffixes are dropped before forwarding, and only accepted tokens advance the live matcher. A draft batch crossing the thinking boundary is rewound to its accepted prefix before selecting the first constrained token. Unconstrained text calls retain their existing decoding paths.
+
+### Tool calls
+
+Automatic tool choice retains the model's native routing and answer format. Before tool-call events are emitted, each parsed call must name a declared tool and its arguments must validate against that tool's schema. Valid arguments are retained without another model call; invalid arguments are regenerated once under the selected tool's constrained schema. Unknown tools and malformed envelopes fail explicitly. Required/named choices use constrained selection and arguments. There is no unconstrained retry loop. Tool calls still use TanStack AI's normal execution/result loop.
+
 ### Thinking budget
 
 Every thinking-capable WebGL model accepts an optional thinking-token ceiling through the shared reasoning option:
@@ -49,6 +59,8 @@ const stream = chat({
 ```
 
 The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `maxTokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. This applies to every LFM3, LFM2.5 Thinking, and Qwen3.5 variant.
+
+After an explicitly exhausted thinking span closes, ordinary text generation masks further actual thinking control tokens. Structured answers remain governed by their schema mask so tag-like text inside JSON strings stays data.
 
 The low-level worker/client generation option is `thinkingBudgetTokens`. Budgeted runs report `thinkingTokens`, `thinkingBudgetTokens`, and `thinkingBudgetExhausted` in `usage.providerUsageDetails`.
 

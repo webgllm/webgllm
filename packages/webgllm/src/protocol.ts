@@ -55,6 +55,8 @@ export type WorkerRequest =
       thinking?: boolean
       /** Close thinking at this many content tokens, then continue the answer. */
       thinkingBudgetTokens?: number
+      /** JSON Schema enforced during answer token selection. */
+      outputSchema?: object
       sampling: Sampling
       /** Most tokens to generate; EOS or remaining model context when left out. */
       maxTokens?: number

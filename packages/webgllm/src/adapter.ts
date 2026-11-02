@@ -15,6 +15,7 @@ import type {
 } from "@tanstack/ai"
 import { resolveReasoning } from "@tanstack/ai/adapter-internals"
 import { BaseTextAdapter } from "@tanstack/ai/adapters"
+import { chooseGuidedTool, addGuidedUsage, validateStructuredValue, structuredAnswer } from "@tanstack-ai-browser/structured-output"
 import type {
   StructuredOutputOptions,
   StructuredOutputResult
@@ -24,7 +25,7 @@ import { generate, loadModel, setKeepLoaded } from "./client.js"
 import { modelMeta } from "./model-meta.js"
 import type { WebGlModelReasoningByName, WebGlTextModel } from "./model-meta.js"
 import type { GenerationPhase, RunTimings } from "./protocol.js"
-import { createThinkingSplitter, splitThinking } from "./reply.js"
+import { createThinkingSplitter } from "./reply.js"
 import type { ReplyPiece } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
@@ -111,6 +112,20 @@ function requestedOutputTokens(options: WebGlTextProviderOptions | undefined) {
     throw new RangeError("maxTokens must be a nonnegative safe integer.")
   }
   return limit
+}
+
+function waitForModel(model: WebGlTextModel, contextLength: number | undefined, signal: AbortSignal | undefined): Promise<void> {
+  signal?.throwIfAborted()
+  if (!signal) return loadModel(model, contextLength)
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal.addEventListener("abort", abort, { once: true })
+    loadModel(model, contextLength).then(() => {
+      signal.removeEventListener("abort", abort)
+      if (signal.aborted) reject(signal.reason)
+      else resolve()
+    }, error => { signal.removeEventListener("abort", abort); reject(error) })
+  })
 }
 
 function contentText(content: ModelMessage["content"]) {
@@ -354,6 +369,7 @@ export class WebGlTextAdapter<
       options.abortController?.signal ??
       (options.request as RequestInit | undefined)?.signal ??
       undefined
+    if (signal?.aborted) return
     const model = this.model
     const timestamp = () => Date.now()
 
@@ -365,8 +381,40 @@ export class WebGlTextAdapter<
       timestamp: timestamp(),
       ...(options.parentRunId && { parentRunId: options.parentRunId })
     }
+    if (options.tools?.length && options.toolChoice && options.toolChoice !== "auto" && options.toolChoice !== "none") {
+      try {
+        const { call, usage } = await chooseGuidedTool(options, (outputSchema, instruction) =>
+          this.structuredOutput({
+            chatOptions: { ...options, systemPrompts: [...normalizeSystemPrompts(options.systemPrompts), { content: instruction }] },
+            outputSchema
+          })
+        )
+        if (signal?.aborted) return
+        if (call) {
+          const toolCallId = nextId("tool")
+          const args = JSON.stringify(call.args)
+          yield { type: EventType.TOOL_CALL_START, toolCallId, toolCallName: call.name, parentMessageId: messageId, index: 0, model, timestamp: timestamp() }
+          yield { type: EventType.TOOL_CALL_ARGS, toolCallId, delta: args, args, model, timestamp: timestamp() }
+          yield { type: EventType.TOOL_CALL_END, toolCallId, toolCallName: call.name, args, input: call.args, model, timestamp: timestamp() }
+          yield { type: EventType.RUN_FINISHED, runId, threadId, model, timestamp: timestamp(), finishReason: "tool_calls", ...(usage && { usage }) }
+        } else {
+          for await (const chunk of this.chatStream({ ...options, runId, tools: [], toolChoice: "none" })) {
+            if (chunk.type === EventType.RUN_STARTED) continue
+            if (chunk.type === EventType.RUN_FINISHED) {
+              const reported = Array.isArray(chunk.usage) ? chunk.usage[0] : chunk.usage
+              yield { ...chunk, usage: addGuidedUsage(usage, reported) }
+            } else yield chunk
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) return
+        const message = errorText(error)
+        yield { type: EventType.RUN_ERROR, model, timestamp: timestamp(), message, error: { message } }
+      }
+      return
+    }
     try {
-      await loadModel(model, this.contextLength)
+      await waitForModel(model, this.contextLength, signal)
     } catch (error) {
       const message = `Couldn't load ${model}: ${errorText(error)}`
       yield {
@@ -475,7 +523,7 @@ export class WebGlTextAdapter<
       model: this.model,
       contextLength: this.contextLength,
       chat,
-      tools: toTools(options.tools),
+      tools: options.toolChoice === "none" ? [] : toTools(options.tools),
       ...thinking,
       sampling: this.sampling(options.modelOptions, thinking.thinking),
       maxTokens,
@@ -500,12 +548,42 @@ export class WebGlTextAdapter<
     endReasoning()
     const { text: rest, markup } = toolSplitter.flush()
     addText(rest)
-    const parsed = markup ? parseToolCalls(markup) : []
+    const parsed = markup && options.tools?.length && options.toolChoice !== "none" ? parseToolCalls(markup) : []
     // Markup that isn't any tool call is shown as the text it is.
     if (markup && parsed.length === 0) addText(markup)
     yield* events.splice(0)
 
-    for (const [index, call] of parsed.entries()) {
+    let repairedUsage: TokenUsage | undefined
+    const validated: typeof parsed = []
+    try {
+      if (markup && options.tools?.length && options.toolChoice !== "none" && parsed.length === 0) {
+        throw new Error("The model produced a malformed tool-call envelope.")
+      }
+      for (const call of parsed) {
+        const tool = options.tools?.find(tool => tool.name === call.name)
+        if (!tool) throw new Error(`The model requested an unknown tool: ${call.name}`)
+        const schema = tool.inputSchema ?? { type: "object", properties: {}, additionalProperties: false }
+        let args = call.args
+        if (!await validateStructuredValue(schema, args)) {
+          const repair = await this.structuredOutput({
+            chatOptions: { ...options, systemPrompts: [...normalizeSystemPrompts(options.systemPrompts), { content: `Return valid arguments for ${tool.name}. Previous draft: ${JSON.stringify(args)}` }] },
+            outputSchema: schema
+          })
+          if (!repair.data || typeof repair.data !== "object" || Array.isArray(repair.data) || !await validateStructuredValue(schema, repair.data)) throw new Error(`Invalid arguments for tool: ${tool.name}`)
+          args = repair.data as Record<string, unknown>
+          repairedUsage = addGuidedUsage(repairedUsage, repair.usage)
+        }
+        if (signal?.aborted) return
+        validated.push({ ...call, args })
+      }
+    } catch (error) {
+      if (signal?.aborted) return
+      const message = errorText(error)
+      yield { type: EventType.RUN_ERROR, model, timestamp: timestamp(), message, error: { message } }
+      return
+    }
+
+    for (const [index, call] of validated.entries()) {
       const toolCallId = nextId("tool")
       const args = JSON.stringify(call.args)
       yield {
@@ -560,7 +638,7 @@ export class WebGlTextAdapter<
       model,
       timestamp: timestamp(),
       finishReason: parsed.length > 0 ? "tool_calls" : "stop",
-      ...(stats && { usage: usageOf(stats) })
+      ...((stats || repairedUsage) && { usage: repairedUsage ? addGuidedUsage(repairedUsage, stats ? usageOf(stats) : undefined) : stats ? usageOf(stats) : undefined })
     }
   }
 
@@ -574,7 +652,9 @@ export class WebGlTextAdapter<
     const { chatOptions, outputSchema } = options
     const thinking = thinkingOptions(chatOptions.reasoning, this.model)
     const maxTokens = requestedOutputTokens(chatOptions.modelOptions)
-    await loadModel(this.model, this.contextLength)
+    const signal = chatOptions.abortController?.signal ?? (chatOptions.request as RequestInit | undefined)?.signal ?? undefined
+    signal?.throwIfAborted()
+    await waitForModel(this.model, this.contextLength, signal)
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
       .concat(
@@ -591,12 +671,13 @@ export class WebGlTextAdapter<
         ...toChatMessages(chatOptions.messages, this.toolFormat)
       ],
       tools: [],
+      outputSchema,
       ...thinking,
       sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
       maxTokens,
       speculative: chatOptions.modelOptions?.speculative,
       pipeline: chatOptions.modelOptions?.pipeline,
-      signal: chatOptions.abortController?.signal
+      signal
     })
     let raw = ""
     const thinkingSplitter = this.onThinking ? createThinkingSplitter() : undefined
@@ -618,7 +699,7 @@ export class WebGlTextAdapter<
       if (!next.done) await stream.return({})
     }
     if (next.value.failure) throw new Error(next.value.failure)
-    const rawText = splitThinking(raw).answer.trim()
+    const rawText = structuredAnswer(raw)
     const json = rawText.replace(/^```(?:json)?\s*|\s*```$/g, "")
     try {
       return {

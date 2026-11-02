@@ -24,6 +24,8 @@ import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
 import { createThinkingBudget } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
+import { createConstraint } from "@tanstack-ai-browser/structured-output"
+import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -452,6 +454,21 @@ async function generate(request: GenerateRequest) {
     tokenizer.specialTokens,
     startsInThinking
   )
+  // LFM2.5 Thinking writes its opening marker itself; its template ends at
+  // assistant\n. Seed that expected marker so the answer grammar never suppresses reasoning.
+  const reasoning = modelMeta(request.model as WebGlTextModel).reasoning
+  const mandatoryThinking = !!reasoning && "levels" in reasoning && !("off" in reasoning.levels)
+  const openThinking = request.outputSchema !== undefined && !startsInThinking && think !== null &&
+    (request.thinking === true || (request.thinking === undefined && mandatoryThinking))
+  const structured = request.outputSchema === undefined ? undefined : new StructuredGeneration(
+    await createConstraint({ schema: request.outputSchema, tokenizer: tokenizer.constraintTokenizer }),
+    tokenizer.specialTokens.eos,
+    tokenizer.specialTokens.thinkEnd,
+    startsInThinking || openThinking,
+    tokenizer.vocabSize
+  )
+  engine.setAllowedTokens(null)
+  try {
   const room = engine.contextLength - prompt.length
   if (room <= 0) {
     throw new Error(
@@ -506,6 +523,7 @@ async function generate(request: GenerateRequest) {
     maxTokens <= 0 ||
     model.cached.length < prompt.length
   ) {
+    if (structured && !stopped.has(id)) throw new Error("Structured output was truncated before generation could produce a schema-valid answer.")
     return post({ type: "done", id, stats })
   }
 
@@ -564,7 +582,17 @@ async function generate(request: GenerateRequest) {
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
+  let appliedMask: Uint32Array | null | undefined
+  const updateAllowed = () => {
+    // JSON literals are governed by their grammar. Only unconstrained replies
+    // reserve control markers after an explicit budgeted reasoning span closes.
+    const mask = structured ? structured.mask() : thinkingBudget?.closedControlMask(vocab) ?? null
+    if (structured?.answering || appliedMask !== mask) engine.setAllowedTokens(mask)
+    appliedMask = mask
+    return mask ?? undefined
+  }
   const distribution = async (r: number, guess = false) => {
+    const mask = updateAllowed()
     if (greedy) {
       const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess, sampling.presence_penalty)
       if (guess && engine.guessing) guessed = engine.guessedToken
@@ -584,6 +612,7 @@ async function generate(request: GenerateRequest) {
     }
     const logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
+    if (mask) maskLogits(logits, mask)
     return sampler.distribution(logits)
   }
   // On the GPU: the distributions after rows 0..rows-1 of a batch whose
@@ -591,8 +620,11 @@ async function generate(request: GenerateRequest) {
   const distributions = async (
     rows: number,
     drafts: Array<number>,
-    guess: boolean
+    guess: boolean,
+    masks?: readonly Uint32Array[]
   ) => {
+    if (masks) engine.setAllowedTokenRows(masks)
+    else updateAllowed()
     if (greedy) {
       const tokens = await engine.argmax(
         0,
@@ -634,7 +666,7 @@ async function generate(request: GenerateRequest) {
   }
 
   // A zero budget may close a template-opened span before any sampling.
-  let token = thinkingBudget?.forcedToken ?? draw(await distribution(row, guessing()))
+  let token = openThinking ? think as number : thinkingBudget?.forcedToken ?? draw(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
   if (request.reportPhases && !stopped.has(id)) {
     post({ type: "phase", id, phase: "generating" })
@@ -648,6 +680,7 @@ async function generate(request: GenerateRequest) {
   // Writes out a token of the reply; false once the reply is over.
   const emit = (t: number) => {
     stats.outputTokens++
+    structured?.observe(t)
     if (t === eos) return false
     thinkingBudget?.observe(t)
     if (onGpu) engine.markSeen(t)
@@ -687,13 +720,16 @@ async function generate(request: GenerateRequest) {
     }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
-    const drafts = draftsFor(
+    const proposed = draftsFor(
       Math.min(
         DRAFTS,
         maxTokens - stats.outputTokens - 1,
         engine.contextLength - engine.position - 1
       )
     )
+    const answeringAtBatchStart = !!structured?.answering
+    const preview = structured?.answering ? structured.previewAnswerDrafts(proposed) : undefined
+    const drafts = preview?.drafts ?? proposed
     const batch = [token, ...drafts]
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
     // Row i's distribution checks draft i + 1; the first draft it rejects
@@ -705,11 +741,18 @@ async function generate(request: GenerateRequest) {
       stats.outputTokens + drafts.length < maxTokens - 1 &&
       engine.position < engine.contextLength - 1
     const all = onGpu
-      ? await distributions(batch.length, drafts, guessLast)
+      ? await distributions(batch.length, drafts, guessLast, preview?.masks)
       : null
     let kept = 1
     let next = -1
+    let constrainedRow = -1
     for (let i = 0; i < batch.length && going; i++) {
+      // A natural close accepted from a draft activates the answer grammar.
+      // Its precomputed thinking distributions cannot select answer tokens.
+      if (!answeringAtBatchStart && structured?.answering && drafts.length > 0) {
+        constrainedRow = kept - 1
+        break
+      }
       // A drafted thinking token may have just used the remaining budget.
       // Stop before accepting another; accept(kept) below rewinds its cache.
       const forced = thinkingBudget?.forcedToken
@@ -749,6 +792,10 @@ async function generate(request: GenerateRequest) {
       engine.accept(kept)
     }
     model.cached.push(...batch.slice(0, kept))
+    if (constrainedRow >= 0 && going) {
+      engine.dropGuess()
+      next = draw(await distribution(constrainedRow, false))
+    }
     if (!going || next < 0) break
     token = next
     going = emit(token)
@@ -784,7 +831,15 @@ async function generate(request: GenerateRequest) {
     model.claimed = engine.gpu.bytes
     void claimMemory(model.model, model.claimed)
   }
+  if (structured && !stopped.has(id) && !structured.complete) {
+    throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
+  }
   post({ type: "done", id, stats })
+  } finally {
+    structured?.dispose()
+    engine.setAllowedTokens(null)
+    engine.dropGuess()
+  }
 }
 
 /**

@@ -2954,6 +2954,11 @@ uniform ivec4 uExtra;
 uniform ivec4 uExtra2;
 /* The batch row that logits row 0 is (when rows are picked one at a time). */
 uniform int uPenaltyRow0;
+uniform usampler2D uAllowed;
+uniform int uAllowedEnabled;
+uniform int uAllowedWidth;
+uniform int uAllowedRows;
+uniform int uAllowedStride;
 uniform float uPresencePenalty;
 /*
  * Token id's logit with the repetition penalty for row r of a batch: the
@@ -2961,6 +2966,13 @@ uniform float uPresencePenalty;
  * uExtra2: draft i is row i + 1's input, so rows after it have seen it).
  */
 float penalized(float v, uint m, int id, int r) {
+  if (uAllowedEnabled != 0) {
+    int word = id >> 5;
+    int maskRow = uAllowedRows == 1 ? 0 : r;
+    if (maskRow >= uAllowedRows) return -1e30;
+    uint bits = texelFetch(uAllowed, ivec2(word % uAllowedWidth, word / uAllowedWidth + maskRow * uAllowedStride), 0).x;
+    if ((bits & (1u << uint(id & 31))) == 0u) return -1e30;
+  }
   if (m == 2u) return -1e30;
   bool generated = m == 3u;
   for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) generated = true;

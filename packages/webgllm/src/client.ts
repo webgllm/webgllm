@@ -273,6 +273,7 @@ export async function* generate(request: {
   thinking?: boolean
   /** Thinking content ceiling; must be a nonnegative safe integer. */
   thinkingBudgetTokens?: number
+  outputSchema?: object
   sampling: Sampling
   maxTokens?: number
   /** Speculative decoding by prompt lookup (default on). */
@@ -323,6 +324,7 @@ export async function* generate(request: {
     ...(request.thinkingBudgetTokens !== undefined && {
       thinkingBudgetTokens: request.thinkingBudgetTokens
     }),
+    ...(request.outputSchema !== undefined && { outputSchema: request.outputSchema }),
     sampling: request.sampling,
     ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
     ...(request.speculative !== undefined && {
