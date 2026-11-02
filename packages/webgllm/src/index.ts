@@ -12,6 +12,7 @@ export type {
 export { hasWebGl2, loadModel, modelStatus, unloadModel } from "./client.js"
 export { setMemoryBudget } from "./model-memory.js"
 export type { ModelStatus } from "./client.js"
+export type { GenerationPhase } from "./protocol.js"
 export {
   WEBGL_MODEL_META,
   WEBGL_MODEL_REASONING,

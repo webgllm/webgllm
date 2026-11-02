@@ -23,8 +23,9 @@ import type {
 import { generate, loadModel, setKeepLoaded } from "./client.js"
 import { modelMeta } from "./model-meta.js"
 import type { WebGlModelReasoningByName, WebGlTextModel } from "./model-meta.js"
-import type { RunTimings } from "./protocol.js"
+import type { GenerationPhase, RunTimings } from "./protocol.js"
 import { createThinkingSplitter, splitThinking } from "./reply.js"
+import type { ReplyPiece } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
 import {
@@ -236,6 +237,10 @@ const nextId = (prefix: string) =>
 
 /** Options for `webglText`. */
 export type WebGlTextConfig = {
+  /** Real worker prefill/decode transitions, independent of streamed text. */
+  onGenerationPhase?: (phase: GenerationPhase) => void
+  /** Raw model-generated thinking text, without tags or answer content. */
+  onThinking?: (delta: string) => void
   /**
    * Most tokens a chat may hold, prompt and reply together: the model's
    * whole context length by default (from its config), never more. The
@@ -269,10 +274,14 @@ export class WebGlTextAdapter<
   override readonly inputModalities = ["text"] as const
 
   private readonly contextLength: number | undefined
+  private readonly onGenerationPhase: WebGlTextConfig["onGenerationPhase"]
+  private readonly onThinking: WebGlTextConfig["onThinking"]
 
   constructor(model: TModel, config: WebGlTextConfig = {}) {
     super({}, model)
     this.contextLength = config.contextLength
+    this.onGenerationPhase = config.onGenerationPhase
+    this.onThinking = config.onThinking
     setKeepLoaded(model, config.keepLoaded ?? false)
   }
 
@@ -388,6 +397,7 @@ export class WebGlTextAdapter<
     const addPieces = (pieces: ReturnType<typeof thinkingSplitter.push>) => {
       for (const piece of pieces) {
         if (piece.kind === "thinking") {
+          if (!signal?.aborted) this.onThinking?.(piece.text)
           if (reasoning === "none") {
             events.push(
               {
@@ -421,6 +431,7 @@ export class WebGlTextAdapter<
     }
 
     const stream = generate({
+      onPhase: this.onGenerationPhase,
       id: nextId("call"),
       model: this.model,
       contextLength: this.contextLength,
@@ -530,6 +541,7 @@ export class WebGlTextAdapter<
       )
       .join("\n\n")
     const stream = generate({
+      onPhase: this.onGenerationPhase,
       id: nextId("call"),
       model: this.model,
       contextLength: this.contextLength,
@@ -546,10 +558,23 @@ export class WebGlTextAdapter<
       signal: chatOptions.abortController?.signal
     })
     let raw = ""
+    const thinkingSplitter = this.onThinking ? createThinkingSplitter() : undefined
+    const addThinking = (pieces: Array<ReplyPiece>) => {
+      if (chatOptions.abortController?.signal.aborted) return
+      for (const piece of pieces) {
+        if (piece.kind === "thinking") this.onThinking?.(piece.text)
+      }
+    }
     let next = await stream.next()
-    while (!next.done) {
-      raw += next.value
-      next = await stream.next()
+    try {
+      while (!next.done) {
+        raw += next.value
+        if (thinkingSplitter) addThinking(thinkingSplitter.push(next.value))
+        next = await stream.next()
+      }
+      if (thinkingSplitter) addThinking(thinkingSplitter.flush())
+    } finally {
+      if (!next.done) await stream.return({})
     }
     if (next.value.failure) throw new Error(next.value.failure)
     const rawText = splitThinking(raw).answer.trim()

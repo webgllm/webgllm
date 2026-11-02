@@ -404,6 +404,7 @@ async function generate(request: GenerateRequest) {
   // lost, or loaded if another was asked for since.
   const model = await startLoad(request.model, request.contextLength)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  if (request.reportPhases) post({ type: "phase", id, phase: "processing" })
   const { engine, tokenizer } = model
   const compiledBefore = engine.gpu.compiled.count
   const prompt = tokenizer.encodeChat(request.chat, {
@@ -596,6 +597,9 @@ async function generate(request: GenerateRequest) {
 
   let token = draw(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
+  if (request.reportPhases && !stopped.has(id)) {
+    post({ type: "phase", id, phase: "generating" })
+  }
   const firstTokenAt = performance.now()
   stats.firstTokenMs = firstTokenAt - requested
   const decoder = tokenizer.createStreamDecoder({ skipSpecialTokens: false })

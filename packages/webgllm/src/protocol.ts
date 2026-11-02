@@ -2,6 +2,8 @@
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
 
+export type GenerationPhase = "processing" | "generating"
+
 /** Token counts and timings of one generation, measured in the worker. */
 export type RunTimings = {
   /** Tokens of the prompt, including any already in the cache. */
@@ -36,6 +38,8 @@ export type WorkerRequest =
   | {
       type: "generate"
       id: string
+      /** Send real prefill/decode lifecycle messages only when requested. */
+      reportPhases?: boolean
       /** The model to run it on: loaded first if it isn't (or its GPU context was lost). */
       model: string
       /** The context to load it for, if it's loaded first (see "load"). */
@@ -83,6 +87,7 @@ export type WorkerResponse =
    * model-memory.ts) and answers "claimed".
    */
   | { type: "claim"; model: string; bytes: number }
+  | { type: "phase"; id: string; phase: GenerationPhase }
   | { type: "token"; id: string; text: string }
   | { type: "done"; id: string; stats: RunTimings }
   | { type: "error"; id: string; message: string }
