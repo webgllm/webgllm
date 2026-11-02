@@ -8,6 +8,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
+import { panelLayout } from "./panels.js"
 import { quantsFromRaw, rawRgba4 } from "./repack.js"
 import type {
   LayerType,
@@ -254,6 +255,16 @@ export const TUNING = {
   foldEach: 0,
   /** 1: writing sizes its attention chunks by the key count (see attend). */
   attendDecodeChunking: 1,
+  /** 1: writing's attention in short chunks laid out in panels (see attendPanel). */
+  flashDecode: 1,
+  /** ...of this many score texels (4 keys each)... */
+  flashChunkTexels: 32,
+  /** ...past this many score texels (-1: where the old path chunks). */
+  flashPast: 128,
+  /** ...at most this many panels across (0: as many as a texture's width holds). */
+  flashPanels: 0,
+  /** Score texels attendPanel reads per step of its loop. */
+  flashUnroll: 1,
   /** Key segments per scores pass (0: as many as the scores buffer holds). */
   segmentGroup: 0,
   /**
@@ -432,6 +443,8 @@ const SCORE_ROWS_LARGE = 128
 const KV_START = 1024
 /** Most key chunks per query in chunked attention (see attendChunk). */
 const ATTEND_CHUNKS = 16
+/** About the most key chunks a writing step's attention combines (see attendPanel). */
+const FLASH_CHUNKS = 128
 /** Logits per chunk when picking candidates on the GPU. */
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
@@ -1021,6 +1034,19 @@ export class Engine {
     this.chunkBufs.set(G, bufs)
     return bufs
   }
+
+  /** attendPanel's partial results, at least width × height (see chunkBuffers). */
+  private panelBuffers(width: number, height: number, G: number) {
+    const have = this.panelBufs.get(G)
+    if (have && have[0].width >= width && have[0].height >= height) return have
+    const w = Math.max(width, have?.[0].width ?? 0)
+    const h = Math.max(height, have?.[0].height ?? 0)
+    have?.forEach((t) => this.gpu.delete(t))
+    const bufs = Array.from({ length: 3 * G }, () => this.gpu.texture(GL.RGBA32F, w, h))
+    this.panelBufs.set(G, bufs)
+    return bufs
+  }
+  private panelBufs = new Map<number, Array<Texture>>()
 
   private vector(values: Float32Array, rows = 1) {
     return this.gpu.texture(GL.RGBA32F, values.length / 4 / rows, rows, {
@@ -2002,10 +2028,13 @@ export class Engine {
     if (TUNING.attendChunkTexels > 0) {
       // Chunked attention (long key ranges) too, forced on for a short
       // batch and a token.
+      // (Writing's panels too: see attendPanel.)
       const saved = TUNING.attendChunkTexels
       const savedDecode = TUNING.attendChunkTexelsDecode
+      const savedPast = TUNING.flashPast
       TUNING.attendChunkTexels = 1
       TUNING.attendChunkTexelsDecode = 1
+      TUNING.flashPast = 0
       try {
         await this.forwardHidden(new Array(12).fill(0))
         await this.logits(await this.forwardHidden([0]))
@@ -2013,6 +2042,7 @@ export class Engine {
       } finally {
         TUNING.attendChunkTexels = saved
         TUNING.attendChunkTexelsDecode = savedDecode
+        TUNING.flashPast = savedPast
         this.reset()
       }
     }
@@ -2080,6 +2110,7 @@ export class Engine {
         TUNING.attendChunkTexels = saved
         TUNING.attendChunkTexelsDecode = savedDecode
       }
+      worst = Math.max(worst, await this.panelError(tokens))
     }
     // The probes' scratch isn't read again (~29 MB for Qwen3.5 2B at a
     // 512-token batch).
@@ -2087,6 +2118,35 @@ export class Engine {
     this.debug = this.kvDebug = null
     return worst
   }
+
+  /**
+   * Writing's attention in panels (attendPanel and its combine) against
+   * the one-pass kernel (which attentionError checks against the CPU),
+   * each attention layer's both ways from the same queries and cache: the
+   * last of `tokens` after the rest, in chunks of 4 keys (enough to take
+   * both of the combine's loops). The largest relative error, as
+   * attentionError's. Leaves the cache empty.
+   */
+  private async panelError(tokens: Array<number>) {
+    if (!this.mrt.chunks || TUNING.flashDecode <= 0) return 0
+    const saved = [TUNING.flashPast, TUNING.flashChunkTexels]
+    try {
+      TUNING.flashPast = 0
+      TUNING.flashChunkTexels = 1
+      this.reset()
+      await this.forwardHidden(tokens.slice(0, -1))
+      this.panelErrors = []
+      await this.forwardHidden(tokens.slice(-1))
+      await this.gpu.finish()
+      return this.panelErrors.length ? Math.max(...this.panelErrors) : Infinity
+    } finally {
+      ;[TUNING.flashPast, TUNING.flashChunkTexels] = saved
+      this.panelErrors = null
+      this.reset()
+    }
+  }
+  /** While panelError runs: each attention layer's error. */
+  private panelErrors: Array<number> | null = null
 
   /**
    * a · wᵀ for `rows` tokens: a few rows leave a split matmul's partial
@@ -2989,7 +3049,6 @@ export class Engine {
     // Keys and values into the cache at positions pos0..., in runs of rows
     // split where a ring cache wraps around or a block of rows ends. (A
     // ring is one block, however tall.)
-    const kvAt = { uKvShift: { int: kvShift }, uKvWidth: { int: kvWidth } }
     for (let m0 = 0; m0 < rows;) {
       const slot = layer.ring ? (pos0 + m0) % layer.ring : pos0 + m0
       const row0 = slot % blockRows
@@ -3038,6 +3097,79 @@ export class Engine {
       })
       m0 += run
     }
+    await this.attention(layer, type, rows, pos0, split, qkvgIn, paced, inCache)
+    if (this.panelErrors) {
+      // panelError: this layer's output again by the one-pass kernel,
+      // from the same queries and cache (that output goes on).
+      const qDims = c.numHeads * c.headDim
+      const read = async () => {
+        this.gpu.run({
+          program: this.gpu.program(K.H2_TO_F32),
+          inputs: { uX: b.attnOut },
+          output: this.debugTexture(),
+          rect: { x: 0, y: 0, width: qDims / 4, height: rows }
+        })
+        return this.gpu.read(this.debugTexture(), { x: 0, y: 0, width: qDims / 4, height: rows })
+      }
+      const got = await read()
+      const saved = TUNING.attendChunkTexels
+      TUNING.attendChunkTexels = 0
+      try {
+        await this.attention(layer, type, rows, pos0, split, qkvgIn, false, inCache)
+      } finally {
+        TUNING.attendChunkTexels = saved
+      }
+      const want = await read()
+      let err = 0
+      let ref = 0
+      for (let i = 0; i < want.length; i++) {
+        err += (got[i] - want[i]) ** 2
+        ref += want[i] ** 2
+      }
+      this.panelErrors.push(
+        got.every(Number.isFinite) ? Math.sqrt(err / Math.max(ref, 1e-30)) : Infinity
+      )
+    }
+    return this.project(b.attnOut, layer.o, b.opOut, rows)
+  }
+
+  /**
+   * Attention proper, after attend has the queries in buffers.q (or the
+   * cache's slots: inCache) and the keys and values in the cache: buffers.attnOut for rows from pos0, the
+   * gate read from the q|k|v|gate projection (qkvgIn, or its split
+   * partial sums).
+   */
+  private async attention(
+    layer: NonNullable<GpuLayer["attention"]>,
+    type: LayerType,
+    rows: number,
+    pos0: number,
+    split: number,
+    qkvgIn: Texture,
+    paced = false,
+    /** Whether attend put the queries in the cache's slots past the batch (see queryInCache). */
+    inCache = false
+  ) {
+    const c = this.config
+    const b = this.buffers
+    const sliding = type === "sliding_attention"
+    const qSlots = this.querySlots()
+    const qSlot0 = pos0 + rows
+    const qDims = c.numHeads * c.headDim
+    const kvDims = c.numKvHeads * c.headDim
+    const read = (source: string) =>
+      this.gpu.program(
+        split
+          ? this.fromSplit(source, ["uQKVG"], split)
+          : this.readPair(source, "uQKVG", qkvgIn)
+      )
+    const qkvgInputs = {
+      uQKVG: qkvgIn,
+      ...(!split && this.quadInputs("uQKVG", qkvgIn))
+    }
+    const kvWidth = this.kvWidth()
+    const kvShift = layer.ring ? 30 : this.kvShift
+    const kvAt = { uKvShift: { int: kvShift }, uKvWidth: { int: kvWidth } }
     // Queries in slices, so the scores buffer stays small: each slice sees
     // keys up to its last query (and, in sliding layers, from its first
     // query's window on). The buffer holds scoreRows queries of every head
@@ -3158,6 +3290,77 @@ export class Engine {
         rows <= SPLIT_ROWS
           ? Math.max(TUNING.attendChunkTexelsDecode, 2 * TUNING.attendChunkTexels)
           : 2 * TUNING.attendChunkTexels
+      const fitSegments = Math.max(1, Math.floor((panels * panelRows) / total))
+      if (
+        rows <= SPLIT_ROWS &&
+        TUNING.flashDecode > 0 &&
+        TUNING.attendChunkTexels > 0 &&
+        this.mrt.chunks &&
+        kt > (TUNING.flashPast >= 0 ? TUNING.flashPast : chunkPast) &&
+        slice === rows - m0 &&
+        segments <= fitSegments
+      ) {
+        // Writing: few queries, so many short chunks of keys are the
+        // parallel work, in one pass after the scores, then one combine
+        // (which walks every chunk: about FLASH_CHUNKS of them at most).
+        const panelW = qDims / 8 / G
+        const lay = panelLayout({
+          kt,
+          segTexels,
+          segments,
+          slice,
+          panelW,
+          maxWidth: this.gpu.limits.maxTextureSize,
+          chunkTexels: TUNING.flashChunkTexels,
+          maxChunks: FLASH_CHUNKS,
+          maxPanels: TUNING.flashPanels
+        })
+        const bufs = this.panelBuffers(lay.width, lay.height, G)
+        const outPanels = { uOutPanels: { int: lay.across }, uOutPanelW: { int: panelW } }
+        scores(j0, keys, segments)
+        this.gpu.run({
+          name: "attend",
+          program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll)),
+          inputs: { ...sIn, uV: layer.kv },
+          uniforms: {
+            ...ring,
+            ...segRows,
+            ...outPanels,
+            uSegChunks: { int: lay.segChunks },
+            uJ0: { int: j0 },
+            uKeys: { int: keys },
+            uGroup: { int: group },
+            uVOff: { int: kvDims / 8 },
+            uSliceQ: { int: slice },
+            uChunkTexels: { int: lay.chunkTexels }
+          },
+          output: bufs,
+          rect: { x: 0, y: 0, width: lay.width, height: lay.height },
+          work: lay.chunkTexels * (2 * G + 8)
+        })
+        this.gpu.run({
+          name: "attend",
+          program: read(K.attendPanelCombine(c.headDim, this.gate(), G)),
+          inputs: {
+            ...Object.fromEntries(bufs.map((t, k) => [`uP${k}`, t])),
+            ...qkvgInputs
+          },
+          uniforms: {
+            uSplitIn: { int: split },
+            ...this.pairIn(qkvgIn),
+            ...outPanels,
+            uM0: { int: m0 },
+            uSliceQ: { int: slice },
+            uChunks: { int: lay.chunks },
+            uGateTexel: { int: (qDims + 2 * kvDims) / 4 }
+          },
+          output: b.attnOut,
+          rect: { x: 0, y: m0, width: qDims / 8, height: slice },
+          work: lay.chunks * 3 * G + 2
+        })
+        m0 += slice
+        continue
+      }
       if (
         segments > 1 ||
         (this.mrt.chunks &&
@@ -3250,7 +3453,6 @@ export class Engine {
       })
       m0 += slice
     }
-    return this.project(b.attnOut, layer.o, b.opOut, rows)
   }
 
   /** Attention's output gate (see K.Gate). */

@@ -2655,6 +2655,221 @@ void main() {
 }`
 }
 
+/**
+ * Writing's chunks of keys (attendChunk's job, for few queries): chunk k
+ * of query qi at texels ((k % uOutPanels) · uOutPanelW + x, (k /
+ * uOutPanels) · uSliceQ + qi), panels side by side, so a pass of short
+ * chunks spreads over many tiles of the render target (a GPU shades a
+ * tile on one core). Chunk k is chunk k % uSegChunks of key segment k /
+ * uSegChunks; chunks past the keys are empty. One loop: each member's
+ * softmax is kept online (a running max, the sums rescaled when it
+ * rises), so each score is read once. Outputs as attendChunk's.
+ */
+function attendPanelSource(headDim: number, G: number, unroll = 1) {
+  const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
+  const names = sNames(G)
+  const steps = (n: number) => Array.from({ length: n }, (_, t) => t)
+  // n score texels from i: every read first (they go out together), then
+  // each member's running max, rescale and sums.
+  const step = (n: number) => `${steps(n)
+    .map(
+      (t) => `    ivec4 j${t} = min(sj0 + 4 * (i + ${t}) + ivec4(0, 1, 2, 3), ivec4(uJ0 + uKeys - 1));
+    if (uRing > 0) j${t} = j${t} - (j${t} / uRing) * uRing;
+    uvec4 a${t}0 = texelFetch(uV, kvAt(vx, j${t}.x), 0);
+    uvec4 a${t}1 = texelFetch(uV, kvAt(vx, j${t}.y), 0);
+    uvec4 a${t}2 = texelFetch(uV, kvAt(vx, j${t}.z), 0);
+    uvec4 a${t}3 = texelFetch(uV, kvAt(vx, j${t}.w), 0);
+${members.map((i) => `    vec4 s${i}_${t} = texelFetch(${names[i]}, ivec2(sx + i + ${t}, row), 0);`).join("\n")}`
+    )
+    .join("\n")}
+${members
+  .map(
+    (i) => `    {
+      float m = mx${i};
+${steps(n)
+  .map((t) => `      m = max(m, max(max(s${i}_${t}.x, s${i}_${t}.y), max(s${i}_${t}.z, s${i}_${t}.w)));`)
+  .join("\n")}
+      float scale = exp(mx${i} - m);
+      mx${i} = m;
+      l${i} *= scale;
+      lo${i} *= scale;
+      hi${i} *= scale;
+${steps(n)
+  .map(
+    (t) => `      {
+        vec4 e = exp(s${i}_${t} - m);
+        l${i} += e;
+        lo${i} += e.x * h2lo(a${t}0) + e.y * h2lo(a${t}1) + e.z * h2lo(a${t}2) + e.w * h2lo(a${t}3);
+        hi${i} += e.x * h2hi(a${t}0) + e.y * h2hi(a${t}1) + e.z * h2hi(a${t}2) + e.w * h2hi(a${t}3);
+      }`
+  )
+  .join("\n")}
+    }`
+  )
+  .join("\n")}`
+  return `${HEADER}
+${names.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uV;
+uniform int uRows;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uGroup;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uVOff;
+uniform int uSliceQ;
+uniform int uChunkTexels;
+uniform int uSegRows;
+uniform int uSegKeys;
+uniform int uSegChunks;
+uniform int uOutPanels;
+uniform int uOutPanelW;
+${KV_AT}
+${members
+  .map(
+    (i) => `layout(location = ${3 * i}) out vec4 o${3 * i};
+layout(location = ${3 * i + 1}) out vec4 o${3 * i + 1};
+layout(location = ${3 * i + 2}) out vec4 o${3 * i + 2};`
+  )
+  .join("\n")}
+void main() {
+  int px = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int op = px / uOutPanelW;
+  int x = px - op * uOutPanelW;
+  int qi = y % uSliceQ;
+  int k = (y / uSliceQ) * uOutPanels + op;
+  int s = k / uSegChunks;
+  int c = k - s * uSegChunks;
+  int g = x / ${U};
+  int u = x - g * ${U};
+  int kh = (g * ${G}) / uGroup;
+  int r = s * uSegRows + g * uRows + qi;
+  int panel = r / uPanelRows;
+  int row = r - panel * uPanelRows;
+  int sx = panel * uKt;
+  int sj0 = uJ0 + s * uSegKeys;
+  int texels = (max(0, min(uKeys - s * uSegKeys, uSegKeys)) + 3) / 4;
+  int t0 = c * uChunkTexels;
+  int t1 = min(texels, t0 + uChunkTexels);
+  int vx = uVOff + kh * ${U} + u;
+${members
+  .map(
+    (i) => `  float mx${i} = -1e30;
+  vec4 l${i} = vec4(0.0);
+  vec4 lo${i} = vec4(0.0);
+  vec4 hi${i} = vec4(0.0);`
+  )
+  .join("\n")}
+  // (Masked keys score -1e30. Until a member's first live key its max is
+  // -1e30 too, so what it sums meanwhile is scaled by exp(-1e30 - max) = 0
+  // at that key; a member with none is written empty below.)
+  int i = t0;
+${
+  unroll > 1
+    ? `  for (; i + ${unroll - 1} < t1; i += ${unroll}) {
+${step(unroll)}
+  }
+`
+    : ""
+}  for (; i < t1; i++) {
+${step(1)}
+  }
+${members
+  .map(
+    (i) => `  bool dead${i} = mx${i} < -1e29;
+  o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
+  o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
+  o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
+  )
+  .join("\n")}
+}`
+}
+
+/** Chunks attendPanelCombine reads per step of its loop. */
+const COMBINE_UNROLL = 8
+
+/**
+ * attendCombine for attendPanel's layout: query m's uChunks chunks from
+ * panels uOutPanels across, uOutPanelW texels each.
+ */
+function attendPanelCombineSource(headDim: number, gate: Gate, G: number) {
+  const U = headDim / 8
+  const P = Array.from({ length: 3 * G }, (_, k) => `uP${k}`)
+  const fetch = (k: number) => {
+    let body = `texelFetch(uP${3 * (G - 1) + k}, p, 0)`
+    for (let i = G - 2; i >= 0; i--)
+      body = `hm == ${i} ? texelFetch(uP${3 * i + k}, p, 0) : ${body}`
+    return body
+  }
+  return `${HEADER}
+${P.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uQKVG;
+uniform int uM0;
+uniform int uSliceQ;
+uniform int uChunks;
+uniform int uGateTexel;
+uniform int uOutPanels;
+uniform int uOutPanelW;
+out uvec4 o;
+int hm;
+vec4 P0(ivec2 p) { return ${fetch(0)}; }
+vec4 P1(ivec2 p) { return ${fetch(1)}; }
+vec4 P2(ivec2 p) { return ${fetch(2)}; }
+ivec2 at(int px, int c, int qi) {
+  int row = c / uOutPanels;
+  return ivec2(px + (c - row * uOutPanels) * uOutPanelW, row * uSliceQ + qi);
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${U};
+  hm = h % ${G};
+  int px = (h / ${G}) * ${U} + (x - h * ${U});
+  int qi = m - uM0;
+  // One pass over the chunks, ${COMBINE_UNROLL} at a time (their reads go out
+  // together: a writing step's combine is a few hundred fragments, so each
+  // waits out its reads' latency), the running max rescaling the sums.
+  // (An empty chunk, max -1e30 and sums 0, adds nothing; every query has
+  // a live key, itself.)
+  float mx = -1e30;
+  float l = 0.0;
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  int c = 0;
+  for (; c + ${COMBINE_UNROLL - 1} < uChunks; c += ${COMBINE_UNROLL}) {
+${Array.from(
+  { length: COMBINE_UNROLL },
+  (_, n) => `    ivec2 p${n} = at(px, c + ${n}, qi);
+    vec2 m${n} = P2(p${n}).xy;
+    vec4 a${n} = P0(p${n});
+    vec4 b${n} = P1(p${n});`
+).join("\n")}
+    float mn = max(mx, ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `m${n}.x`).reduce((a, b) => `max(${a}, ${b})`)});
+    float scale = exp(mx - mn);
+${Array.from({ length: COMBINE_UNROLL }, (_, n) => `    float w${n} = exp(m${n}.x - mn);`).join("\n")}
+    l = l * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `m${n}.y * w${n}`).join(" + ")};
+    lo = lo * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `w${n} * a${n}`).join(" + ")};
+    hi = hi * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `w${n} * b${n}`).join(" + ")};
+    mx = mn;
+  }
+  for (; c < uChunks; c++) {
+    ivec2 p = at(px, c, qi);
+    vec2 ml = P2(p).xy;
+    float mn = max(mx, ml.x);
+    float scale = exp(mx - mn);
+    float w = exp(ml.x - mn);
+    l = l * scale + ml.y * w;
+    lo = lo * scale + w * P0(p);
+    hi = hi * scale + w * P1(p);
+    mx = mn;
+  }
+  ${gateOut(gate)}
+}`
+}
+
 /** Values into the h2 cache: 8 dims per texel, rows offset to the cache position. */
 function valuesSource(headDim: number) {
   const U = headDim / 8
@@ -3462,5 +3677,7 @@ export function withPairSplit(source: string, split: number) {
 
 export const attendChunk = memo(attendChunkSource)
 export const attendCombine = memo(attendCombineSource)
+export const attendPanel = memo(attendPanelSource)
+export const attendPanelCombine = memo(attendPanelCombineSource)
 
 export const embedFold = memo(embedFoldSource)
