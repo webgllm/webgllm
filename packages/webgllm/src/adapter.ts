@@ -656,12 +656,11 @@ export class WebGlTextAdapter<
     signal?.throwIfAborted()
     await waitForModel(this.model, this.contextLength, signal)
     signal?.throwIfAborted()
-    const system = normalizeSystemPrompts(chatOptions.systemPrompts)
-      .map((p) => p.content)
-      .concat(
-        `Answer with only a JSON value matching this JSON Schema:\n${JSON.stringify(outputSchema)}`
-      )
-      .join("\n\n")
+    const cachePrefix = [
+      ...normalizeSystemPrompts(chatOptions.systemPrompts).map((p) => p.content),
+      "Answer with only a JSON value matching this JSON Schema:\n"
+    ].join("\n\n")
+    const system = cachePrefix + JSON.stringify(outputSchema)
     const stream = generate({
       onPhase: this.onGenerationPhase,
       id: nextId("call"),
@@ -673,6 +672,7 @@ export class WebGlTextAdapter<
       ],
       tools: [],
       outputSchema,
+      cachePrefix,
       ...thinking,
       sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
       maxTokens,

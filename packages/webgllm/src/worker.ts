@@ -11,7 +11,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
-import { anchorFor, readPrompt } from "./prompt.js"
+import { anchorFor, prefixAnchorFor, readPrompt } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -501,13 +501,15 @@ async function generate(request: GenerateRequest) {
   const promptStart = performance.now()
   let row = await readPrompt(engine, prompt, start, model.cached, {
     stop: () => stopped.has(id),
-    anchor: anchorFor(
-      tokenizer,
-      prompt,
-      request.chat,
-      request.thinking,
-      request.tools.length ? request.tools : undefined
-    )
+    anchor: (request.cachePrefix === undefined
+      ? undefined
+      : prefixAnchorFor(tokenizer, prompt, request.cachePrefix, request.thinking)) ?? anchorFor(
+        tokenizer,
+        prompt,
+        request.chat,
+        request.thinking,
+        request.tools.length ? request.tools : undefined
+      )
   })
   const stats: RunTimings = {
     inputTokens: prompt.length,

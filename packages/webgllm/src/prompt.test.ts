@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { anchorFor, promptPlan, sharedPrefix, unsharedTail } from "./prompt.js"
+import { anchorFor, prefixAnchorFor, promptPlan, sharedPrefix, unsharedTail } from "./prompt.js"
 import type { ChatMessage, Tokenizer } from "./tokenizer.js"
 
 // Token ids for a toy chat template: words map to ids, specials below 10.
@@ -141,5 +141,31 @@ describe("promptPlan", () => {
       { size: 512, snapshot: "batch" },
       { size: 76, snapshot: "end" }
     ])
+  })
+})
+
+
+describe("structured system-prefix checkpoints", () => {
+  test("retains the identical system prefix before changing schema tokens", () => {
+    const tok = toyTokenizer(false)
+    const prefix = "Static game rules schema follows"
+    const first = tok.encodeChat([
+      { role: "system", content: prefix + " choice-A" },
+      { role: "user", content: "board one" }
+    ], { addGenerationPrompt: true })
+    const second = tok.encodeChat([
+      { role: "system", content: prefix + " choice-B" },
+      { role: "user", content: "board two" }
+    ], { addGenerationPrompt: true })
+    const anchor = prefixAnchorFor(tok, first, prefix, false)
+    assert.equal(anchor, 8)
+    assert.equal(prefixAnchorFor(tok, second, prefix, false), anchor)
+    assert.ok(sharedPrefix(first, second) >= (anchor as number))
+    assert.ok((anchor as number) < first.length)
+  })
+  test("uses actual shared tokens when separately encoded boundary tokens differ", () => {
+    const tok = { encodeChat: () => [11, 12, 99] } as unknown as Tokenizer
+    assert.equal(prefixAnchorFor(tok, [11, 12, 50, 60], "prefix", false), 2)
+    assert.equal(prefixAnchorFor(tok, [80, 81], "prefix", false), undefined)
   })
 })

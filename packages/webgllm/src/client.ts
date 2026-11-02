@@ -274,6 +274,8 @@ export async function* generate(request: {
   /** Thinking content ceiling; must be a nonnegative safe integer. */
   thinkingBudgetTokens?: number
   outputSchema?: object
+  /** Stable system prefix, checkpointed before a changing structured schema. */
+  cachePrefix?: string
   sampling: Sampling
   maxTokens?: number
   /** Speculative decoding by prompt lookup (default on). */
@@ -325,6 +327,7 @@ export async function* generate(request: {
       thinkingBudgetTokens: request.thinkingBudgetTokens
     }),
     ...(request.outputSchema !== undefined && { outputSchema: request.outputSchema }),
+    ...(request.cachePrefix !== undefined && { cachePrefix: request.cachePrefix }),
     sampling: request.sampling,
     ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
     ...(request.speculative !== undefined && {

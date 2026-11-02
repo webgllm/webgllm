@@ -28,7 +28,7 @@ test("structured output forwards the actual schema and limits to worker generati
   unloadModel()
   const adapter = webglText("LiquidAI/LFM3-1.7B-GGUF")
   const schema = { type: "object", properties: { moveId: { type: "string", enum: ["b6-a5"] } }, required: ["moveId"], additionalProperties: false }
-  const chatOptions = { model: adapter.model, threadId: "schema-forwarding", logger: resolveDebugOption(false), messages: [{ role: "user" as const, content: "Choose" }], modelOptions: { maxTokens: 8192 }, reasoning: { level: "high" as const, summary: true, budgetTokens: 512 } }
+  const chatOptions = { model: adapter.model, threadId: "schema-forwarding", logger: resolveDebugOption(false), systemPrompts: [{ content: "Static rules." }], messages: [{ role: "user" as const, content: "Choose" }], modelOptions: { maxTokens: 8192 }, reasoning: { level: "high" as const, summary: true, budgetTokens: 512 } }
   const result = await adapter.structuredOutput({ chatOptions, outputSchema: schema })
   assert.deepEqual(result.data, { moveId: "b6-a5" })
   const request = SchemaWorker.requests.find(r => r.type === "generate")
@@ -36,6 +36,17 @@ test("structured output forwards the actual schema and limits to worker generati
   assert.deepEqual(request.outputSchema, schema)
   assert.equal(request.maxTokens, 8192)
   assert.equal(request.thinkingBudgetTokens, 512)
+  assert.equal(request.cachePrefix, "Static rules.\n\nAnswer with only a JSON value matching this JSON Schema:\n")
+  assert.ok(String(request.chat[0].content).startsWith(request.cachePrefix as string))
+  assert.ok(!request.cachePrefix?.includes("b6-a5"))
+  const different = { ...schema, properties: { moveId: { type: "string", enum: ["c6-d5"] } } }
+  await adapter.structuredOutput({ chatOptions, outputSchema: different })
+  const requests = SchemaWorker.requests.filter(r => r.type === "generate")
+  const second = requests[requests.length - 1]
+  assert.ok(second && second.type === "generate")
+  assert.equal(second.cachePrefix, request.cachePrefix)
+  assert.notEqual(second.chat[0].content, request.chat[0].content)
+
   SchemaWorker.failure = "Structured output was truncated before the JSON Schema was satisfied."
   await assert.rejects(adapter.structuredOutput({ chatOptions, outputSchema: schema }), /truncated/)
   unloadModel()

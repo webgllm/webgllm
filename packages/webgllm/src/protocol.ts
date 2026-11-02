@@ -57,6 +57,8 @@ export type WorkerRequest =
       thinkingBudgetTokens?: number
       /** JSON Schema enforced during answer token selection. */
       outputSchema?: object
+      /** Text prefix of the system message to retain as a cache checkpoint. */
+      cachePrefix?: string
       sampling: Sampling
       /** Most tokens to generate; EOS or remaining model context when left out. */
       maxTokens?: number
