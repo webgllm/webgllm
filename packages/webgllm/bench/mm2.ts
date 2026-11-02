@@ -25,7 +25,7 @@ uvec4 packH2(vec4 a, vec4 b) {
 type Variant = {
   weights: "rgba4" | "bytes" | "words" | "unorm8"
   acts: "f16" | "h2"
-  tokens: 1 | 2 | 4 | 8
+  tokens: 1 | 2 | 4 | 6 | 8
   /** Weights, activations and block sums as mediump (half precision on Metal?). */
   half?: boolean
   /** Timing only: skip the activation sums (wrong results). */
@@ -42,6 +42,19 @@ type Variant = {
   centered?: boolean
   /** One token, K split into this many slices (fragment (g, slice)), as writing does. */
   split?: number
+  /** RGBA4, 4 tokens: each block's activation sums read from uSum (texel (kb, m0 / 4)), not added up here. */
+  sums?: boolean
+  /**
+   * unorm8: each step's activations for every token held, and each row's
+   * byte texel split just before its dots (fewer values live at once).
+   */
+  lean?: boolean
+  /** Timing only (wrong results): rgba4 weights fetched for row 0 only, used for all 4 rows. */
+  oneRow?: boolean
+  /** Timing only (wrong results): activations fetched for token 0 only, used for every token. */
+  oneAct?: boolean
+  /** Fragment (x, y) computes token group x for row group y: the output transposed. */
+  transposed?: boolean
 }
 
 function kernel(v: Variant) {
@@ -50,6 +63,7 @@ function kernel(v: Variant) {
   const line = (s: string) => L.push(`    ${s}`)
   line(`vec4 d = texelFetch(uS, ivec2(kb, g), 0);`)
   for (let t = 0; t < T; t++) line(`vec4 b${t} = vec4(0.0); float s${t} = 0.0;`)
+  if (v.oneAct) line(`vec4 a0;`)
   // Activation k = 4j..4j+3 of token t as a vec4.
   const act = (j: string, t: number) =>
     v.acts === "f16"
@@ -110,20 +124,55 @@ function kernel(v: Variant) {
       line(`}`)
     }
     for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * s${t});`)
-  } else if (v.weights === "rgba4") {
-    // Texel (kb * 32 + r * 8 + j, g): row r, weights 4j..4j+3 (q / 15).
+  } else if (v.weights === "rgba4" && v.sums) {
     for (let j = 0; j < 8; j++) {
       line(`{`)
       for (const r of [0, 1, 2, 3])
         line(`  vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0);`)
       for (let t = 0; t < T; t++) {
         line(`  { vec4 a = ${act(String(j), t)};`)
+        line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+      }
+      line(`}`)
+    }
+    line(`vec4 S = texelFetch(uSum, ivec2(kb, m0 / 4), 0);`)
+    for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * S.${"xyzw"[t]});`)
+  } else if (v.weights === "rgba4") {
+    // Texel (kb * 32 + r * 8 + j, g): row r, weights 4j..4j+3 (q / 15).
+    for (let j = 0; j < 8; j++) {
+      line(`{`)
+      for (const r of [0, 1, 2, 3])
+        line(
+          v.oneRow && r > 0
+            ? `  vec4 w${r} = w0.yzwx;`
+            : `  vec4 w${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g), 0);`
+        )
+      for (let t = 0; t < T; t++) {
+        line(v.oneAct && t > 0 ? `  { vec4 a = a0 * ${1 + t}.0;` : `  { vec4 a = ${act(String(j), t)};`)
+        if (v.oneAct && t === 0) line(`  a0 = a;`)
         line(`    s${t} += dot(a, vec4(1.0));`)
         line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
       }
       line(`}`)
     }
     for (let t = 0; t < T; t++) line(`acc${t} += d * (15.0 * b${t} - 8.0 * s${t});`)
+  } else if (v.weights === "unorm8" && v.lean) {
+    for (let w = 0; w < 4; w++) {
+      line(`{`)
+      for (let t = 0; t < T; t++) {
+        line(`  vec4 x${t} = ${w & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${w >> 1}, m0 + ${t}), 0));`)
+        line(`  vec4 y${t} = ${w & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${(w >> 1) + 2}, m0 + ${t}), 0));`)
+        line(`  s${t} += dot(x${t} + y${t}, vec4(1.0));`)
+      }
+      for (const r of [0, 1, 2, 3]) {
+        line(`  { vec4 B = floor(texelFetch(uW, ivec2(kb * 16 + ${r * 4 + w}, g), 0) * 255.0 + 0.5);`)
+        line(`    vec4 H = floor(B * 0.0625);`)
+        line(`    vec4 L = B - 16.0 * H;`)
+        line(`    ${Array.from({ length: T }, (_, t) => `b${t}.${"xyzw"[r]} += dot(L, x${t}) + dot(H, y${t});`).join(" ")} }`)
+      }
+      line(`}`)
+    }
+    for (let t = 0; t < T; t++) line(`acc${t} += d * (b${t} - 8.0 * s${t});`)
   } else if (v.weights === "unorm8") {
     // RGBA8 texel (kb * 16 + r * 4 + w, g), read as floats: bytes of weights
     // 4w.. (low nibbles) and 16+4w.. (high), split with float math.
@@ -213,13 +262,16 @@ vec4 h2pick(uvec4 u, int hi) { return hi == 1 ? h2hi(u) : h2lo(u); }
 uniform ${v.acts === "f16" ? "sampler2D" : "usampler2D"} uA;
 uniform ${v.weights === "rgba4" || v.weights === "unorm8" ? "sampler2D" : "usampler2D"} uW;
 uniform sampler2D uS;
+uniform sampler2D uSum;
 uniform int uKb;
 uniform int uKbS;
 ${outs}
 void main() {
-  int g = int(gl_FragCoord.x);
+  int g = int(gl_FragCoord.${v.transposed ? "y" : "x"});
   ${
-    v.split
+    v.transposed
+      ? `int m0 = int(gl_FragCoord.x) * ${T}; int kb0 = 0; int kb1 = uKb;`
+      : v.split
       ? "int m0 = 0; int kb0 = int(gl_FragCoord.y) * uKbS; int kb1 = kb0 + uKbS;"
       : `int m0 = int(gl_FragCoord.y) * ${T}; int kb0 = 0; int kb1 = uKb;`
   }
@@ -282,12 +334,61 @@ ${L.join("\n")}
 function tileKernel(
   R: number,
   T: number,
-  o: { sameActs?: boolean; outputs?: number; fold?: boolean } = {}
+  o: { sameActs?: boolean; outputs?: number; fold?: boolean; pw?: boolean; loop?: boolean } = {}
 ) {
   const groups = R / 4
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
-  if (o.fold) {
+  if (o.pw && o.loop) {
+    // As pw, but each block's four h2 texel columns in a loop the compiler
+    // can't unroll (uSteps is 4): fewer fetches in flight at once.
+    for (let G = 0; G < groups; G++) {
+      line(`vec4 d${G} = texelFetch(uS, ivec2(kb, g + ${G}), 0);`)
+      line(`vec4 e${G} = 15.0 * d${G}; vec4 f${G} = 8.0 * d${G};`)
+    }
+    line(`for (int jj = 0; jj < uSteps; jj++) {`)
+    for (let t = 0; t < T; t++)
+      line(`  uvec4 u${t} = texelFetch(uA, ivec2(kb * 4 + jj, m0 + ${t}), 0);`)
+    for (const half of [0, 1]) {
+      line(`  {`)
+      for (let G = 0; G < groups; G++)
+        for (const r of [0, 1, 2, 3]) {
+          const c = "xyzw"[r]
+          line(`    vec4 w${G}${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + half} + 2 * jj, g + ${G}), 0) * e${G}.${c} - f${G}.${c};`)
+        }
+      for (let t = 0; t < T; t++) {
+        line(`    { vec4 a = ${half ? "h2hi" : "h2lo"}(u${t});`)
+        for (let G = 0; G < groups; G++)
+          line(`      acc${t}_${G} += vec4(dot(w${G}0, a), dot(w${G}1, a), dot(w${G}2, a), dot(w${G}3, a));`)
+        line(`    }`)
+      }
+      line(`  }`)
+    }
+    line(`}`)
+  } else if (o.pw) {
+    // Prescaled weights: each step's weights become (15 q - z) · d (one
+    // multiply-add per weight, shared by every token), and the dots add
+    // straight into the accumulators: no per-block sums held.
+    for (let G = 0; G < groups; G++) {
+      line(`vec4 d${G} = texelFetch(uS, ivec2(kb, g + ${G}), 0);`)
+      line(`vec4 e${G} = 15.0 * d${G}; vec4 f${G} = 8.0 * d${G};`)
+    }
+    for (let j = 0; j < 8; j++) {
+      line(`{`)
+      for (let G = 0; G < groups; G++)
+        for (const r of [0, 1, 2, 3]) {
+          const c = "xyzw"[r]
+          line(`  vec4 w${G}${r} = texelFetch(uW, ivec2(kb * 32 + ${r * 8 + j}, g + ${G}), 0) * e${G}.${c} - f${G}.${c};`)
+        }
+      for (let t = 0; t < T; t++) {
+        line(`  { vec4 a = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, ${o.sameActs ? "" : "m0 + "}${t}), 0));`)
+        for (let G = 0; G < groups; G++)
+          line(`    acc${t}_${G} += vec4(dot(w${G}0, a), dot(w${G}1, a), dot(w${G}2, a), dot(w${G}3, a));`)
+        line(`  }`)
+      }
+      line(`}`)
+    }
+  } else if (o.fold) {
     // The scale times 15 into each step: no per-block sums per row, and
     // one row group's weights live at a time.
     for (let G = 0; G < groups; G++)
@@ -345,17 +446,24 @@ function tileKernel(
   const n = o.outputs ?? total
   const outs: Array<string> = []
   const writes: Array<string> = []
-  for (let k = 0; k < n; k++) {
+  // (Fewer outputs than pairs: the extra pairs added into them, so none is dead code.)
+  const pairs: Array<[string, string]> = []
+  for (let k = 0; k < total; k++) {
     const G = Math.floor(k / (T / 2))
     const tp = k % (T / 2)
+    pairs.push([`acc${2 * tp}_${G}`, `acc${2 * tp + 1}_${G}`])
+  }
+  for (let k = 0; k < n; k++) {
+    const mine = pairs.filter((_, i) => i % n === k)
     outs.push(`layout(location = ${k}) out uvec4 o${k};`)
-    writes.push(`o${k} = packH2(acc${2 * tp}_${G}, acc${2 * tp + 1}_${G});`)
+    writes.push(`o${k} = packH2(${mine.map((p) => p[0]).join(" + ")}, ${mine.map((p) => p[1]).join(" + ")});`)
   }
   return `${HEADER}
 uniform usampler2D uA;
 uniform sampler2D uW;
 uniform sampler2D uS;
 uniform int uKb;
+uniform int uSteps;
 ${outs.join("\n")}
 void main() {
   int g = int(gl_FragCoord.x) * ${groups};
@@ -549,11 +657,11 @@ void main() { o = vec4(0.0); }`)
   }
 }
 
-async function main(params: { batch?: number; only?: string }) {
+async function main(params: { batch?: number; only?: string; pick?: string }) {
   const gpu = new Gpu(new OffscreenCanvas(1, 1))
   const gl = gpu.gl
   log(`GPU: ${gpu.limits.renderer}`)
-  if (params.batch) return shapes(gpu, params.batch, params.only)
+  if (params.batch) return shapes(gpu, params.batch, params.only, params.pick)
   {
     // Transform feedback chains: vertex shaders writing buffers, each draw
     // reading the last one's output as a uniform buffer, no framebuffer.
@@ -939,16 +1047,32 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
  * activations RGBA16F (texel (kq, m)). Each fragment: R rows × T tokens,
  * only dots in the loop; outputs h2 pairs.
  */
-function pureKernel(R: 4 | 8, T: 4 | 8, half: boolean, unroll = 2, acts: "f16" | "h2" = "f16") {
+function pureKernel(
+  R: 4 | 8,
+  T: 4 | 8,
+  half: boolean,
+  unroll = 2,
+  acts: "f16" | "h2" = "f16",
+  /** The weights as RGBA16F (4 a texel) or h2 (RGBA32UI, 8 a texel: texel (wx + q) / 2). */
+  wts: "f16" | "h2" = "f16"
+) {
   const P = half ? "mediump " : ""
   const L: Array<string> = []
   const line = (x: string) => L.push(`    ${x}`)
   if (acts === "h2")
     for (let t = 0; t < T; t++)
       for (let u = 0; u < unroll; u += 2) line(`uvec4 u${t}_${u} = texelFetch(uA, ivec2((kq + ${u}) / 2, m0 + ${t}), 0);`)
+  if (wts === "h2")
+    for (let r = 0; r < R; r++)
+      for (let u = 0; u < unroll; u += 2) line(`uvec4 W${r}_${u} = texelFetch(uW, ivec2((wx + kq + ${u}) / 2, wy + ${r}), 0);`)
   for (let u = 0; u < unroll; u++) {
     line(`{ int q = kq + ${u};`)
-    for (let r = 0; r < R; r++) line(`  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + q, wy + ${r}), 0);`)
+    for (let r = 0; r < R; r++)
+      line(
+        wts === "h2"
+          ? `  ${P}vec4 w${r} = ${u & 1 ? "h2hi" : "h2lo"}(W${r}_${u & ~1});`
+          : `  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + q, wy + ${r}), 0);`
+      )
     for (let t = 0; t < T; t++) {
       line(
         acts === "h2"
@@ -972,7 +1096,7 @@ function pureKernel(R: 4 | 8, T: 4 | 8, half: boolean, unroll = 2, acts: "f16" |
     writes.push(`o${k} = packH2(${vecs[2 * k]}, ${vecs[2 * k + 1]});`)
   }
   return `${HEADER}
-uniform ${half ? "mediump " : ""}sampler2D uW;
+uniform ${wts === "h2" ? "usampler2D" : `${half ? "mediump " : ""}sampler2D`} uW;
 uniform ${acts === "h2" ? "usampler2D" : `${half ? "mediump " : ""}sampler2D`} uA;
 uniform int uKq;
 uniform int uH;
@@ -992,7 +1116,12 @@ ${L.join("\n")}
 }`
 }
 
-async function shapes(gpu: Gpu, batch: number, only?: string) {
+/**
+ * `pick`: a regular expression; only the variants whose label (as logged,
+ * from "w=") matches run, and none of the tile or plain f16 kernels.
+ */
+async function shapes(gpu: Gpu, batch: number, only?: string, pick?: string) {
+  const picked = pick ? new RegExp(pick) : null
   const gl = gpu.gl
   const params = { batch }
   // PowerVR skips draws whose output is overwritten unread: each timed
@@ -1040,7 +1169,7 @@ void main() { o = ${read}; }`)
             : { format: gl.RGBA_INTEGER, type: gl.UNSIGNED_INT, pixels: new Uint32Array(noise(n * 16), 0, n * 4) }
     return gpu.texture(internal, width, height, data)
   }
-  if (batch >= 2) {
+  if (batch >= 2 && !picked) {
     // gate|up 15360 × 2048 fused with SwiGLU: 3840 fragments wide.
     const N = 15360
     const K = 2048
@@ -1122,6 +1251,7 @@ void main() { o = ${read}; }`)
         pixels: new Uint32Array(halves((K / 8) * M * 8).buffer)
       })
       const flops = 2 * N * K * M
+      const sums = gpu.texture(gl.RGBA32F, blocks, M / 4)
       const variants: Array<Variant> =
         M === 1
           ? [
@@ -1139,8 +1269,18 @@ void main() { o = ${read}; }`)
             ]
           : [
               { weights: "unorm8", acts: "h2", tokens: 4 },
+              { weights: "unorm8", acts: "h2", tokens: 4, lean: true },
               { weights: "bytes", acts: "h2", tokens: 4 },
               { weights: "rgba4", acts: "h2", tokens: 4 },
+              { weights: "rgba4", acts: "h2", tokens: 4, sums: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, noSum: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, paired: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, transposed: true },
+              { weights: "rgba4", acts: "h2", tokens: 6 },
+              { weights: "rgba4", acts: "h2", tokens: 8 },
+              { weights: "rgba4", acts: "h2", tokens: 4, oneRow: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, oneAct: true },
+              { weights: "rgba4", acts: "h2", tokens: 4, oneRow: true, oneAct: true },
               { weights: "rgba4", acts: "f16", tokens: 4 },
               { weights: "rgba4", acts: "h2", tokens: 4, half: true },
               { weights: "rgba4", acts: "f16", tokens: 4, half: true },
@@ -1150,13 +1290,18 @@ void main() { o = ${read}; }`)
               { weights: "rgba4", acts: "h2", tokens: 8, centered: true, half: true },
               { weights: "rgba4", acts: "f16", tokens: 4, half: true, noSum: true }
             ]
-      for (const v of variants) {
+      // (Picked variants: three passes over the list, so a busy GPU slows each alike.)
+      for (const v of picked ? [...variants, ...variants, ...variants] : variants) {
         const T = v.tokens
-        const rows = v.split ?? Math.max(1, M / T)
+        const desc = `w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.sums ? " sums read" : ""}${v.lean ? " lean" : ""}${v.oneRow ? " one row" : ""}${v.oneAct ? " one act" : ""}${v.transposed ? " transposed" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}${v.centered ? " centered" : ""}${v.split ? ` split ${v.split}` : ""}`
+        if (picked && !picked.test(desc)) continue
+        const rows = v.split ?? Math.max(1, Math.floor(M / T))
         const outs = [0, 1].map((): Array<Texture> =>
           T === 1
             ? [gpu.texture(gl.RGBA32F, G, rows)]
-            : Array.from({ length: T / 2 }, () => gpu.texture(gl.RGBA32UI, G, rows))
+            : Array.from({ length: T / 2 }, () =>
+                v.transposed ? gpu.texture(gl.RGBA32UI, rows, G) : gpu.texture(gl.RGBA32UI, G, rows)
+              )
         )
         const program = gpu.program(kernel(v))
         const run = (i: number) =>
@@ -1173,7 +1318,8 @@ void main() { o = ${read}; }`)
                     : v.weights === "words"
                       ? (wWords ?? wBytes)
                       : wBytes,
-              uS: scales
+              uS: scales,
+              uSum: sums
             },
             uniforms: { uKb: { int: blocks }, uKbS: { int: Math.ceil(blocks / (v.split ?? 1)) } },
             output: outs[i % 2].length === 1 ? outs[i % 2][0] : outs[i % 2]
@@ -1191,11 +1337,11 @@ void main() { o = ${read}; }`)
           best = Math.min(best, (performance.now() - t0) / n)
         }
         log(
-          `MM2 ${label} ${N}x${K} M=${M} w=${v.weights} a=${v.acts} T=${T}${v.half ? " half" : ""}${v.noSum ? " no sums" : ""}${v.paired ? " paired" : ""}${v.fold ? " fold" : ""}${v.centered ? " centered" : ""}${v.split ? ` split ${v.split}` : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
+          `MM2 ${label} ${N}x${K} M=${M} ${desc}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s, ${((N * K) / 2 / best / 1e6).toFixed(0)} GB/s of weights`
         )
         for (const set of outs) for (const t of set) gpu.delete(t)
       }
-      if (M === 1)
+      if (M === 1 && !picked)
         for (const R of [1, 2] as const)
           for (const split of [4, 8]) {
             const width = (G * 4) / R
@@ -1232,9 +1378,22 @@ void main() { o = ${read}; }`)
         [8, 4, " fold", { fold: true }],
         [4, 8, " fold", { fold: true }],
         [12, 2, " fold", { fold: true }],
-        [16, 2, " fold", { fold: true }]
-      ] as Array<[number, number, string, { sameActs?: boolean; outputs?: number; fold?: boolean }]>) {
+        [16, 2, " fold", { fold: true }],
+        [8, 2, "", {}],
+        [4, 8, "", {}],
+        [4, 8, " 2 outputs", { outputs: 2 }],
+        [8, 4, "", {}],
+        [8, 4, " 2 outputs", { outputs: 2 }],
+        [4, 4, " pw", { pw: true }],
+        [4, 8, " pw", { pw: true }],
+        [8, 4, " pw", { pw: true }],
+        [8, 2, " pw", { pw: true }],
+        [4, 4, " pw loop", { pw: true, loop: true }],
+        [4, 8, " pw loop", { pw: true, loop: true }],
+        [8, 4, " pw loop", { pw: true, loop: true }]
+      ] as Array<[number, number, string, { sameActs?: boolean; outputs?: number; fold?: boolean; pw?: boolean; loop?: boolean }]>) {
         if (N % rows || M < T) continue
+        if (picked && !picked.test(`tile ${rows}x${T}${label2}`)) continue
         const width = N / rows
         const count = opts.outputs ?? (rows * T) / 8
         const outs = [0, 1].map(() =>
@@ -1246,7 +1405,7 @@ void main() { o = ${read}; }`)
             name: "mm",
             program,
             inputs: { uA: aH2, uW: wRgba4, uS: scales },
-            uniforms: { uKb: { int: blocks } },
+            uniforms: { uKb: { int: blocks }, uSteps: { int: 4 } },
             output: outs[i % 2]
           })
         run(0)
@@ -1273,25 +1432,37 @@ void main() { o = ${read}; }`)
           type: gl.HALF_FLOAT,
           pixels: halves(cols * (K / 4) * H * 4)
         })
-        for (const [R, T, half, unroll, acts] of [
-          [4, 4, false, 2, "f16"],
-          [4, 4, false, 2, "h2"],
-          [4, 4, true, 2, "f16"],
-          [4, 4, true, 2, "h2"],
-          [4, 8, true, 2, "f16"],
-          [4, 8, true, 2, "h2"],
-          [8, 4, true, 2, "h2"]
-        ] as Array<[4 | 8, 4 | 8, boolean, number, "f16" | "h2"]>) {
+        const wH2 = gpu.texture(gl.RGBA32UI, cols * (K / 8), H, {
+          format: gl.RGBA_INTEGER,
+          type: gl.UNSIGNED_INT,
+          pixels: new Uint32Array(halves(cols * (K / 8) * H * 8).buffer)
+        })
+        const pures = ([
+          [4, 4, false, 2, "f16", "f16"],
+          [4, 4, false, 2, "h2", "f16"],
+          [4, 4, true, 2, "f16", "f16"],
+          [4, 4, true, 2, "h2", "f16"],
+          [4, 4, false, 2, "h2", "h2"],
+          [4, 4, true, 2, "h2", "h2"],
+          [4, 4, false, 2, "f16", "h2"],
+          [4, 8, true, 2, "f16", "f16"],
+          [4, 8, true, 2, "h2", "f16"],
+          [8, 4, true, 2, "h2", "f16"]
+        ] as Array<[4 | 8, 4 | 8, boolean, number, "f16" | "h2", "f16" | "h2"]>).filter(
+          ([R, T, half, , acts, wts]) =>
+            !picked || picked.test(`PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}`)
+        )
+        for (const [R, T, half, unroll, acts, wts] of picked ? [...pures, ...pures, ...pures] : pures) {
           const count = (R * T) / 8
           const outs = [0, 1].map(() =>
             Array.from({ length: count }, () => gpu.texture(gl.RGBA32UI, N / R, M / T))
           )
-          const program = gpu.program(pureKernel(R, T, half, unroll, acts))
+          const program = gpu.program(pureKernel(R, T, half, unroll, acts, wts))
           const run = (i: number) =>
             gpu.run({
               name: "mm",
               program,
-              inputs: { uW: wF16, uA: acts === "h2" ? aH2 : aF16 },
+              inputs: { uW: wts === "h2" ? wH2 : wF16, uA: acts === "h2" ? aH2 : aF16 },
               uniforms: { uKq: { int: K / 4 }, uH: { int: H } },
               output: outs[i % 2]
             })
@@ -1306,14 +1477,16 @@ void main() { o = ${read}; }`)
             best = Math.min(best, (performance.now() - t0) / 10)
           }
           log(
-            `MM2 ${label} ${N}x${K} M=${M} PURE f16 ${R}x${T}${half ? " half" : ""} acts ${acts}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
+            `MM2 ${label} ${N}x${K} M=${M} PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
           )
           for (const set of outs) for (const t of set) gpu.delete(t)
         }
+        gpu.delete(wH2)
         gpu.delete(wF16)
       }
       gpu.delete(aF16)
       gpu.delete(aH2)
+      gpu.delete(sums)
     }
     gpu.delete(wRgba4)
     gpu.delete(wBytes)
