@@ -308,6 +308,7 @@ async function load(
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
     timings.tunedF16Matmul = engine.tuned.f16Matmul ?? -1
     timings.tunedF16Pack = engine.tuned.f16Pack ?? -1
+    timings.tunedFlashDecode = engine.tuned.flashDecode ?? -1
     // Attention against the CPU's (and Qwen3.5's chunked recurrence against
     // a token at a time): a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).

@@ -218,13 +218,31 @@ What's left is the chain of passes that each read the last one's output. LFM3 GG
 
 Where it went: on an iPhone 16 Pro Max, writing an LFM3 token from a 7,900-token cache spent 5.9 of 46 GPU ms in attention (attend 4.3, scores 1.6). `attnab` on an M3 (one writing token's attention passes, all 11 LFM3 attention layers) split the same way: of 2.6 ms at 7,900 tokens, the chunk pass ~1.5, scores ~0.5, the combine ~0.2, the five sliding layers ~0.3; at 64 tokens 0.83 ms, all of it the passes themselves. The chunk pass read as many texels as scores but took three times as long: 31 chunks of 64 texels, 128 fragments each (3,968 in all, 4–16 tiles of a 128×31 target), each walking its chunk twice (the max, then the weighted sum) with one value texel and two score texels a step. The 6 full-attention layers' cache is ~97 MB at 7,900 tokens; the M3 streams that in ~0.12 ms, so the old pass was waiting on its own reads, not memory.
 
-What's kept (`TUNING.flashDecode` 1; 0 is the old path): writing (≤ 8 rows) past 512 keys (`flashPast` 128 texels) reads its keys in chunks of 32 texels (`flashChunkTexels`; more where that would make over 128 chunks), the softmax kept online in one loop (each score read once), chunk k at panel k across a target as wide as the GPU's textures allow (`attendPanel`: LFM3 at 7,900 tokens, 62 chunks, a 7,936×1 target, ~250 tiles), then a combine that walks 8 chunks a step with their reads issued together (it's a few hundred fragments: each waits out its reads). Scores are unchanged. The self-check compares each attention layer's panel output with the one-pass kernel's from the same queries and cache (2e-4–3.5e-4 on the M3); the warm-up compiles both kernels.
+What's kept: writing (≤ 8 rows) past 512 keys (`flashPast` 128 texels) can read its keys in chunks of 32 texels (`flashChunkTexels`; more where that would make over 128 chunks), the softmax kept online in one loop (each score read once), chunk k in panel k % 2 of row k / 2 (`flashPanels` 2: LFM3 at 7,900 tokens, 62 chunks on a 256×31 target), then a combine that walks 8 chunks a step with their reads issued together (it's a few hundred fragments: each waits out its reads). Scores are unchanged. `Engine.tune` times this against the old chunks on a scratch 4,096-key cache of the first full-attention layer's shape and keeps it where it's 4% faster and twice its noise (`tuned.flashDecode`; `TUNING.flashDecode` 1 forces it, 0 is the old path): the iPhone 16 Pro Max picks it, 14% faster (LFM3 and Qwen3.5, 4 tunes in a row, noise ≤ 1.8%); an M3 shared with other GPU work measured 13–32% faster but often too noisy to switch. The self-check compares each attention layer's panel output with the one-pass kernel's from the same queries and cache (2e-4–3.5e-4), whichever path the GPU writes with; the warm-up compiles the path in use.
 
-M3 Ultra, Chrome, `attnab=flashDecode:0,1`, best of 20 alternated rounds (ms per writing token, attention passes only):
+The first version put every chunk side by side (a 7,936×1 target at 7,900 tokens): 2× faster on the M3, but on the iPhone 2.4× slower than the old chunks (`attnab`, LFM3, 7,900 tokens: 14.4 against 6.0 ms). The phone, `attnab` alternated in one page, ms per token (best of 8):
+
+| LFM3, 7,900 tokens | old | all across | 16 across | 8 | 4 | 3 | 2 | 1 |
+|---|---|---|---|---|---|---|---|---|
+| run 1 | 6.00 | 14.43 | | 5.17 | | | | |
+| run 2 | 5.97 | | 6.95 | 5.41 | 4.96 | | 4.61 | |
+| run 3 | 7.53 | | | | | 4.90 | 5.07 | 5.08 |
+
+Other knobs at 2 across on the phone: 64-texel chunks 3.41 against 3.50 ms at 7,900 tokens (Qwen3.5: 3.50 against 3.90, but slower at 512 and 2,048); the max first and then the sums (`flashOnline` 0) 5.31 against 5.07; 2 texels a step (`flashUnroll` 2) 4.99 against 5.07. At 2 across, iPhone 16 Pro Max (Safari), old → new, best of 8:
+
+| ms per token, attention passes only | 512 | 2,048 | 7,900 |
+|---|---|---|---|
+| LFM3 (11 attention layers) | 1.06 → 0.82 | 2.11 → 1.79 | 7.53 → 5.07 |
+| Qwen3.5 2B (6) | 0.52 → 0.41 | 0.91 → 0.71 | 4.91 → 3.90 |
+
+Whole writing steps from 7,900 tokens on the phone (`abDecode`, GPU ms a token, median of 6 alternated rounds): LFM3 GGUF 50.1 → 48.9 (best 49.2 → 47.6), Qwen3.5 GGUF 46.0 → 45.3 (best 45.0 → 44.2).
+
+M3 Ultra, Chrome, `attnab=flashDecode:0,1`, best of 16–20 alternated rounds (ms per writing token, attention passes only):
 
 | | 512 | 2,048 | 7,900 |
 |---|---|---|---|
-| LFM3 (11 attention layers) | 1.15 → 0.99 | 1.22 → 1.04 | 2.57 → 1.26 |
-| Qwen3.5 2B (6) | 0.81 → 0.67 | 0.83 → 0.68 | 2.18 → 0.86 |
+| LFM3, all across | 1.15 → 0.99 | 1.22 → 1.04 | 2.57 → 1.26 |
+| LFM3, 2 across | 1.16 → 1.00 | 1.22 → 0.97 | 2.55 → 1.64 |
+| Qwen3.5 2B, all across | 0.81 → 0.67 | 0.83 → 0.68 | 2.18 → 0.86 |
 
-Tried on the M3 and not kept: one panel across (chunks stacked in rows, 128×62): 1.67 against 1.33 ms; 16-texel chunks (124 at 7,900 tokens): the combine doubles and Qwen3.5 slows (1.42 against 0.86); 64-texel chunks within noise of 32; 2 or 4 texels per step of the chunk loop (`flashUnroll`) flat. The two-loop chunk pass with the combine still a chunk at a time cost as much in the combine as in the chunks at 124 chunks.
+Tried on the M3 and not kept: 16-texel chunks (124 at 7,900 tokens): the combine doubles and Qwen3.5 slows (1.42 against 0.86); 2 or 4 texels per step of the chunk loop flat. The two-loop chunk pass with the combine still a chunk at a time cost as much in the combine as in the chunks at 124 chunks. On Apple GPUs `skip=` of a kind of pass can mislead: passes left drawing into one target back to back get elided (skipping attend left the scores passes at 0.13 ms for all 11 layers on the phone).

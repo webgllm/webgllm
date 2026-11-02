@@ -1,8 +1,7 @@
 /**
  * Writing's attention over a long cache (see attendPanel in gpu/kernels.ts):
  * a token's keys in short chunks, each a fragment per 8 dims of a row group
- * of heads, laid out in panels side by side so the pass covers many tiles
- * of its render target (a tile-based GPU shades each tile on one core),
+ * of heads, laid out in panels (a few side by side, the rest in rows below),
  * then one combine pass over every chunk. This file holds the layout's
  * arithmetic and a CPU model of both passes' math, for the tests.
  */

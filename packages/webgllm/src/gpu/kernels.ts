@@ -2658,14 +2658,15 @@ void main() {
 /**
  * Writing's chunks of keys (attendChunk's job, for few queries): chunk k
  * of query qi at texels ((k % uOutPanels) · uOutPanelW + x, (k /
- * uOutPanels) · uSliceQ + qi), panels side by side, so a pass of short
- * chunks spreads over many tiles of the render target (a GPU shades a
- * tile on one core). Chunk k is chunk k % uSegChunks of key segment k /
- * uSegChunks; chunks past the keys are empty. One loop: each member's
- * softmax is kept online (a running max, the sums rescaled when it
- * rises), so each score is read once. Outputs as attendChunk's.
+ * uOutPanels) · uSliceQ + qi), panels side by side (a few: a long
+ * one-row target is several times slower on an iPhone). Chunk k is chunk k % uSegChunks of key segment k /
+ * uSegChunks; chunks past the keys are empty. `online`: one loop, each
+ * member's softmax kept online (a running max, the sums rescaled when it
+ * rises), so each score is read once; else the max first, then the sums
+ * (a shorter chain of dependent steps a key). `unroll` score texels a
+ * step. Outputs as attendChunk's.
  */
-function attendPanelSource(headDim: number, G: number, unroll = 1) {
+function attendPanelSource(headDim: number, G: number, unroll = 1, online = true) {
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   const names = sNames(G)
@@ -2686,7 +2687,9 @@ ${members.map((i) => `    vec4 s${i}_${t} = texelFetch(${names[i]}, ivec2(sx + i
 ${members
   .map(
     (i) => `    {
-      float m = mx${i};
+${
+  online
+    ? `      float m = mx${i};
 ${steps(n)
   .map((t) => `      m = max(m, max(max(s${i}_${t}.x, s${i}_${t}.y), max(s${i}_${t}.z, s${i}_${t}.w)));`)
   .join("\n")}
@@ -2694,7 +2697,9 @@ ${steps(n)
       mx${i} = m;
       l${i} *= scale;
       lo${i} *= scale;
-      hi${i} *= scale;
+      hi${i} *= scale;`
+    : `      float m = mx${i};`
+}
 ${steps(n)
   .map(
     (t) => `      {
@@ -2766,7 +2771,21 @@ ${members
   // (Masked keys score -1e30. Until a member's first live key its max is
   // -1e30 too, so what it sums meanwhile is scaled by exp(-1e30 - max) = 0
   // at that key; a member with none is written empty below.)
-  int i = t0;
+${
+  online
+    ? ""
+    : `  // Each member's max over the chunk first (the scores are read again
+  // below, from the cache), so the sums need no rescaling.
+  for (int i = t0; i < t1; i++) {
+${members
+  .map(
+    (i) => `    vec4 s${i} = texelFetch(${names[i]}, ivec2(sx + i, row), 0);
+    mx${i} = max(mx${i}, max(max(s${i}.x, s${i}.y), max(s${i}.z, s${i}.w)));`
+  )
+  .join("\n")}
+  }
+`
+}  int i = t0;
 ${
   unroll > 1
     ? `  for (; i + ${unroll - 1} < t1; i += ${unroll}) {

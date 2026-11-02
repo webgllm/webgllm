@@ -255,16 +255,27 @@ export const TUNING = {
   foldEach: 0,
   /** 1: writing sizes its attention chunks by the key count (see attend). */
   attendDecodeChunking: 1,
-  /** 1: writing's attention in short chunks laid out in panels (see attendPanel). */
-  flashDecode: 1,
+  /**
+   * 1: writing's attention in short chunks laid out in panels (see
+   * attendPanel); 0: the old chunks. Engine.tune times both on a long
+   * cache and keeps panels where they're clearly faster (tuned.flashDecode).
+   */
+  flashDecode: 0,
   /** ...of this many score texels (4 keys each)... */
   flashChunkTexels: 32,
   /** ...past this many score texels (-1: where the old path chunks). */
   flashPast: 128,
-  /** ...at most this many panels across (0: as many as a texture's width holds). */
-  flashPanels: 0,
+  /**
+   * ...at most this many panels across (0: as many as a texture's width
+   * holds): an iPhone 16 Pro Max took 14.4 ms over LFM3's 7,900 keys with
+   * every chunk side by side (a 7,936×1 target), 5.2-5.4 with 8 across and
+   * 4.6 with 2, the old path 6.0; an M3 is 15-25% slower at 2 than at 4 or all, still well ahead of the old path.
+   */
+  flashPanels: 2,
   /** Score texels attendPanel reads per step of its loop. */
   flashUnroll: 1,
+  /** 1: attendPanel keeps the softmax online (one loop); 0: the max first. */
+  flashOnline: 1,
   /** Key segments per scores pass (0: as many as the scores buffer holds). */
   segmentGroup: 0,
   /**
@@ -353,6 +364,8 @@ export type Tuned = {
   shortSplit: number | null
   f16Matmul?: number | null
   f16Pack?: number | null
+  /** Writing's attention in panels (TUNING.flashDecode) or not. */
+  flashDecode?: number | null
 }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
@@ -1093,7 +1106,7 @@ export class Engine {
    * `f16Pack`: how the f16 matmul reads (TUNING.f16Pack), wherever
    * prompts take it.
    */
-  tuned: Tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
+  tuned: Tuned = { shortSplit: null, f16Matmul: null, f16Pack: null, flashDecode: null }
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -1109,7 +1122,7 @@ export class Engine {
    */
   async tune(stop: () => boolean = () => false): Promise<Tuned | null> {
     const before = { ...this.tuned }
-    this.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
+    this.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null, flashDecode: null }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
     // an attention block's (the first of each kind), one feed-forward's.
@@ -1132,7 +1145,9 @@ export class Engine {
     const choose = async (
       key: keyof Tuned,
       candidates: Array<number>,
-      rows: number
+      rows: number,
+      /** What to time (default: the layer's prompt matmuls for `rows`). */
+      work: (rows: number) => void = run
     ): Promise<number | null> => {
       // The alternatives once untimed (first use costs more; the warm-up
       // already ran TUNING's), and TUNING's timed once: each sample repeats
@@ -1141,20 +1156,20 @@ export class Engine {
       if (stop()) throw new Stopped()
       for (let c = 1; c < candidates.length; c++) {
         this.tuned[key] = candidates[c]
-        run(rows)
+        work(rows)
       }
       this.tuned[key] = candidates[0]
       await this.gpu.finish()
       if (stop()) throw new Stopped()
       const t0 = performance.now()
-      run(rows)
+      work(rows)
       await this.gpu.finish()
       const reps = Math.max(1, Math.min(16, Math.ceil(25 / (performance.now() - t0))))
       // An idle GPU clocks down: busy it ~100 ms first, so the clock has
       // come up before anything is timed.
       for (const start = performance.now(); performance.now() - start < 100; ) {
         if (stop()) throw new Stopped()
-        for (let r = 0; r < reps; r++) run(rows)
+        for (let r = 0; r < reps; r++) work(rows)
         await this.gpu.finish()
       }
       const rounds = candidates.map((): Array<number> => [])
@@ -1166,7 +1181,7 @@ export class Engine {
           this.tuned[key] = candidates[c]
           await this.gpu.finish()
           const t = performance.now()
-          for (let r = 0; r < reps; r++) run(rows)
+          for (let r = 0; r < reps; r++) work(rows)
           await this.gpu.finish()
           rounds[c].push(performance.now() - t)
         }
@@ -1214,7 +1229,29 @@ export class Engine {
               batch
             )
           : null
-      picked = { shortSplit, f16Matmul, f16Pack }
+      this.tuned.f16Pack = f16Pack
+      // Writing's attention from a long cache (a synthetic one: 4,096
+      // keys in a scratch cache of the first full-attention layer's
+      // shape), in panels or the old way: Apple's phone and desktop GPUs
+      // disagreed on panel layouts, and other GPUs are untimed.
+      const full = this.layers.find((l) => l.attention && l.type !== "sliding_attention")
+      const keys = Math.min(4096, this.contextLength)
+      let flashDecode: number | null = null
+      if (full?.attention && this.mrt.chunks && TUNING.attendChunkTexels > 0 && keys > 4 * TUNING.flashPast) {
+        const kv = this.kvTexture(keys)
+        const layer = { ...full.attention, kv }
+        try {
+          flashDecode = await choose(
+            "flashDecode",
+            [TUNING.flashDecode, TUNING.flashDecode > 0 ? 0 : 1],
+            1,
+            () => void this.attention(layer, full.type, 1, keys - 1, 0, this.buffers.qkvg)
+          )
+        } finally {
+          this.gpu.delete(kv)
+        }
+      }
+      picked = { shortSplit, f16Matmul, f16Pack, flashDecode }
     } catch (error) {
       this.tuned = before
       this.f16Trim()
@@ -2028,7 +2065,7 @@ export class Engine {
     if (TUNING.attendChunkTexels > 0) {
       // Chunked attention (long key ranges) too, forced on for a short
       // batch and a token.
-      // (Writing's panels too: see attendPanel.)
+      // (Writing's panels too, where this GPU writes with them: see attendPanel.)
       const saved = TUNING.attendChunkTexels
       const savedDecode = TUNING.attendChunkTexelsDecode
       const savedPast = TUNING.flashPast
@@ -2128,11 +2165,15 @@ export class Engine {
    * attentionError's. Leaves the cache empty.
    */
   private async panelError(tokens: Array<number>) {
-    if (!this.mrt.chunks || TUNING.flashDecode <= 0) return 0
-    const saved = [TUNING.flashPast, TUNING.flashChunkTexels]
+    if (!this.mrt.chunks) return 0
+    const saved = [TUNING.flashPast, TUNING.flashChunkTexels, TUNING.flashDecode]
+    const tuned = this.tuned.flashDecode
+    this.tuned.flashDecode = null
     try {
+      // (Whether or not this GPU writes that way: the tuner may pick it.)
       TUNING.flashPast = 0
       TUNING.flashChunkTexels = 1
+      TUNING.flashDecode = 1
       this.reset()
       await this.forwardHidden(tokens.slice(0, -1))
       this.panelErrors = []
@@ -2140,7 +2181,8 @@ export class Engine {
       await this.gpu.finish()
       return this.panelErrors.length ? Math.max(...this.panelErrors) : Infinity
     } finally {
-      ;[TUNING.flashPast, TUNING.flashChunkTexels] = saved
+      ;[TUNING.flashPast, TUNING.flashChunkTexels, TUNING.flashDecode] = saved
+      this.tuned.flashDecode = tuned
       this.panelErrors = null
       this.reset()
     }
@@ -3293,7 +3335,7 @@ export class Engine {
       const fitSegments = Math.max(1, Math.floor((panels * panelRows) / total))
       if (
         rows <= SPLIT_ROWS &&
-        TUNING.flashDecode > 0 &&
+        (this.tuned.flashDecode ?? TUNING.flashDecode) > 0 &&
         TUNING.attendChunkTexels > 0 &&
         this.mrt.chunks &&
         kt > (TUNING.flashPast >= 0 ? TUNING.flashPast : chunkPast) &&
@@ -3320,7 +3362,7 @@ export class Engine {
         scores(j0, keys, segments)
         this.gpu.run({
           name: "attend",
-          program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll)),
+          program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll, TUNING.flashOnline > 0)),
           inputs: { ...sIn, uV: layer.kv },
           uniforms: {
             ...ring,
