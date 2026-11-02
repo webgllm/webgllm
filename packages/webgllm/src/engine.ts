@@ -216,6 +216,13 @@ export const TUNING = {
    * 1 multiplies by its weights there, 2 reads h2(x · weights) the add drew.
    */
   foldNorm: 2,
+  /**
+   * With foldNorm 2: each norm folds on its own (the feed-forward's even
+   * where the operator's matmuls can't), and 8-bit split matmuls fold the
+   * prescaled input too (Qwen3.5 GGUF's Q8_0 beta|alpha): no norm passes.
+   * 0: a layer folds both norms or neither, 4-bit matmuls only.
+   */
+  foldEach: 1,
   /** 1: writing sizes its attention chunks by the key count (see attend). */
   attendDecodeChunking: 1,
   /** Key segments per scores pass (0: as many as the scores buffer holds). */
@@ -2276,12 +2283,15 @@ export class Engine {
     a: Texture,
     w: GpuMatrix,
     rows: number,
-    norm?: Texture | "prescaled"
+    norm?: Texture | "prescaled",
+    /** The output's first texel column (another matmul's slices beside it: see linearAttend). */
+    x0 = 0
   ) {
-    // RGBA4 and 4-bit byte texels have the split kernel that folds norms.
+    // RGBA4 and 4-bit byte texels have the split kernel that folds norms;
+    // the generic one folds the add's prescaled input (see foldEach).
     const own = w.rgba4 || (w.bits === 4 && w.bytes)
-    if (norm && !own)
-      throw new Error("Only 4-bit RGBA4 or byte matmuls fold the norm in.")
+    if (norm && !own && norm !== "prescaled")
+      throw new Error("Only 4-bit RGBA4 or byte matmuls fold the norm weights in.")
     const bits = w.bits
     if (bits === 6)
       throw new GpuError("Q6_K weights are only read as the output head.")
@@ -2319,7 +2329,8 @@ export class Engine {
                 bytes: !w.rgba4,
                 unorm: w.unorm,
                 packed: w.packed,
-                normed: !norm ? false : norm === "prescaled" ? norm : "weights"
+                normed: !norm ? false : norm === "prescaled" ? norm : "weights",
+                offset: x0 > 0
               })
             : K.matmul({
                 bits,
@@ -2329,7 +2340,9 @@ export class Engine {
                 bytes: w.bytes,
                 unorm: w.unorm,
                 packed: w.packed,
-                split: true
+                split: true,
+                normed: norm === "prescaled" ? norm : false,
+                offset: x0 > 0
               })
         ),
         inputs: !norm
@@ -2341,6 +2354,7 @@ export class Engine {
           ...shape,
           uSplit: { int: slices },
           uKbSlice: { int: kbSlice },
+          ...(x0 > 0 && { uGx0: { int: x0 } }),
           ...(norm && {
             uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
             uROff: { int: this.config.hiddenSize / 4 },
@@ -2350,7 +2364,7 @@ export class Engine {
           })
         },
         output: this.buffers.partial,
-        rect: { x: 0, y: 0, width: w.groups, height: rows * slices }
+        rect: { x: x0, y: 0, width: w.groups, height: rows * slices }
       })
       return slices
     }
@@ -3893,27 +3907,33 @@ export class Engine {
     const e = this.embedding
     // A few rows: the split matmuls apply the norm to the residual as they
     // read it (no norm pass; see TUNING.foldNorm).
+    const prescaled = TUNING.foldNorm === 2 && this.mrt.scaled
+    // (foldEach: 8-bit matrices fold the prescaled input too, and each of a
+    // layer's two norms folds where its own matmuls can.)
+    const each = prescaled && TUNING.foldEach > 0
     const folds = (m?: GpuMatrix) =>
-      !!m && (m.rgba4 || (m.bits === 4 && m.bytes))
+      !!m && (m.rgba4 || (m.bits === 4 && m.bytes) || (each && m.bits === 8))
+    const canFold = rows <= SPLIT_ROWS && TUNING.foldNorm > 0 && !probe
+    const opFolds = (l: GpuLayer) =>
+      folds(l.conv?.inProj ?? l.attention?.qkvg ?? l.linear?.inProj) &&
+      (!l.linear || folds(l.linear.ba))
+    /** Whether layer j's operator matmuls fold its norm. */
     const foldAt = (j: number) => {
       const l = this.layers[j]
-      return (
-        rows <= SPLIT_ROWS &&
-        TUNING.foldNorm > 0 &&
-        !probe &&
-        folds(l.conv?.inProj ?? l.attention?.qkvg ?? l.linear?.inProj) &&
-        (!l.linear || folds(l.linear.ba)) &&
-        folds(l.gateUp)
-      )
+      return canFold && opFolds(l) && (each || folds(l.gateUp))
     }
-    const prescaled = TUNING.foldNorm === 2 && this.mrt.scaled
+    /** Whether layer j's gate|up matmul folds its norm. */
+    const foldFfn = (j: number) => {
+      const l = this.layers[j]
+      return canFold && folds(l.gateUp) && (each || opFolds(l))
+    }
     // The embedding draws layer 0's sums of squares and scaled input too.
     const embedFolded = prescaled && e.rgba4 && foldAt(0)
     // The last add draws the final norm's scaled input for the head.
     this.headScaled =
       prescaled &&
       (e.rgba4 || (e.bits === 6 && !e.bytes && TUNING.q6FoldNorm > 0)) &&
-      foldAt(this.layers.length - 1)
+      foldFfn(this.layers.length - 1)
     if (embedFolded) {
       const texels = c.hiddenSize / 4
       const embedInputs = {
@@ -4020,6 +4040,7 @@ export class Engine {
         this.gpu.flush()
       const [h, next] = b.residual
       const fold = foldAt(i)
+      const ffnFold = foldFfn(i)
       // (Layer 0 folds only if the embedding drew its sums and input.)
       const opIn: MatIn =
         fold && (i > 0 || (embedFolded && prescaled))
@@ -4090,7 +4111,7 @@ export class Engine {
         next,
         rows,
         opSplit,
-        fold && prescaled ? layer.ffnNorm : undefined
+        ffnFold && prescaled ? layer.ffnNorm : undefined
       )
       await look(i, "after_op", next, c.hiddenSize)
       // A prompt batch's last layer: only the last row goes on (its hidden
@@ -4101,11 +4122,11 @@ export class Engine {
       const base = tail ? h : next
       const dest = tail ? next : h
       if (tail) this.copyRow(next, rows - 1, h)
-      if (!fold) this.normToH2(base, layer.ffnNorm, b.normed, fr)
+      if (!ffnFold) this.normToH2(base, layer.ffnNorm, b.normed, fr)
       if (fr <= SPLIT_ROWS) {
         // A few rows: the split matmul's slices are summed and through
         // SwiGLU in one pass.
-        const slices = fold
+        const slices = ffnFold
           ? this.splitPartials(
               next,
               layer.gateUp,

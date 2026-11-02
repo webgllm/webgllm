@@ -143,6 +143,14 @@ export type MatmulOptions = {
    * (for layer weights not in RGBA4: 8-bit).
    */
   pair?: boolean
+  /**
+   * With `split`: read h2(x · norm weights) the add drew at column uAOff of
+   * uA, and apply the row's 1 / RMS (from uR's sums of squares) last, as
+   * matmulSplitRgba4's "prescaled" does.
+   */
+  normed?: false | "prescaled"
+  /** With `split`: output texel x holds row group x - uGx0 (a region of a shared target). */
+  offset?: boolean
 }
 
 /**
@@ -165,8 +173,9 @@ function matmulSource(o: MatmulOptions) {
     line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
     if (o.zeros) line(`vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`)
   }
+  const aOff = o.normed === "prescaled" ? "uAOff + " : ""
   for (const j of [0, 1, 2, 3]) {
-    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
+    line(`uvec4 a${j} = texelFetch(uA, ivec2(${aOff}kb * 4 + ${j}, m), 0);`)
     line(`${P}vec4 A${2 * j} = h2lo(a${j});`)
     line(`${P}vec4 A${2 * j + 1} = h2hi(a${j});`)
   }
@@ -244,7 +253,7 @@ function matmulSource(o: MatmulOptions) {
   int kb0 = 0;
   int kb1 = uKb;`
     : o.split
-      ? `int g = x;
+      ? `int g = x${o.offset ? " - uGx0" : ""};
   int m = y / uSplit;
   int slice = y - m * uSplit;
   int kb0 = slice * uKbSlice;
@@ -255,7 +264,8 @@ function matmulSource(o: MatmulOptions) {
   int kb1 = uKb;`
   const weights =
     o.bytes && o.bits === 8 ? "isampler2D" : o.unorm ? "sampler2D" : "usampler2D"
-  return `${HEADER}
+  return `${HEADER}${o.normed === "prescaled" ? `${RMS_SCALE}\nuniform int uAOff;` : ""}
+${o.offset ? "uniform int uGx0;" : ""}
 uniform usampler2D uA;
 uniform ${weights} uW;
 uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
@@ -281,7 +291,7 @@ void main() {
   for (int kb = kb0; kb < kb1; kb++) {
 ${body.join("\n")}
   }
-  ${o.pair ? "if (tt == 0) r0 = acc;\n  else o = packH2(r0, acc);\n  }" : "o = acc;"}
+  ${o.pair ? "if (tt == 0) r0 = acc;\n  else o = packH2(r0, acc);\n  }" : o.normed === "prescaled" ? `o = acc * (rmsScale(m) * ${PRESCALE}.0);` : "o = acc;"}
 }`
 }
 
@@ -601,6 +611,8 @@ function matmulSplitRgba4Source(o: {
    * row's 1 / RMS (from the residual uR's sums of squares) is applied last.
    */
   normed?: false | "weights" | "prescaled"
+  /** Output texel x holds row group x - uGx0 (a region of a shared target). */
+  offset?: boolean
 }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
@@ -685,9 +697,10 @@ uniform int uH;
 uniform int uRowTexels;
 uniform int uSplit;
 uniform int uKbSlice;
+${o.offset ? "uniform int uGx0;" : ""}
 out vec4 o;
 void main() {
-  int g = int(gl_FragCoord.x);
+  int g = int(gl_FragCoord.x)${o.offset ? " - uGx0" : ""};
   int y = int(gl_FragCoord.y);
   int m = y / uSplit;
   int slice = y - m * uSplit;
