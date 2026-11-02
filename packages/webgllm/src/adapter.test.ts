@@ -195,7 +195,7 @@ const LFM3_ONNX = "onnx-community/LFM3-1.7B-ONNX" as const
 
 type Assert<T extends true> = T
 export type GgufBudgetCapability = Assert<AdapterReasoning<WebGlTextAdapter<typeof LFM3_GGUF>>["budget"]>
-export type OnnxHasNoBudgetCapability = Assert<AdapterReasoning<WebGlTextAdapter<typeof LFM3_ONNX>>["budget"] extends false ? true : false>
+export type OnnxBudgetCapability = Assert<AdapterReasoning<WebGlTextAdapter<typeof LFM3_ONNX>>["budget"]>
 
 function budgetOptions(reasoning?: ReasoningRequest): TextOptions<WebGlTextProviderOptions> {
   return {
@@ -307,9 +307,14 @@ test("LFM3 rejects invalid thinking budgets before starting a worker", { timeout
   }
 })
 
-test("only LFM3 GGUF advertises a thinking budget", async () => {
+test("every thinking-capable WebGL model advertises budget support", async () => {
   const { WEBGL_MODEL_META } = await import("./model-meta.js")
-  assert.deepEqual(Object.entries(WEBGL_MODEL_META).filter(([, meta]) => meta.reasoning && meta.reasoning.budget).map(([model]) => model), [LFM3_GGUF])
+  for (const [model, meta] of Object.entries(WEBGL_MODEL_META)) {
+    if (meta.supports.capabilities.includes("thinking")) {
+      assert.ok(meta.reasoning && "budget" in meta.reasoning, model)
+      assert.equal(meta.reasoning.budget, true, model)
+    } else assert.equal(meta.reasoning, undefined, model)
+  }
 })
 
 test("LFM3 forwards zero budgets and ignores a valid cap when thinking is off", { timeout: 10_000 }, async () => {
@@ -341,16 +346,42 @@ test("LFM3 forwards zero budgets and ignores a valid cap when thinking is off", 
   }
 })
 
-test("LFM3 variants without budget support reject active thinking caps before loading", { timeout: 10_000 }, async () => {
+test("all thinking models forward the budget and caller output cap in both adapter paths", { timeout: 10_000 }, async () => {
   const { webglText } = await import("./adapter.js")
+  const { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } = await import("./model-meta.js")
   const { unloadModel } = await import("./client.js")
-  unloadModel()
-  const previousWorker = FakeWorker.last
-  const adapter = webglText(LFM3_ONNX)
-  const options = { ...budgetOptions({ level: "high", summary: true, budgetTokens: 256 }), model: LFM3_ONNX }
-  await assert.rejects(collect(adapter.chatStream(options)), /does not support a thinking token budget/)
-  await assert.rejects(adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } }), /does not support a thinking token budget/)
-  assert.equal(FakeWorker.last, previousWorker)
+  const requests: Array<Extract<WorkerRequest, { type: "generate" }>> = []
+  FakeWorker.onGenerate = (worker, request) => {
+    requests.push(request)
+    worker.send({ type: "token", id: request.id, text: '{"moveId":"b6-a5"}' })
+    worker.send({ type: "done", id: request.id, stats: STATS })
+  }
+  try {
+    for (const model of WEBGL_TEXT_MODELS) {
+      unloadModel()
+      const adapter = webglText(model)
+      const reasons = WEBGL_MODEL_META[model].reasoning
+      const options = {
+        ...budgetOptions(reasons ? { level: "high", summary: true, budgetTokens: 512 } : undefined),
+        model, modelOptions: { maxTokens: 8192 }
+      }
+      await collect(adapter.chatStream(options))
+      await adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } })
+      for (const request of requests.slice(-2)) {
+        assert.equal(request.thinkingBudgetTokens, reasons ? 512 : undefined, model)
+        assert.equal(request.maxTokens, 8192, model)
+        assert.equal(request.contextLength, undefined, "caller did not override the model context")
+      }
+    }
+    unloadModel()
+    const adapter = webglText(LFM3_GGUF)
+    const answer = await chat({ adapter, threadId: "shared-max-tokens", messages: [{ role: "user", content: "Choose a move." }], reasoning: { level: "high", budgetTokens: 512 }, modelOptions: { maxTokens: 8192, max_new_tokens: 64 }, stream: false })
+    assert.ok(answer)
+    assert.equal(requests.at(-1)?.maxTokens, 8192, "canonical maxTokens wins over the legacy alias")
+  } finally {
+    FakeWorker.onGenerate = undefined
+    unloadModel()
+  }
 })
 
 
@@ -399,5 +430,20 @@ test("every WebGL model uses its recommended text sampling in both adapter paths
   } finally {
     FakeWorker.onGenerate = undefined
     unloadModel()
+  }
+})
+
+
+test("invalid output caps reject before model loading", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  unloadModel()
+  const previous = FakeWorker.last
+  const adapter = webglText(LFM3_GGUF)
+  for (const value of [-1, 1.5, NaN, Infinity]) {
+    const options = { ...budgetOptions(), modelOptions: { maxTokens: value } }
+    await assert.rejects(collect(adapter.chatStream(options)), /nonnegative safe integer/)
+    await assert.rejects(adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } }), /nonnegative safe integer/)
+    assert.equal(FakeWorker.last, previous)
   }
 })

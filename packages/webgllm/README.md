@@ -32,23 +32,23 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
 
-Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. Omitting `max_new_tokens` uses the worker's existing 4,096-token ceiling, bounded by remaining context.
+Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. The supported models declare no default output cap in their generation configs. When neither `modelOptions.maxTokens` nor its legacy alias `max_new_tokens` is supplied, generation continues until EOS or the remaining configured model context is exhausted. An explicit value is honored in both streaming and structured-output calls and bounded by remaining context; `maxTokens` wins if both names are supplied. Thinking budgets are separate from this total output limit.
 
 ### Thinking budget
 
-LFM3 GGUF accepts an optional thinking-token ceiling through the shared reasoning option:
+Every thinking-capable WebGL model accepts an optional thinking-token ceiling through the shared reasoning option:
 
 ```ts
 const stream = chat({
   adapter: webglText("LiquidAI/LFM3-1.7B-GGUF"),
   messages,
   threadId,
-  reasoning: { level: "high", budgetTokens: 256 },
-  modelOptions: { max_new_tokens: 512 }
+  reasoning: { level: "high", budgetTokens: 512 },
+  modelOptions: { maxTokens: 8192 }
 })
 ```
 
-The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `max_new_tokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. Only LFM3 GGUF currently advertises budget support.
+The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `maxTokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. This applies to every LFM3, LFM2.5 Thinking, and Qwen3.5 variant.
 
 The low-level worker/client generation option is `thinkingBudgetTokens`. Budgeted runs report `thinkingTokens`, `thinkingBudgetTokens`, and `thinkingBudgetExhausted` in `usage.providerUsageDetails`.
 

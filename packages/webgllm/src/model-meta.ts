@@ -52,7 +52,7 @@ export type WebGlModelMeta = {
 
 const THINKING_SWITCH = {
   levels: { off: "false", high: "true" },
-  budget: false
+  budget: true
 } as const
 
 const TOOLS_AND_THINKING = {
@@ -67,7 +67,7 @@ const TOOLS = {
 } as const
 
 /** LFM2.5 Thinking always thinks: its template takes no switch. */
-const ALWAYS_THINKS = { levels: { high: "true" }, budget: false } as const
+const ALWAYS_THINKS = { levels: { high: "true" }, budget: true } as const
 
 /** LFM2.5's card: temperature 0.1, top-k 50, repetition penalty 1.05. */
 const LFM2_5_SAMPLING = {
@@ -115,7 +115,7 @@ const LFM3_1_7B_GGUF = {
   },
   supports: TOOLS_AND_THINKING,
   size: "1.7b",
-  reasoning: { ...THINKING_SWITCH, budget: true },
+  reasoning: THINKING_SWITCH,
   sampling: LFM3_SAMPLING,
   toolFormat: "lfm3"
 } as const satisfies WebGlModelMeta

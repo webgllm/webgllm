@@ -37,7 +37,9 @@ import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
 /** Per-call `modelOptions`: sampling over the model card's, and the most tokens to generate. */
 export type WebGlTextProviderOptions = Partial<Sampling> & {
-  /** Most tokens to generate: 4,096 by default. */
+  /** Maximum generated tokens, thinking included; otherwise EOS or remaining context. */
+  maxTokens?: number
+  /** Legacy alias for maxTokens. maxTokens takes precedence when both are supplied. */
   max_new_tokens?: number
   /**
    * Draft tokens by prompt lookup and check them in one batch (speculative
@@ -100,6 +102,15 @@ function thinkingOptions(
     throw new Error(`${model} does not support a thinking token budget.`)
   }
   return { thinking, thinkingBudgetTokens: resolved.budgetTokens }
+}
+
+/** Resolve a caller's output cap without introducing a provider-wide default. */
+function requestedOutputTokens(options: WebGlTextProviderOptions | undefined) {
+  const limit = options?.maxTokens ?? options?.max_new_tokens
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+    throw new RangeError("maxTokens must be a nonnegative safe integer.")
+  }
+  return limit
 }
 
 function contentText(content: ModelMessage["content"]) {
@@ -334,6 +345,7 @@ export class WebGlTextAdapter<
     options: TextOptions<WebGlTextProviderOptions>
   ): AsyncIterable<AdapterYieldChunk> {
     const thinking = thinkingOptions(options.reasoning, this.model)
+    const maxTokens = requestedOutputTokens(options.modelOptions)
     const runId = options.runId ?? nextId("run")
     const threadId = options.threadId
     const messageId = nextId("msg")
@@ -466,7 +478,7 @@ export class WebGlTextAdapter<
       tools: toTools(options.tools),
       ...thinking,
       sampling: this.sampling(options.modelOptions, thinking.thinking),
-      maxTokens: options.modelOptions?.max_new_tokens,
+      maxTokens,
       speculative: options.modelOptions?.speculative,
       pipeline: options.modelOptions?.pipeline,
       signal
@@ -561,6 +573,7 @@ export class WebGlTextAdapter<
   ): Promise<StructuredOutputResult<unknown>> {
     const { chatOptions, outputSchema } = options
     const thinking = thinkingOptions(chatOptions.reasoning, this.model)
+    const maxTokens = requestedOutputTokens(chatOptions.modelOptions)
     await loadModel(this.model, this.contextLength)
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
@@ -580,7 +593,7 @@ export class WebGlTextAdapter<
       tools: [],
       ...thinking,
       sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
-      maxTokens: chatOptions.modelOptions?.max_new_tokens,
+      maxTokens,
       speculative: chatOptions.modelOptions?.speculative,
       pipeline: chatOptions.modelOptions?.pipeline,
       signal: chatOptions.abortController?.signal

@@ -22,6 +22,7 @@ import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
 import { createThinkingBudget } from "./thinking-budget.js"
+import { outputTokenLimit } from "./generation-limits.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -76,10 +77,6 @@ const DRAFTS = 7
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
 
-/** Most tokens a reply may have, unless the caller says otherwise. */
-const DEFAULT_MAX_TOKENS = 4096
-/** Below this much room for a reply, the chat is too long to answer. */
-const MIN_REPLY_TOKENS = 32
 
 /** FNV-1a of a string, as hex (for note keys). */
 function hash(text: string) {
@@ -425,11 +422,13 @@ async function generate(request: GenerateRequest) {
     startsInThinking
   )
   const room = engine.contextLength - prompt.length
-  if (room < MIN_REPLY_TOKENS) {
+  if (room <= 0) {
     throw new Error(
       `This session is too long for the model: ${prompt.length} tokens, and it can read ${engine.contextLength} at most, reply included. Start a new session to keep going.`
     )
   }
+
+  const maxTokens = outputTokenLimit(room, request.maxTokens)
 
   // Reuse the cache for the longest prefix this prompt shares with it. The
   // whole prompt only if its end was saved with its last hidden row (the
@@ -463,7 +462,6 @@ async function generate(request: GenerateRequest) {
     engine.snapshot(i === prompt.length ? row : undefined)
     if (stopped.has(id)) break
   }
-  const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
   const stats: RunTimings = {
     inputTokens: prompt.length,
     cachedTokens: start,

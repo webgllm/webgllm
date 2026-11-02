@@ -56,7 +56,7 @@ export type WorkerRequest =
       /** Close thinking at this many content tokens, then continue the answer. */
       thinkingBudgetTokens?: number
       sampling: Sampling
-      /** Most tokens to generate; the worker's default when left out. */
+      /** Most tokens to generate; EOS or remaining model context when left out. */
       maxTokens?: number
       /** Draft tokens by prompt lookup (speculative decoding); on by default. */
       speculative?: boolean
