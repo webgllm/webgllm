@@ -1509,6 +1509,18 @@ async function smoke(params: {
     log(
       `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
+    // Render passes a writing step starts with each value.
+    const passes = async (v: number) => {
+      ;(TUNING as Record<string, number>)[knob] = v
+      const before = engine.gpu.passes
+      await engine.forwardNoLogits([next])
+      return engine.gpu.passes - before
+    }
+    const pa = await passes(a)
+    const pb = await passes(b)
+    ;(TUNING as Record<string, number>)[knob] = original
+    await engine.gpu.finish()
+    log(`AB PASSES per writing step ${knob}=${a}: ${pa}; ${knob}=${b}: ${pb}`)
   }
   // Sweeps: ?sweep=knob:v1,v2,…;knob2:… times each value of each knob
   // (others at their defaults) on the prompt, its first 40 tokens, and
