@@ -434,14 +434,17 @@ uniform int uRowTexels;
 uniform int uKq;
 uniform int uHd;
 uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
 out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
   int c = x / uKq;
-  int kq = x - c * uKq;
+  int kq = x - c * uKq + uKq0;
   int row = c * uHd + y;
   if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
   int g = row / 4;
   int r = row - g * 4;
   int col = g / uH;
@@ -479,14 +482,17 @@ uniform int uRowTexels;
 uniform int uKq;
 uniform int uHd;
 uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
 out vec4 o;
 void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
   int c = x / uKq;
-  int kq = x - c * uKq;
+  int kq = x - c * uKq + uKq0;
   int row = c * uHd + y;
   if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
   int g = row / 4;
   int r = row - g * 4;
   int col = g / uH;
@@ -580,6 +586,9 @@ uniform int uKq;
 uniform int uHd;
 uniform int uSliceRows;
 uniform int uKqSlice;
+uniform int uRow0;
+uniform int uKq0;
+uniform int uKqW;
 layout(location = 0) out uvec4 o0;
 layout(location = 1) out uvec4 o1;
 void main() {
@@ -587,9 +596,9 @@ void main() {
   int y = int(gl_FragCoord.y);
   int slice = y / uSliceRows;
   int m0 = 4 * (y - slice * uSliceRows);
-  int row = 4 * g;
+  int row = 4 * g - uRow0;
   int c = row / uHd;
-  int wx = c * uKq;
+  int wx = c * uKqW - uKq0;
   int wy = row - c * uHd;
   int kq0 = slice * uKqSlice;
   int kq1 = min(uKq, kq0 + uKqSlice);
@@ -654,6 +663,9 @@ uniform int uKq;
 uniform int uHd;
 uniform int uSliceRows;
 uniform int uKqSlice;
+uniform int uRow0;
+uniform int uKq0;
+uniform int uKqW;
 layout(location = 0) out uvec4 o0;
 layout(location = 1) out uvec4 o1;
 void main() {
@@ -661,9 +673,9 @@ void main() {
   int y = int(gl_FragCoord.y);
   int slice = y / uSliceRows;
   int m0 = 4 * (y - slice * uSliceRows);
-  int row = 4 * g;
+  int row = 4 * g - uRow0;
   int c = row / uHd;
-  int wx = c * uKq;
+  int wx = c * uKqW - uKq0;
   int wy = row - c * uHd;
   // (Slices are whole blocks, 8 K texels each, and wx a multiple of uKq:
   // every step starts on an even texel.)

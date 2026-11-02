@@ -112,7 +112,29 @@ What does pay is the f16 matmul reading h2 texels (TUNING.f16Pack 3): its dequan
 | Qwen3.5 ONNX | 204.6 → 195.7 (−4%) | 1,007 → 900 (−11%) | 66.2 → 59.3 |
 | Qwen3.5 GGUF | 260.3 → 249.7 (−4%) | 1,956 → 1,821 (−7%) | 101.1 → 96.1 |
 
-Writing doesn't use it. RGBA4 weights through the f16 matmul (`f16Matmul:2`) with f16Pack 3 read LFM3's 535-token prompt in 163 ms against 179 in place (−9%), for the f16 scratch's 60 MiB. The engine keeps TUNING.f16Pack 0 and lets Engine.tune pick 3 where it's faster on the GPU (only where prompts take the f16 matmul: byte weights, as on PowerVR), since PowerVR's 16-byte texels stream slowest (`bandwidth.html`) and its unpackHalf2x16 costs ALU there.
+Writing doesn't use it. On an iPhone 16 Pro Max (Safari, LFM3 GGUF, 546 tokens) it pays more: byte weights 3,069 → 2,398 ms (−22%), and RGBA4 weights through the f16 matmul (`f16Matmul:2`) with h2 reads beat the in-place kernel, 3,768 → 3,243 ms (−14%); the M3: 163 vs 179 ms (−9%). So f16Pack 3 is the default, and Engine.tune times 0 against it wherever prompts take the f16 matmul (PowerVR's 16-byte texels stream slowest and its unpackHalf2x16 costs ALU, so the Pixel chooses by timing): on the M3, 0 is 8–16% slower.
+
+RGBA4 weights through the f16 matmul need its scratch, which ae8aceb removed (60 MiB for LFM3, 48 for Qwen3.5). `f16ScratchMiB` (32) bounds it: a matrix bigger than that is dequantized and multiplied a group of its K-slices at a time (rows at a time if one slice doesn't fit: `Engine.f16Plan`), the scratch shaped for the fewest chunks. The logits are bit for bit the same. On the M3 the chunks cost what the f16 matmul saved (each waits on the last; within one page, alternating):
+
+| 535-token prompt (M3) | in place | f16, whole matrix | f16, 32 MiB chunks |
+|---|---|---|---|
+| LFM3 GGUF | 203 ms | 196 | 216 |
+| LFM3 GGUF, 2,048 tokens | 688 | 652 | 724–736 |
+| LFM3 ONNX | 176 | 164 | 177–178 |
+| Qwen3.5 GGUF | 318 | 308 | 326–333 |
+| Qwen3.5 ONNX | 204 | 187 | 200–201 |
+
+Smaller chunks cost more: LFM3 at 16 MiB 210 ms and 24 MiB 213, against 179 at 32 and 165 whole (row chunks rather than K-slices: 242 at 16 MiB); two scratch textures in turn (a chunk's dequantization not waiting on the last chunk's matmul) made no difference. So RGBA4 weights stay in place by default (TUNING.f16Matmul 1) and Engine.tune times the chunked f16 matmul against them on a full batch, keeping it where it's faster: the M3 keeps in place (the chunked f16 matmul timed 13–19% slower on 256-token batches, and within its noise on full ones). Byte weights, which have no in-place kernel, keep the whole matrix (`f16ScratchBytesMiB` 0; 32 MiB chunks: 180 vs 165 ms on the M3).
+
+Textures (M3, a 535-token prompt; LFM3 GGUF / Qwen3.5 GGUF, at load and the peak):
+
+| | LFM3 | Qwen3.5 |
+|---|---|---|
+| RGBA4 in place | 1,239 / 1,307 MiB | 1,487 / 1,542 |
+| RGBA4, f16 matmul in 32 MiB chunks | 1,271 / 1,339 | 1,519 / 1,574 |
+| RGBA4, f16 matmul, whole matrix | 1,299 / 1,367 | 1,535 / 1,590 |
+| bytes, f16Pack 0 (before) | 1,316 / 1,384 | 1,549 / 1,604 |
+| bytes, f16Pack 3 | 1,299 / 1,367 | 1,535 / 1,590 |
 
 ## Writing experiments that lost (Pixel 10 Pro, Oct 31)
 
