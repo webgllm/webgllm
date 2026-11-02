@@ -655,6 +655,7 @@ export class WebGlTextAdapter<
     const signal = chatOptions.abortController?.signal ?? (chatOptions.request as RequestInit | undefined)?.signal ?? undefined
     signal?.throwIfAborted()
     await waitForModel(this.model, this.contextLength, signal)
+    signal?.throwIfAborted()
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
       .concat(
@@ -682,7 +683,7 @@ export class WebGlTextAdapter<
     let raw = ""
     const thinkingSplitter = this.onThinking ? createThinkingSplitter() : undefined
     const addThinking = (pieces: Array<ReplyPiece>) => {
-      if (chatOptions.abortController?.signal.aborted) return
+      if (signal?.aborted) return
       for (const piece of pieces) {
         if (piece.kind === "thinking") this.onThinking?.(piece.text)
       }
@@ -690,6 +691,7 @@ export class WebGlTextAdapter<
     let next = await stream.next()
     try {
       while (!next.done) {
+        signal?.throwIfAborted()
         raw += next.value
         if (thinkingSplitter) addThinking(thinkingSplitter.push(next.value))
         next = await stream.next()
@@ -698,6 +700,7 @@ export class WebGlTextAdapter<
     } finally {
       if (!next.done) await stream.return({})
     }
+    signal?.throwIfAborted()
     if (next.value.failure) throw new Error(next.value.failure)
     const rawText = structuredAnswer(raw)
     const json = rawText.replace(/^```(?:json)?\s*|\s*```$/g, "")

@@ -170,7 +170,7 @@ test("aborted structured generations cannot publish later phases", { timeout: 10
     }, 0)
   }
   try {
-    await adapter.structuredOutput({
+    await assert.rejects(adapter.structuredOutput({
       chatOptions: {
         logger: resolveDebugOption(false),
         threadId: "adapter-test",
@@ -179,7 +179,7 @@ test("aborted structured generations cannot publish later phases", { timeout: 10
         abortController: controller
       },
       outputSchema: { type: "object" }
-    })
+    }), { name: "AbortError" })
     assert.deepEqual(phases, ["processing"])
     assert.deepEqual(thinking, ["before "], "aborted turns cannot append thinking text")
     assert.ok(FakeWorker.last?.posted.some((message) => message.type === "stop"))
@@ -446,4 +446,29 @@ test("invalid output caps reject before model loading", { timeout: 10_000 }, asy
     await assert.rejects(adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } }), /nonnegative safe integer/)
     assert.equal(FakeWorker.last, previous)
   }
+})
+
+test("request.signal abort blocks buffered thinking flush and rejects a late completion", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  unloadModel()
+  const controller = new AbortController()
+  const request = new Request("http://localhost", { signal: controller.signal })
+  const thoughts: string[] = []
+  const adapter = webglText(LFM3_GGUF, { onThinking: delta => thoughts.push(delta) })
+  FakeWorker.onGenerate = (worker, generation) => {
+    worker.send({ type: "token", id: generation.id, text: "<think>before</th" })
+    setTimeout(() => {
+      controller.abort()
+      worker.send({ type: "done", id: generation.id, stats: STATS })
+    }, 0)
+  }
+  try {
+    await assert.rejects(adapter.structuredOutput({ chatOptions: {
+      logger: resolveDebugOption(false), threadId: "cancel-buffered-thought", model: adapter.model,
+      messages: [{ role: "user", content: "Choose a move" }], request
+    }, outputSchema: { type: "object" } }), { name: "AbortError" })
+    assert.deepEqual(thoughts, ["before"], "cancelled flush must not publish a partial reasoning delimiter")
+    assert.ok(FakeWorker.last?.posted.some(message => message.type === "stop"))
+  } finally { FakeWorker.onGenerate = undefined; unloadModel() }
 })
