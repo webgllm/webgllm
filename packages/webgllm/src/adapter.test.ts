@@ -352,3 +352,52 @@ test("LFM3 variants without budget support reject active thinking caps before lo
   await assert.rejects(adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } }), /does not support a thinking token budget/)
   assert.equal(FakeWorker.last, previousWorker)
 })
+
+
+test("every WebGL model uses its recommended text sampling in both adapter paths", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { WEBGL_TEXT_MODELS } = await import("./model-meta.js")
+  const { unloadModel } = await import("./client.js")
+  const requests: Array<Extract<WorkerRequest, { type: "generate" }>> = []
+  FakeWorker.onGenerate = (worker, request) => {
+    requests.push(request)
+    worker.send({ type: "token", id: request.id, text: '{"ok":true}' })
+    worker.send({ type: "done", id: request.id, stats: STATS })
+  }
+  try {
+    for (const model of WEBGL_TEXT_MODELS) {
+      const qwen = model.includes("Qwen3.5")
+      const modes = qwen ? [undefined, false, true] : [undefined]
+      for (const thinking of modes) {
+        unloadModel()
+        const options: TextOptions<WebGlTextProviderOptions> = {
+          logger: resolveDebugOption(false), threadId: "model-defaults", model,
+          messages: [{ role: "user", content: "Hello" }],
+          ...(thinking !== undefined && { reasoning: { level: thinking ? "high" : "off", summary: true } })
+        }
+        const adapter = webglText(model)
+        await collect(adapter.chatStream(options))
+        await adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } })
+        const expected = qwen
+          ? { temperature: 1, top_k: 20, top_p: thinking ? 0.95 : 1, min_p: 0, presence_penalty: thinking ? 1.5 : 2, repetition_penalty: 1 }
+          : { temperature: model.includes("Thinking") ? 0.05 : 0.1, top_k: 50, repetition_penalty: model.includes("LFM3") ? 1.1 : 1.05 }
+        for (const request of requests.slice(-2)) {
+          assert.deepEqual(request.sampling, expected, `${model}, thinking=${thinking}`)
+          assert.equal(request.maxTokens, undefined, "no caller output cap is introduced")
+        }
+      }
+    }
+    unloadModel()
+    const adapter = webglText("unsloth/Qwen3.5-2B-GGUF")
+    await collect(adapter.chatStream({
+      logger: resolveDebugOption(false), threadId: "sampling-overrides", model: adapter.model,
+      messages: [{ role: "user", content: "Hello" }],
+      reasoning: { level: "high", summary: true },
+      modelOptions: { temperature: 0, top_k: 1, top_p: 0.8, min_p: 0.1, presence_penalty: 0, repetition_penalty: 1.2 }
+    }))
+    assert.deepEqual(requests.at(-1)?.sampling, { temperature: 0, top_k: 1, top_p: 0.8, min_p: 0.1, presence_penalty: 0, repetition_penalty: 1.2 })
+  } finally {
+    FakeWorker.onGenerate = undefined
+    unloadModel()
+  }
+})

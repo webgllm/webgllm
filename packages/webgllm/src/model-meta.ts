@@ -44,6 +44,8 @@ export type WebGlModelMeta = {
   /** Reasoning levels for `chat({ reasoning })`: the template's enable_thinking. */
   reasoning?: ModelReasoning
   sampling: Sampling
+  /** Recommended text sampling when the chat template enables thinking. */
+  thinkingSampling?: Sampling
   /** How the model writes tool calls: LFM3's when left out. */
   toolFormat?: ToolFormat
 }
@@ -241,12 +243,20 @@ const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
   thinking: true
 })
 
-/** Qwen3.5's generation config: temperature 0.6, top-k 20, top-p 0.95. */
+/** Qwen3.5-2B model card: non-thinking text recommendations (all our inputs are text). */
 const QWEN_3_5_SAMPLING = {
-  temperature: 0.6,
+  temperature: 1,
   top_k: 20,
-  top_p: 0.95,
+  top_p: 1,
+  min_p: 0,
+  presence_penalty: 2,
   repetition_penalty: 1
+} as const satisfies Sampling
+/** The same card's thinking text recommendations. */
+const QWEN_3_5_THINKING_SAMPLING = {
+  ...QWEN_3_5_SAMPLING,
+  top_p: 0.95,
+  presence_penalty: 1.5
 } as const satisfies Sampling
 
 const QWEN_3_5_2B_REPO = { repo: "Qwen/Qwen3.5-2B" }
@@ -273,6 +283,7 @@ const QWEN_3_5_2B_GGUF = {
   size: "2b",
   reasoning: THINKING_SWITCH,
   sampling: QWEN_3_5_SAMPLING,
+  thinkingSampling: QWEN_3_5_THINKING_SAMPLING,
   toolFormat: "qwen3.5"
 } as const satisfies WebGlModelMeta
 
@@ -304,6 +315,7 @@ const QWEN_3_5_2B_ONNX = {
   size: "2b",
   reasoning: THINKING_SWITCH,
   sampling: QWEN_3_5_SAMPLING,
+  thinkingSampling: QWEN_3_5_THINKING_SAMPLING,
   toolFormat: "qwen3.5"
 } as const satisfies WebGlModelMeta
 

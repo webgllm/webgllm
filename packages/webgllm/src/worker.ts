@@ -491,7 +491,7 @@ async function generate(request: GenerateRequest) {
   const greedy = sampling.temperature <= 0 || sampling.top_k === 1
   const onGpu = greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS)
   const sampler = createSampler(
-    onGpu ? { ...sampling, repetition_penalty: 1 } : sampling
+    onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
   if (onGpu) engine.setSeen(prompt, vocab)
   else sampler.see(prompt)
@@ -538,7 +538,7 @@ async function generate(request: GenerateRequest) {
   // forward meanwhile.
   const distribution = async (r: number, guess = false) => {
     if (greedy) {
-      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess)
+      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess, sampling.presence_penalty)
       if (guess && engine.guessing) guessed = engine.guessedToken
       return { ids: Int32Array.of(token), p: Float32Array.of(1) }
     }
@@ -547,7 +547,8 @@ async function generate(request: GenerateRequest) {
         r,
         sampling.top_k,
         sampling.repetition_penalty,
-        guess
+        guess,
+        sampling.presence_penalty
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       const d = sampler.distribution(logits)
@@ -570,7 +571,8 @@ async function generate(request: GenerateRequest) {
         rows,
         sampling.repetition_penalty,
         drafts,
-        guess
+        guess,
+        sampling.presence_penalty
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       return Array.from(tokens, (token) => ({
@@ -584,7 +586,9 @@ async function generate(request: GenerateRequest) {
       sampling.top_k,
       sampling.repetition_penalty,
       drafts,
-      guess
+      guess,
+      0,
+      sampling.presence_penalty
     )
     if (guess && engine.guessing) guessed = engine.guessedToken
     return picked.map(({ ids, logits }) => {
@@ -619,7 +623,7 @@ async function generate(request: GenerateRequest) {
     if (t === eos) return false
     thinkingBudget?.observe(t)
     if (onGpu) engine.markSeen(t)
-    else sampler.see([t])
+    else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
     const text = decoder.push(t)

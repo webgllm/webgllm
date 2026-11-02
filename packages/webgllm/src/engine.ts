@@ -658,7 +658,7 @@ export class Engine {
         OUT_WIDTH,
         Math.ceil(c.vocabSize / 4 / OUT_WIDTH) * SPLIT_ROWS
       ),
-      /** Per token: 0, 1 seen (repetition penalty), 2 never drawn. Same rows as the logits. */
+      /** Per token: 0 unseen, 1 prompt, 2 never drawn, 3 generated. Same rows as the logits. */
       mask: this.gpu.texture(
         GL.R8UI,
         OUT_WIDTH * 4,
@@ -3075,8 +3075,8 @@ export class Engine {
   /** Adds one token to those the repetition penalty applies to. */
   markSeen(token: number) {
     const data = this.maskData
-    if (!data || data[token] !== 0) return
-    data[token] = 1
+    if (!data || data[token] === 2 || data[token] === 3) return
+    data[token] = 3
     const width = this.buffers.mask.width
     this.gpu.write(
       this.buffers.mask,
@@ -3100,9 +3100,10 @@ export class Engine {
     row: number,
     chunks: number,
     penalty: number,
-    guess = false
+    guess = false,
+    presencePenalty = 0
   ): Promise<{ ids: Int32Array; logits: Float32Array }> {
-    return (await this.pick(row, 1, chunks, penalty, [], guess))[0]
+    return (await this.pick(row, 1, chunks, penalty, [], guess, 0, presencePenalty))[0]
   }
 
   private greedyOut: Texture | null = null
@@ -3119,7 +3120,8 @@ export class Engine {
     rows: number,
     penalty: number,
     drafts: Array<number>,
-    guess = false
+    guess = false,
+    presencePenalty = 0
   ): Promise<Int32Array> {
     const c = this.config
     const b = this.buffers
@@ -3129,6 +3131,7 @@ export class Engine {
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
@@ -3196,7 +3199,8 @@ export class Engine {
     penalty: number,
     drafts: Array<number>,
     guess = false,
-    penaltyRow0 = 0
+    penaltyRow0 = 0,
+    presencePenalty = 0
   ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
@@ -3210,6 +3214,7 @@ export class Engine {
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },

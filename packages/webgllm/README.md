@@ -21,7 +21,7 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 ## Models
 
-`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; Qwen3.5: temperature 0.6, top-k 20, top-p 0.95).
+`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; LFM2.5 Instruct/350M: temperature 0.1, top-k 50, repetition penalty 1.05; LFM2.5 Thinking: temperature 0.05, top-k 50, repetition penalty 1.05; Qwen3.5 text: temperature 1, top-k 20, top-p 1 and presence penalty 2 without thinking, top-p 0.95 and presence penalty 1.5 with thinking).
 
 | Model                            | Weights                                                       | Download |
 | -------------------------------- | ------------------------------------------------------------- | -------- |
@@ -31,6 +31,8 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 | `unsloth/Qwen3.5-2B-GGUF`        | unsloth's Q4_0 GGUF (its few Q4_1 and Q5_K matrices as 8-bit) | 1.21 GB  |
 
 LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
+
+Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. Omitting `max_new_tokens` uses the worker's existing 4,096-token ceiling, bounded by remaining context.
 
 ### Thinking budget
 

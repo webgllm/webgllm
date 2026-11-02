@@ -7,6 +7,10 @@ export type Sampling = {
   repetition_penalty: number
   /** Nucleus sampling: the likeliest tokens up to this probability. */
   top_p?: number
+  /** Minimum probability relative to the most likely token; zero disables it. */
+  min_p?: number
+  /** Subtract once for tokens generated in this reply (not prompt-only tokens). */
+  presence_penalty?: number
 }
 
 /**
@@ -18,13 +22,19 @@ export function createSampler({
   temperature,
   top_k,
   repetition_penalty,
-  top_p = 1
+  top_p = 1,
+  min_p = 0,
+  presence_penalty = 0
 }: Sampling) {
   const seen = new Set<number>()
+  const generated = new Set<number>()
   return {
     /** Tokens to penalize from now on: the prompt, then each one drawn. */
-    see(tokens: Iterable<number>) {
-      for (const t of tokens) seen.add(t)
+    see(tokens: Iterable<number>, output = false) {
+      for (const t of tokens) {
+        seen.add(t)
+        if (output) generated.add(t)
+      }
     },
     /**
      * The distribution the next token is drawn from: the kept tokens
@@ -39,6 +49,9 @@ export function createSampler({
           logits[token] =
             x < 0 ? x * repetition_penalty : x / repetition_penalty
         }
+      }
+      if (presence_penalty !== 0) {
+        for (const token of generated) logits[token] -= presence_penalty
       }
       const k = Math.max(
         1,
@@ -74,6 +87,15 @@ export function createSampler({
       for (let j = 0; j < k; j++) {
         kept[j] = Math.exp((kept[j] - max) / temperature)
         total += kept[j]
+      }
+      if (min_p > 0) {
+        // Softmax weights are relative to the largest logit, whose weight is 1.
+        for (let j = 0; j < k; j++) {
+          if (kept[j] < min_p) {
+            total -= kept[j]
+            kept[j] = 0
+          }
+        }
       }
       if (top_p < 1) {
         const order = Array.from({ length: k }, (_, j) => j).sort(

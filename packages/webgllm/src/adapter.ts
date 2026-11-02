@@ -311,16 +311,22 @@ export class WebGlTextAdapter<
   }
 
   private sampling(
-    modelOptions: WebGlTextProviderOptions | undefined
+    modelOptions: WebGlTextProviderOptions | undefined,
+    thinking: boolean | undefined
   ): Sampling {
-    const base = modelMeta(this.model).sampling
+    const meta = modelMeta(this.model)
+    const base = thinking ? meta.thinkingSampling ?? meta.sampling : meta.sampling
     const top_p = modelOptions?.top_p ?? base.top_p
+    const min_p = modelOptions?.min_p ?? base.min_p
+    const presence_penalty = modelOptions?.presence_penalty ?? base.presence_penalty
     return {
       temperature: modelOptions?.temperature ?? base.temperature,
       top_k: modelOptions?.top_k ?? base.top_k,
       repetition_penalty:
         modelOptions?.repetition_penalty ?? base.repetition_penalty,
-      ...(top_p !== undefined && { top_p })
+      ...(top_p !== undefined && { top_p }),
+      ...(min_p !== undefined && { min_p }),
+      ...(presence_penalty !== undefined && { presence_penalty })
     }
   }
 
@@ -459,7 +465,7 @@ export class WebGlTextAdapter<
       chat,
       tools: toTools(options.tools),
       ...thinking,
-      sampling: this.sampling(options.modelOptions),
+      sampling: this.sampling(options.modelOptions, thinking.thinking),
       maxTokens: options.modelOptions?.max_new_tokens,
       speculative: options.modelOptions?.speculative,
       pipeline: options.modelOptions?.pipeline,
@@ -573,7 +579,7 @@ export class WebGlTextAdapter<
       ],
       tools: [],
       ...thinking,
-      sampling: this.sampling(chatOptions.modelOptions),
+      sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
       maxTokens: chatOptions.modelOptions?.max_new_tokens,
       speculative: chatOptions.modelOptions?.speculative,
       pipeline: chatOptions.modelOptions?.pipeline,
