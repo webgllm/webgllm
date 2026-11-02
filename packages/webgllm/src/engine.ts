@@ -217,6 +217,11 @@ export const TUNING = {
    */
   f16ScratchMiB: 32,
   /**
+   * Engine.tune times the f16 matmul's choices on full prompt batches
+   * through this many layers (0: all of them).
+   */
+  tuneLayers: 8,
+  /**
    * The same for byte weights, whose prompts have no in-place kernel:
    * 0, the whole matrix, as they always had.
    */
@@ -1081,7 +1086,10 @@ export class Engine {
    * turn, the order reversed in the second round, best of 2. Call after warmUp; returns what it picked, or null (choices
    * unchanged) if `stop` said to stop first.
    */
-  async tune(stop: () => boolean = () => false): Promise<Tuned | null> {
+  async tune(
+    stop: () => boolean = () => false,
+    options: { keepCache?: boolean } = {}
+  ): Promise<Tuned | null> {
     const before = { ...this.tuned }
     this.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
     const b = this.buffers
@@ -1102,11 +1110,28 @@ export class Engine {
       this.matmul(b.normed, ffn.gateUp, b.gateUp, rows)
       this.matmul(b.act, ffn.down, b.ffnOut, rows)
     }
+    // A full prompt batch through the first TUNING.tuneLayers layers, every
+    // pass as a prompt runs them (synthetic tokens, the cache reset
+    // before each): what the f16 matmul's choices change isn't only the
+    // matmuls (see the f16 choices below).
+    const tokens = Array.from({ length: Math.min(this.batchSize, this.capacity) }, (_, i) => 1000 + (i % 5000))
+    let forwards = false
+    const forward = async () => {
+      forwards = true
+      const all = this.layers
+      if (TUNING.tuneLayers > 0) this.layers = all.slice(0, TUNING.tuneLayers)
+      try {
+        this.reset()
+        await this.forwardHidden(tokens)
+      } finally {
+        this.layers = all
+      }
+    }
     class Stopped extends Error {}
     const choose = async (
       key: keyof Tuned,
       candidates: Array<number>,
-      rows: number
+      sample: () => unknown
     ): Promise<number | null> => {
       // The alternatives once untimed (first use costs more; the warm-up
       // already ran TUNING's), and TUNING's timed once: each sample repeats
@@ -1115,20 +1140,20 @@ export class Engine {
       if (stop()) throw new Stopped()
       for (let c = 1; c < candidates.length; c++) {
         this.tuned[key] = candidates[c]
-        run(rows)
+        await sample()
       }
       this.tuned[key] = candidates[0]
       await this.gpu.finish()
       if (stop()) throw new Stopped()
       const t0 = performance.now()
-      run(rows)
+      await sample()
       await this.gpu.finish()
       const reps = Math.max(1, Math.min(16, Math.ceil(25 / (performance.now() - t0))))
       // An idle GPU clocks down: busy it ~100 ms first, so the clock has
       // come up before anything is timed.
       for (const start = performance.now(); performance.now() - start < 100; ) {
         if (stop()) throw new Stopped()
-        for (let r = 0; r < reps; r++) run(rows)
+        for (let r = 0; r < reps; r++) await sample()
         await this.gpu.finish()
       }
       const rounds = candidates.map((): Array<number> => [])
@@ -1140,7 +1165,7 @@ export class Engine {
           this.tuned[key] = candidates[c]
           await this.gpu.finish()
           const t = performance.now()
-          for (let r = 0; r < reps; r++) run(rows)
+          for (let r = 0; r < reps; r++) await sample()
           await this.gpu.finish()
           rounds[c].push(performance.now() - t)
         }
@@ -1159,38 +1184,42 @@ export class Engine {
     }
     let picked: Tuned
     try {
+      const short = Math.min(40, this.capacity)
       const shortSplit = await choose(
         "shortSplit",
         [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
-        Math.min(40, this.capacity)
+        () => run(short)
       )
-      // Then, each on a full batch (the f16 matmul dequantizes each matrix
-      // once a batch, so a shorter one would weigh that more than prompts
-      // do), the picks so far in place: RGBA4 weights through the f16
-      // matmul or in place, then how the f16 matmul reads, wherever
-      // prompts take it.
       this.tuned.shortSplit = shortSplit
+      // Then, with the picks so far in place, RGBA4 weights through the
+      // f16 matmul or in place, then how the f16 matmul reads (wherever
+      // prompts take it), each timed on full prompt batches through the
+      // first layers, not a layer's matmuls alone: an iPhone 16 Pro Max
+      // reads whole prompts 16% faster through the f16 matmul, but its
+      // matmuls timed back to back come out even, as each dequantization
+      // then waits on the matmul before it rather than filling the gaps
+      // between a prompt's small dependent passes. Forwards need the cache:
+      // if the caller keeps something in it (`keepCache`), these choices
+      // are left for another time (undefined).
       const quad = this.quadMatmuls && TUNING.quad > 0
-      const batch = Math.min(this.batchSize, this.capacity)
-      const f16Matmul =
-        quad &&
-        TUNING.f16Matmul > 0 &&
-        this.f16Mats().some((m) => m.rgba4) &&
-        this.f16Sized()
-          ? await choose("f16Matmul", [TUNING.f16Matmul, TUNING.f16Matmul > 1 ? 1 : 2], batch)
-          : null
-      this.tuned.f16Matmul = f16Matmul
-      const f16Pack =
-        quad && this.usesF16() && this.f16Scratch()
-          ? await choose(
-              "f16Pack",
-              [TUNING.f16Pack & 3, (TUNING.f16Pack & 3) === 3 ? 0 : 3],
-              batch
-            )
-          : null
+      const free = !options.keepCache
+      let f16Matmul: number | null | undefined = null
+      let f16Pack: number | null | undefined = null
+      if (quad && TUNING.f16Matmul > 0 && this.f16Mats().some((m) => m.rgba4) && this.f16Sized())
+        f16Matmul = free
+          ? await choose("f16Matmul", [TUNING.f16Matmul, TUNING.f16Matmul > 1 ? 1 : 2], forward)
+          : undefined
+      this.tuned.f16Matmul = f16Matmul ?? null
+      if (quad && this.usesF16() && this.f16Scratch())
+        f16Pack = free
+          ? await choose("f16Pack", [TUNING.f16Pack & 3, (TUNING.f16Pack & 3) === 3 ? 0 : 3], forward)
+          : undefined
       picked = { shortSplit, f16Matmul, f16Pack }
+      if (forwards) this.reset()
     } catch (error) {
       this.tuned = before
+      // (A forward stopped part way leaves its batch in the cache.)
+      if (forwards) this.reset()
       this.f16Trim()
       if (error instanceof Stopped) return null
       throw error

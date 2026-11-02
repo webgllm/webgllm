@@ -1537,6 +1537,25 @@ async function smoke(params: {
   // Sweeps: ?sweep=knob:v1,v2,…;knob2:… times each value of each knob
   // (others at their defaults) on the prompt, its first 40 tokens, and
   // writing (GPU time of 16 queued steps), rounds interleaved, medians.
+  // ?tuneab=knob:a,b: Engine.tune run with each value of a TUNING knob in
+  // turn, 3 rounds, printing what it picked and measured each time.
+  const tuneab = (params as { tuneab?: string }).tuneab
+  if (tuneab) {
+    const T = TUNING as Record<string, number>
+    const [knob, list] = tuneab.split(":")
+    const original = T[knob]
+    for (let round = 0; round < 3; round++)
+      for (const v of list.split(",").map(Number)) {
+        T[knob] = v
+        const t = performance.now()
+        const picked = await engine.tune()
+        log(
+          `TUNEAB ${knob}=${v} (round ${round + 1}, ${(performance.now() - t).toFixed(0)} ms): ${JSON.stringify({ ...picked, ...engine.tuneReport })}`
+        )
+      }
+    T[knob] = original
+    engine.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null }
+  }
   if (params.sweep) {
     const T = TUNING as Record<string, number>
     const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
