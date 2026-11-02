@@ -306,6 +306,7 @@ async function load(
     for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
+    timings.tunedF16Pack = engine.tuned.f16Pack ?? -1
     // Attention against the CPU's (and Qwen3.5's chunked recurrence against
     // a token at a time): a GPU whose compiler gets a kernel wrong
     // tries again with the simplest passes, then says so (not gibberish).

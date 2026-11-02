@@ -92,6 +92,28 @@ How fast the GPU streams a 64 MiB texture through texelFetch, by texel size (RGB
 
 `?batch=512&only=LFM3`: matmul layouts on the model's shapes (random weights; each timed draw's output gets read, so PowerVR can't skip it). On the Pixel the engine's RGBA4, 4-tokens-per-fragment prompt layout is fastest (~285 GFLOP/s); byte and word texels unpacked in the shader are 10–25% slower.
 
+`&pick=<regex>` runs only the variants whose label matches (from `w=…`, `tile …` or `PURE …`), three passes over the list so a shared GPU slows each alike: e.g. `pick=^(w=rgba4 a=h2 T=4|PURE 4x4 acts (f16|h2) w (f16|h2))$`.
+
+## Prompt matmul experiments on Apple (M3 Ultra, Nov 1)
+
+Where a prompt's time goes (`check.html?smoke=1&len=1024&batch=512&skip=…&alternate=1`, LFM3 GGUF on RGBA4): matmuls 81%, attention (attend, scores) 6%, the adds 4%, conv 4%, norms 6%, heads 3%. Then `mm2.html?batch=512&only=LFM3&pick=…` on the 4-token RGBA4 kernel (gate|up as 2 K-slices 2.6–2.7 ms, down as 4 K-slices 1.7 ms):
+
+- It isn't bound by its arithmetic: no activation sums (wrong results, timing only) is 3% faster, centered weights, mediump and each h2 texel fetched once for both halves are the same speed.
+- Nor by weight fetches alone or activation fetches alone: one weight texel used for all 4 rows (a quarter of the weight fetches) or one token's activations for all 4 tokens are no faster; both at once are 1.6× faster. The transposed output (fragment x a token group) is the same speed.
+- So bigger tiles would pay, but every kernel with more than 4 rows × 4 tokens' live state falls off a cliff on this compiler: 4 rows × 6 tokens (3 outputs) 7× slower, 4×8 and 8×4 8–10×, the same with their sums added into 2 outputs (so it isn't the 64 bytes of outputs), with the scale folded into each weight as it's read (no per-block sums) 8×, and with the K steps in a loop that can't unroll still 3–4×. 8 rows × 2 tokens: 1.4× slower. The 4×4 tile is the one that fits.
+- The block's activation sums read from a texture rather than added up: 2× slower. Byte weights (RGBA8, split in the shader) with fewer values live: still 6× slower.
+
+What does pay is the f16 matmul reading h2 texels (TUNING.f16Pack 3): its dequantized weights written as h2 (8 halves a texel, half the fragments in the dequantization) and its activations read straight from their h2 tensor (no RGBA16F copy, a pass fewer a matmul): half the fetches for the same bytes. `PURE 4x4 acts h2 w h2` against `acts f16 w f16`: gate|up 2.56 vs 3.37 ms, down 1.61 vs 1.84; against the in-place RGBA4 kernel 2.75 and 1.73. In the engine, the same logits (`LOGITS HASH` unchanged on GGUF weights; ONNX KL ≤1.5e-5, rounding of the zero points), and on byte weights (`tune=layerRgba4:0`, 5 rounds alternating, medians):
+
+| | 535-token prompt, f16Pack 0 → 3 | 2,048 | 40 |
+|---|---|---|---|
+| LFM3 GGUF | 203.8 → 188.9 ms (−7%) | 717 → 693 (−3%) | 73.9 → 61.9 |
+| LFM3 ONNX | 181.8 → 165.7 (−9%) | 1,209 → 1,136 (−6%) | 60.9 → 53.1 |
+| Qwen3.5 ONNX | 204.6 → 195.7 (−4%) | 1,007 → 900 (−11%) | 66.2 → 59.3 |
+| Qwen3.5 GGUF | 260.3 → 249.7 (−4%) | 1,956 → 1,821 (−7%) | 101.1 → 96.1 |
+
+Writing doesn't use it. RGBA4 weights through the f16 matmul (`f16Matmul:2`) with f16Pack 3 read LFM3's 535-token prompt in 163 ms against 179 in place (−9%), for the f16 scratch's 60 MiB. The engine keeps TUNING.f16Pack 0 and lets Engine.tune pick 3 where it's faster on the GPU (only where prompts take the f16 matmul: byte weights, as on PowerVR), since PowerVR's 16-byte texels stream slowest (`bandwidth.html`) and its unpackHalf2x16 costs ALU there.
+
 ## Writing experiments that lost (Pixel 10 Pro, Oct 31)
 
 - gate|up and SwiGLU in one pass with no K-split (576 fragments for the 350M, each over all of K): 3× slower on the Pixel and 1.8× on an M3. Writing passes need thousands of fragments; a pass fewer doesn't pay for that.

@@ -195,6 +195,15 @@ export const TUNING = {
    * precision, less exact); options.matmulPrecision "mediump" turns it on.
    */
   f16Half: 0,
+  /**
+   * How the f16 matmul reads (see matmulF16's `packed`), as bits: 1 the
+   * activations straight from their h2 tensor, 8 halves a fetch, with no
+   * RGBA16F copy (one pass and its scratch fewer); 2 the dequantized
+   * weights as h2 too (the same bytes in half the fetches); 0: both as
+   * RGBA16F, 4 values a fetch. Engine.tune times 3 against this on a GPU
+   * whose prompts take the f16 matmul, and keeps it where it's faster.
+   */
+  f16Pack: 0,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
   /** ...and at most this many (readers add them up). */
@@ -288,7 +297,7 @@ export const TUNING = {
 type HeadOut = { logits: Texture; split: number; stride: number }
 
 /** See Engine.tuned. */
-export type Tuned = { shortSplit: number | null }
+export type Tuned = { shortSplit: number | null; f16Pack?: number | null }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
 type Snapshot = {
@@ -964,8 +973,10 @@ export class Engine {
    * from an earlier load. (Full batches' slice size isn't tuned: timed
    * alone, their matmuls show no steady difference, though a whole prompt
    * on an M3 does; timing whole prompts would take seconds on a phone.)
+   * `f16Pack`: how the f16 prompt matmul reads (TUNING.f16Pack), where
+   * prompts take it (byte-texel weights, as on PowerVR).
    */
-  tuned: Tuned = { shortSplit: null }
+  tuned: Tuned = { shortSplit: null, f16Pack: null }
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -981,7 +992,7 @@ export class Engine {
    */
   async tune(stop: () => boolean = () => false): Promise<Tuned | null> {
     const before = { ...this.tuned }
-    this.tuned = { shortSplit: null }
+    this.tuned = { shortSplit: null, f16Pack: null }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
     // an attention block's (the first of each kind), one feed-forward's.
@@ -1057,19 +1068,32 @@ export class Engine {
     }
     let picked: Tuned
     try {
-      picked = {
-        shortSplit: await choose(
-          "shortSplit",
-          [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
-          Math.min(40, this.capacity)
-        )
-      }
+      const shortSplit = await choose(
+        "shortSplit",
+        [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
+        Math.min(40, this.capacity)
+      )
+      // h2 reads for the f16 matmul, where prompts take it: timed on a
+      // 256-token batch (its dequantization weighs a little more than in a
+      // full one), with shortSplit's pick in place.
+      this.tuned.shortSplit = shortSplit
+      const f16Pack =
+        this.quadMatmuls && TUNING.quad > 0 && this.f16Scratch()
+          ? await choose(
+              "f16Pack",
+              [TUNING.f16Pack & 3, (TUNING.f16Pack & 3) === 3 ? 0 : 3],
+              Math.min(256, this.capacity)
+            )
+          : null
+      picked = { shortSplit, f16Pack }
     } catch (error) {
       this.tuned = before
+      this.f16Trim()
       if (error instanceof Stopped) return null
       throw error
     }
     this.tuned = picked
+    this.f16Trim()
     return picked
   }
 
@@ -1816,6 +1840,9 @@ export class Engine {
   async warmUp(options: { shortOnly?: boolean } = {}) {
     // (`shortOnly`: just a short batch, for programs a new Engine.tune pick
     // reads with; it resets the cache like the rest.)
+    // The f16 scratch as a remembered tuned f16Pack reads it (the load made
+    // TUNING's).
+    if (this.quadMatmuls && this.f16Scratch()) this.f16Trim()
     // Every program a layer compiles is shared by the layers of its kind:
     // the warm-up reads through the first and last layers (their own
     // variants: folded embedding, last-row tail) and one of each other
@@ -2019,13 +2046,26 @@ export class Engine {
 
   /**
    * The f16 prompt matmul's scratch: one matrix's dequantized weights (rows
-   * wrapped into columns uHd tall) and the activations as RGBA16F, in two
-   * textures used in turn (a matmul's conversion needn't wait for the last
-   * matmul's reads). Null until made; false where RGBA16F can't be drawn
-   * into.
+   * wrapped into columns uHd tall: RGBA16F, or h2 with TUNING.f16Pack's
+   * bit 2) and, unless it reads them as h2 (bit 1), the activations as
+   * RGBA16F, in two textures used in turn (a matmul's conversion needn't
+   * wait for the last matmul's reads). Each texture is made when first
+   * needed (a sweep can change f16Pack). Null until sized; false where
+   * there are no such matrices or no column height fits.
    */
   private f16:
-    | { w: Texture; a: [Texture, Texture]; hd: number; next: number }
+    | {
+        hd: number
+        /** The weights' width in RGBA16F texels (h2: half). */
+        width: number
+        kMax: number
+        w?: Texture
+        wh2?: Texture
+        a?: [Texture, Texture]
+        /** Whether RGBA16F can be drawn into (asked when first needed). */
+        halfRenders?: boolean
+        next: number
+      }
     | null
     | false = null
 
@@ -2055,9 +2095,52 @@ export class Engine {
       .filter((m): m is GpuMatrix => !!m && this.takesF16(m))
   }
 
+  /** How the f16 matmul reads: this GPU's tuned choice, else TUNING.f16Pack. */
+  private f16Pack() {
+    return (this.tuned.f16Pack ?? TUNING.f16Pack) & 3
+  }
+
+  /** Frees the f16 scratch textures the current f16Pack doesn't use. */
+  private f16Trim() {
+    const f = this.f16
+    if (!f) return
+    const pack = this.f16Pack()
+    if (pack & 2 && f.w) {
+      this.gpu.delete(f.w)
+      f.w = undefined
+    }
+    if (!(pack & 2) && f.wh2) {
+      this.gpu.delete(f.wh2)
+      f.wh2 = undefined
+    }
+    if (pack & 1 && f.a) {
+      for (const t of f.a) this.gpu.delete(t)
+      f.a = undefined
+    }
+  }
+
+  /**
+   * The f16 scratch, its textures for f16Pack made; false if it needs
+   * RGBA16F where that can't be drawn into.
+   */
   private f16Scratch() {
+    const f = this.f16Sized()
+    if (!f) return false
+    const pack = this.f16Pack()
+    // (canRender draws and reads back: asked once, not every matmul.)
+    if ((pack & 3) !== 3 && !(f.halfRenders ??= this.gpu.canRender([GL.RGBA16F])))
+      return false
+    if (pack & 2) f.wh2 ??= this.gpu.texture(GL.RGBA32UI, f.width / 2, f.hd)
+    else f.w ??= this.gpu.texture(GL.RGBA16F, f.width, f.hd)
+    if (!(pack & 1))
+      f.a ??= [0, 1].map(() =>
+        this.gpu.texture(GL.RGBA16F, f.kMax / 4, this.capacity)
+      ) as [Texture, Texture]
+    return f
+  }
+
+  private f16Sized() {
     if (this.f16 !== null) return this.f16
-    if (!this.gpu.canRender([GL.RGBA16F])) return (this.f16 = false)
     const mats = this.f16Mats()
     if (mats.length === 0) return (this.f16 = false)
     const max = this.gpu.limits.maxTextureSize
@@ -2069,13 +2152,11 @@ export class Engine {
         best = { hd, width }
     }
     if (!best) return (this.f16 = false)
-    const kMax = Math.max(...mats.map((m) => m.K))
+    // (Every K is whole blocks, so widths are even: h2 halves them exactly.)
     this.f16 = {
-      w: this.gpu.texture(GL.RGBA16F, best.width, best.hd),
-      a: [0, 1].map(() =>
-        this.gpu.texture(GL.RGBA16F, kMax / 4, this.capacity)
-      ) as [Texture, Texture],
       hd: best.hd,
+      width: best.width,
+      kMax: Math.max(...mats.map((m) => m.K)),
       next: 0
     }
     return this.f16
@@ -2124,18 +2205,24 @@ export class Engine {
           : false
       if (f) {
         const kq = w.K / 4
-        const fa = f.a[f.next]
-        f.next ^= 1
+        const pack = this.f16Pack()
+        const h2W = (pack & 2) !== 0
+        const wOut = h2W ? f.wh2 : f.w
+        if (!wOut) throw new GpuError("The f16 matmul's scratch is missing.")
         this.gpu.run({
           name: "dequant",
           program: this.gpu.program(
             w.rgba4
-              ? this.scalesOf(w, K.dequantRgba4({ zeros: !!w.zeros || w.packed }))
+              ? this.scalesOf(
+                  w,
+                  K.dequantRgba4({ zeros: !!w.zeros || w.packed, h2: h2W })
+                )
               : K.dequantBytes({
                   zeros: !!w.zeros,
                   words: !w.bytes,
                   unorm: w.unorm,
-                  packed: w.packed
+                  packed: w.packed,
+                  h2: h2W
                 })
           ),
           inputs: {
@@ -2151,36 +2238,44 @@ export class Engine {
             uHd: { int: f.hd },
             uN: { int: w.N }
           },
-          output: f.w,
+          output: wOut,
           rect: {
             x: 0,
             y: 0,
-            width: Math.ceil(w.N / f.hd) * kq,
+            width: (Math.ceil(w.N / f.hd) * kq) / (h2W ? 2 : 1),
             height: Math.min(f.hd, w.N)
           },
-          work: 3
+          work: h2W ? 6 : 3
         })
-        this.gpu.run({
-          name: "dequant",
-          program: this.gpu.program(K.H2_TO_F16),
-          inputs: { uA: a },
-          output: fa,
-          rect: {
-            x: 0,
-            y: 0,
-            width: kq,
-            height: Math.min(quadRows * 4, fa.height)
-          }
-        })
+        // The activations as RGBA16F, unless the matmul reads their h2.
+        let fa = a
+        if (!(pack & 1)) {
+          if (!f.a) throw new GpuError("The f16 matmul's scratch is missing.")
+          fa = f.a[f.next]
+          f.next ^= 1
+          this.gpu.run({
+            name: "dequant",
+            program: this.gpu.program(K.H2_TO_F16),
+            inputs: { uA: a },
+            output: fa,
+            rect: {
+              x: 0,
+              y: 0,
+              width: kq,
+              height: Math.min(quadRows * 4, fa.height)
+            }
+          })
+        }
         const kqSlice = kbSlice * 8
         this.gpu.run({
           name: "matmul",
           program: this.gpu.program(
             K.matmulF16({
-              half: TUNING.f16Half > 0 || this.precision === "mediump"
+              half: TUNING.f16Half > 0 || this.precision === "mediump",
+              packed: pack
             })
           ),
-          inputs: { uW: f.w, uA: fa },
+          inputs: { uW: wOut, uA: fa },
           uniforms: {
             uKq: { int: kq },
             uHd: { int: f.hd },
