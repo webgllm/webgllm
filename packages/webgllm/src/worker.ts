@@ -66,6 +66,8 @@ type Loaded = {
    * (see tuneWhenIdle), then its picks join this note.
    */
   untuned?: { key: string; note: GpuNote }
+  /** The last tuning left choices for an empty cache (tried again once it's empty). */
+  tunedPartly?: boolean
 }
 
 let current: Loaded | null = null
@@ -334,7 +336,9 @@ async function load(
       release(engine)
       return await load(model, signal, contextLength, true)
     }
-    const base = fresh ?? (note?.tuned ? null : note)
+    // (A note whose tuning left choices for later is tuned again.)
+    const tunedAll = note?.tuned && "f16Matmul" in note.tuned && "f16Pack" in note.tuned
+    const base = fresh ?? (tunedAll ? null : note)
     // What it took, in place of the estimate.
     await claimMemory(model, engine.gpu.bytes)
     if (signal.aborted) throw new Superseded()
@@ -781,14 +785,21 @@ function tuneWhenIdle() {
   const loaded = current
   const untuned = loaded?.untuned
   if (!loaded || !untuned || tuning || pending > 0) return
+  if (loaded.tunedPartly && loaded.cached.length > 0) return
   tuning = (async () => {
-    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded)
+    // (Its prompt-batch timings reset the cache: not while it holds a chat.)
+    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded, {
+      keepCache: loaded.cached.length > 0
+    })
     post({
       type: "log",
       text: `tuned in the background: ${picked ? JSON.stringify({ ...picked, ...loaded.engine.tuneReport }) : "stopped for a request"}`
     })
     if (!picked || current !== loaded) return
-    loaded.untuned = undefined
+    // Choices left for an empty cache (undefined) are tried again then.
+    const complete = picked.f16Matmul !== undefined && picked.f16Pack !== undefined
+    if (complete) loaded.untuned = undefined
+    else loaded.tunedPartly = true
     // A new pick reads short batches' results with programs the warm-up
     // didn't compile: compiled now while the cache is empty (else on the
     // first short prompt).
