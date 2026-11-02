@@ -788,6 +788,8 @@ async function smoke(params: {
   texels?: "bytes" | "words"
   ab?: string
   abDecode?: string
+  /** knob:a,b: attention's passes alone from a cache of decodeAt tokens, values alternating. */
+  attnab?: string
   sweep?: string
   /** abDecode's and sweep's rounds, times this (a busy GPU: more rounds). */
   rounds?: number
@@ -930,6 +932,74 @@ async function smoke(params: {
       log(
         `LAYOUT ${c.layout} (writing matmul: RGBA4 ${c.rgba4Ms.toFixed(3)} ms, bytes ${c.bytesMs.toFixed(3)} ms)`
       )
+  }
+  // Attention alone: ?attnab=knob:a,b,…&decodeAt=N reads N tokens, then
+  // times one writing token's attention passes (every attention layer's)
+  // at 64, 512, 2,048 and N cached tokens, values alternating. Variants of
+  // several knobs: attnab=default|knob:v,knob2:v|…; skip:name leaves out
+  // passes of that name.
+  if (params.attnab) {
+    const spec = params.attnab
+    const variants: Array<Array<[string, string]>> = spec.includes("|")
+      ? spec.split("|").map((v) =>
+          v === "default" ? [] : v.split(",").map((kv) => kv.split(":") as [string, string])
+        )
+      : (() => {
+          const [knob, list] = spec.split(":")
+          return list.split(",").map((v): Array<[string, string]> => [[knob, v]])
+        })()
+    const labels = variants.map((v) => v.map(([k, x]) => `${k}=${x}`).join(",") || "default")
+    const T = TUNING as Record<string, number>
+    const saved = { ...T }
+    const at = params.decodeAt ?? 2048
+    const tokens = Array.from({ length: at }, (_, i) => 1000 + (i % 5000))
+    engine.reset()
+    await engine.forward(tokens)
+    engine.snapshot()
+    type Internals = {
+      layers: Array<{ type: string; attention?: unknown }>
+      buffers: { qkvg: unknown }
+      attention(layer: unknown, type: string, rows: number, pos0: number, split: number, qkvgIn: unknown): Promise<void>
+    }
+    const e = engine as unknown as Internals
+    const attn = e.layers.filter((l) => l.attention)
+    // One token's attention in every attention layer (nothing else of the
+    // step: no matmuls, no heads), `reps` times queued, one wait.
+    const reps = 32
+    const timeOne = async (n: number, pos: number) => {
+      Object.assign(T, saved)
+      engine.gpu.skip = new Set()
+      for (const [k, x] of variants[n]) {
+        if (k === "skip") engine.gpu.skip = new Set([x])
+        else T[k] = Number(x)
+      }
+      await engine.gpu.finish()
+      const t = performance.now()
+      for (let r = 0; r < reps; r++)
+        for (const l of attn) await e.attention(l.attention, l.type, 1, pos, 0, e.buffers.qkvg)
+      await engine.gpu.finish()
+      return (performance.now() - t) / reps
+    }
+    const med = (xs: Array<number>) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)]
+    const attnAt = (params as { attnAt?: string }).attnAt
+    const positions = attnAt
+      ? attnAt.split(",").map(Number).filter((p) => p <= at)
+      : [...new Set([64, 512, 1024, 2048, at].filter((p) => p <= at))]
+    const rounds = Number((params as { rounds?: string }).rounds ?? 12)
+    const order = variants.map((_, n) => n)
+    for (const pos of positions) {
+      const runs = variants.map(() => [] as Array<number>)
+      for (const n of order) await timeOne(n, pos)
+      for (let round = 0; round < rounds; round++)
+        for (const n of round % 2 ? [...order].reverse() : order) runs[n].push(await timeOne(n, pos))
+      log(
+        `ATTN at ${pos}, ms per token (all ${attn.length} attention layers; median, min of ${rounds}): ` +
+          order.map((n) => `${labels[n]} ${med(runs[n]).toFixed(3)} ${Math.min(...runs[n]).toFixed(3)}`).join("; ")
+      )
+    }
+    Object.assign(T, saved)
+    engine.gpu.skip = new Set()
+    return
   }
   // Profile: the prompt with each kind of pass left out in turn.
   if (params.skip) {
@@ -1616,6 +1686,11 @@ async function smoke(params: {
         engine.reset()
         const out: Array<Float32Array> = [await engine.forward(prompt)]
         for (let i = 0; i < 16; i++) out.push(await engine.forward([1000 + i]))
+        // Draft-sized batches too (a few rows: writing's path), row by row.
+        for (const n of [3, 8]) {
+          const last = await engine.forwardHidden(Array.from({ length: n }, (_, i) => 2000 + i))
+          for (let r = last - n + 1; r <= last; r++) out.push((await engine.logits(r)).slice())
+        }
         return out
       } finally {
         ;(TUNING as Record<string, number>)[knob] = saved
@@ -1631,7 +1706,7 @@ async function smoke(params: {
       if (r.top1) same++
     }
     log(
-      `COMPARE ${knob}=${a} vs ${b} over ${prompt.length} tokens + 16 steps: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${ra.length}`
+      `COMPARE ${knob}=${a} vs ${b} over ${prompt.length} tokens + 16 steps + batches of 3 and 8: worst KL ${worst.toExponential(2)}, top-1 same ${same}/${ra.length}`
     )
     engine.reset()
   }
