@@ -4,6 +4,7 @@
  * the convolutions' state on the GPU between calls.
  */
 import { attentionError } from "./attention-check.js"
+import { queriesFit, slotRuns } from "./cache-slots.js"
 import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
@@ -227,6 +228,13 @@ export const TUNING = {
   attendDecodeChunking: 1,
   /** Key segments per scores pass (0: as many as the scores buffer holds). */
   segmentGroup: 0,
+  /**
+   * 1: writing's queries go into free slots of their layer's KV cache
+   * texture (past the tokens being written, as f32 bits), drawn in the
+   * same render pass as the new keys and values, and the scores read them
+   * there: one render pass fewer per attention layer (see queryInCache).
+   */
+  qInCache: 1,
   /**
    * The worker's speculative decoding (see worker.ts): drafts follow an
    * earlier occurrence of at least draftMatch last tokens, as many as
@@ -2623,13 +2631,45 @@ export class Engine {
     })
   }
 
+  /** Cache slots (rows) a token's queries take in queryInCache. */
+  private querySlots() {
+    const c = this.config
+    return Math.ceil((c.numHeads * c.headDim) / 4 / this.kvWidth())
+  }
+
+  /**
+   * Whether a `rows`-row batch at pos0 puts its queries in free slots of
+   * the layer's cache (see TUNING.qInCache): slots past the batch's own,
+   * which the cache holds (a ring: none its queries' windows reach), each
+   * head's query texels within one cache row.
+   */
+  private queryInCache(
+    layer: NonNullable<GpuLayer["attention"]>,
+    rows: number,
+    pos0: number
+  ) {
+    const c = this.config
+    if (TUNING.qInCache <= 0 || rows > SPLIT_ROWS) return false
+    if (this.kvWidth() % (c.headDim / 4) !== 0) return false
+    return queriesFit({
+      pos0,
+      rows,
+      slots: this.querySlots(),
+      ring: layer.ring,
+      window: c.slidingWindow,
+      positions: this.kvPositions
+    })
+  }
+
   private async attend(
     layer: NonNullable<GpuLayer["attention"]>,
     type: LayerType,
     rows: number,
     pos0: number,
     input: MatIn,
-    paced = false
+    paced = false,
+    /** Whether the queries may go in the cache (see queryInCache; not while probing). */
+    queriesInCache = false
   ) {
     const c = this.config
     const b = this.buffers
@@ -2650,7 +2690,46 @@ export class Engine {
       uQKVG: qkvgIn,
       ...(!split && this.quadInputs("uQKVG", qkvgIn))
     }
-    // Queries: normalized, rotated, scaled by 1/sqrt(head dim).
+    const kvWidth = this.kvWidth()
+    const kvShift = layer.ring ? 30 : this.kvShift
+    const blockRows = 2 ** kvShift
+    const inCache = queriesInCache && this.queryInCache(layer, rows, pos0)
+    const qSlots = this.querySlots()
+    const qSlot0 = pos0 + rows
+    // Queries: normalized, rotated, scaled by 1/sqrt(head dim); into the
+    // cache's slots from qSlot0 (in runs, as the keys below), or b.q.
+    const cacheShape = { kvWidth, slots: qSlots, texels: qDims / 4 }
+    if (inCache)
+      for (const { s0, row0, block, run } of slotRuns(qSlot0, qSlots * rows, blockRows, layer.ring)) {
+        const x0 = block * kvWidth
+        this.gpu.run({
+          name: "heads",
+          program: read(
+            K.headPrep({
+              out: "cache",
+              rope: true,
+              norm: true,
+              headDim: c.headDim,
+              cache: cacheShape
+            })
+          ),
+          inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
+          uniforms: {
+            uSplitIn: { int: split },
+            ...this.pairIn(qkvgIn),
+            uBase: { int: 0 },
+            uPairTexels: { int: pairTexels },
+            uPos0: { int: pos0 },
+            uRowOffset: { int: row0 - s0 },
+            uXOff: { int: x0 },
+            uEps: c.normEps,
+            uScale: 1 / Math.sqrt(c.headDim)
+          },
+          output: layer.kv,
+          rect: { x: x0, y: row0, width: kvWidth, height: run }
+        })
+      }
+    else
     this.gpu.run({
       name: "heads",
       program: read(
@@ -2674,9 +2753,6 @@ export class Engine {
     // Keys and values into the cache at positions pos0..., in runs of rows
     // split where a ring cache wraps around or a block of rows ends. (A
     // ring is one block, however tall.)
-    const kvWidth = this.kvWidth()
-    const kvShift = layer.ring ? 30 : this.kvShift
-    const blockRows = 2 ** kvShift
     const kvAt = { uKvShift: { int: kvShift }, uKvWidth: { int: kvWidth } }
     for (let m0 = 0; m0 < rows;) {
       const slot = layer.ring ? (pos0 + m0) % layer.ring : pos0 + m0
@@ -2817,10 +2893,13 @@ export class Engine {
       const scores = (sj0: number, sKeys: number, n: number) =>
         this.gpu.run({
           name: "scores",
-          program: this.gpu.program(K.scores(c.headDim, G)),
-          inputs: { uQ: b.q, uK: layer.kv },
+          program: this.gpu.program(
+            K.scores(c.headDim, G, inCache ? { kvWidth, slots: qSlots } : undefined)
+          ),
+          inputs: inCache ? { uK: layer.kv } : { uQ: b.q, uK: layer.kv },
           uniforms: {
             ...ring,
+            ...(inCache && { uQSlot0: { int: qSlot0 } }),
             ...segRows,
             uJ0: { int: sj0 },
             uKeys: { int: sKeys },
@@ -4018,7 +4097,12 @@ export class Engine {
     const rows = batch.length
     const pos0 = this.position
     this.gpu.hints = TUNING.renderHints
-    this.reserve(pos0 + rows)
+    // (Writing: room past the batch for its queries too, see queryInCache.)
+    this.reserve(
+      rows <= SPLIT_ROWS && TUNING.qInCache > 0
+        ? Math.min(this.contextLength, pos0 + rows * (1 + this.querySlots()))
+        : pos0 + rows
+    )
     if (!idsOnGpu) {
       this.gpu.write(
         b.ids,
@@ -4203,7 +4287,8 @@ export class Engine {
           rows,
           pos0,
           opIn,
-          paced
+          paced,
+          !probe
         )
         await look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)

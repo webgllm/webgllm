@@ -1983,13 +1983,21 @@ void main() {
  * queries) or h2 (8 dims per texel, for the key cache).
  */
 function headPrepSource(o: {
-  out: "f32" | "h2"
+  /**
+   * "cache": the f32 queries' bits, into free slots of the KV cache
+   * texture (see queryInCache): the fragment at slot uQSlot0 + (y −
+   * uRowOffset), texel x − uXOff holds query texel (slot % qSlots) ·
+   * kvWidth + x of token slot / qSlots.
+   */
+  out: "f32" | "h2" | "cache"
   rope: boolean
   norm: boolean
   /** Dims per head (LFM3: 128, LFM2: 64). */
   headDim: number
+  /** With "cache": texels per cache row, slots per token, query texels per token. */
+  cache?: { kvWidth: number; slots: number; texels: number }
 }) {
-  const texelsPerOut = o.out === "f32" ? 1 : 2
+  const texelsPerOut = o.out === "h2" ? 2 : 1
   // f32 texels per head; the RoPE table's sines start half a head in.
   const T = o.headDim / 4
   const prep = `
@@ -2015,6 +2023,16 @@ vec4 rotated(int base, int t, int pos, float inv) {
       : "return v;"
   }
 }`
+  const c = o.cache
+  if (o.out === "cache" && !c) throw new Error("Queries in the cache need its shape.")
+  const where =
+    o.out === "cache" && c
+      ? `int slot = int(gl_FragCoord.y) - uRowOffset;
+  m = slot / ${c.slots};
+  int x = (slot - m * ${c.slots}) * ${c.kvWidth} + int(gl_FragCoord.x) - uXOff;
+  if (x >= ${c.texels}) { o = uvec4(0u); return; }`
+      : `int x = int(gl_FragCoord.x) - uXOff;
+  m = int(gl_FragCoord.y) - uRowOffset;`
   return `${HEADER}
 uniform usampler2D uQKVG;
 uniform sampler2D uNorm;
@@ -2030,8 +2048,7 @@ int m;
 ${prep}
 out ${o.out === "f32" ? "vec4" : "uvec4"} o;
 void main() {
-  int x = int(gl_FragCoord.x) - uXOff;
-  m = int(gl_FragCoord.y) - uRowOffset;
+  ${where}
   int head = x / ${T / texelsPerOut};
   int t0 = (x % ${T / texelsPerOut}) * ${texelsPerOut};
   int base = uBase + head * ${T};
@@ -2050,7 +2067,9 @@ void main() {
   ${
     o.out === "f32"
       ? "o = rotated(base, t0, pos, inv) * uScale;"
-      : "o = packH2(rotated(base, t0, pos, inv), rotated(base, t0 + 1, pos, inv));"
+      : o.out === "cache"
+        ? "o = floatBitsToUint(rotated(base, t0, pos, inv) * uScale);"
+        : "o = packH2(rotated(base, t0, pos, inv), rotated(base, t0 + 1, pos, inv));"
   }
 }`
 }
@@ -2116,11 +2135,32 @@ const scoreAt = (G: number) => {
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
  * (later than the query, outside the sliding window, past uKeys) get -1e30.
  */
-function scoresSource(headDim: number, G: number) {
+function scoresSource(
+  headDim: number,
+  G: number,
+  /** Queries as headPrep's "cache" left them (uK's slots from uQSlot0), not uQ. */
+  cache?: { kvWidth: number; slots: number }
+) {
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
+  // A head's query texels never straddle a cache row (kvWidth is a whole
+  // number of heads' texels): one address a member.
+  const query = (i: number) =>
+    cache
+      ? `ivec2 pq${i};
+  {
+    int t = (h0 + ${i}) * ${2 * U};
+    int slot = uQSlot0 + m * ${cache.slots} + t / ${cache.kvWidth};
+    if (uRing > 0) slot -= (slot / uRing) * uRing;
+    pq${i} = kvAt(t - (t / ${cache.kvWidth}) * ${cache.kvWidth}, slot);
+  }`
+      : ""
+  const qa = (i: number, k: number) =>
+    cache
+      ? `uintBitsToFloat(texelFetch(uK, ivec2(pq${i}.x + 2 * u + ${k}, pq${i}.y), 0))`
+      : `texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u + ${k}, m), 0)`
   return `${HEADER}
-uniform sampler2D uQ;
+${cache ? "uniform int uQSlot0;" : "uniform sampler2D uQ;"}
 uniform usampler2D uK;
 uniform int uRows;
 uniform int uM0;
@@ -2169,6 +2209,7 @@ void main() {
     ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
     return;
   }
+${members.map(query).join("\n")}
   ivec2 p0 = kvAt(kh * ${U}, row.x);
   ivec2 p1 = kvAt(kh * ${U}, row.y);
   ivec2 p2 = kvAt(kh * ${U}, row.z);
@@ -2184,8 +2225,8 @@ void main() {
 ${members
   .map(
     (i) => `    {
-      vec4 qa = texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u, m), 0);
-      vec4 qb = texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u + 1, m), 0);
+      vec4 qa = ${qa(i, 0)};
+      vec4 qb = ${qa(i, 1)};
       acc${i} += vec4(dot(qa, l0) + dot(qb, u0), dot(qa, l1) + dot(qb, u1),
         dot(qa, l2) + dot(qb, u2), dot(qa, l3) + dot(qb, u3));
     }`
