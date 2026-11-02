@@ -221,9 +221,12 @@ export const TUNING = {
    * With foldNorm 2: each norm folds on its own (the feed-forward's even
    * where the operator's matmuls can't), and 8-bit split matmuls fold the
    * prescaled input too (Qwen3.5 GGUF's Q8_0 beta|alpha): no norm passes.
-   * 0: a layer folds both norms or neither, 4-bit matmuls only.
+   * 0: a layer folds both norms or neither, 4-bit matmuls only. Off: on
+   * an iPhone 16 Pro Max (Qwen3.5 GGUF, sweep alternated in one page) it
+   * wrote 1.6% slower (32.5 against 32.0 GPU ms a token) and read prompts
+   * slower, though an M3 wrote 5% faster.
    */
-  foldEach: 1,
+  foldEach: 0,
   /** 1: writing sizes its attention chunks by the key count (see attend). */
   attendDecodeChunking: 1,
   /** Key segments per scores pass (0: as many as the scores buffer holds). */
