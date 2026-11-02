@@ -1507,7 +1507,7 @@ async function smoke(params: {
     }
     ;(TUNING as Record<string, number>)[knob] = original
     log(
-      `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
+      `AB GPU ${knob}=${a}: ${med(gpuTok[a]).toFixed(2)} ms/token, best ${Math.min(...gpuTok[a]).toFixed(2)} (${gpuTok[a].map((t) => t.toFixed(1)).join(" ")}); ${knob}=${b}: ${med(gpuTok[b]).toFixed(2)} ms/token, best ${Math.min(...gpuTok[b]).toFixed(2)} (${gpuTok[b].map((t) => t.toFixed(1)).join(" ")})`
     )
     // Render passes a writing step starts with each value.
     const passes = async (v: number) => {
