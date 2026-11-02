@@ -253,6 +253,8 @@ export async function* generate(request: {
   chat: Array<ChatMessage>
   tools: Array<ChatTool>
   thinking?: boolean
+  /** Thinking content ceiling; must be a nonnegative safe integer. */
+  thinkingBudgetTokens?: number
   sampling: Sampling
   maxTokens?: number
   /** Speculative decoding by prompt lookup (default on). */
@@ -300,6 +302,9 @@ export async function* generate(request: {
     chat: request.chat,
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),
+    ...(request.thinkingBudgetTokens !== undefined && {
+      thinkingBudgetTokens: request.thinkingBudgetTokens
+    }),
     sampling: request.sampling,
     ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
     ...(request.speculative !== undefined && {

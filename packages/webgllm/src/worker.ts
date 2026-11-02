@@ -21,6 +21,7 @@ import type { GpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
+import { createThinkingBudget } from "./thinking-budget.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -412,6 +413,17 @@ async function generate(request: GenerateRequest) {
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
     addGenerationPrompt: true
   })
+  const think = tokenizer.specialTokens.think
+  const last = prompt[prompt.length - 1]
+  const startsInThinking = think !== null &&
+    (last === think ||
+      (prompt[prompt.length - 2] === think &&
+        tokenizer.decode([last]).trim() === ""))
+  const thinkingBudget = createThinkingBudget(
+    request.thinkingBudgetTokens,
+    tokenizer.specialTokens,
+    startsInThinking
+  )
   const room = engine.contextLength - prompt.length
   if (room < MIN_REPLY_TOKENS) {
     throw new Error(
@@ -458,7 +470,8 @@ async function generate(request: GenerateRequest) {
     outputTokens: 0,
     firstTokenMs: null,
     promptMs: performance.now() - promptStart,
-    decodeMs: 0
+    decodeMs: 0,
+    ...thinkingBudget?.stats
   }
   if (
     stopped.has(id) ||
@@ -584,18 +597,12 @@ async function generate(request: GenerateRequest) {
   // the prompt with `<think>`, Qwen3.5 with `<think>\n`), the reply starts
   // inside it: say so first, as the model would have, so the thinking
   // reads as thinking.
-  const think = tokenizer.specialTokens.think
-  const last = prompt[prompt.length - 1]
-  if (
-    think !== null &&
-    (last === think ||
-      (prompt[prompt.length - 2] === think &&
-        tokenizer.decode([last]).trim() === ""))
-  ) {
+  if (startsInThinking) {
     post({ type: "token", id, text: THINK_OPEN })
   }
 
-  let token = draw(await distribution(row, guessing()))
+  // A zero budget may close a template-opened span before any sampling.
+  let token = thinkingBudget?.forcedToken ?? draw(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
   if (request.reportPhases && !stopped.has(id)) {
     post({ type: "phase", id, phase: "generating" })
@@ -610,6 +617,7 @@ async function generate(request: GenerateRequest) {
   const emit = (t: number) => {
     stats.outputTokens++
     if (t === eos) return false
+    thinkingBudget?.observe(t)
     if (onGpu) engine.markSeen(t)
     else sampler.see([t])
     policy.drawn(t)
@@ -637,7 +645,7 @@ async function generate(request: GenerateRequest) {
           !draftsNext()
         const guess = more && guessing()
         const d = await distribution(0, guess)
-        token = draw(d)
+        token = thinkingBudget?.forcedToken ?? draw(d)
         if (!guess) scoreGuess(d, token)
         policy.alone(performance.now() - stepStart)
         going = emit(token)
@@ -670,6 +678,13 @@ async function generate(request: GenerateRequest) {
     let kept = 1
     let next = -1
     for (let i = 0; i < batch.length && going; i++) {
+      // A drafted thinking token may have just used the remaining budget.
+      // Stop before accepting another; accept(kept) below rewinds its cache.
+      const forced = thinkingBudget?.forcedToken
+      if (forced !== undefined && forced !== null) {
+        next = forced
+        break
+      }
       const last = i + 1 === batch.length
       const d = all ? all[i] : await distribution(i, last && guessLast)
       if (last) {
@@ -712,6 +727,7 @@ async function generate(request: GenerateRequest) {
   if (rest) post({ type: "token", id, text: rest })
   engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
+  if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)
   // Programs the warm-up missed compile mid-request: worth knowing.
   const compiled = engine.gpu.compiled.count - compiledBefore
   if (compiled > 0) {

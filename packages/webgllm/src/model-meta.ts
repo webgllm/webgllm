@@ -113,7 +113,7 @@ const LFM3_1_7B_GGUF = {
   },
   supports: TOOLS_AND_THINKING,
   size: "1.7b",
-  reasoning: THINKING_SWITCH,
+  reasoning: { ...THINKING_SWITCH, budget: true },
   sampling: LFM3_SAMPLING,
   toolFormat: "lfm3"
 } as const satisfies WebGlModelMeta

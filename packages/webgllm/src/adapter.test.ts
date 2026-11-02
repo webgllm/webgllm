@@ -1,3 +1,6 @@
+import { chat } from "@tanstack/ai"
+import type { AdapterReasoning, ReasoningRequest, TextOptions } from "@tanstack/ai"
+import type { WebGlTextAdapter, WebGlTextProviderOptions } from "./adapter.js"
 import { resolveDebugOption } from "@tanstack/ai/adapter-internals"
 import assert from "node:assert/strict"
 import { test } from "node:test"
@@ -47,9 +50,11 @@ test("leaving the stream early stops the generation in the worker", { timeout: 1
   const { webglText } = await import("./adapter.js")
   const adapter = webglText("onnx-community/LFM3-1.7B-ONNX")
   const stream = adapter.chatStream({
+    logger: resolveDebugOption(false),
+    threadId: "adapter-test",
     model: "onnx-community/LFM3-1.7B-ONNX",
     messages: [{ role: "user", content: "hi" }]
-  } as Parameters<typeof adapter.chatStream>[0])
+  })
   let content = 0
   for await (const chunk of stream) {
     if ((chunk as { type: string }).type === "TEXT_MESSAGE_CONTENT" && ++content === 2) break
@@ -101,7 +106,7 @@ test("structured output forwards real phases, ignoring synthetic thinking text a
     const result = await adapter.structuredOutput({
       chatOptions: { logger: resolveDebugOption(false), threadId: "adapter-test", model: adapter.model, messages: [{ role: "user", content: "choose a move" }] },
       outputSchema: { type: "object", properties: { moveId: { type: "string" } } }
-    } as Parameters<typeof adapter.structuredOutput>[0])
+    })
     assert.deepEqual(result.data, { moveId: "b6-a5" })
     assert.deepEqual(phases, ["processing", "generating"])
     const request = FakeWorker.last?.posted.find((message) => message.type === "generate")
@@ -133,7 +138,7 @@ test("structured output streams only thinking text across split tags", { timeout
     const result = await adapter.structuredOutput({
       chatOptions: { logger: resolveDebugOption(false), threadId: "adapter-test", model: adapter.model, messages: [{ role: "user", content: "choose a move" }] },
       outputSchema: { type: "object" }
-    } as Parameters<typeof adapter.structuredOutput>[0])
+    })
     assert.equal(thinking.join(""), "Analyze a capture.")
     assert.deepEqual(result.data, { moveId: "b6-a5" })
     assert.equal(result.rawText, '{"moveId":"b6-a5"}')
@@ -174,7 +179,7 @@ test("aborted structured generations cannot publish later phases", { timeout: 10
         abortController: controller
       },
       outputSchema: { type: "object" }
-    } as Parameters<typeof adapter.structuredOutput>[0])
+    })
     assert.deepEqual(phases, ["processing"])
     assert.deepEqual(thinking, ["before "], "aborted turns cannot append thinking text")
     assert.ok(FakeWorker.last?.posted.some((message) => message.type === "stop"))
@@ -182,4 +187,168 @@ test("aborted structured generations cannot publish later phases", { timeout: 10
     FakeWorker.onGenerate = undefined
     unloadModel()
   }
+})
+
+
+const LFM3_GGUF = "LiquidAI/LFM3-1.7B-GGUF" as const
+const LFM3_ONNX = "onnx-community/LFM3-1.7B-ONNX" as const
+
+type Assert<T extends true> = T
+export type GgufBudgetCapability = Assert<AdapterReasoning<WebGlTextAdapter<typeof LFM3_GGUF>>["budget"]>
+export type OnnxHasNoBudgetCapability = Assert<AdapterReasoning<WebGlTextAdapter<typeof LFM3_ONNX>>["budget"] extends false ? true : false>
+
+function budgetOptions(reasoning?: ReasoningRequest): TextOptions<WebGlTextProviderOptions> {
+  return {
+    logger: resolveDebugOption(false),
+    threadId: "adapter-thinking-budget-test",
+    model: LFM3_GGUF,
+    messages: [{ role: "user", content: "Choose a move." }],
+    ...(reasoning && { reasoning }),
+    modelOptions: { max_new_tokens: 1024 }
+  }
+}
+
+async function collect(stream: AsyncIterable<unknown>) {
+  const chunks: unknown[] = []
+  for await (const chunk of stream) chunks.push(chunk)
+  return chunks
+}
+
+test("LFM3 GGUF forwards an explicit thinking budget through shared chat and structured output", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  const expectedStats: RunTimings = {
+    ...STATS,
+    outputTokens: 270,
+    thinkingTokens: 256,
+    thinkingBudgetTokens: 256,
+    thinkingBudgetExhausted: true
+  }
+  const requests: Array<Extract<WorkerRequest, { type: "generate" }>> = []
+  FakeWorker.onGenerate = (worker, request) => {
+    requests.push(request)
+    worker.send({ type: "token", id: request.id, text: '<think>Plan.</think>{"moveId":"b6-a5"}' })
+    worker.send({ type: "done", id: request.id, stats: expectedStats })
+  }
+  try {
+    unloadModel()
+    const adapter = webglText(LFM3_GGUF)
+    const result = await chat({
+      adapter,
+      threadId: "shared-budget-test",
+      messages: [{ role: "user", content: "Choose a move." }],
+      reasoning: { level: "high", budgetTokens: 256 },
+      modelOptions: { max_new_tokens: 1024 },
+      stream: false
+    })
+    const reportedUsage = result.chunks.find(chunk => chunk.type === "RUN_FINISHED")?.usage
+    const usage = Array.isArray(reportedUsage) ? reportedUsage[0] : reportedUsage
+    assert.ok(usage && "providerUsageDetails" in usage)
+    assert.equal(usage.providerUsageDetails?.thinkingTokens, 256)
+    assert.equal(usage.providerUsageDetails?.thinkingBudgetTokens, 256)
+    assert.equal(usage.providerUsageDetails?.thinkingBudgetExhausted, true)
+    const structured = await adapter.structuredOutput({
+      chatOptions: budgetOptions({ level: "high", summary: true, budgetTokens: 256 }),
+      outputSchema: { type: "object" }
+    })
+    assert.deepEqual(structured.data, { moveId: "b6-a5" })
+    assert.equal(structured.usage?.providerUsageDetails?.thinkingTokens, 256)
+    assert.equal(structured.usage?.providerUsageDetails?.thinkingBudgetTokens, 256)
+    assert.equal(structured.usage?.providerUsageDetails?.thinkingBudgetExhausted, true)
+    assert.equal(requests.length, 2)
+    for (const request of requests) {
+      assert.equal(request.thinking, true)
+      assert.equal(request.thinkingBudgetTokens, 256)
+      assert.equal(request.maxTokens, 1024, "max_new_tokens remains the total output limit")
+    }
+  } finally {
+    FakeWorker.onGenerate = undefined
+    unloadModel()
+  }
+})
+
+test("LFM3 reasoning shorthand and omitted budgets remain unlimited", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  const requests: Array<Extract<WorkerRequest, { type: "generate" }>> = []
+  FakeWorker.onGenerate = (worker, request) => {
+    requests.push(request)
+    worker.send({ type: "token", id: request.id, text: '{"moveId":"b6-a5"}' })
+    worker.send({ type: "done", id: request.id, stats: STATS })
+  }
+  try {
+    unloadModel()
+    const adapter = webglText(LFM3_GGUF)
+    await chat({ adapter, threadId: "shorthand-budget-test", messages: [{ role: "user", content: "Choose a move." }], reasoning: "high", stream: false })
+    for (const reasoning of [undefined, { level: "high", summary: true }, { level: "off", summary: true } ] satisfies Array<ReasoningRequest | undefined>) {
+      await collect(adapter.chatStream(budgetOptions(reasoning)))
+      await adapter.structuredOutput({ chatOptions: budgetOptions(reasoning), outputSchema: { type: "object" } })
+    }
+    assert.equal(requests[0].thinking, true)
+    assert.ok(requests.every(request => request.thinkingBudgetTokens === undefined), "no 16k default may be introduced")
+    assert.deepEqual(requests.slice(1).map(request => request.thinking), [undefined, undefined, true, true, false, false])
+  } finally {
+    FakeWorker.onGenerate = undefined
+    unloadModel()
+  }
+})
+
+test("LFM3 rejects invalid thinking budgets before starting a worker", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  unloadModel()
+  const previousWorker = FakeWorker.last
+  const adapter = webglText(LFM3_GGUF)
+  for (const value of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "256"]) {
+    const reasoning = { level: "high", summary: true, budgetTokens: value } as unknown as ReasoningRequest
+    await assert.rejects(collect(adapter.chatStream(budgetOptions(reasoning))), /budgetTokens.*non-negative safe integer/)
+    await assert.rejects(adapter.structuredOutput({ chatOptions: budgetOptions(reasoning), outputSchema: { type: "object" } }), /budgetTokens.*non-negative safe integer/)
+    assert.equal(FakeWorker.last, previousWorker)
+  }
+})
+
+test("only LFM3 GGUF advertises a thinking budget", async () => {
+  const { WEBGL_MODEL_META } = await import("./model-meta.js")
+  assert.deepEqual(Object.entries(WEBGL_MODEL_META).filter(([, meta]) => meta.reasoning && meta.reasoning.budget).map(([model]) => model), [LFM3_GGUF])
+})
+
+test("LFM3 forwards zero budgets and ignores a valid cap when thinking is off", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  const requests: Array<Extract<WorkerRequest, { type: "generate" }>> = []
+  FakeWorker.onGenerate = (worker, request) => {
+    requests.push(request)
+    worker.send({ type: "token", id: request.id, text: '{"moveId":"b6-a5"}' })
+    worker.send({ type: "done", id: request.id, stats: STATS })
+  }
+  try {
+    unloadModel()
+    const adapter = webglText(LFM3_GGUF)
+    for (const reasoning of [
+      { level: "high", summary: true, budgetTokens: 0 },
+      { level: "off", summary: true, budgetTokens: 256 }
+    ] satisfies ReasoningRequest[]) {
+      await collect(adapter.chatStream(budgetOptions(reasoning)))
+      await adapter.structuredOutput({ chatOptions: budgetOptions(reasoning), outputSchema: { type: "object" } })
+    }
+    assert.deepEqual(requests.map(request => [request.thinking, request.thinkingBudgetTokens]), [
+      [true, 0], [true, 0], [false, undefined], [false, undefined]
+    ])
+    await assert.rejects(adapter.structuredOutput({ chatOptions: budgetOptions({ level: "off", summary: true, budgetTokens: -1 }), outputSchema: { type: "object" } }), /non-negative safe integer/)
+  } finally {
+    FakeWorker.onGenerate = undefined
+    unloadModel()
+  }
+})
+
+test("LFM3 variants without budget support reject active thinking caps before loading", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  unloadModel()
+  const previousWorker = FakeWorker.last
+  const adapter = webglText(LFM3_ONNX)
+  const options = { ...budgetOptions({ level: "high", summary: true, budgetTokens: 256 }), model: LFM3_ONNX }
+  await assert.rejects(collect(adapter.chatStream(options)), /does not support a thinking token budget/)
+  await assert.rejects(adapter.structuredOutput({ chatOptions: options, outputSchema: { type: "object" } }), /does not support a thinking token budget/)
+  assert.equal(FakeWorker.last, previousWorker)
 })

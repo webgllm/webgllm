@@ -32,6 +32,24 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
 
+### Thinking budget
+
+LFM3 GGUF accepts an optional thinking-token ceiling through the shared reasoning option:
+
+```ts
+const stream = chat({
+  adapter: webglText("LiquidAI/LFM3-1.7B-GGUF"),
+  messages,
+  threadId,
+  reasoning: { level: "high", budgetTokens: 256 },
+  modelOptions: { max_new_tokens: 512 }
+})
+```
+
+The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `max_new_tokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. Only LFM3 GGUF currently advertises budget support.
+
+The low-level worker/client generation option is `thinkingBudgetTokens`. Budgeted runs report `thinkingTokens`, `thinkingBudgetTokens`, and `thinkingBudgetExhausted` in `usage.providerUsageDetails`.
+
 ### Speed
 
 Pixel 10 Pro (PowerVR DXT-48-1536), Firefox 159, a 515-token prompt:

@@ -22,6 +22,11 @@ export type RunTimings = {
   draftBatches?: number
   draftsChecked?: number
   draftsKept?: number
+  /** Thinking content tokens, excluding opening and closing markers. */
+  thinkingTokens?: number
+  /** Requested thinking ceiling; omitted when generation is unbudgeted. */
+  thinkingBudgetTokens?: number
+  thinkingBudgetExhausted?: boolean
 }
 
 export type WorkerRequest =
@@ -48,6 +53,8 @@ export type WorkerRequest =
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean
+      /** Close thinking at this many content tokens, then continue the answer. */
+      thinkingBudgetTokens?: number
       sampling: Sampling
       /** Most tokens to generate; the worker's default when left out. */
       maxTokens?: number

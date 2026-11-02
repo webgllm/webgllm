@@ -61,6 +61,12 @@ export type WebGlProviderUsageDetails = {
   decodeMs?: number
   /** Tokens generated after the first one, over `decodeMs`. */
   decodeTokens?: number
+  /** Model-generated tokens inside the thinking block. */
+  thinkingTokens?: number
+  /** Explicit maximum thinking tokens requested for this generation. */
+  thinkingBudgetTokens?: number
+  /** Whether thinking reached the explicit budget. */
+  thinkingBudgetExhausted?: boolean
 }
 
 type ResolveReasoning<TModel extends string> =
@@ -76,13 +82,24 @@ type MetadataByModality = {
   document: unknown
 }
 
-/** The template's `enable_thinking` for a request; the template's default when it doesn't ask. */
-function enableThinking(
+/** Resolve the template switch and only an explicitly requested thinking cap. */
+function thinkingOptions(
   request: ReasoningRequest | undefined,
   model: WebGlTextModel
-) {
-  const value = resolveReasoning(request, modelMeta(model).reasoning)?.value
-  return value === undefined ? undefined : value === "true"
+): { thinking: boolean | undefined; thinkingBudgetTokens?: number } {
+  const budget = request?.budgetTokens
+  if (budget !== undefined && (!Number.isSafeInteger(budget) || budget < 0)) {
+    throw new RangeError("reasoning.budgetTokens must be a non-negative safe integer.")
+  }
+  const capability = modelMeta(model).reasoning
+  const resolved = resolveReasoning(request, capability)
+  const thinking = resolved?.value === undefined ? undefined : resolved.value === "true"
+  // String levels and omitted budgets preserve unlimited thinking; off ignores a valid cap.
+  if (budget === undefined || thinking === false) return { thinking }
+  if (!capability || !capability.budget || !resolved) {
+    throw new Error(`${model} does not support a thinking token budget.`)
+  }
+  return { thinking, thinkingBudgetTokens: resolved.budgetTokens }
 }
 
 function contentText(content: ModelMessage["content"]) {
@@ -220,6 +237,9 @@ function usageOf(stats: RunTimings): TokenUsage {
   usage.providerUsageDetails = {
     ...(stats.firstTokenMs !== null && { firstTokenMs: stats.firstTokenMs }),
     promptMs: stats.promptMs,
+    ...(stats.thinkingTokens !== undefined && { thinkingTokens: stats.thinkingTokens }),
+    ...(stats.thinkingBudgetTokens !== undefined && { thinkingBudgetTokens: stats.thinkingBudgetTokens }),
+    ...(stats.thinkingBudgetExhausted !== undefined && { thinkingBudgetExhausted: stats.thinkingBudgetExhausted }),
     ...(stats.firstTokenMs !== null && {
       decodeMs: stats.decodeMs,
       decodeTokens: Math.max(stats.outputTokens - 1, 0)
@@ -307,6 +327,7 @@ export class WebGlTextAdapter<
   async *chatStream(
     options: TextOptions<WebGlTextProviderOptions>
   ): AsyncIterable<AdapterYieldChunk> {
+    const thinking = thinkingOptions(options.reasoning, this.model)
     const runId = options.runId ?? nextId("run")
     const threadId = options.threadId
     const messageId = nextId("msg")
@@ -437,7 +458,7 @@ export class WebGlTextAdapter<
       contextLength: this.contextLength,
       chat,
       tools: toTools(options.tools),
-      thinking: enableThinking(options.reasoning, model),
+      ...thinking,
       sampling: this.sampling(options.modelOptions),
       maxTokens: options.modelOptions?.max_new_tokens,
       speculative: options.modelOptions?.speculative,
@@ -533,6 +554,7 @@ export class WebGlTextAdapter<
     options: StructuredOutputOptions<WebGlTextProviderOptions>
   ): Promise<StructuredOutputResult<unknown>> {
     const { chatOptions, outputSchema } = options
+    const thinking = thinkingOptions(chatOptions.reasoning, this.model)
     await loadModel(this.model, this.contextLength)
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
@@ -550,7 +572,7 @@ export class WebGlTextAdapter<
         ...toChatMessages(chatOptions.messages, this.toolFormat)
       ],
       tools: [],
-      thinking: enableThinking(chatOptions.reasoning, this.model),
+      ...thinking,
       sampling: this.sampling(chatOptions.modelOptions),
       maxTokens: chatOptions.modelOptions?.max_new_tokens,
       speculative: chatOptions.modelOptions?.speculative,
