@@ -69,7 +69,7 @@ export type WorkerRequest =
   | { type: "stop"; id: string }
   /** The page made room for the model (see "claim"): the worker loads it. */
   | { type: "claimed" }
-  /** For benchmarks: engine tuning knobs (see TUNING in engine.ts). */
+  /** Engine tuning knobs (see TUNING in engine.ts): for benchmarks, and setPromptBatch. */
   | { type: "tune"; values: Record<string, number> }
 
 export type WorkerResponse =
