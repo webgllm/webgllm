@@ -1162,12 +1162,18 @@ export class Engine {
     const forward = async () => {
       forwards = true
       const all = this.layers
-      if (TUNING.tuneLayers > 0) this.layers = all.slice(0, TUNING.tuneLayers)
+      const work = this.work
+      const subset = TUNING.tuneLayers > 0
+      if (subset) {
+        this.layers = all.slice(0, TUNING.tuneLayers)
+        this.work = null
+      }
       try {
         this.reset()
         await this.forwardHidden(tokens)
       } finally {
         this.layers = all
+        if (subset) this.work = work
       }
     }
     class Stopped extends Error {}
