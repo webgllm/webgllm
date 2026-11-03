@@ -40,6 +40,31 @@ Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), 
 
 Thinking and answer generation have separate states. Thinking uses its normal pipeline/speculative optimizations and caller budget, with EOS suppressed until an answer can be produced. Natural or budget-forced thinking completion activates the schema mask. Models that emit their own opening thinking marker receive that marker before constrained generation when thinking is requested. The constrained answer phase supports pipeline guesses and speculative drafts. Each proposed answer prefix uses a cloned grammar state and its own GPU mask; invalid suffixes are dropped before forwarding, and only accepted tokens advance the live matcher. A draft batch crossing the thinking boundary is rewound to its accepted prefix before selecting the first constrained token. Unconstrained text calls retain their existing decoding paths.
 
+### Prompt caching
+
+The engine reuses only matching rendered token IDs. System instructions, message
+roles, schemas and tool guidance keep their existing serialization; no extra user
+messages, layout options or application-managed cache boundaries are required.
+Changing a schema or earlier message can reduce the reusable prefix.
+
+A token-verified system/tool checkpoint shares the existing snapshot budget with
+the ordinary conversational anchor. System checkpoints tag existing legacy prefill endpoints without changing batch
+sizes or adding model forwards; no exact-prefix split is introduced. Ordinary
+conversational anchors retain their original positions and supported
+in-batch behavior. This avoids adding model passes to short requests merely to
+save speculative checkpoints.
+
+Actual reuse is reported in `promptTokensDetails.cachedTokens`. Optional
+`providerUsageDetails` fields separate prompt, tokenizer, schema and cache-restore
+work and report the selected checkpoints. Restore timing measures CPU matching and
+command submission; queued GPU restoration completes with subsequent prompt work.
+
+`chat({ promptCache: "none" })` clears owned inference-cache state before and after
+the call, including error/cancellation paths, and skips optional checkpoint work.
+Weights remain loaded and generation retains its own autoregressive KV state.
+Omitted/`"short"`/`"long"` retain existing budgets/lifetimes; no TTL is added. Cache
+keys cannot substitute for matching tokens and do not create separate GPU caches.
+
 ### Tool calls
 
 Automatic tool choice retains the model's native routing and answer format. Before tool-call events are emitted, each parsed call must name a declared tool and its arguments must validate against that tool's schema. Valid arguments are retained without another model call; invalid arguments are regenerated once under the selected tool's constrained schema. Unknown tools and malformed envelopes fail explicitly. Required/named choices use constrained selection and arguments. There is no unconstrained retry loop. Tool calls still use TanStack AI's normal execution/result loop.

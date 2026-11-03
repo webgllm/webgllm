@@ -56,7 +56,7 @@ test("guided auto, required, and named tools emit exactly one coherent AGUI call
     try {
       const chunks = []
       for await (const chunk of webglText(MODEL).chatStream({ ...options(), toolChoice })) chunks.push(chunk)
-      assert.equal(requests, toolChoice === "required" ? 2 : 1)
+      assert.equal(requests, 1)
       assert.equal(chunks.filter(c => c.type === "RUN_STARTED").length, 1)
       const starts = chunks.filter(c => c.type === "TOOL_CALL_START")
       const args = chunks.filter(c => c.type === "TOOL_CALL_ARGS")

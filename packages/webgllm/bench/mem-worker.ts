@@ -15,14 +15,15 @@ import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
 import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
-import { anchorFor, readPrompt } from "../src/prompt.js"
+import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
+import { checkPrefixCache } from "./prefix-cache-check.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
 
 type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
-  mode: "chat" | "ab"
+  mode: "chat" | "ab" | "prefix"
   /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
@@ -493,6 +494,34 @@ async function ab(params: Params, got: Awaited<ReturnType<typeof files>>) {
   log(`AB SUMMARY (${params.model}, ${params.length}-token prompt, ${params.reply}-token reply, median of ${params.rounds}):\n${lines.join("\n")}`)
 }
 
+/** ?mode=prefix: verify real GPU restoration after an independent task. */
+async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    // Stable context spans a natural batch so the test exercises a retained point.
+    const system: ChatMessage = { role: "system", content: "Follow the current request and reply accurately. " + padded(got.tokenizer, [], "Shared context for independent tasks.", params.length, params.thinking) }
+    const chats: Array<Array<ChatMessage>> = ["First independent task.", "Different independent task."].map(task => [
+      system,
+      { role: "user" as const, content: task + "\n" + padded(got.tokenizer, [], task, params.length, params.thinking) }
+    ])
+    const prompts = chats.map(chat => got.tokenizer.encodeChat(chat, { addGenerationPrompt: true, enableThinking: params.thinking }))
+    const prefixes = chats.map((chat,index) => systemPrefixFor(got.tokenizer, prompts[index], chat, params.thinking))
+    if (!prefixes[0] || !prefixes[1]) throw new Error("This template has no verified system-prefix checkpoint.")
+    const anchors = chats.map((chat,index) => anchorFor(got.tokenizer,prompts[index],chat,params.thinking))
+    const result = await checkPrefixCache(engine, prompts[0], prompts[1], {
+      firstPrefix: prefixes[0], secondPrefix: prefixes[1], firstAnchor: anchors[0], secondAnchor: anchors[1]
+    })
+    if (result.restoredTokens <= 0) throw new Error("Numerical cache check did not restore a nonempty selected checkpoint.")
+    const reported = { model: params.model, mode: params.mode, ...result, peakBytes: peak }
+    log(`PREFIX CACHE CHECK ${JSON.stringify(reported)}`)
+    postMessage({ type: "result", value: reported })
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
 async function run(params: Params) {
   if (params.cdp) {
     // The GPU process before any of this page's textures: what the
@@ -505,5 +534,6 @@ async function run(params: Params) {
   }
   const got = await files(params.model)
   if (params.mode === "ab") await ab(params, got)
+  else if (params.mode === "prefix") await prefixCheck(params, got)
   else await chat(params, got)
 }

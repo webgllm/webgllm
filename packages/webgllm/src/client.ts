@@ -269,6 +269,8 @@ export async function* generate(request: {
   /** The context the model is loaded for (see loadModel). */
   contextLength?: number
   chat: Array<ChatMessage>
+  /** False resets retained prompt state before/after this generation, keeping model weights. */
+  cachePrompt?: boolean
   tools: Array<ChatTool>
   thinking?: boolean
   /** Thinking content ceiling; must be a nonnegative safe integer. */
@@ -319,6 +321,7 @@ export async function* generate(request: {
       contextLength: request.contextLength
     }),
     chat: request.chat,
+    ...(request.cachePrompt !== undefined && { cachePrompt: request.cachePrompt }),
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),
     ...(request.thinkingBudgetTokens !== undefined && {

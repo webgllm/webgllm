@@ -11,7 +11,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
-import { anchorFor, readPrompt } from "./prompt.js"
+import { anchorFor, readPrompt, systemPrefixFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -26,6 +26,7 @@ import { createThinkingBudget } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "@tanstack-ai-browser/structured-output"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
+import { withPromptCachePolicy } from "./prompt-cache-policy.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -435,14 +436,20 @@ async function generate(request: GenerateRequest) {
   // lost, or loaded if another was asked for since.
   const model = await startLoad(request.model, request.contextLength)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  return withPromptCachePolicy(model, request.cachePrompt, async () => {
   if (request.reportPhases) post({ type: "phase", id, phase: "processing" })
   const { engine, tokenizer } = model
   const compiledBefore = engine.gpu.compiled.count
+  const tokenizeAt = performance.now()
   const prompt = tokenizer.encodeChat(request.chat, {
     tools: request.tools.length ? request.tools : undefined,
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
     addGenerationPrompt: true
   })
+  const cacheEnabled = request.cachePrompt !== false
+  const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
+  const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
+  const tokenizeMs = performance.now() - tokenizeAt
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
   const startsInThinking = think !== null &&
@@ -460,6 +467,7 @@ async function generate(request: GenerateRequest) {
   const mandatoryThinking = !!reasoning && "levels" in reasoning && !("off" in reasoning.levels)
   const openThinking = request.outputSchema !== undefined && !startsInThinking && think !== null &&
     (request.thinking === true || (request.thinking === undefined && mandatoryThinking))
+  const schemaAt = performance.now()
   const structured = request.outputSchema === undefined ? undefined : new StructuredGeneration(
     await createConstraint({ schema: request.outputSchema, tokenizer: tokenizer.constraintTokenizer }),
     tokenizer.specialTokens.eos,
@@ -467,6 +475,7 @@ async function generate(request: GenerateRequest) {
     startsInThinking || openThinking,
     tokenizer.vocabSize
   )
+  const schemaMs = performance.now() - schemaAt
   engine.setAllowedTokens(null)
   try {
   const room = engine.contextLength - prompt.length
@@ -482,6 +491,7 @@ async function generate(request: GenerateRequest) {
   // whole prompt only if its end was saved with its last hidden row (the
   // same prompt again: a retry); else the last token is read again, for
   // the logits after it.
+  const restoreAt = performance.now()
   let common = 0
   while (
     common < model.cached.length &&
@@ -495,19 +505,16 @@ async function generate(request: GenerateRequest) {
     ? engine.resume(common)
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
+  const cacheRestoreMs = performance.now() - restoreAt
 
   // Read the rest of the prompt (see readPrompt), with the anchor snapshot
   // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
   let row = await readPrompt(engine, prompt, start, model.cached, {
     stop: () => stopped.has(id),
-    anchor: anchorFor(
-      tokenizer,
-      prompt,
-      request.chat,
-      request.thinking,
-      request.tools.length ? request.tools : undefined
-    )
+    prefix,
+    anchor,
+    checkpoints: cacheEnabled
   })
   const stats: RunTimings = {
     inputTokens: prompt.length,
@@ -515,6 +522,12 @@ async function generate(request: GenerateRequest) {
     outputTokens: 0,
     firstTokenMs: null,
     promptMs: performance.now() - promptStart,
+    tokenizeMs,
+    schemaMs,
+    cacheRestoreMs,
+    cacheMatchedTokens: common,
+    cachePrefixTokens: engine.snapshotPosition("prefix") ?? 0,
+    cacheAnchorTokens: engine.snapshotPosition("anchor") ?? 0,
     decodeMs: 0,
     ...thinkingBudget?.stats
   }
@@ -804,7 +817,7 @@ async function generate(request: GenerateRequest) {
   engine.dropGuess()
   const rest = decoder.flush()
   if (rest) post({ type: "token", id, text: rest })
-  engine.snapshot()
+  if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
   if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)
   // Programs the warm-up missed compile mid-request: worth knowing.
@@ -840,6 +853,7 @@ async function generate(request: GenerateRequest) {
     engine.setAllowedTokens(null)
     engine.dropGuess()
   }
+  })
 }
 
 /**
