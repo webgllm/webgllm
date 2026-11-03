@@ -1,0 +1,11 @@
+{
+  "baselineRevision": "7c5f8562b4684576656a7e78befd909bd0681971",
+  "sourceRevision": "fff04d91300b00c495eeec7ac54052b73a3c3fbf",
+  "fixtureSha256": "c2e629280afc28fcb1035686dad53c22805a60db6cde5935fc7e4c7160bce9cc",
+  "variants": [
+    "baseline",
+    "exact",
+    "memo"
+  ],
+  "page": "/__review-prefix-qa.html"
+}

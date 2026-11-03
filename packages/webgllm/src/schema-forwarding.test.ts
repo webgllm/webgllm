@@ -8,6 +8,7 @@ import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 class SchemaWorker {
   static requests: WorkerRequest[] = []
   static failure: string | undefined
+  static text = '{"moveId":"b6-a5"}'
   onmessage: ((event: { data: WorkerResponse }) => void) | null = null
   postMessage(message: WorkerRequest) {
     SchemaWorker.requests.push(message)
@@ -15,7 +16,7 @@ class SchemaWorker {
     if (message.type === "generate") {
       if (SchemaWorker.failure) this.onmessage?.({ data: { type: "error", id: message.id, message: SchemaWorker.failure } })
       else {
-        this.onmessage?.({ data: { type: "token", id: message.id, text: '{"moveId":"b6-a5"}' } })
+        this.onmessage?.({ data: { type: "token", id: message.id, text: SchemaWorker.text } })
         this.onmessage?.({ data: { type: "done", id: message.id, stats: { inputTokens: 10, cachedTokens: 0, outputTokens: 8, firstTokenMs: 1, promptMs: 1, decodeMs: 1 } } })
       }
     }
@@ -109,4 +110,23 @@ test("current tool thinking and authoritative tool results use baseline roles wi
     assert.equal(request.chat.at(-1)?.content,'{"value":"current"}');assert.equal(request.thinking,false)
     assert.ok(!JSON.stringify(request.chat).includes("OLD_THOUGHT"));assert.equal(JSON.stringify(messages),original)
   }finally{unloadModel()}
+})
+
+test("matcher failures are explicit, never retried or replaced, and JSON tag literals stay intact",async()=>{
+  const {webglText}=await import("./adapter.js"),{unloadModel}=await import("./client.js")
+  const literal="Paris</think>Paris <think>tag</think>"
+  const outputSchema={type:"object",properties:{value:{const:literal}},required:["value"],additionalProperties:false}
+  const adapter=webglText("LiquidAI/LFM3-1.7B-GGUF")
+  const invoke=()=>adapter.structuredOutput({chatOptions:{model:adapter.model,threadId:"explicit-errors",logger:resolveDebugOption(false),messages:[{role:"user",content:"Return the value"}],reasoning:{level:"off",summary:true}},outputSchema})
+  unloadModel()
+  try{
+    SchemaWorker.requests=[];SchemaWorker.failure="No token can complete the requested output schema."
+    await assert.rejects(invoke(),/No token can complete/)
+    assert.equal(SchemaWorker.requests.filter(r=>r.type==="generate").length,1)
+    SchemaWorker.failure=undefined;SchemaWorker.requests=[];SchemaWorker.text='Paris</think>Paris'
+    await assert.rejects(invoke(),/isn't JSON/)
+    assert.equal(SchemaWorker.requests.filter(r=>r.type==="generate").length,1)
+    SchemaWorker.text=JSON.stringify({value:literal})
+    const result=await invoke();assert.deepEqual(result.data,{value:literal});assert.equal(result.rawText,SchemaWorker.text)
+  }finally{SchemaWorker.failure=undefined;SchemaWorker.text='{"moveId":"b6-a5"}';unloadModel()}
 })

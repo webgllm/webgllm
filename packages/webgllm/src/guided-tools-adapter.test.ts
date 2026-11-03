@@ -165,3 +165,15 @@ test("no declared tools means hallucinated native calls remain text", async () =
     } finally { unloadModel() }
   }
 })
+
+test("failed native generations never publish tool calls or trigger repair",async()=>{
+  const {webglText}=await import("./adapter.js"),{unloadModel}=await import("./client.js")
+  unloadModel();let requests=0
+  ToolWorker.generate=(worker,request)=>{requests++;worker.send({type:"token",id:request.id,text:'<tool_call>{"name":"lookup","arguments":{"query":"checkers"}}</tool_call>'});worker.send({type:"error",id:request.id,message:"No token can complete the requested output schema."})}
+  try{
+    const chunks=[];for await(const chunk of webglText(MODEL).chatStream({...options(),toolChoice:"auto"}))chunks.push(chunk)
+    assert.equal(requests,1)
+    assert.equal(chunks.filter(c=>c.type==="RUN_ERROR").length,1)
+    assert.ok(!chunks.some(c=>c.type==="TOOL_CALL_START"||c.type==="TOOL_CALL_END"||c.type==="RUN_FINISHED"))
+  }finally{unloadModel()}
+})
