@@ -14,7 +14,52 @@ export function sharedPrefix(a: ArrayLike<number>, b: ArrayLike<number>) {
   return n
 }
 
-const tails = new WeakMap<Tokenizer, Map<string, number>>()
+const tails = new WeakMap<Tokenizer, { key: string; tail: number }>()
+const prefixes = new WeakMap<Tokenizer, { key: string; tokens: Array<number> }>()
+
+/**
+ * A reusable system/tools boundary, measured from the actual chat template and
+ * verified token-for-token against this prompt. User-required templates use two
+ * tokenize-only probes; unsupported templates keep conversational caching.
+ */
+export function systemPrefixFor(
+  tokenizer: Tokenizer,
+  prompt: Array<number>,
+  chat: Array<ChatMessage>,
+  thinking: boolean | undefined,
+  tools?: Array<ChatTool>
+): number | undefined {
+  const first = chat.findIndex(message => message.role !== "system")
+  const system = first < 0 ? chat : chat.slice(0, first)
+  if (!system.length && !tools?.length) return undefined
+  const key = JSON.stringify({ system, thinking, tools })
+  let known = prefixes.get(tokenizer)
+  if (!known || known.key !== key) {
+    const options = {
+      addGenerationPrompt: false,
+      ...(tools?.length && { tools }),
+      ...(thinking !== undefined && { enableThinking: thinking })
+    }
+    let tokens: Array<number>
+    try {
+      tokens = tokenizer.encodeChat(system, options)
+    } catch {
+      // Some templates (Qwen3.5) require a user query even when only their
+      // system/tool prefix is wanted. Probe tokenization only, never inference.
+      // The actual request stays unchanged and is checked against this prefix.
+      try {
+        const a = tokenizer.encodeChat([...system, { role: "user", content: "A" }], options)
+        const b = tokenizer.encodeChat([...system, { role: "user", content: "B" }], options)
+        tokens = a.slice(0, sharedPrefix(a, b))
+      } catch { tokens = [] }
+    }
+    known = { key, tokens }
+    prefixes.set(tokenizer, known)
+  }
+  const length = Math.min(sharedPrefix(known.tokens, prompt), prompt.length - 1)
+  return length > 0 ? length : undefined
+}
+
 
 /**
  * How many tokens at the end of a prompt the next user turn's prompt won't
@@ -31,11 +76,9 @@ export function unsharedTail(
   thinking: boolean | undefined,
   tools?: Array<ChatTool>
 ) {
-  const key = `${thinking}`
-  let byKey = tails.get(tokenizer)
-  if (!byKey) tails.set(tokenizer, (byKey = new Map()))
-  const known = byKey.get(key)
-  if (known !== undefined) return known
+  const key = JSON.stringify({ thinking, tools })
+  const known = tails.get(tokenizer)
+  if (known?.key === key) return known.tail
   const options = {
     addGenerationPrompt: true,
     ...(tools?.length && { tools }),
@@ -48,7 +91,7 @@ export function unsharedTail(
     options
   )
   const tail = prompt.length - sharedPrefix(prompt, next)
-  byKey.set(key, tail)
+  tails.set(tokenizer, { key, tail })
   return tail
 }
 
@@ -84,6 +127,14 @@ export function anchorFor(
  * anchor inside a batch is saved from inside it (`saveAt` tokens in) where
  * the engine can (`inside`), else the batches split there.
  */
+export type PromptReadStep = {
+  size: number
+  snapshot: "prefix" | "anchor" | "end" | "batch" | null
+  saveAt?: number
+  /** A natural endpoint can serve both ordinary conversation and static prefix. */
+  prefix?: boolean
+}
+
 export function promptPlan(
   batchSizes: (count: number) => Array<number>,
   length: number,
@@ -91,17 +142,13 @@ export function promptPlan(
   anchor: number | undefined,
   few: boolean,
   inside = false
-) {
+): Array<PromptReadStep> {
   const within = anchor !== undefined && anchor > start && anchor < length
   const sizes =
     within && !inside
       ? [...batchSizes(anchor - start), ...batchSizes(length - anchor)]
       : batchSizes(length - start)
-  const plan: Array<{
-    size: number
-    snapshot: "anchor" | "end" | "batch" | null
-    saveAt?: number
-  }> = []
+  const plan: Array<PromptReadStep> = []
   let at = start
   for (const size of sizes) {
     const from = at
@@ -118,6 +165,24 @@ export function promptPlan(
   return plan
 }
 
+/** Protect an existing legacy batch endpoint; never change batching to capture a prefix. */
+export function naturalPromptPlan(
+  batchSizes: (count: number) => Array<number>, length: number, start: number,
+  anchor: number | undefined, few: boolean, inside: boolean, prefix?: number
+): Array<PromptReadStep> {
+  const plan = promptPlan(batchSizes, length, start, anchor, few, inside)
+  let at = start
+  let prefixAt: number | undefined
+  for (const step of plan) { at += step.size; if (prefix !== undefined && at <= prefix) prefixAt = at }
+  at = start
+  return plan.map(step => {
+    at += step.size
+    const stable = at === prefixAt
+    return { ...step, snapshot: stable && step.snapshot !== "anchor" ? "prefix" : step.snapshot,
+      ...(stable && step.snapshot === "anchor" && { prefix: true }) }
+  })
+}
+
 /**
  * Reads prompt[start..] into `engine` (whose cache holds prompt[..start])
  * as promptPlan says, appending each batch to `cached` once it's read.
@@ -129,26 +194,24 @@ export async function readPrompt(
   prompt: Array<number>,
   start: number,
   cached: Array<number>,
-  options: { stop?: () => boolean; anchor?: number } = {}
+  options: { stop?: () => boolean; anchor?: number; prefix?: number; checkpoints?: boolean } = {}
 ): Promise<number> {
   const few = engine.snapshotLimit < 4
   let row = 0
   let i = start
-  for (const { size, snapshot, saveAt } of promptPlan(
-    (n) => engine.batchSizes(n),
-    prompt.length,
-    start,
-    options.anchor,
-    few,
-    engine.canSaveInside
-  )) {
+  const plan: Array<PromptReadStep> = options.checkpoints === false
+    ? engine.batchSizes(prompt.length - start).map(size => ({ size, snapshot: null }))
+    : naturalPromptPlan(n => engine.batchSizes(n), prompt.length, start, options.anchor, few, engine.canSaveInside, engine.snapshotLimit >= 2 ? options.prefix : undefined)
+  for (const { size, snapshot, saveAt, prefix: alsoPrefix } of plan) {
     const batch = prompt.slice(i, i + size)
     i += size
     row = await engine.forwardHidden(batch, saveAt !== undefined ? { saveAt } : {})
     cached.push(...batch)
     const end = i === prompt.length ? row : undefined
-    if (snapshot === "anchor") engine.snapshot(end, true)
+    if (snapshot === "prefix") engine.snapshot(end, "prefix")
+    else if (snapshot === "anchor") engine.snapshot(end, true)
     else if (snapshot) engine.snapshot(end)
+    if (alsoPrefix) engine.snapshot(end, "prefix")
     if (options.stop?.()) break
   }
   return row

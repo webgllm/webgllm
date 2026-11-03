@@ -16,6 +16,18 @@ export type RunTimings = {
   firstTokenMs: number | null
   /** Reading the part of the prompt that wasn't cached, in ms. */
   promptMs: number
+  /** Chat-template encoding and token-verified prefix-boundary discovery. */
+  tokenizeMs?: number
+  /** Generation-local schema/constraint setup, before prefill. */
+  schemaMs?: number
+  /** CPU prefix matching and restore-command submission, without a GPU synchronization. */
+  cacheRestoreMs?: number
+  /** Tokens matching the previous request before checkpoint selection. */
+  cacheMatchedTokens?: number
+  /** Actual retained system/tools prefix checkpoint selected for this request. */
+  cachePrefixTokens?: number
+  /** Actual retained ordinary conversational checkpoint. */
+  cacheAnchorTokens?: number
   /** From the first generated token to the last, in ms. */
   decodeMs: number
   /** Speculative decoding: batches with drafts, drafts checked, drafts kept. */
@@ -50,6 +62,8 @@ export type WorkerRequest =
       /** The context to load it for, if it's loaded first (see "load"). */
       contextLength?: number
       chat: Array<ChatMessage>
+      /** Explicit false disables cross-call inference-cache reuse and retention. */
+      cachePrompt?: boolean
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean

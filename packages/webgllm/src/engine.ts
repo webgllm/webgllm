@@ -5,6 +5,8 @@
  */
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
+import { checkpointsToDrop } from "./checkpoint-policy.js"
+import type { SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
@@ -382,6 +384,8 @@ type Snapshot = {
   hidden?: Texture
   /** The anchor: dropped for room only once a newer anchor is saved (see snapshot). */
   anchor?: boolean
+  /** Stable system/tool prefix, retained alongside the conversational anchor. */
+  prefix?: boolean
 }
 
 /**
@@ -1775,13 +1779,13 @@ export class Engine {
     return this.canDraft ? MAX_SNAPSHOTS : Math.max(1, TUNING.linearSnapshots)
   }
 
-  /** Frees the oldest snapshots but the anchor until at most `keep` are left. */
-  private dropSnapshots(keep: number) {
-    for (const [p, old] of this.snapshots) {
-      if (this.snapshots.size <= keep) break
-      if (old.anchor) continue
-      this.freeSnapshot(old)
-      this.snapshots.delete(p)
+  /** Retains the reusable prefix and conversational anchor within the existing limit. */
+  private dropSnapshots(keep: number, replacing?: SnapshotRole) {
+    const points = [...this.snapshots].map(([position, saved]) => ({ position, anchor: saved.anchor, prefix: saved.prefix }))
+    for (const position of checkpointsToDrop(points, keep, replacing)) {
+      const saved = this.snapshots.get(position)
+      if (saved) this.freeSnapshot(saved)
+      this.snapshots.delete(position)
     }
   }
 
@@ -1789,24 +1793,27 @@ export class Engine {
    * Saves what's needed to resume at the current position (see
    * `snapshots`), so a later prompt that shares the tokens so far reads only
    * what's new. Keeps the latest snapshotLimit, the oldest freed before a
-   * new one is made (so no more than that are ever held), except the
-   * anchor: the latest snapshot saved with `anchor` (where the next user
-   * turn's prompt stops sharing this chat's: see readPrompt) stays until a
-   * newer anchor replaces it. With `hiddenRow` (the row of the last batch
+   * new one is made (so no more than that are ever held). The stable prefix
+   * and latest conversational anchor have priority over discretionary batch
+   * points; with room for only one, conversational behavior is unchanged.
+   * With `hiddenRow` (the row of the last batch
    * holding the last token), keeps that token's hidden state too, so
    * `resume` can draw the next token's logits without reading it again.
    */
-  snapshot(hiddenRow?: number, anchor = false) {
+  snapshot(hiddenRow?: number, anchor: boolean | "prefix" = false) {
+    if (anchor === "prefix" && this.snapshotLimit < 2) return
     if (this.guessAt !== null)
       throw new Error("Snapshot while a guessed token is pending.")
     const at = this.position
     const had = this.snapshots.get(at)
     if (had) {
       if (hiddenRow !== undefined && !had.hidden) had.hidden = this.copyHidden(hiddenRow)
-      if (anchor) this.keepSnapshot(at, had, true)
+      if (anchor) this.keepSnapshot(at, had, anchor)
       return
     }
-    this.dropSnapshots(this.snapshotLimit - 1)
+    // Do not evict either useful anchor just to save a discretionary point.
+    if (!anchor && [...this.snapshots.values()].filter(saved => saved.anchor || saved.prefix).length >= this.snapshotLimit) return
+    this.dropSnapshots(this.snapshotLimit - 1, anchor === true ? "anchor" : anchor || undefined)
     const W = this.config.slidingWindow
     const saved: Snapshot = {
       conv: [] as Array<Texture>,
@@ -1847,14 +1854,21 @@ export class Engine {
   }
 
   /** Adds `saved` as the snapshot at `at` (the anchor, with `anchor`), then drops the oldest past the limit. */
-  private keepSnapshot(at: number, saved: Snapshot, anchor: boolean) {
+  private keepSnapshot(at: number, saved: Snapshot, anchor: boolean | "prefix") {
     this.snapshots.set(at, saved)
     if (anchor) {
-      for (const s of this.snapshots.values()) s.anchor = false
-      saved.anchor = true
+      const role = anchor === true ? "anchor" : "prefix"
+      for (const s of this.snapshots.values()) s[role] = false
+      saved[role] = true
     }
     // (An anchor kept past the limit goes once it's no longer the anchor.)
     this.dropSnapshots(this.snapshotLimit)
+  }
+
+  /** The selected retained checkpoint, for cache diagnostics and native correctness checks. */
+  snapshotPosition(role: SnapshotRole): number | undefined {
+    for (const [position, saved] of this.snapshots) if (saved[role]) return position
+    return undefined
   }
 
   /** A copy of an f32 texture. */
@@ -3948,7 +3962,7 @@ export class Engine {
       if (!this.canSaveInside || tokens.length > this.capacity || !(saveAt > 0 && saveAt < tokens.length))
         throw new Error(`Can't save a snapshot after ${saveAt} of a ${tokens.length}-token batch.`)
       // Room first, so no more than the limit are ever held.
-      this.dropSnapshots(this.snapshotLimit - 1)
+      this.dropSnapshots(this.snapshotLimit - 1, "anchor")
       const pos0 = this.position
       this.saving = []
       try {

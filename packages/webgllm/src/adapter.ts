@@ -60,6 +60,18 @@ export type WebGlProviderUsageDetails = {
   firstTokenMs?: number
   /** Reading the part of the prompt that wasn't cached. */
   promptMs?: number
+  /** Template encoding and reusable-prefix boundary discovery. */
+  tokenizeMs?: number
+  /** Generation-local constrained-decoding setup. */
+  schemaMs?: number
+  /** CPU prefix matching and restore command submission, without a GPU fence. */
+  cacheRestoreMs?: number
+  /** Raw token prefix match before checkpoint selection. */
+  cacheMatchedTokens?: number
+  /** Actual retained system/tool checkpoint selected without extra model forwards. */
+  cachePrefixTokens?: number
+  /** Actual retained ordinary conversational checkpoint. */
+  cacheAnchorTokens?: number
   /** From the first generated token to the last. */
   decodeMs?: number
   /** Tokens generated after the first one, over `decodeMs`. */
@@ -263,6 +275,12 @@ function usageOf(stats: RunTimings): TokenUsage {
   usage.providerUsageDetails = {
     ...(stats.firstTokenMs !== null && { firstTokenMs: stats.firstTokenMs }),
     promptMs: stats.promptMs,
+    ...(stats.tokenizeMs !== undefined && { tokenizeMs: stats.tokenizeMs }),
+    ...(stats.schemaMs !== undefined && { schemaMs: stats.schemaMs }),
+    ...(stats.cacheRestoreMs !== undefined && { cacheRestoreMs: stats.cacheRestoreMs }),
+    ...(stats.cacheMatchedTokens !== undefined && { cacheMatchedTokens: stats.cacheMatchedTokens }),
+    ...(stats.cachePrefixTokens !== undefined && { cachePrefixTokens: stats.cachePrefixTokens }),
+    ...(stats.cacheAnchorTokens !== undefined && { cacheAnchorTokens: stats.cacheAnchorTokens }),
     ...(stats.thinkingTokens !== undefined && { thinkingTokens: stats.thinkingTokens }),
     ...(stats.thinkingBudgetTokens !== undefined && { thinkingBudgetTokens: stats.thinkingBudgetTokens }),
     ...(stats.thinkingBudgetExhausted !== undefined && { thinkingBudgetExhausted: stats.thinkingBudgetExhausted }),
@@ -524,6 +542,7 @@ export class WebGlTextAdapter<
       contextLength: this.contextLength,
       chat,
       tools: options.toolChoice === "none" ? [] : toTools(options.tools),
+      ...(options.promptCache?.retention === "none" && { cachePrompt: false }),
       ...thinking,
       sampling: this.sampling(options.modelOptions, thinking.thinking),
       maxTokens,
@@ -672,6 +691,7 @@ export class WebGlTextAdapter<
         ...toChatMessages(chatOptions.messages, this.toolFormat)
       ],
       tools: [],
+      ...(chatOptions.promptCache?.retention === "none" && { cachePrompt: false }),
       outputSchema,
       ...thinking,
       sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
