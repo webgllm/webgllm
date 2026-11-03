@@ -1,3 +1,4 @@
+import { adaptivePrefixFor } from "./checkpoint-policy.js"
 /**
  * The WebGL 2 worker: downloads a model to the Origin Private File System,
  * uploads its weights to the GPU on an OffscreenCanvas, and runs
@@ -11,7 +12,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
-import { anchorFor, readPrompt, systemPrefixFor } from "./prompt.js"
+import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -62,6 +63,8 @@ type Loaded = {
   tokenizer: Tokenizer
   /** Token ids in the engine's cache, in order. */
   cached: Array<number>
+  /** Recent verified common content, for conservative short-prefix promotion. */
+  previousShared?: number
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
@@ -505,14 +508,27 @@ async function generate(request: GenerateRequest) {
     ? engine.resume(common)
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
+  let natural: number | undefined
+  if (cacheEnabled && common > 0 && !whole && prefix !== undefined && prefix > start) {
+    let at = start
+    for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
+  }
+  const framing = cacheEnabled && common > 0 && !whole
+    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking) : 0
+  const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
+  if (!whole) model.previousShared = plan.previousShared
   const cacheRestoreMs = performance.now() - restoreAt
 
   // Read the rest of the prompt (see readPrompt), with the anchor snapshot
   // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
+  const reusablePrefix = plan.prefix
   let row = await readPrompt(engine, prompt, start, model.cached, {
     stop: () => stopped.has(id),
-    prefix,
+    // After a changed request reveals a shorter common boundary, retain it
+    // during this ordinary forward. One-off cold calls incur no extra work.
+    prefix: reusablePrefix,
+    ...(cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0 && { observedPrefix: reusablePrefix }),
     anchor,
     checkpoints: cacheEnabled
   })

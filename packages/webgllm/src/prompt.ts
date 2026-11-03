@@ -14,6 +14,27 @@ export function sharedPrefix(a: ArrayLike<number>, b: ArrayLike<number>) {
   return n
 }
 
+const framing = new WeakMap<Tokenizer, Map<string, Array<number>>>()
+
+/** Tokenization-only probes identify framing, not instructions; no probe is sent to a model. */
+export function templateFramingFor(tokenizer: Tokenizer, prompt: Array<number>, role: string, thinking?: boolean): number {
+  if (role !== "system" && role !== "user") return 0
+  let entries = framing.get(tokenizer)
+  if (!entries) { entries = new Map(); framing.set(tokenizer, entries) }
+  const key = JSON.stringify({ role, thinking })
+  let tokens = entries.get(key)
+  if (!tokens) {
+    const chat = (content: string): Array<ChatMessage> => [{ role, content }, ...(role === "system" ? [{ role: "user" as const, content: "Z" }] : [])]
+    try {
+      const options = { addGenerationPrompt: false, ...(thinking !== undefined && { enableThinking: thinking }) }
+      const a = tokenizer.encodeChat(chat("A"), options), b = tokenizer.encodeChat(chat("B"), options)
+      tokens = a.slice(0, sharedPrefix(a, b))
+    } catch { tokens = [] }
+    entries.set(key, tokens)
+  }
+  return sharedPrefix(tokens, prompt)
+}
+
 const tails = new WeakMap<Tokenizer, { key: string; tail: number }>()
 const prefixes = new WeakMap<Tokenizer, { key: string; tokens: Array<number> }>()
 
@@ -194,9 +215,13 @@ export async function readPrompt(
   prompt: Array<number>,
   start: number,
   cached: Array<number>,
-  options: { stop?: () => boolean; anchor?: number; prefix?: number; checkpoints?: boolean } = {}
+  options: { stop?: () => boolean; anchor?: number; prefix?: number; observedPrefix?: number; checkpoints?: boolean } = {}
 ): Promise<number> {
   const few = engine.snapshotLimit < 4
+  // Rewind may select an ordinary retained checkpoint. Promoting it is metadata
+  // only: don't lose that verified fallback to a later long dynamic tail.
+  if (options.checkpoints !== false && engine.snapshotLimit >= 2 && start > 0 && start < prompt.length && options.prefix === start && engine.snapshotPosition("prefix") !== start)
+    engine.snapshot(undefined, "prefix")
   let row = 0
   let i = start
   const plan: Array<PromptReadStep> = options.checkpoints === false
@@ -205,13 +230,18 @@ export async function readPrompt(
   for (const { size, snapshot, saveAt, prefix: alsoPrefix } of plan) {
     const batch = prompt.slice(i, i + size)
     i += size
-    row = await engine.forwardHidden(batch, saveAt !== undefined ? { saveAt } : {})
+    const observed = options.checkpoints === false || engine.snapshotLimit < 2 ? undefined : options.observedPrefix
+    const prefixAt = observed !== undefined && observed > i - size && observed < i ? observed - (i - size) : undefined
+    row = await engine.forwardHidden(batch, {
+      ...(saveAt !== undefined && { saveAt }),
+      ...(prefixAt !== undefined && { prefixAt })
+    })
     cached.push(...batch)
     const end = i === prompt.length ? row : undefined
     if (snapshot === "prefix") engine.snapshot(end, "prefix")
     else if (snapshot === "anchor") engine.snapshot(end, true)
     else if (snapshot) engine.snapshot(end)
-    if (alsoPrefix) engine.snapshot(end, "prefix")
+    if (alsoPrefix || options.checkpoints !== false && options.observedPrefix === i && engine.snapshotLimit >= 2) engine.snapshot(end, "prefix")
     if (options.stop?.()) break
   }
   return row
