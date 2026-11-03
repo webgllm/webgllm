@@ -1,7 +1,7 @@
 /**
  * The models this package runs: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
- * 4-bit ONNX builds), the LFM2.5 / LFM2 ONNX builds the Transformers.js
- * package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
+ * 4-bit ONNX builds), official LFM2.5 GGUFs, the LFM2.5 / LFM2 ONNX builds
+ * the Transformers.js package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
  * q4f16 ONNX), each with its files (at their latest version) and the
  * sampling from its card.
  */
@@ -243,6 +243,38 @@ const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
   thinking: true
 })
 
+/** Official Q4_0 GGUFs; QAD tokenizers/templates accompany those exact builds. */
+function lfm2Gguf<const T extends string>(o: { name: T; file: string; size: string; thinking: boolean; tokenizerRepo: string; tokenizerPrefix?: string }) {
+  const tokenizer = { repo: o.tokenizerRepo }
+  const prefix = o.tokenizerPrefix ?? ""
+  return {
+    name: o.name, format: "gguf",
+    files: { kind: "gguf", model: { repo: o.name, path: o.file } },
+    tokenizer: {
+      tokenizer: { ...tokenizer, path: `${prefix}tokenizer.json` },
+      config: { ...tokenizer, path: `${prefix}tokenizer_config.json` },
+      chatTemplate: { ...tokenizer, path: `${prefix}chat_template.jinja` }
+    },
+    supports: o.thinking ? TOOLS_AND_THINKING : TOOLS,
+    size: o.size,
+    ...(o.thinking && { reasoning: ALWAYS_THINKS }),
+    sampling: o.thinking ? LFM2_5_THINKING_SAMPLING : LFM2_5_SAMPLING,
+    toolFormat: "lfm2"
+  } as const satisfies WebGlModelMeta
+}
+const LFM2_5_350M_GGUF = lfm2Gguf({
+  name: "LiquidAI/LFM2.5-350M-GGUF", file: "LFM2.5-350M-QAD-Q4_0.gguf", size: "350m", thinking: false,
+  tokenizerRepo: "LiquidAI/LFM2.5-350M-GGUF", tokenizerPrefix: "qad/"
+})
+const LFM2_5_1_2B_GGUF = lfm2Gguf({
+  name: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF", file: "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf", size: "1.2b", thinking: false,
+  tokenizerRepo: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF", tokenizerPrefix: "qad/"
+})
+const LFM2_5_1_2B_THINKING_GGUF = lfm2Gguf({
+  name: "LiquidAI/LFM2.5-1.2B-Thinking-GGUF", file: "LFM2.5-1.2B-Thinking-Q4_0.gguf", size: "1.2b", thinking: true,
+  tokenizerRepo: "LiquidAI/LFM2.5-1.2B-Thinking"
+})
+
 /** Qwen3.5-2B model card: non-thinking text recommendations (all our inputs are text). */
 const QWEN_3_5_SAMPLING = {
   temperature: 1,
@@ -335,6 +367,9 @@ export const WEBGL_TEXT_MODELS = [
   LFM2_5_1_2B_WEB.name,
   LFM2_5_1_2B_THINKING_WEB.name,
   LFM2_5_350M.name,
+  LFM2_5_350M_GGUF.name,
+  LFM2_5_1_2B_GGUF.name,
+  LFM2_5_1_2B_THINKING_GGUF.name,
   QWEN_3_5_2B_GGUF.name,
   QWEN_3_5_2B_ONNX.name
 ] as const
@@ -353,6 +388,9 @@ export const WEBGL_MODEL_META: Readonly<
   [LFM2_5_1_2B_WEB.name]: LFM2_5_1_2B_WEB,
   [LFM2_5_1_2B_THINKING_WEB.name]: LFM2_5_1_2B_THINKING_WEB,
   [LFM2_5_350M.name]: LFM2_5_350M,
+  [LFM2_5_350M_GGUF.name]: LFM2_5_350M_GGUF,
+  [LFM2_5_1_2B_GGUF.name]: LFM2_5_1_2B_GGUF,
+  [LFM2_5_1_2B_THINKING_GGUF.name]: LFM2_5_1_2B_THINKING_GGUF,
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
   [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX
 }
@@ -362,6 +400,7 @@ const WEBGL_REASONING = {
   [LFM3_1_7B_WEB.name]: LFM3_1_7B_WEB.reasoning,
   [LFM3_1_7B_ONNX.name]: LFM3_1_7B_ONNX.reasoning,
   [LFM2_5_1_2B_THINKING.name]: ALWAYS_THINKS,
+  [LFM2_5_1_2B_THINKING_GGUF.name]: ALWAYS_THINKS,
   [LFM2_5_1_2B_THINKING_WEB.name]: ALWAYS_THINKS,
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF.reasoning,
   [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX.reasoning
