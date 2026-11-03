@@ -41,7 +41,7 @@ const handler='function handleMessage({ data }: MessageEvent<WorkerResponse>) {'
 if(!client.includes(handler))throw Error('Client response handler changed.');
 client=client.replace(handler,handler+'\n  // Diagnostic packets must not hit the default generation-completion branch.\n  if (data.type === "review-trace" || data.type === "review-progress") return');
 await writeFile(clientPath,client);
-const baselinePath='packages/structured-output/bench/results/webgl-single-before.json';
+const baselinePath='packages/webgl/bench/fixtures/trace-baseline.json';
 const baselineBytes=await readFile(join(repoRoot,baselinePath));
 const baseline=JSON.parse(baselineBytes.toString('utf8'));
 const countries=['France','Japan','Italy','Spain'];

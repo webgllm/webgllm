@@ -56,8 +56,8 @@ The ONNX model kept its normal 1,024-token batch; the others kept 512.
   texture bytes and peak tracked GPU allocations. These are allocator measurements,
   not a measurement of total Chrome/driver physical memory.
 
-Raw native records: [LFM3](lfm3-numerical.json.gz), [Qwen](qwen-numerical.json.gz),
-[ONNX](onnx-numerical.json.gz).
+Raw native records: LFM3 (raw run archived locally), Qwen (raw run archived locally),
+ONNX (raw run archived locally).
 
 ## Standard SDK integration and long-prefix control
 
@@ -86,7 +86,7 @@ had one matcher dead end on a required London weather call. This error class als
 occurs in baseline; this change does not claim to fix the existing structured-output
 matcher issue. No missing value was guessed, no tags stripped, no schema weakened,
 and no retry used to convert these failures into passes. Full errors/requests remain
-in [Qwen SDK raw results](qwen-sdk.json.gz).
+in Qwen SDK raw results (raw run archived locally).
 
 Pre-aborted TanStack structured finalization in this installed version reports the
 generic `structured output finalization produced no result`, with no native request.
@@ -95,8 +95,8 @@ inference; it does not require the SDK to preserve an AbortError class. During-r
 cancellation and subsequent inference were checked through the real adapter. An
 additional focused LFM cancellation run passed 12/12.
 
-Raw SDK results: [LFM3](lfm3-sdk.json.gz), [Qwen](qwen-sdk.json.gz),
-[focused cancellation](lfm3-cancellation.json.gz).
+Raw SDK results: LFM3 (raw run archived locally), Qwen (raw run archived locally),
+focused cancellation (raw run archived locally).
 
 ## Throughput and its limits
 
@@ -138,8 +138,8 @@ requests typically reuse 410 input tokens; the pre-feature lean layout reused ze
 The seven-position recorded-game replay returns 28/28 legal results across both
 historical/current layouts. Exact repeats retain full prompt reuse on LFM3.
 
-See [quality](checkers-quality.json.gz), [cache replay](checkers-replay.json.gz),
-and [Chrome proof](checkers-chrome.png). Timing differences across earlier app reports
+See quality (raw run archived locally), cache replay (raw run archived locally),
+and Chrome proof (raw run archived locally). Timing differences across earlier app reports
 are not claimed as a controlled performance improvement.
 
 ## Automated validation and reproduction
@@ -151,8 +151,8 @@ cover cold batching, short and fluctuating prefixes, preserved long-profile hits
 existing-point promotion, exact-retry retention, cache-disable/one-snapshot paths,
 bounded simultaneous anchors, and interruption cleanup.
 
-[Before regression output](before-regression.log), [Nx output](nx-checks.log),
-[audit](checkers-audit.log), [source/dependency manifest](source-manifest.json).
+Before regression output (raw run archived locally), Nx output (raw run archived locally),
+audit (raw run archived locally), source/dependency manifest (raw run archived locally).
 Some numerical/diagnostic records were taken while admission policy was being
 refined; final SDK/profile checks exercise the completed policy. Final Checkers
 records were captured after the last metadata-retention guards and build checks.

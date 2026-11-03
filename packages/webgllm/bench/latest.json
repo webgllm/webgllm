@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "kind": "lfm2.5-gguf-validation",
+  "models": [
+    {
+      "model": "LiquidAI/LFM2.5-350M-GGUF",
+      "numericalTopMatches": 8,
+      "numericalSteps": 8,
+      "nativeCpuMaxKl": 0.00689460335984021,
+      "nativeCpuThresholdPass": true,
+      "structuredPasses": 4,
+      "toolPasses": 2,
+      "exactRepeatCachedTokens": 78,
+      "changedPromptCachedTokens": 65,
+      "sampling": {
+        "temperature": 0.1,
+        "top_k": 50,
+        "repetition_penalty": 1.05,
+        "top_p": 1,
+        "min_p": 0
+      },
+      "thinkingBudgetForTest": null
+    },
+    {
+      "model": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+      "numericalTopMatches": 8,
+      "numericalSteps": 8,
+      "nativeCpuMaxKl": 0.03547477769252943,
+      "nativeCpuThresholdPass": false,
+      "structuredPasses": 4,
+      "toolPasses": 2,
+      "exactRepeatCachedTokens": 78,
+      "changedPromptCachedTokens": 65,
+      "sampling": {
+        "temperature": 0.1,
+        "top_k": 50,
+        "repetition_penalty": 1.05,
+        "top_p": 1,
+        "min_p": 0
+      },
+      "thinkingBudgetForTest": null
+    },
+    {
+      "model": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+      "numericalTopMatches": 8,
+      "numericalSteps": 8,
+      "nativeCpuMaxKl": 0.00014900599919917765,
+      "nativeCpuThresholdPass": true,
+      "structuredPasses": 4,
+      "toolPasses": 2,
+      "exactRepeatCachedTokens": 78,
+      "changedPromptCachedTokens": 65,
+      "sampling": {
+        "temperature": 0.05,
+        "top_k": 50,
+        "repetition_penalty": 1.05,
+        "top_p": 1,
+        "min_p": 0
+      },
+      "thinkingBudgetForTest": 512
+    }
+  ],
+  "sources": [
+    {
+      "key": "350m",
+      "repo": "LiquidAI/LFM2.5-350M-GGUF",
+      "revision": "657e078c94084481950a2d555a941481f715536b",
+      "file": "LFM2.5-350M-QAD-Q4_0.gguf",
+      "bytes": 219312832,
+      "sha256": "3d10b6ab8fc91a919534b9558e266255aca0bbc7f6d015963599aa9e74e05b1d"
+    },
+    {
+      "key": "instruct",
+      "repo": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+      "revision": "8ed288026e23958ad9dfa92d53ed773a8eee7125",
+      "file": "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf",
+      "bytes": 695755488,
+      "sha256": "bb741ebb106d543e9de114b843a3d3d73d51c74b5801e69da2abde821a0cb3e1"
+    },
+    {
+      "key": "thinking",
+      "repo": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+      "revision": "b71945805f7d4d87dabd73e26098d44bcad6c35f",
+      "file": "LFM2.5-1.2B-Thinking-Q4_0.gguf",
+      "bytes": 695755392,
+      "sha256": "b7739ac36c81bb412f93127e5c3ec3af636bd52ef656ea8c4a88289bf9df5608"
+    }
+  ],
+  "instructPrecisionControl": {
+    "maximumKl": 0.0003750191636738467,
+    "topTokenMatches": 8,
+    "steps": 8
+  },
+  "thinkingShortBudgetObservation": {
+    "budgetTokens": 128,
+    "requestedCity": "London",
+    "returnedCity": "Paris",
+    "format": "schema-valid; semantic error",
+    "final512BudgetRunPassed": true
+  }
+}

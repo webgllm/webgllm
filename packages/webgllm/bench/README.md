@@ -1,5 +1,9 @@
 # Bench
 
+Raw run artifacts are no longer tracked. Keep only [the latest compact summary](latest.json);
+regenerate raw files locally as needed. Fixed regression fixtures remain separate.
+
+
 Pages for checking and timing the engine, served cross-origin isolated by `server.mjs`, which also bundles the package's TypeScript on request (`/bundle/<path>.js` is `<path>.ts`).
 
 ```sh

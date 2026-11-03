@@ -161,3 +161,13 @@ Phones take the same 512-token batch: nothing a GPU reports tells an iPhone's ~2
 The most JavaScript memory a load takes is ~110 MiB: it streams the weights, a layer or a chunk of the embedding at a time. The worker claims the textures it measured from the page's memory budget (`setMemoryBudget`; before a load, an estimate: 1.4× the weight files), and claims again as the cache grows; if the GPU runs out of memory growing the cache, the reply stops with an error asking for a new session.
 
 **Status:** early (0.x); the API may change. See the [repository README](https://github.com/daveycodez/tanstack-ai-browser#readme).
+
+## LFM2.5 GGUF variants
+
+WebGL also supports `LiquidAI/LFM2.5-350M-GGUF`,
+`LiquidAI/LFM2.5-1.2B-Instruct-GGUF`, and
+`LiquidAI/LFM2.5-1.2B-Thinking-GGUF`. The first two use official QAD Q4_0 files;
+Thinking uses its official Q4_0 file and always reasons, with native reasoning-budget
+support. Each inherits its model-card sampling recommendations; caller overrides and
+model context/output defaults retain their existing behavior. Lofi lists them under
+WebGL. See [validation and reproduction](bench/LFM2-GGUF.md).
