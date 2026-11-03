@@ -1880,8 +1880,14 @@ export class Engine {
   /** A copy of an f32 texture. */
   private copyOf(from: Texture) {
     const copy = this.gpu.texture(GL.RGBA32F, from.width, from.height)
-    this.gpu.run({ program: this.gpu.program(K.COPY), inputs: { uX: from }, output: copy })
-    return copy
+    try {
+      this.gpu.run({ program: this.gpu.program(K.COPY), inputs: { uX: from }, output: copy })
+      return copy
+    } catch (error) {
+      // The caller cannot own this texture until the copy has returned.
+      this.gpu.delete(copy)
+      throw error
+    }
   }
 
   /**
@@ -3653,11 +3659,11 @@ export class Engine {
       output: t.qkv,
       rect: { x: 0, y: 0, width: C4, height: rows }
     })
-    for (const [m, out] of [
-      [rows, layer.convState[1]],
-      // (The conv state after saveAt's rows, for a snapshot there.)
-      ...(saveAt ? [[saveAt, this.f32(lin.C, width - 1)] as const] : [])
-    ] as const) {
+    for (const m of [rows, ...(saveAt !== undefined ? [saveAt] : [])]) {
+      // Own the anchor copy before compiling or drawing it. Do not allocate it
+      // ahead of the full-batch state pass, which can itself be interrupted.
+      const out = m === saveAt ? this.f32(lin.C, width - 1) : layer.convState[1]
+      if (m === saveAt) this.saving?.push(out)
       this.gpu.run({
         name: "linear",
         program: read(K.linConvState(width)),
@@ -3666,7 +3672,6 @@ export class Engine {
         output: out,
         rect: { x: 0, y: 0, width: C4, height: width - 1 }
       })
-      if (m === saveAt) this.saving?.push(out)
     }
     layer.convState.reverse()
     this.gpu.run({

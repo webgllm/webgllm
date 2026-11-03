@@ -1,0 +1,13 @@
+{
+  "date": "2026-11-03",
+  "baselineEngine": "aaf9992",
+  "head": "a5c2bb4",
+  "llguidance": "0.2.1",
+  "tokenizerUrl": "https://huggingface.co/Qwen/Qwen3.5-2B/resolve/main/tokenizer.json",
+  "tokenizerSha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "sourceHashes": {
+    "packages/structured-output/src/index.ts": "271534355dd86fc9cc5652cef7cb89e7c6fa10c601470a6fa31333fc0e0c23dd",
+    "packages/structured-output/src/canonical-mask.ts": "106bd833a73d9171768f4be6d435c0e2fd5b527f13b5e84c44d3daf2d8b2618d",
+    "packages/structured-output/src/canonical-mask.test.ts": "2874a4097ef2fd05c5717e8912a70458881fec1a6fd1197517b630969342745b"
+  }
+}

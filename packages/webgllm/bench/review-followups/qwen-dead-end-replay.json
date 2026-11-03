@@ -1,0 +1,311 @@
+{
+  "scope": "Independent CPU mechanism replay; historical native London attribution remains unproven.",
+  "tokenizerSha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "vocabSize": 248070,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "enum": [
+          "Paris",
+          "Tokyo",
+          "London",
+          "Berlin"
+        ]
+      }
+    },
+    "required": [
+      "city"
+    ],
+    "additionalProperties": false,
+    "x-guidance": {
+      "whitespace_flexible": false,
+      "key_separator": ":",
+      "item_separator": ","
+    }
+  },
+  "unfiltered": [
+    {
+      "name": "captured-Paris-prefix",
+      "steps": [
+        {
+          "token": 90,
+          "bytes": [
+            123
+          ],
+          "piece": "{",
+          "allowed": true
+        },
+        {
+          "token": 1,
+          "bytes": [
+            34
+          ],
+          "piece": "\"",
+          "allowed": true
+        },
+        {
+          "token": 8656,
+          "bytes": [
+            99,
+            105,
+            116,
+            121
+          ],
+          "piece": "city",
+          "allowed": true
+        },
+        {
+          "token": 763,
+          "bytes": [
+            34,
+            58
+          ],
+          "piece": "\":",
+          "allowed": true
+        },
+        {
+          "token": 65399,
+          "bytes": [
+            34,
+            80
+          ],
+          "piece": "\"P",
+          "allowed": true
+        },
+        {
+          "token": 157,
+          "bytes": [
+            225
+          ],
+          "piece": "�",
+          "allowed": true
+        },
+        {
+          "token": 116,
+          "bytes": [
+            184
+          ],
+          "piece": "�",
+          "allowed": true
+        }
+      ],
+      "result": {
+        "stop": true,
+        "reason": "dead_end"
+      },
+      "utf8State": {
+        "expected": 3,
+        "seen": 2,
+        "codePoint": 120,
+        "minimum": 2048,
+        "first": 225
+      },
+      "maskInstrumentation": {
+        "trieNodesVisited": 2032,
+        "sharedJsonMaskCacheHits": 0,
+        "sharedJsonMaskCacheMisses": 0,
+        "sharedJsonMaskCacheEntries": 0,
+        "sharedJsonMaskCacheWords": 0,
+        "sharedJsonMaskCacheEvictions": 0
+      }
+    },
+    {
+      "name": "London-prefix",
+      "steps": [
+        {
+          "token": 90,
+          "bytes": [
+            123
+          ],
+          "piece": "{",
+          "allowed": true
+        },
+        {
+          "token": 1,
+          "bytes": [
+            34
+          ],
+          "piece": "\"",
+          "allowed": true
+        },
+        {
+          "token": 66,
+          "bytes": [
+            99
+          ],
+          "piece": "c",
+          "allowed": true
+        },
+        {
+          "token": 72,
+          "bytes": [
+            105
+          ],
+          "piece": "i",
+          "allowed": true
+        },
+        {
+          "token": 83,
+          "bytes": [
+            116
+          ],
+          "piece": "t",
+          "allowed": true
+        },
+        {
+          "token": 88,
+          "bytes": [
+            121
+          ],
+          "piece": "y",
+          "allowed": true
+        },
+        {
+          "token": 1,
+          "bytes": [
+            34
+          ],
+          "piece": "\"",
+          "allowed": true
+        },
+        {
+          "token": 25,
+          "bytes": [
+            58
+          ],
+          "piece": ":",
+          "allowed": true
+        },
+        {
+          "token": 1,
+          "bytes": [
+            34
+          ],
+          "piece": "\"",
+          "allowed": true
+        },
+        {
+          "token": 43,
+          "bytes": [
+            76
+          ],
+          "piece": "L",
+          "allowed": true
+        },
+        {
+          "token": 157,
+          "bytes": [
+            225
+          ],
+          "piece": "�",
+          "allowed": true
+        },
+        {
+          "token": 116,
+          "bytes": [
+            184
+          ],
+          "piece": "�",
+          "allowed": true
+        }
+      ],
+      "result": {
+        "stop": true,
+        "reason": "dead_end"
+      },
+      "utf8State": {
+        "expected": 3,
+        "seen": 2,
+        "codePoint": 120,
+        "minimum": 2048,
+        "first": 225
+      },
+      "maskInstrumentation": {
+        "trieNodesVisited": 6684,
+        "sharedJsonMaskCacheHits": 0,
+        "sharedJsonMaskCacheMisses": 0,
+        "sharedJsonMaskCacheEntries": 0,
+        "sharedJsonMaskCacheWords": 0,
+        "sharedJsonMaskCacheEvictions": 0
+      }
+    }
+  ],
+  "asciiIntersectionProof": [
+    {
+      "city": "Paris",
+      "complete": true,
+      "filteredMasks": 11
+    },
+    {
+      "city": "Tokyo",
+      "complete": true,
+      "filteredMasks": 11
+    },
+    {
+      "city": "London",
+      "complete": true,
+      "filteredMasks": 12
+    },
+    {
+      "city": "Berlin",
+      "complete": true,
+      "filteredMasks": 12
+    }
+  ],
+  "escapedPrefixLimit": [
+    {
+      "prefix": "{\"city\":\"P\\u00e9",
+      "tokens": [
+        90,
+        1,
+        66,
+        72,
+        83,
+        88,
+        1,
+        25,
+        1,
+        47,
+        59,
+        84,
+        15,
+        15,
+        68,
+        24
+      ],
+      "decodedValue": "Pé",
+      "possibleCityContinuations": [],
+      "matcherStillHasMask": true,
+      "asciiFilterStillHasMask": true,
+      "limitation": "ASCII intersection does not repair escaped-character prefix viability."
+    },
+    {
+      "prefix": "{\"city\":\"P\\u0041",
+      "tokens": [
+        90,
+        1,
+        66,
+        72,
+        83,
+        88,
+        1,
+        25,
+        1,
+        47,
+        59,
+        84,
+        15,
+        15,
+        19,
+        16
+      ],
+      "decodedValue": "PA",
+      "possibleCityContinuations": [],
+      "matcherStillHasMask": true,
+      "asciiFilterStillHasMask": true,
+      "limitation": "ASCII intersection does not repair escaped-character prefix viability."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "scope": "Exact canonical language oracle; unchanged four-city schema. Every Qwen token compared at every canonical byte prefix.",
+  "prefixes": 40,
+  "vocab": 248070,
+  "comparisons": 9922800,
+  "mismatches": []
+}
