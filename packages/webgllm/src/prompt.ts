@@ -52,22 +52,6 @@ export function unsharedTail(
   return tail
 }
 
-/** A real shared token boundary; encoding separately can merge the final text
- * differently, so compare tokens instead of assuming character/token counts. */
-export function prefixAnchorFor(
-  tokenizer: Tokenizer,
-  prompt: Array<number>,
-  prefix: string,
-  thinking: boolean | undefined
-): number | undefined {
-  const encoded = tokenizer.encodeChat([{ role: "system", content: prefix }], {
-    addGenerationPrompt: false,
-    ...(thinking !== undefined && { enableThinking: thinking })
-  })
-  const common = sharedPrefix(prompt, encoded)
-  return common > 0 && common < prompt.length ? common : undefined
-}
-
 /**
  * Where to keep the anchor snapshot for `prompt` (see Engine.snapshot):
  * where the next user turn's prompt will stop sharing it, if it asks a
