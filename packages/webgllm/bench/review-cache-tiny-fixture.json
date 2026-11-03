@@ -1,0 +1,1 @@
+{"replay": [{"caseId": "tiny-cold", "systemPrompt": "Return the exact requested value.", "prompt": "Set move to alpha.", "choices": [{"id": "alpha", "label": "alpha"}, {"id": "beta", "label": "beta"}], "expectedMoveIds": ["alpha"], "source": {"kind": "single-prompt cold-overhead control"}}], "quality": [], "negative": []}

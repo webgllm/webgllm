@@ -1,0 +1,184 @@
+
+ NX   Running targets test, typecheck, lint, build for 2 projects:
+
+- structured-output
+- prompt-api
+
+
+
+> nx run structured-output:build  [local cache]
+
+> tsc --build tsconfig.lib.json
+
+
+> nx run prompt-api:build
+
+> tsc --build tsconfig.lib.json
+
+
+> nx run structured-output:lint
+
+> eslint .
+
+(node:41526) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> nx run structured-output:typecheck
+
+> tsc --build --emitDeclarationOnly
+
+
+> nx run prompt-api:typecheck
+
+> tsc --build --emitDeclarationOnly
+
+
+> nx run prompt-api:lint
+
+> eslint .
+
+(node:41571) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+> nx run structured-output:test
+
+(node:41525) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+$ node scripts/test.mjs
+(node:41544) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:41545) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ Apfel off/omitted remains one pass with model defaults and exact schema [90m(11.788542ms)[39m[39m
+[32m✔ Apfel high caps only draft, preserves final settings, schema and caller history [90m(2.91375ms)[39m[39m
+[32m✔ Apfel high without a budget invents no cap; explicit smaller caller cap is preserved [90m(0.813709ms)[39m[39m
+[32m✔ Apfel zero budget skips draft and negative or invalid budgets fail before requests [90m(0.459583ms)[39m[39m
+[32m✔ Apfel emits reasoning before final text and preserves tool selection and calls [90m(1.480166ms)[39m[39m
+[32m✔ Apfel request.signal and legacy abortController cancel before, during draft and final [90m(0.721209ms)[39m[39m
+[32m✔ Apfel draft errors do not silently generate a final answer or retry [90m(0.4075ms)[39m[39m
+[32m✔ Apfel stopping a reasoning stream closes the draft and never starts the final [90m(0.1455ms)[39m[39m
+[32m✔ TanStack chat forwards Apfel high/off reasoning through structured finalization [90m(4.138417ms)[39m[39m
+[32m✔ Apfel draft notes preserve the original user turn and authoritative tool-result ordering [90m(0.363125ms)[39m[39m
+[32m✔ Apfel preserves provider token accounting without clamping or claiming a natural stop exhausted its budget [90m(0.140291ms)[39m[39m
+[32m✔ Apfel cancellation from a generation-phase callback prevents the draft request [90m(0.074583ms)[39m[39m
+(node:41546) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ webgl: structured cancellation via request.signal and legacy controller [90m(85.485958ms)[39m[39m
+[32m✔ transformers-js: structured cancellation via request.signal and legacy controller [90m(45.932708ms)[39m[39m
+[32m✔ wllama: structured cancellation via request.signal and legacy controller [90m(39.498875ms)[39m[39m
+[32m✔ prompt-api: structured cancellation via request.signal and legacy controller [90m(29.9685ms)[39m[39m
+[32m✔ apfel: structured cancellation via request.signal and legacy controller [90m(30.501ms)[39m[39m
+[32m✔ installed TanStack chat forwards abortController through structured chatOptions.request.signal [90m(3.7045ms)[39m[39m
+[32m✔ Prompt API cancellation during usage measurement cannot publish a late answer [90m(0.221334ms)[39m[39m
+[32m✔ Prompt API initialization checks aborts across availability and late session creation [90m(3.295416ms)[39m[39m
+(node:41547) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ a move object enforces the enum and permits only EOS after completion [90m(14.61275ms)[39m[39m
+[32m✔ clones maintain separate speculative prefixes [90m(12.120458ms)[39m[39m
+[32m✔ exact UTF-8 bytes and escaped strings are accepted across token boundaries [90m(17.291ms)[39m[39m
+[32m✔ HF ByteLevel vocabulary bridge preserves raw byte tokens and added special ids [90m(1.14675ms)[39m[39m
+[32m✔ EOS override supports runtimes that keep EOS on model configuration [90m(1.740417ms)[39m[39m
+[32m✔ unsupported assertions fail explicitly [90m(0.26ms)[39m[39m
+[32m✔ invalid tokenizers and dead ends fail explicitly [90m(0.288666ms)[39m[39m
+[32m✔ numeric roots preserve valid extensions after an accepting prefix [90m(10.612208ms)[39m[39m
+[32m✔ structured answer preserves tag literals in JSON and strips only leading reasoning [90m(0.202667ms)[39m[39m
+[32m✔ compact punctuation forbids whitespace loops outside strings while preserving string spaces [90m(16.309625ms)[39m[39m
+[32m✔ finite tool-routing and argument enums reject wrong prefixes before closing quotes [90m(14.995041ms)[39m[39m
+[32m✔ parsed structured values validate schemas without a model tokenizer [90m(569.419667ms)[39m[39m
+[32m✔ parsed value validation rejects non-JSON coercions and cycles [90m(103.09675ms)[39m[39m
+[32m✔ parsed native arguments validate independent of property insertion order and string whitespace [90m(18.820958ms)[39m[39m
+(node:41548) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ guided auto selects tools and constrains their original argument schema [90m(0.83175ms)[39m[39m
+[32m✔ guided answer does not fabricate tool calls [90m(0.082ms)[39m[39m
+[32m✔ specific tool skips routing and multiple required tools cannot select answer [90m(0.6405ms)[39m[39m
+[32m✔ guided tools reject malformed args and unknown tool names [90m(0.134042ms)[39m[39m
+[32m✔ guided stages preserve reported cached-token usage without inventing hits [90m(0.102875ms)[39m[39m
+[32m✔ one required tool skips its forced routing pass and keeps the exact argument constraint and usage [90m(0.097125ms)[39m[39m
+[32m✔ multiple required tools still route before constraining the selected tool's arguments [90m(0.143083ms)[39m[39m
+[32m✔ required one-tool fast path preserves early and in-generation cancellation [90m(0.201083ms)[39m[39m
+(node:41549) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ wllama: the same public chat promptCache matrix requires no provider-specific consumer options [90m(78.509125ms)[39m[39m
+[32m✔ apfel: the same public chat promptCache matrix requires no provider-specific consumer options [90m(57.036667ms)[39m[39m
+[32m✔ prompt-api: the same public chat promptCache matrix requires no provider-specific consumer options [90m(42.995792ms)[39m[39m
+[32m✔ wllama streaming translates only the standard none hint and forwards real backend cache counts [90m(3.967541ms)[39m[39m
+[32m✔ native structured requests preserve exact schema and current tool-result messages [90m(0.60625ms)[39m[39m
+[32m✔ apfel reports provider cache usage honestly without fabricating support for retention hints [90m(0.671417ms)[39m[39m
+[32m✔ wllama skips managed prompt-state persistence when its effective native cache flag is false [90m(13.097292ms)[39m[39m
+(node:41550) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ wllama delegates the exact schema, thinking switch and output cap, and rejects length completion [90m(63.426417ms)[39m[39m
+[32m✔ Prompt API passes the exact native schema and rejects unsupported schemas without downgrade or retry [90m(24.805208ms)[39m[39m
+[32m✔ apfel forwards the exact guided schema and caller output cap, and rejects length completion [90m(44.473875ms)[39m[39m
+[32m✔ Prompt API tool schemas preserve assertions instead of weakening them [90m(3.849958ms)[39m[39m
+[32m✔ wllama maps explicit thinking budgets through its public runtime option in both paths [90m(32.064667ms)[39m[39m
+(node:41551) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ Prompt API off/omitted reasoning remains one native constrained pass [90m(1.54175ms)[39m[39m
+[32m✔ emulated Prompt API budget subtracts message overhead and never aborts the final caller [90m(2.328334ms)[39m[39m
+[32m✔ emulated thinking with no budget has no invented token ceiling [90m(0.336958ms)[39m[39m
+[32m✔ caller abort before or during draft prevents final generation, via request.signal or legacy abortController [90m(0.828125ms)[39m[39m
+[32m✔ caller abort interrupts final generation after an emulated draft [90m(0.259208ms)[39m[39m
+[32m✔ emulated draft preserves constrained tool selection and argument generation [90m(0.963625ms)[39m[39m
+[32m✔ zero emulated budget skips the draft but retains constrained final generation [90m(0.149084ms)[39m[39m
+[32m✔ emulated stream keeps native tool calls and labels its reasoning usage [90m(0.471208ms)[39m[39m
+[32m✔ off and omitted streamed calls preserve retained session behavior [90m(0.349541ms)[39m[39m
+[32m✔ shared TanStack chat forwards opt-in reasoning to the Prompt API adapter [90m(5.574709ms)[39m[39m
+[32m✔ invalid emulated budgets reject before leasing a native session [90m(0.162375ms)[39m[39m
+[32m✔ Prompt API required one-tool calls skip the forced routing clone and constrain arguments once [90m(0.234458ms)[39m[39m
+[32m✔ Prompt API auto and multiple required tools still need constrained routing decisions [90m(0.358042ms)[39m[39m
+[32m✔ Prompt API forced one-tool argument cancellation cleans up its clone and lease without publishing a call [90m(0.121666ms)[39m[39m
+(node:41552) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ structured calls reuse a clean base, use fresh clones, preserve the exact schema and report cached input [90m(2.730458ms)[39m[39m
+[32m✔ stateless structured callers reuse matching system/options bases without a thread ID [90m(0.324417ms)[39m[39m
+[32m✔ thread, system, sampling and language changes never reuse incompatible bases [90m(0.700667ms)[39m[39m
+[32m✔ compatible history appends only its gap, while edited history resets the prefix [90m(0.530583ms)[39m[39m
+[32m✔ structured finalization never replaces the retained chat/tool namespace [90m(2.342625ms)[39m[39m
+[32m✔ request.signal and legacy cancellation stop clones without discarding healthy prefixes [90m(0.7545ms)[39m[39m
+[32m✔ abort while cloning preserves its parent; native schema failures and invalid JSON do too [90m(0.431375ms)[39m[39m
+[32m✔ concurrent generations share an already warm base and cannot affect each other's clone [90m(0.254666ms)[39m[39m
+[32m✔ overlapping cold calls share one prepared base without orphan sessions [90m(0.153833ms)[39m[39m
+[32m✔ explicit cleanup and the existing shared cache bound include structured bases [90m(0.362166ms)[39m[39m
+[32m✔ concurrent distinct cold structured threads trim idle bases back to the retained limit [90m(5.703584ms)[39m[39m
+[32m✔ pool trimming preserves independent concurrent clones and their cancellation [90m(0.450667ms)[39m[39m
+[32m✔ trimming never destroys busy leases and keeps idle eviction in LRU order [90m(0.199333ms)[39m[39m
+[32m✔ concurrent cold chat leases sharing a key destroy the detached session on release [90m(0.105458ms)[39m[39m
+[32m✔ clone overflow is reported on structured usage and invokes the existing callback [90m(0.111958ms)[39m[39m
+[32m✔ the public TanStack structured-output path reuses the adapter base across calls [90m(0.563834ms)[39m[39m
+[32m✔ structured bases with different expected input modalities are isolated [90m(0.107875ms)[39m[39m
+[32m✔ a queued caller can cancel promptly without letting later preparation bypass the active one [90m(0.204208ms)[39m[39m
+[32m✔ emulated working notes and constrained answers never contaminate a cached base [90m(0.715084ms)[39m[39m
+[32m✔ a browser-destroyed cached base is recreated before generation without retrying a response [90m(0.454375ms)[39m[39m
+[32m✔ public TanStack promptCache none creates fresh structured requests with no managed cached prefix [90m(0.806083ms)[39m[39m
+[32m✔ none bypasses anonymous structured bases and does not evict a previous reusable session [90m(0.42275ms)[39m[39m
+[32m✔ custom standard cache keys share compatible structured prefixes and still reset changed history or options [90m(0.278292ms)[39m[39m
+[32m✔ short and long preserve the existing opportunistic cache without imposing different retention caps [90m(0.132875ms)[39m[39m
+[32m✔ streaming cache-key reuse keeps AG-UI correlation on each caller thread [90m(0.325792ms)[39m[39m
+[32m✔ standard none streaming releases each session instead of retaining conversational state [90m(0.317083ms)[39m[39m
+[32m✔ emulated reasoning streams remain ephemeral even with an explicit long-lived cache key [90m(0.522333ms)[39m[39m
+[32m✔ concurrent uncached requests and cancellation clean up every per-request native session [90m(0.216208ms)[39m[39m
+[32m✔ an explicit shared cache key never substitutes for compatible caller history [90m(0.202416ms)[39m[39m
+(node:41553) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[32m✔ Wllama caller aborts stop both loading waits, while the shared background load completes [90m(38.114791ms)[39m[39m
+[34mℹ tests 98[39m
+[34mℹ suites 0[39m
+[34mℹ pass 98[39m
+[34mℹ fail 0[39m
+[34mℹ cancelled 0[39m
+[34mℹ skipped 0[39m
+[34mℹ todo 0[39m
+[34mℹ duration_ms 1803.241667[39m
+
+
+
+ NX   Successfully ran targets test, typecheck, lint, build for 2 projects
+
+Nx read the output from the cache instead of running the command for 1 out of 7 tasks.
+
+  Run duration:      2.1s
+  Cache:             1/7 hit (14%)
+  Critical path:     2.1s (1 task)
+  Recoverable time:  13ms (1% of the run)

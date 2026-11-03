@@ -34,3 +34,15 @@ test("flush preserves incomplete marker-shaped answer prefixes and removes compl
   }
   assert.deepEqual(splitThinking('<think>plan</think><think> </think>'), { thinking: 'plan', answer: '' })
 })
+
+test("literal JSON retains Paris closing markers, nonempty thought tags and UTF-8 text exactly",()=>{
+  const value="Paris</think>Paris <think>tag</think> héllo 👑"
+  const raw=JSON.stringify({value})
+  for(const chunks of [[raw],[...raw],raw.match(/.{1,3}/gu)??[raw]]){
+    const pieces=streamed(chunks)
+    const answer=pieces.filter(piece=>piece.kind==="answer").map(piece=>piece.text).join("")
+    assert.equal(answer,raw)
+    assert.equal(JSON.parse(answer).value,value)
+    assert.equal(pieces.filter(piece=>piece.kind==="thinking").length,0)
+  }
+})

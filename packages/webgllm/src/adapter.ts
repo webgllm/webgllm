@@ -575,6 +575,7 @@ export class WebGlTextAdapter<
     let repairedUsage: TokenUsage | undefined
     const validated: typeof parsed = []
     try {
+      if (failure) throw new Error(failure)
       if (markup && options.tools?.length && options.toolChoice !== "none" && parsed.length === 0) {
         throw new Error("The model produced a malformed tool-call envelope.")
       }
@@ -596,6 +597,7 @@ export class WebGlTextAdapter<
         validated.push({ ...call, args })
       }
     } catch (error) {
+      if (textStarted) yield { type: EventType.TEXT_MESSAGE_END, messageId, model, timestamp: timestamp() }
       if (signal?.aborted) return
       const message = errorText(error)
       yield { type: EventType.RUN_ERROR, model, timestamp: timestamp(), message, error: { message } }
@@ -639,16 +641,6 @@ export class WebGlTextAdapter<
         model,
         timestamp: timestamp()
       }
-    }
-    if (failure) {
-      yield {
-        type: EventType.RUN_ERROR,
-        model,
-        timestamp: timestamp(),
-        message: failure,
-        error: { message: failure }
-      }
-      return
     }
     yield {
       type: EventType.RUN_FINISHED,
