@@ -1162,12 +1162,18 @@ export class Engine {
     const forward = async () => {
       forwards = true
       const all = this.layers
-      if (TUNING.tuneLayers > 0) this.layers = all.slice(0, TUNING.tuneLayers)
+      const work = this.work
+      const subset = TUNING.tuneLayers > 0
+      if (subset) {
+        this.layers = all.slice(0, TUNING.tuneLayers)
+        this.work = null
+      }
       try {
         this.reset()
         await this.forwardHidden(tokens)
       } finally {
         this.layers = all
+        if (subset) this.work = work
       }
     }
     class Stopped extends Error {}
@@ -1889,6 +1895,9 @@ export class Engine {
 
   /** What a batch saving a snapshot partway has copied so far (see forwardBatch). */
   private saving: Array<Texture> | null = null
+
+  /** A learned shared boundary, extracted without splitting the forward batch. */
+  private prefixSaving: { row: number; state: Snapshot } | null = null
 
   /** Whether `resume(position)` would work: a snapshot there kept its last hidden row. */
   canResume(position: number) {
@@ -2939,6 +2948,18 @@ export class Engine {
           : this.readPair(source, "uBCx", bcx)
       )
     const bcxIn = { uBCx: bcx, ...(!split && this.quadInputs("uBCx", bcx)) }
+    if (this.prefixSaving) {
+      const copy = this.f32(c.hiddenSize, c.convKernel - 1)
+      this.prefixSaving.state.conv.push(copy)
+      this.gpu.run({
+        name: "conv",
+        program: read(K.convState(c.convKernel)),
+        inputs: { ...bcxIn, uState: layer.state[0] },
+        uniforms: { uDt: { int: dt }, uM: { int: this.prefixSaving.row }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
+        output: copy,
+        rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
+      })
+    }
     if (rows <= SPLIT_ROWS && TUNING.fuseConv > 0 && this.mrt.conv) {
       // A few rows: the output and the new state in one pass.
       this.gpu.run({
@@ -3565,7 +3586,7 @@ export class Engine {
     const b = this.buffers
     const t = b.lin
     if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
-    if (fusable && saveAt === undefined && this.fusesLinear(layer, rows))
+    if (fusable && saveAt === undefined && !this.prefixSaving && this.fusesLinear(layer, rows))
       return this.linearFused(layer, rows, input)
     const dk = lin.l.keyHeadDim
     const dv = lin.l.valueHeadDim
@@ -3612,6 +3633,18 @@ export class Engine {
     const read = reader("uIn", inTex, split)
     const inInputs = pairInputs("uIn", inTex, split)
     const inUniforms = { uSplitIn: { int: split }, ...this.pairIn(inTex) }
+    if (this.prefixSaving) {
+      const copy = this.f32(lin.C, width - 1)
+      this.prefixSaving.state.linear.push(copy)
+      this.gpu.run({
+        name: "linear",
+        program: read(K.linConvState(width)),
+        inputs: { ...inInputs, uState: layer.convState[0] },
+        uniforms: { ...inUniforms, uM: { int: this.prefixSaving.row } },
+        output: copy,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 }
+      })
+    }
     this.gpu.run({
       name: "linear",
       program: read(K.linConv(width)),
@@ -3682,6 +3715,7 @@ export class Engine {
       })
       layer.state.reverse()
       if (r + 1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (r + 1 === this.prefixSaving?.row) this.prefixSaving.state.linear.push(this.copyOf(layer.state[0]))
       // (Each token reads and writes the whole state: ~4 multiply-adds an element.)
       if (paced) await this.charge(4 * lin.V * dk)
     }
@@ -3865,6 +3899,17 @@ export class Engine {
       else
         for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const)
           run(K.linChunkOut({ ...heads, out }), outIn, tex, V4, {}, rect, dk)
+      const prefixRow = this.prefixSaving?.row
+      if (prefixRow !== undefined && c0 < prefixRow && prefixRow < c1) {
+        const copy = this.f32(lin.V, dk)
+        this.prefixSaving!.state.linear.push(copy)
+        run(
+          K.linChunkState(heads),
+          { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
+          copy, V4, { uC0: { int: c0 }, uC1: { int: prefixRow } },
+          { x: 0, y: 0, width: V4, height: dk }, prefixRow - c0
+        )
+      }
       run(
         K.linChunkState(heads),
         { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
@@ -3876,6 +3921,7 @@ export class Engine {
       )
       layer.state.reverse()
       if (c1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (c1 === prefixRow) this.prefixSaving!.state.linear.push(this.copyOf(layer.state[0]))
       // (Reading and writing the state: ~3 multiply-adds an element a token.)
       if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
     }
@@ -3945,6 +3991,8 @@ export class Engine {
        * most; see canSaveInside).
        */
       saveAt?: number
+      /** Observed shared prefix, copied inside this batch without another model pass. */
+      prefixAt?: number
     } = {}
   ): Promise<number> {
     if (options.draft) return this.forwardDraft(Array.from(tokens))
@@ -3957,23 +4005,36 @@ export class Engine {
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
     }
-    const { saveAt } = options
-    if (saveAt !== undefined) {
-      if (!this.canSaveInside || tokens.length > this.capacity || !(saveAt > 0 && saveAt < tokens.length))
-        throw new Error(`Can't save a snapshot after ${saveAt} of a ${tokens.length}-token batch.`)
-      // Room first, so no more than the limit are ever held.
-      this.dropSnapshots(this.snapshotLimit - 1, "anchor")
+    const { saveAt, prefixAt } = options
+    if (saveAt !== undefined || prefixAt !== undefined) {
+      if (tokens.length > this.capacity ||
+        (saveAt !== undefined && (!this.canSaveInside || !(saveAt > 0 && saveAt < tokens.length))) ||
+        (prefixAt !== undefined && (this.snapshotLimit < 2 || !(prefixAt > 0 && prefixAt < tokens.length))))
+        throw new Error(`Can't save an in-batch checkpoint for ${tokens.length} tokens.`)
+      const same = prefixAt !== undefined && prefixAt === saveAt
+      const count = Number(saveAt !== undefined) + Number(prefixAt !== undefined && !same)
+      // Reserve all new state before allocating; partial copies count toward the limit.
+      this.dropSnapshots(this.snapshotLimit - count, count === 1 ? saveAt !== undefined ? "anchor" : "prefix" : undefined)
       const pos0 = this.position
-      this.saving = []
+      const learned: Snapshot | undefined = prefixAt !== undefined && !same ? { conv: [], windows: [], linear: [] } : undefined
+      this.saving = saveAt !== undefined ? [] : null
+      this.prefixSaving = learned ? { row: prefixAt!, state: learned } : null
       try {
         const last = await this.forwardBatch(Array.from(tokens), undefined, false, saveAt)
-        this.keepSnapshot(pos0 + saveAt, { conv: [], windows: [], linear: this.saving }, true)
+        if (saveAt !== undefined) {
+          const saved: Snapshot = { conv: [], windows: [], linear: this.saving! }
+          this.keepSnapshot(pos0 + saveAt, saved, true)
+          if (same) this.keepSnapshot(pos0 + saveAt, saved, "prefix")
+        }
+        if (learned) this.keepSnapshot(pos0 + prefixAt!, learned, "prefix")
         return last
       } catch (error) {
-        for (const t of this.saving) this.gpu.delete(t)
+        for (const t of this.saving ?? []) this.gpu.delete(t)
+        if (learned) this.freeSnapshot(learned)
         throw error
       } finally {
         this.saving = null
+        this.prefixSaving = null
       }
     }
     let last = 0
@@ -4856,6 +4917,12 @@ export class Engine {
           paced,
           !probe
         )
+        if (this.prefixSaving && layer.attention.ring) {
+          const at = pos0 + this.prefixSaving.row
+          const window = this.gpu.texture(GL.RGBA32UI, layer.attention.kv.width, c.slidingWindow)
+          this.prefixSaving.state.windows.push(window)
+          this.copyPositions(layer.attention.kv, layer.attention.ring, window, c.slidingWindow, Math.max(0, at - c.slidingWindow), at)
+        }
         await look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)

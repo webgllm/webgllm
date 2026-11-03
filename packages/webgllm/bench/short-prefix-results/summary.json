@@ -1,0 +1,42 @@
+{
+  "lfm3": {
+    "before": {
+      "passed": 60,
+      "total": 60,
+      "textTokS": 89.74842174590607,
+      "profileChangedCached": [
+        1024,
+        1024
+      ]
+    },
+    "after": {
+      "passed": 60,
+      "total": 60,
+      "textTokS": 89.74525068680074,
+      "profileChangedCached": [
+        1024,
+        1024
+      ]
+    }
+  },
+  "qwen": {
+    "before": {
+      "passed": 56,
+      "total": 60,
+      "textTokS": 66.93840261414702,
+      "profileChangedCached": [
+        1024,
+        1024
+      ]
+    },
+    "after": {
+      "passed": 59,
+      "total": 60,
+      "textTokS": 67.0703798891668,
+      "profileChangedCached": [
+        1024,
+        1024
+      ]
+    }
+  }
+}
