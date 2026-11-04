@@ -2943,7 +2943,7 @@ void main() {
  * Picking candidates on the GPU, so writing a token reads back ~50 KB
  * instead of every logit. Logits are the output head's wrapped layout
  * (uOutW RGBA texels, 4·uOutW logits, per row); the mask (R8UI, 4·uOutW
- * wide) marks tokens seen (1: repetition penalty) or never to draw (2).
+ * wide) marks prompt tokens (1), never to draw (2), or generated tokens (3).
  */
 const PENALIZED = `
 uniform int uLogitRows;
@@ -2954,18 +2954,32 @@ uniform ivec4 uExtra;
 uniform ivec4 uExtra2;
 /* The batch row that logits row 0 is (when rows are picked one at a time). */
 uniform int uPenaltyRow0;
+uniform usampler2D uAllowed;
+uniform int uAllowedEnabled;
+uniform int uAllowedWidth;
+uniform int uAllowedRows;
+uniform int uAllowedStride;
+uniform float uPresencePenalty;
 /*
  * Token id's logit with the repetition penalty for row r of a batch: the
  * mask's seen tokens, and the batch's drafts before row r (uExtra, then
  * uExtra2: draft i is row i + 1's input, so rows after it have seen it).
  */
 float penalized(float v, uint m, int id, int r) {
+  if (uAllowedEnabled != 0) {
+    int word = id >> 5;
+    int maskRow = uAllowedRows == 1 ? 0 : r;
+    if (maskRow >= uAllowedRows) return -1e30;
+    uint bits = texelFetch(uAllowed, ivec2(word % uAllowedWidth, word / uAllowedWidth + maskRow * uAllowedStride), 0).x;
+    if ((bits & (1u << uint(id & 31))) == 0u) return -1e30;
+  }
   if (m == 2u) return -1e30;
-  bool seen = m == 1u;
-  for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) seen = true;
-  for (int k = 0; k < 4; k++) if (k + 4 < r && uExtra2[k] == id) seen = true;
-  if (seen) return v < 0.0 ? v * uPenalty : v / uPenalty;
-  return v;
+  bool generated = m == 3u;
+  for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) generated = true;
+  for (int k = 0; k < 4; k++) if (k + 4 < r && uExtra2[k] == id) generated = true;
+  bool seen = m == 1u || generated;
+  if (seen) v = v < 0.0 ? v * uPenalty : v / uPenalty;
+  return generated ? v - uPresencePenalty : v;
 }
 vec4 chunkTexel(int c, int t, int r) {
   int texel = c * 64 + t;

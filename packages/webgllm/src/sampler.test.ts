@@ -31,6 +31,27 @@ describe("createSampler", () => {
     assert.equal(logits[2], -2)
   })
 
+  test("presence penalty applies once to generated tokens, without penalizing prompt-only tokens", () => {
+    const s = createSampler({ temperature: 0, top_k: 0, repetition_penalty: 2, presence_penalty: 1.5 })
+    s.see([0, 1])
+    s.see([1, 1, 2], true)
+    const logits = Float32Array.of(4, 6, -1, 1)
+    s.distribution(logits)
+    assert.deepEqual([...logits], [2, 1.5, -3.5, 1])
+    const fresh = createSampler({ temperature: 0, top_k: 0, repetition_penalty: 1, presence_penalty: 2 })
+    const next = Float32Array.of(4, 6, -1, 1)
+    fresh.distribution(next)
+    assert.deepEqual([...next], [4, 6, -1, 1], "generated history resets for every reply")
+  })
+
+  test("min_p filters relative to the highest probability and renormalizes before top_p", () => {
+    const s = createSampler({ temperature: 1, top_k: 0, repetition_penalty: 1, min_p: 0.5, top_p: 0.9 })
+    const d = s.distribution(Float32Array.of(0, Math.log(0.6), Math.log(0.1)))
+    assert.equal(d.p[2], 0)
+    assert.ok(Math.abs(d.p[0] - 0.625) < 1e-6)
+    assert.ok(Math.abs(sum(d.p) - 1) < 1e-6)
+  })
+
   test("top_k keeps the k likeliest, normalized", () => {
     const s = createSampler({ temperature: 1, top_k: 2, repetition_penalty: 1 })
     const d = s.distribution(Float32Array.of(1, 4, 2, 3))

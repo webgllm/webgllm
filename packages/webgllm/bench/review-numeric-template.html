@@ -1,0 +1,62 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Actual chess prefix numerical review</title><style>body{font:15px system-ui;background:#f6f7f9;color:#243246;max-width:1120px;margin:32px auto;padding:0 24px}button{font:inherit;padding:12px 18px}table{width:100%;border-collapse:collapse;margin:24px 0}td,th{text-align:left;padding:10px;border-bottom:1px solid #d4dbe2}pre{font:12px/1.5 monospace;white-space:pre-wrap;overflow-wrap:anywhere}.note{color:#5b6573}</style></head><body><h1>Actual chess prefix numerical review</h1><p class="note">Baseline → exact checkpoint → token memo. Identical SDK-converted chess requests, batch 512, model context and snapshot limits unchanged. Logits only; no game answer is generated.</p><button id="review-numeric-run">Run numerical cache review</button><p id="review-numeric-status" role="status">Ready. Native inference starts only on Run.</p><table><thead><tr><th>Variant / pair</th><th>Common / restored</th><th>Max absolute / KL</th><th>Top-1</th><th>Matched copy control</th></tr></thead><tbody id="review-numeric-rows"></tbody></table><details open><summary>Complete reproducible report</summary><pre id="review-numeric-results"></pre></details>
+<!-- Generate the temporary page from the repository root, after review-cache-prepare.mjs:
+python3 - <<'PY'
+from pathlib import Path
+import json
+root = Path.cwd().resolve()
+source = (root / 'packages/webgl/bench/review-numeric-template.html').read_text()
+(root / 'apps/checkers/__review-numeric-qa.html').write_text(source.replace('__ROOT' + '_URL__', json.dumps('/@fs/' + root.as_posix())))
+PY
+Open http://localhost:3002/__review-numeric-qa.html on the existing Vite dev server.
+-->
+<script type="module">
+import {chat,normalizeSystemPrompts} from '@tanstack/ai';
+import {z} from 'zod';
+import {webglText} from '@tanstack-ai-browser/webgl';
+const ROOT_URL=__ROOT_URL__.replace(/\/$/,'');
+const fixtureUrl=ROOT_URL+'/packages/webgl/bench/review-cache-fixtures.json';
+const workerUrl=ROOT_URL+'/packages/webgl/bench/review-numeric-worker.ts';
+const button=document.querySelector('#review-numeric-run'),status=document.querySelector('#review-numeric-status'),rows=document.querySelector('#review-numeric-rows'),output=document.querySelector('#review-numeric-results');
+const model='LiquidAI/LFM3-1.7B-GGUF';let worker;
+const sha=async text=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text))),byte=>byte.toString(16).padStart(2,'0')).join('');
+async function capture(row,index){
+ if(typeof row.systemPrompt!=='string'||typeof row.prompt!=='string'||!Array.isArray(row.choices)||!row.choices.length)throw new Error('Malformed replay fixture '+index);
+ const labels=row.choices.map(choice=>choice.label);if(labels.some(label=>typeof label!=='string'))throw new Error('Fixture choice labels must be strings.');
+ const adapter=webglText(model);let captured;
+ adapter.structuredOutput=async({chatOptions,outputSchema})=>{
+  const originalSystem=normalizeSystemPrompts(chatOptions.systemPrompts).map(prompt=>prompt.content).join('\n\n');
+  const system=normalizeSystemPrompts(chatOptions.systemPrompts).map(prompt=>prompt.content).concat(`Answer with only a JSON value matching this JSON Schema:\n${JSON.stringify(outputSchema)}`).join('\n\n');
+  const messages=chatOptions.messages.map(message=>{if(typeof message.content!=='string')throw new Error('Review fixture must use the original text-only chess request.');return {role:message.role,content:message.content};});
+  captured={id:row.caseId??row.id??`replay-${index+1}`,recordedPromptTokens:row.recordedPromptTokens,originalSystem,chat:[{role:'system',content:system},...messages],outputSchema,source:row.source??null};
+  // SDK conversion capture only; this deterministic placeholder is not a model prediction.
+  return {data:{move:labels[0]},rawText:JSON.stringify({move:labels[0]}),model};
+ };
+ await chat({adapter,threadId:'review-numeric-sdk-capture',systemPrompts:[row.systemPrompt],messages:[{role:'user',content:row.prompt}],outputSchema:z.strictObject({move:z.enum(labels)}),stream:false,reasoning:'off'});
+ if(!captured)throw new Error('The installed SDK did not invoke structured finalization.');
+ captured.schemaHash=await sha(JSON.stringify(captured.outputSchema));captured.chatHash=await sha(JSON.stringify(captured.chat));return captured;
+}
+button.addEventListener('click',async()=>{
+ button.disabled=true;rows.textContent='';output.textContent='';worker?.terminate();
+ try{
+  status.textContent='Capturing exact SDK schema serialization from the immutable chess fixture…';
+  const text=await (await fetch(fixtureUrl)).text(),fixture=JSON.parse(text);
+  if(!Array.isArray(fixture.replay)||fixture.replay.length<2)throw new Error('Fixture is missing its replay requests.');
+  const requests=[];for(const[index,row]of fixture.replay.entries())requests.push(await capture(row,index));
+  const provenance={fixtureUrl,fixtureSha256:await sha(text),fixtureMetadata:Object.fromEntries(Object.entries(fixture).filter(([key])=>key!=='replay'&&key!=='quality'&&key!=='negative')),sdk:'installed @tanstack/ai via public chat() structured finalization',schemaContract:'z.strictObject({move:z.enum(originalChoiceLabels)})',promptSerialization:'exact baseline adapter normalized system + JSON.stringify(SDK outputSchema)',requests};
+  output.textContent=JSON.stringify({provenance},null,2);
+  // A direct /@fs/ module worker avoids Vite's generated ?worker wrapper on this page.
+  worker=new Worker(workerUrl,{type:'module'});worker.onmessage=({data})=>{
+   if(data.type==='status')status.textContent=data.message;
+   if(data.type==='result'){
+    const r=data.result,row=document.createElement('tr');
+    for(const value of [`${data.variant}: ${r.firstId} → ${r.secondId}`,`${r.commonTokens} / ${r.restoredTokens}`,`${r.maxAbs} / ${r.kl}`,r.top1Equal?'Same':'DIFFERENT',r.copyControl.skipped?'No nonzero restore':r.copyControl.pass?'Bit-identical':'DIFFERENT']){const td=document.createElement('td');td.textContent=value;row.append(td)}rows.append(row);
+   }
+   if(data.type==='done'||data.type==='error'){
+    output.textContent=JSON.stringify(data.report,null,2);status.textContent=data.type==='done'?'Complete. All numerical comparisons are printed below.':'Failed: '+(data.report.error?.message??JSON.stringify(data.report.error));button.disabled=false;worker.terminate();worker=undefined;
+   }
+  };worker.onerror=event=>{status.textContent='Worker failed: '+event.message;button.disabled=false;worker?.terminate();worker=undefined;};
+  worker.postMessage({type:'run',model,requests,provenance});
+ }catch(error){status.textContent='Failed: '+error.message;output.textContent=JSON.stringify({error:String(error)},null,2);button.disabled=false;}
+});
+addEventListener('pagehide',()=>worker?.terminate());
+</script></body></html>

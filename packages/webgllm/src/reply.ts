@@ -73,12 +73,27 @@ export function createThinkingSplitter() {
         buffer = buffer.slice(end + THINK_CLOSE.length)
         state = "answer"
       } else {
-        // A close in the answer is dropped: told not to think, the model
-        // sometimes still thinks a little and closes it.
-        buffer = buffer.split(THINK_CLOSE).join("")
-        const keep = partialTag(buffer, THINK_CLOSE)
-        pieces.push(...answer(buffer.slice(0, buffer.length - keep)))
-        buffer = buffer.slice(buffer.length - keep)
+        if (!answered) {
+          // A budgeted model may reopen thinking and immediately be closed again.
+          // Strip only complete empty blocks before the first visible answer.
+          const lead = buffer.trimStart()
+          if ((lead.length < THINK_OPEN.length && THINK_OPEN.startsWith(lead)) || (lead.length < THINK_CLOSE.length && THINK_CLOSE.startsWith(lead))) return pieces
+          if (lead.startsWith(THINK_CLOSE)) {
+            buffer = lead.slice(THINK_CLOSE.length)
+            continue
+          }
+          if (lead.startsWith(THINK_OPEN)) {
+            const afterOpen = lead.slice(THINK_OPEN.length).trimStart()
+            if (afterOpen.length < THINK_CLOSE.length && THINK_CLOSE.startsWith(afterOpen)) return pieces
+            if (afterOpen.startsWith(THINK_CLOSE)) {
+              buffer = afterOpen.slice(THINK_CLOSE.length)
+              continue
+            }
+          }
+        }
+        // Once answer text starts, marker-shaped content is literal data.
+        pieces.push(...answer(buffer))
+        buffer = ""
         return pieces
       }
     }

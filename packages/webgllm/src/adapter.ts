@@ -15,6 +15,7 @@ import type {
 } from "@tanstack/ai"
 import { resolveReasoning } from "@tanstack/ai/adapter-internals"
 import { BaseTextAdapter } from "@tanstack/ai/adapters"
+import { chooseGuidedTool, addGuidedUsage, validateStructuredValue, structuredAnswer } from "@tanstack-ai-browser/structured-output"
 import type {
   StructuredOutputOptions,
   StructuredOutputResult
@@ -23,8 +24,9 @@ import type {
 import { generate, loadModel, setKeepLoaded } from "./client.js"
 import { modelMeta } from "./model-meta.js"
 import type { WebGlModelReasoningByName, WebGlTextModel } from "./model-meta.js"
-import type { RunTimings } from "./protocol.js"
-import { createThinkingSplitter, splitThinking } from "./reply.js"
+import type { GenerationPhase, RunTimings } from "./protocol.js"
+import { createThinkingSplitter } from "./reply.js"
+import type { ReplyPiece } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
 import {
@@ -36,7 +38,9 @@ import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
 /** Per-call `modelOptions`: sampling over the model card's, and the most tokens to generate. */
 export type WebGlTextProviderOptions = Partial<Sampling> & {
-  /** Most tokens to generate: 4,096 by default. */
+  /** Maximum generated tokens, thinking included; otherwise EOS or remaining context. */
+  maxTokens?: number
+  /** Legacy alias for maxTokens. maxTokens takes precedence when both are supplied. */
   max_new_tokens?: number
   /**
    * Draft tokens by prompt lookup and check them in one batch (speculative
@@ -56,10 +60,28 @@ export type WebGlProviderUsageDetails = {
   firstTokenMs?: number
   /** Reading the part of the prompt that wasn't cached. */
   promptMs?: number
+  /** Template encoding and reusable-prefix boundary discovery. */
+  tokenizeMs?: number
+  /** Generation-local constrained-decoding setup. */
+  schemaMs?: number
+  /** CPU prefix matching and restore command submission, without a GPU fence. */
+  cacheRestoreMs?: number
+  /** Raw token prefix match before checkpoint selection. */
+  cacheMatchedTokens?: number
+  /** Actual retained system/tool checkpoint selected without extra model forwards. */
+  cachePrefixTokens?: number
+  /** Actual retained ordinary conversational checkpoint. */
+  cacheAnchorTokens?: number
   /** From the first generated token to the last. */
   decodeMs?: number
   /** Tokens generated after the first one, over `decodeMs`. */
   decodeTokens?: number
+  /** Model-generated tokens inside the thinking block. */
+  thinkingTokens?: number
+  /** Explicit maximum thinking tokens requested for this generation. */
+  thinkingBudgetTokens?: number
+  /** Whether thinking reached the explicit budget. */
+  thinkingBudgetExhausted?: boolean
 }
 
 type ResolveReasoning<TModel extends string> =
@@ -75,13 +97,47 @@ type MetadataByModality = {
   document: unknown
 }
 
-/** The template's `enable_thinking` for a request; the template's default when it doesn't ask. */
-function enableThinking(
+/** Resolve the template switch and only an explicitly requested thinking cap. */
+function thinkingOptions(
   request: ReasoningRequest | undefined,
   model: WebGlTextModel
-) {
-  const value = resolveReasoning(request, modelMeta(model).reasoning)?.value
-  return value === undefined ? undefined : value === "true"
+): { thinking: boolean | undefined; thinkingBudgetTokens?: number } {
+  const budget = request?.budgetTokens
+  if (budget !== undefined && (!Number.isSafeInteger(budget) || budget < 0)) {
+    throw new RangeError("reasoning.budgetTokens must be a non-negative safe integer.")
+  }
+  const capability = modelMeta(model).reasoning
+  const resolved = resolveReasoning(request, capability)
+  const thinking = resolved?.value === undefined ? undefined : resolved.value === "true"
+  // String levels and omitted budgets preserve unlimited thinking; off ignores a valid cap.
+  if (budget === undefined || thinking === false) return { thinking }
+  if (!capability || !capability.budget || !resolved) {
+    throw new Error(`${model} does not support a thinking token budget.`)
+  }
+  return { thinking, thinkingBudgetTokens: resolved.budgetTokens }
+}
+
+/** Resolve a caller's output cap without introducing a provider-wide default. */
+function requestedOutputTokens(options: WebGlTextProviderOptions | undefined) {
+  const limit = options?.maxTokens ?? options?.max_new_tokens
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+    throw new RangeError("maxTokens must be a nonnegative safe integer.")
+  }
+  return limit
+}
+
+function waitForModel(model: WebGlTextModel, contextLength: number | undefined, signal: AbortSignal | undefined): Promise<void> {
+  signal?.throwIfAborted()
+  if (!signal) return loadModel(model, contextLength)
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal.addEventListener("abort", abort, { once: true })
+    loadModel(model, contextLength).then(() => {
+      signal.removeEventListener("abort", abort)
+      if (signal.aborted) reject(signal.reason)
+      else resolve()
+    }, error => { signal.removeEventListener("abort", abort); reject(error) })
+  })
 }
 
 function contentText(content: ModelMessage["content"]) {
@@ -219,6 +275,15 @@ function usageOf(stats: RunTimings): TokenUsage {
   usage.providerUsageDetails = {
     ...(stats.firstTokenMs !== null && { firstTokenMs: stats.firstTokenMs }),
     promptMs: stats.promptMs,
+    ...(stats.tokenizeMs !== undefined && { tokenizeMs: stats.tokenizeMs }),
+    ...(stats.schemaMs !== undefined && { schemaMs: stats.schemaMs }),
+    ...(stats.cacheRestoreMs !== undefined && { cacheRestoreMs: stats.cacheRestoreMs }),
+    ...(stats.cacheMatchedTokens !== undefined && { cacheMatchedTokens: stats.cacheMatchedTokens }),
+    ...(stats.cachePrefixTokens !== undefined && { cachePrefixTokens: stats.cachePrefixTokens }),
+    ...(stats.cacheAnchorTokens !== undefined && { cacheAnchorTokens: stats.cacheAnchorTokens }),
+    ...(stats.thinkingTokens !== undefined && { thinkingTokens: stats.thinkingTokens }),
+    ...(stats.thinkingBudgetTokens !== undefined && { thinkingBudgetTokens: stats.thinkingBudgetTokens }),
+    ...(stats.thinkingBudgetExhausted !== undefined && { thinkingBudgetExhausted: stats.thinkingBudgetExhausted }),
     ...(stats.firstTokenMs !== null && {
       decodeMs: stats.decodeMs,
       decodeTokens: Math.max(stats.outputTokens - 1, 0)
@@ -236,6 +301,10 @@ const nextId = (prefix: string) =>
 
 /** Options for `webglText`. */
 export type WebGlTextConfig = {
+  /** Real worker prefill/decode transitions, independent of streamed text. */
+  onGenerationPhase?: (phase: GenerationPhase) => void
+  /** Raw model-generated thinking text, without tags or answer content. */
+  onThinking?: (delta: string) => void
   /**
    * Most tokens a chat may hold, prompt and reply together: the model's
    * whole context length by default (from its config), never more. The
@@ -269,10 +338,14 @@ export class WebGlTextAdapter<
   override readonly inputModalities = ["text"] as const
 
   private readonly contextLength: number | undefined
+  private readonly onGenerationPhase: WebGlTextConfig["onGenerationPhase"]
+  private readonly onThinking: WebGlTextConfig["onThinking"]
 
   constructor(model: TModel, config: WebGlTextConfig = {}) {
     super({}, model)
     this.contextLength = config.contextLength
+    this.onGenerationPhase = config.onGenerationPhase
+    this.onThinking = config.onThinking
     setKeepLoaded(model, config.keepLoaded ?? false)
   }
 
@@ -282,22 +355,30 @@ export class WebGlTextAdapter<
   }
 
   private sampling(
-    modelOptions: WebGlTextProviderOptions | undefined
+    modelOptions: WebGlTextProviderOptions | undefined,
+    thinking: boolean | undefined
   ): Sampling {
-    const base = modelMeta(this.model).sampling
+    const meta = modelMeta(this.model)
+    const base = thinking ? meta.thinkingSampling ?? meta.sampling : meta.sampling
     const top_p = modelOptions?.top_p ?? base.top_p
+    const min_p = modelOptions?.min_p ?? base.min_p
+    const presence_penalty = modelOptions?.presence_penalty ?? base.presence_penalty
     return {
       temperature: modelOptions?.temperature ?? base.temperature,
       top_k: modelOptions?.top_k ?? base.top_k,
       repetition_penalty:
         modelOptions?.repetition_penalty ?? base.repetition_penalty,
-      ...(top_p !== undefined && { top_p })
+      ...(top_p !== undefined && { top_p }),
+      ...(min_p !== undefined && { min_p }),
+      ...(presence_penalty !== undefined && { presence_penalty })
     }
   }
 
   async *chatStream(
     options: TextOptions<WebGlTextProviderOptions>
   ): AsyncIterable<AdapterYieldChunk> {
+    const thinking = thinkingOptions(options.reasoning, this.model)
+    const maxTokens = requestedOutputTokens(options.modelOptions)
     const runId = options.runId ?? nextId("run")
     const threadId = options.threadId
     const messageId = nextId("msg")
@@ -306,6 +387,7 @@ export class WebGlTextAdapter<
       options.abortController?.signal ??
       (options.request as RequestInit | undefined)?.signal ??
       undefined
+    if (signal?.aborted) return
     const model = this.model
     const timestamp = () => Date.now()
 
@@ -317,9 +399,42 @@ export class WebGlTextAdapter<
       timestamp: timestamp(),
       ...(options.parentRunId && { parentRunId: options.parentRunId })
     }
+    if (options.tools?.length && options.toolChoice && options.toolChoice !== "auto" && options.toolChoice !== "none") {
+      try {
+        const { call, usage } = await chooseGuidedTool(options, (outputSchema, instruction) =>
+          this.structuredOutput({
+            chatOptions: { ...options, systemPrompts: [...normalizeSystemPrompts(options.systemPrompts), { content: instruction }] },
+            outputSchema
+          })
+        )
+        if (signal?.aborted) return
+        if (call) {
+          const toolCallId = nextId("tool")
+          const args = JSON.stringify(call.args)
+          yield { type: EventType.TOOL_CALL_START, toolCallId, toolCallName: call.name, parentMessageId: messageId, index: 0, model, timestamp: timestamp() }
+          yield { type: EventType.TOOL_CALL_ARGS, toolCallId, delta: args, args, model, timestamp: timestamp() }
+          yield { type: EventType.TOOL_CALL_END, toolCallId, toolCallName: call.name, args, input: call.args, model, timestamp: timestamp() }
+          yield { type: EventType.RUN_FINISHED, runId, threadId, model, timestamp: timestamp(), finishReason: "tool_calls", ...(usage && { usage }) }
+        } else {
+          for await (const chunk of this.chatStream({ ...options, runId, tools: [], toolChoice: "none" })) {
+            if (chunk.type === EventType.RUN_STARTED) continue
+            if (chunk.type === EventType.RUN_FINISHED) {
+              const reported = Array.isArray(chunk.usage) ? chunk.usage[0] : chunk.usage
+              yield { ...chunk, usage: addGuidedUsage(usage, reported) }
+            } else yield chunk
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) return
+        const message = errorText(error)
+        yield { type: EventType.RUN_ERROR, model, timestamp: timestamp(), message, error: { message } }
+      }
+      return
+    }
     try {
-      await loadModel(model, this.contextLength)
+      await waitForModel(model, this.contextLength, signal)
     } catch (error) {
+      if (signal?.aborted) return
       const message = `Couldn't load ${model}: ${errorText(error)}`
       yield {
         type: EventType.RUN_ERROR,
@@ -388,6 +503,7 @@ export class WebGlTextAdapter<
     const addPieces = (pieces: ReturnType<typeof thinkingSplitter.push>) => {
       for (const piece of pieces) {
         if (piece.kind === "thinking") {
+          if (!signal?.aborted) this.onThinking?.(piece.text)
           if (reasoning === "none") {
             events.push(
               {
@@ -421,14 +537,16 @@ export class WebGlTextAdapter<
     }
 
     const stream = generate({
+      onPhase: this.onGenerationPhase,
       id: nextId("call"),
       model: this.model,
       contextLength: this.contextLength,
       chat,
-      tools: toTools(options.tools),
-      thinking: enableThinking(options.reasoning, model),
-      sampling: this.sampling(options.modelOptions),
-      maxTokens: options.modelOptions?.max_new_tokens,
+      tools: options.toolChoice === "none" ? [] : toTools(options.tools),
+      ...(options.promptCache?.retention === "none" && { cachePrompt: false }),
+      ...thinking,
+      sampling: this.sampling(options.modelOptions, thinking.thinking),
+      maxTokens,
       speculative: options.modelOptions?.speculative,
       pipeline: options.modelOptions?.pipeline,
       signal
@@ -450,12 +568,44 @@ export class WebGlTextAdapter<
     endReasoning()
     const { text: rest, markup } = toolSplitter.flush()
     addText(rest)
-    const parsed = markup ? parseToolCalls(markup) : []
+    const parsed = markup && options.tools?.length && options.toolChoice !== "none" ? parseToolCalls(markup) : []
     // Markup that isn't any tool call is shown as the text it is.
     if (markup && parsed.length === 0) addText(markup)
     yield* events.splice(0)
 
-    for (const [index, call] of parsed.entries()) {
+    let repairedUsage: TokenUsage | undefined
+    const validated: typeof parsed = []
+    try {
+      if (failure) throw new Error(failure)
+      if (markup && options.tools?.length && options.toolChoice !== "none" && parsed.length === 0) {
+        throw new Error("The model produced a malformed tool-call envelope.")
+      }
+      for (const call of parsed) {
+        const tool = options.tools?.find(tool => tool.name === call.name)
+        if (!tool) throw new Error(`The model requested an unknown tool: ${call.name}`)
+        const schema = tool.inputSchema ?? { type: "object", properties: {}, additionalProperties: false }
+        let args = call.args
+        if (!await validateStructuredValue(schema, args)) {
+          const repair = await this.structuredOutput({
+            chatOptions: { ...options, systemPrompts: [...normalizeSystemPrompts(options.systemPrompts), { content: `Return valid arguments for ${tool.name}. Previous draft: ${JSON.stringify(args)}` }] },
+            outputSchema: schema
+          })
+          if (!repair.data || typeof repair.data !== "object" || Array.isArray(repair.data) || !await validateStructuredValue(schema, repair.data)) throw new Error(`Invalid arguments for tool: ${tool.name}`)
+          args = repair.data as Record<string, unknown>
+          repairedUsage = addGuidedUsage(repairedUsage, repair.usage)
+        }
+        if (signal?.aborted) return
+        validated.push({ ...call, args })
+      }
+    } catch (error) {
+      if (textStarted) yield { type: EventType.TEXT_MESSAGE_END, messageId, model, timestamp: timestamp() }
+      if (signal?.aborted) return
+      const message = errorText(error)
+      yield { type: EventType.RUN_ERROR, model, timestamp: timestamp(), message, error: { message } }
+      return
+    }
+
+    for (const [index, call] of validated.entries()) {
       const toolCallId = nextId("tool")
       const args = JSON.stringify(call.args)
       yield {
@@ -493,16 +643,6 @@ export class WebGlTextAdapter<
         timestamp: timestamp()
       }
     }
-    if (failure) {
-      yield {
-        type: EventType.RUN_ERROR,
-        model,
-        timestamp: timestamp(),
-        message: failure,
-        error: { message: failure }
-      }
-      return
-    }
     yield {
       type: EventType.RUN_FINISHED,
       runId,
@@ -510,7 +650,7 @@ export class WebGlTextAdapter<
       model,
       timestamp: timestamp(),
       finishReason: parsed.length > 0 ? "tool_calls" : "stop",
-      ...(stats && { usage: usageOf(stats) })
+      ...((stats || repairedUsage) && { usage: repairedUsage ? addGuidedUsage(repairedUsage, stats ? usageOf(stats) : undefined) : stats ? usageOf(stats) : undefined })
     }
   }
 
@@ -522,7 +662,12 @@ export class WebGlTextAdapter<
     options: StructuredOutputOptions<WebGlTextProviderOptions>
   ): Promise<StructuredOutputResult<unknown>> {
     const { chatOptions, outputSchema } = options
-    await loadModel(this.model, this.contextLength)
+    const thinking = thinkingOptions(chatOptions.reasoning, this.model)
+    const maxTokens = requestedOutputTokens(chatOptions.modelOptions)
+    const signal = chatOptions.abortController?.signal ?? (chatOptions.request as RequestInit | undefined)?.signal ?? undefined
+    signal?.throwIfAborted()
+    await waitForModel(this.model, this.contextLength, signal)
+    signal?.throwIfAborted()
     const system = normalizeSystemPrompts(chatOptions.systemPrompts)
       .map((p) => p.content)
       .concat(
@@ -530,6 +675,7 @@ export class WebGlTextAdapter<
       )
       .join("\n\n")
     const stream = generate({
+      onPhase: this.onGenerationPhase,
       id: nextId("call"),
       model: this.model,
       contextLength: this.contextLength,
@@ -538,21 +684,38 @@ export class WebGlTextAdapter<
         ...toChatMessages(chatOptions.messages, this.toolFormat)
       ],
       tools: [],
-      thinking: enableThinking(chatOptions.reasoning, this.model),
-      sampling: this.sampling(chatOptions.modelOptions),
-      maxTokens: chatOptions.modelOptions?.max_new_tokens,
+      ...(chatOptions.promptCache?.retention === "none" && { cachePrompt: false }),
+      outputSchema,
+      ...thinking,
+      sampling: this.sampling(chatOptions.modelOptions, thinking.thinking),
+      maxTokens,
       speculative: chatOptions.modelOptions?.speculative,
       pipeline: chatOptions.modelOptions?.pipeline,
-      signal: chatOptions.abortController?.signal
+      signal
     })
     let raw = ""
-    let next = await stream.next()
-    while (!next.done) {
-      raw += next.value
-      next = await stream.next()
+    const thinkingSplitter = this.onThinking ? createThinkingSplitter() : undefined
+    const addThinking = (pieces: Array<ReplyPiece>) => {
+      if (signal?.aborted) return
+      for (const piece of pieces) {
+        if (piece.kind === "thinking") this.onThinking?.(piece.text)
+      }
     }
+    let next = await stream.next()
+    try {
+      while (!next.done) {
+        signal?.throwIfAborted()
+        raw += next.value
+        if (thinkingSplitter) addThinking(thinkingSplitter.push(next.value))
+        next = await stream.next()
+      }
+      if (thinkingSplitter) addThinking(thinkingSplitter.flush())
+    } finally {
+      if (!next.done) await stream.return({})
+    }
+    signal?.throwIfAborted()
     if (next.value.failure) throw new Error(next.value.failure)
-    const rawText = splitThinking(raw).answer.trim()
+    const rawText = structuredAnswer(raw)
     const json = rawText.replace(/^```(?:json)?\s*|\s*```$/g, "")
     try {
       return {

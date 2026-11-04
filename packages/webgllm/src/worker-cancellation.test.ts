@@ -1,0 +1,103 @@
+import assert from "node:assert/strict"
+import { after, test } from "node:test"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { pathToFileURL } from "node:url"
+import { createRequire } from "node:module"
+import type { WorkerRequest, WorkerResponse } from "./protocol.js"
+import { readPrompt } from "./prompt.js"
+import type { Engine } from "./engine.js"
+
+const require = createRequire(join(process.cwd(), "package.json"))
+const { build } = await import(pathToFileURL(require.resolve("esbuild")).href) as typeof import("esbuild")
+const temporary = await mkdtemp(join(tmpdir(), "webgl-worker-cancel-"))
+after(() => rm(temporary, { recursive: true, force: true }))
+const source = await readFile(join(process.cwd(), "src/worker.ts"), "utf8")
+const start = source.indexOf("async function generate(request: GenerateRequest)")
+const end = source.indexOf("\n/**\n * Generations run one after another", start)
+assert.ok(start >= 0 && end > start, "exercise the current complete worker generate function")
+const outfile = join(temporary, "generate.mjs")
+await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), contents: `
+  import { adaptivePrefixFor } from './checkpoint-policy.js';
+  import { modelMeta } from './model-meta.js';
+  import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from './prompt.js';
+  import { createThinkingBudget } from './thinking-budget.js';
+  import { outputTokenLimit } from './generation-limits.js';
+  import { StructuredGeneration } from './structured-generation.js';
+  import { withPromptCachePolicy } from './prompt-cache-policy.js';
+  export function makeGenerate(state) {
+    const stopped=state.stopped,post=m=>state.messages.push(m);
+    const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();
+    ${source.slice(start, end)}
+    return generate;
+  }
+` }, outfile, bundle: true, format: "esm", platform: "node", conditions: ["@tanstack-ai-browser/source"], logLevel: "error" })
+const { makeGenerate } = await import(pathToFileURL(outfile).href)
+function gate() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+function probe() {
+  const calls = { forwards: 0, rewinds: 0, disposed: 0, drops: 0, masks: 0, snapshots: 0 }
+  const cached = [9, 9], stopped = new Set<string>(), messages: WorkerResponse[] = []
+  const engine = {
+    contextLength: 8192, snapshotLimit: 2, canSaveInside: false,
+    gpu: { compiled: { count: 0 } },
+    setAllowedTokens() { calls.masks++ }, dropGuess() { calls.drops++ },
+    reset() { cached.length = 0 }, canResume() { return false },
+    rewind() { calls.rewinds++; return 0 }, snapshotPosition() { return undefined },
+    snapshot() { calls.snapshots++; return undefined },
+    batchSizes(count: number) { const sizes = []; for (; count; count -= Math.min(256, count)) sizes.push(Math.min(256, count)); return sizes },
+    async forwardHidden() { calls.forwards++; return 0 }
+  }
+  const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
+    specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, constraintTokenizer: {} }
+  return { calls, stopped, messages, model: { engine, tokenizer, cached },
+    createConstraint: async () => ({ dispose() { calls.disposed++ } }) }
+}
+const request = (id: string, cachePrompt: boolean): Extract<WorkerRequest, { type: "generate" }> => ({
+  type: "generate", id, model: "LiquidAI/LFM3-1.7B-GGUF", cachePrompt,
+  chat: [{ role: "user", content: "Choose a move" }], tools: [], thinking: false,
+  outputSchema: { type: "object", properties: { move: { const: "a" } } },
+  sampling: { temperature: 0.1, top_k: 50, top_p: 0.1, min_p: 0, repetition_penalty: 1, presence_penalty: 0 }
+})
+
+for (const cache of [true, false]) test(`stop during constraint loading performs zero forwards and disposes the constraint (cache ${cache})`, async () => {
+  const state = probe(), entered = gate(), pending = gate()
+  const constraint = await state.createConstraint()
+  state.createConstraint = async () => { entered.release(); await pending.promise; return constraint }
+  const generate = makeGenerate(state)
+  const job = generate(request("cancelled", cache))
+  await entered.promise; state.stopped.add("cancelled"); pending.release(); await job
+  assert.equal(state.calls.forwards, 0)
+  assert.equal(state.calls.rewinds, 0, "cancellation must precede prompt-cache restoration too")
+  assert.deepEqual(state.model.cached, cache ? [9, 9] : [])
+  assert.equal(state.calls.disposed, 1); assert.equal(state.calls.drops, 1)
+  assert.equal(state.calls.masks, 1, "the cleanup scope clears any allowed-token mask")
+  assert.equal(state.messages.some(m => m.type === "token"), false)
+  const done = state.messages.find(m => m.type === "done")
+  assert.ok(done?.type === "done"); assert.equal(done.stats.inputTokens, 0); assert.equal(done.stats.outputTokens, 0)
+  // The next queued request still uses the unchanged real prompt reader.
+  const recovery = { ...request("next-request", cache), maxTokens: 0 }; delete recovery.outputSchema
+  await generate(recovery)
+  assert.equal(state.calls.forwards, 2)
+  assert.deepEqual(state.model.cached, cache ? state.model.tokenizer.encodeChat() : [])
+  assert.ok(state.messages.some(m => m.type === "done" && m.id === "next-request"))
+})
+
+test("readPrompt does not forward or promote checkpoints if already stopped", async () => {
+  const state = probe(), cached = [...state.model.cached]
+  const engine = state.model.engine as unknown as Engine
+  await readPrompt(engine, [9, 9, 10, 11], 2, state.model.cached, { prefix: 2, stop: () => true })
+  assert.equal(state.calls.forwards, 0); assert.equal(state.calls.snapshots, 0); assert.deepEqual(state.model.cached, cached)
+})
+
+test("readPrompt checks stop again between planning and the first forward", async () => {
+  const state = probe(); let stopped = false
+  state.model.engine.batchSizes = count => { stopped = true; return [count] }
+  const before = [...state.model.cached]
+  await readPrompt(state.model.engine as unknown as Engine, Array(512).fill(10), 0, state.model.cached, { checkpoints: false, stop: () => stopped })
+  assert.equal(state.calls.forwards, 0); assert.deepEqual(state.model.cached, before)
+})

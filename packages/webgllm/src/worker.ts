@@ -1,3 +1,4 @@
+import { adaptivePrefixFor } from "./checkpoint-policy.js"
 /**
  * The WebGL 2 worker: downloads a model to the Origin Private File System,
  * uploads its weights to the GPU on an OffscreenCanvas, and runs
@@ -11,7 +12,7 @@ import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta } from "./model-meta.js"
-import { anchorFor, readPrompt } from "./prompt.js"
+import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
@@ -22,6 +23,11 @@ import type { GpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
+import { createThinkingBudget } from "./thinking-budget.js"
+import { outputTokenLimit } from "./generation-limits.js"
+import { createConstraint } from "@tanstack-ai-browser/structured-output"
+import { StructuredGeneration, maskLogits } from "./structured-generation.js"
+import { withPromptCachePolicy } from "./prompt-cache-policy.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -57,6 +63,8 @@ type Loaded = {
   tokenizer: Tokenizer
   /** Token ids in the engine's cache, in order. */
   cached: Array<number>
+  /** Recent verified common content, for conservative short-prefix promotion. */
+  previousShared?: number
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
@@ -93,10 +101,6 @@ const DRAFTS = 7
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
 
-/** Most tokens a reply may have, unless the caller says otherwise. */
-const DEFAULT_MAX_TOKENS = 4096
-/** Below this much room for a reply, the chat is too long to answer. */
-const MIN_REPLY_TOKENS = 32
 
 /** FNV-1a of a string, as hex (for note keys). */
 function hash(text: string) {
@@ -435,24 +439,63 @@ async function generate(request: GenerateRequest) {
   // lost, or loaded if another was asked for since.
   const model = await startLoad(request.model, request.contextLength)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  return withPromptCachePolicy(model, request.cachePrompt, async () => {
+  if (request.reportPhases) post({ type: "phase", id, phase: "processing" })
   const { engine, tokenizer } = model
   const compiledBefore = engine.gpu.compiled.count
+  const tokenizeAt = performance.now()
   const prompt = tokenizer.encodeChat(request.chat, {
     tools: request.tools.length ? request.tools : undefined,
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
     addGenerationPrompt: true
   })
+  const cacheEnabled = request.cachePrompt !== false
+  const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
+  const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
+  const tokenizeMs = performance.now() - tokenizeAt
+  const think = tokenizer.specialTokens.think
+  const last = prompt[prompt.length - 1]
+  const startsInThinking = think !== null &&
+    (last === think ||
+      (prompt[prompt.length - 2] === think &&
+        tokenizer.decode([last]).trim() === ""))
+  const thinkingBudget = createThinkingBudget(
+    request.thinkingBudgetTokens,
+    tokenizer.specialTokens,
+    startsInThinking
+  )
+  // LFM2.5 Thinking writes its opening marker itself; its template ends at
+  // assistant\n. Seed that expected marker so the answer grammar never suppresses reasoning.
+  const reasoning = modelMeta(request.model as WebGlTextModel).reasoning
+  const mandatoryThinking = !!reasoning && "levels" in reasoning && !("off" in reasoning.levels)
+  const openThinking = request.outputSchema !== undefined && !startsInThinking && think !== null &&
+    (request.thinking === true || (request.thinking === undefined && mandatoryThinking))
+  const schemaAt = performance.now()
+  const structured = request.outputSchema === undefined ? undefined : new StructuredGeneration(
+    await createConstraint({ schema: request.outputSchema, tokenizer: tokenizer.constraintTokenizer }),
+    tokenizer.specialTokens.eos,
+    tokenizer.specialTokens.thinkEnd,
+    startsInThinking || openThinking,
+    tokenizer.vocabSize
+  )
+  const schemaMs = performance.now() - schemaAt
+  try {
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  engine.setAllowedTokens(null)
   const room = engine.contextLength - prompt.length
-  if (room < MIN_REPLY_TOKENS) {
+  if (room <= 0) {
     throw new Error(
       `This session is too long for the model: ${prompt.length} tokens, and it can read ${engine.contextLength} at most, reply included. Start a new session to keep going.`
     )
   }
 
+  const maxTokens = outputTokenLimit(room, request.maxTokens)
+
   // Reuse the cache for the longest prefix this prompt shares with it. The
   // whole prompt only if its end was saved with its last hidden row (the
   // same prompt again: a retry); else the last token is read again, for
   // the logits after it.
+  const restoreAt = performance.now()
   let common = 0
   while (
     common < model.cached.length &&
@@ -466,34 +509,51 @@ async function generate(request: GenerateRequest) {
     ? engine.resume(common)
     : engine.rewind(Math.min(common, prompt.length - 1))
   model.cached.length = start
+  let natural: number | undefined
+  if (cacheEnabled && common > 0 && !whole && prefix !== undefined && prefix > start) {
+    let at = start
+    for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
+  }
+  const framing = cacheEnabled && common > 0 && !whole
+    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking) : 0
+  const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
+  if (!whole) model.previousShared = plan.previousShared
+  const cacheRestoreMs = performance.now() - restoreAt
 
   // Read the rest of the prompt (see readPrompt), with the anchor snapshot
   // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
+  const reusablePrefix = plan.prefix
   let row = await readPrompt(engine, prompt, start, model.cached, {
     stop: () => stopped.has(id),
-    anchor: anchorFor(
-      tokenizer,
-      prompt,
-      request.chat,
-      request.thinking,
-      request.tools.length ? request.tools : undefined
-    )
+    // After a changed request reveals a shorter common boundary, retain it
+    // during this ordinary forward. One-off cold calls incur no extra work.
+    prefix: reusablePrefix,
+    ...(cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0 && { observedPrefix: reusablePrefix }),
+    anchor,
+    checkpoints: cacheEnabled
   })
-  const maxTokens = Math.min(request.maxTokens ?? DEFAULT_MAX_TOKENS, room)
   const stats: RunTimings = {
     inputTokens: prompt.length,
     cachedTokens: start,
     outputTokens: 0,
     firstTokenMs: null,
     promptMs: performance.now() - promptStart,
-    decodeMs: 0
+    tokenizeMs,
+    schemaMs,
+    cacheRestoreMs,
+    cacheMatchedTokens: common,
+    cachePrefixTokens: engine.snapshotPosition("prefix") ?? 0,
+    cacheAnchorTokens: engine.snapshotPosition("anchor") ?? 0,
+    decodeMs: 0,
+    ...thinkingBudget?.stats
   }
   if (
     stopped.has(id) ||
     maxTokens <= 0 ||
     model.cached.length < prompt.length
   ) {
+    if (structured && !stopped.has(id)) throw new Error("Structured output was truncated before generation could produce a schema-valid answer.")
     return post({ type: "done", id, stats })
   }
 
@@ -507,7 +567,7 @@ async function generate(request: GenerateRequest) {
   const greedy = sampling.temperature <= 0 || sampling.top_k === 1
   const onGpu = greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS)
   const sampler = createSampler(
-    onGpu ? { ...sampling, repetition_penalty: 1 } : sampling
+    onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
   if (onGpu) engine.setSeen(prompt, vocab)
   else sampler.see(prompt)
@@ -552,9 +612,19 @@ async function generate(request: GenerateRequest) {
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
+  let appliedMask: Uint32Array | null | undefined
+  const updateAllowed = () => {
+    // JSON literals are governed by their grammar. Only unconstrained replies
+    // reserve control markers after an explicit budgeted reasoning span closes.
+    const mask = structured ? structured.mask() : thinkingBudget?.closedControlMask(vocab) ?? null
+    if (structured?.answering || appliedMask !== mask) engine.setAllowedTokens(mask)
+    appliedMask = mask
+    return mask ?? undefined
+  }
   const distribution = async (r: number, guess = false) => {
+    const mask = updateAllowed()
     if (greedy) {
-      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess)
+      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess, sampling.presence_penalty)
       if (guess && engine.guessing) guessed = engine.guessedToken
       return { ids: Int32Array.of(token), p: Float32Array.of(1) }
     }
@@ -563,7 +633,8 @@ async function generate(request: GenerateRequest) {
         r,
         sampling.top_k,
         sampling.repetition_penalty,
-        guess
+        guess,
+        sampling.presence_penalty
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       const d = sampler.distribution(logits)
@@ -571,6 +642,7 @@ async function generate(request: GenerateRequest) {
     }
     const logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
+    if (mask) maskLogits(logits, mask)
     return sampler.distribution(logits)
   }
   // On the GPU: the distributions after rows 0..rows-1 of a batch whose
@@ -578,15 +650,19 @@ async function generate(request: GenerateRequest) {
   const distributions = async (
     rows: number,
     drafts: Array<number>,
-    guess: boolean
+    guess: boolean,
+    masks?: readonly Uint32Array[]
   ) => {
+    if (masks) engine.setAllowedTokenRows(masks)
+    else updateAllowed()
     if (greedy) {
       const tokens = await engine.argmax(
         0,
         rows,
         sampling.repetition_penalty,
         drafts,
-        guess
+        guess,
+        sampling.presence_penalty
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       return Array.from(tokens, (token) => ({
@@ -600,7 +676,9 @@ async function generate(request: GenerateRequest) {
       sampling.top_k,
       sampling.repetition_penalty,
       drafts,
-      guess
+      guess,
+      0,
+      sampling.presence_penalty
     )
     if (guess && engine.guessing) guessed = engine.guessedToken
     return picked.map(({ ids, logits }) => {
@@ -613,19 +691,16 @@ async function generate(request: GenerateRequest) {
   // the prompt with `<think>`, Qwen3.5 with `<think>\n`), the reply starts
   // inside it: say so first, as the model would have, so the thinking
   // reads as thinking.
-  const think = tokenizer.specialTokens.think
-  const last = prompt[prompt.length - 1]
-  if (
-    think !== null &&
-    (last === think ||
-      (prompt[prompt.length - 2] === think &&
-        tokenizer.decode([last]).trim() === ""))
-  ) {
+  if (startsInThinking) {
     post({ type: "token", id, text: THINK_OPEN })
   }
 
-  let token = draw(await distribution(row, guessing()))
+  // A zero budget may close a template-opened span before any sampling.
+  let token = openThinking ? think as number : thinkingBudget?.forcedToken ?? draw(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
+  if (request.reportPhases && !stopped.has(id)) {
+    post({ type: "phase", id, phase: "generating" })
+  }
   const firstTokenAt = performance.now()
   stats.firstTokenMs = firstTokenAt - requested
   const decoder = tokenizer.createStreamDecoder({ skipSpecialTokens: false })
@@ -635,9 +710,11 @@ async function generate(request: GenerateRequest) {
   // Writes out a token of the reply; false once the reply is over.
   const emit = (t: number) => {
     stats.outputTokens++
+    structured?.observe(t)
     if (t === eos) return false
+    thinkingBudget?.observe(t)
     if (onGpu) engine.markSeen(t)
-    else sampler.see([t])
+    else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
     const text = decoder.push(t)
@@ -663,7 +740,7 @@ async function generate(request: GenerateRequest) {
           !draftsNext()
         const guess = more && guessing()
         const d = await distribution(0, guess)
-        token = draw(d)
+        token = thinkingBudget?.forcedToken ?? draw(d)
         if (!guess) scoreGuess(d, token)
         policy.alone(performance.now() - stepStart)
         going = emit(token)
@@ -673,13 +750,16 @@ async function generate(request: GenerateRequest) {
     }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
-    const drafts = draftsFor(
+    const proposed = draftsFor(
       Math.min(
         DRAFTS,
         maxTokens - stats.outputTokens - 1,
         engine.contextLength - engine.position - 1
       )
     )
+    const answeringAtBatchStart = !!structured?.answering
+    const preview = structured?.answering ? structured.previewAnswerDrafts(proposed) : undefined
+    const drafts = preview?.drafts ?? proposed
     const batch = [token, ...drafts]
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
     // Row i's distribution checks draft i + 1; the first draft it rejects
@@ -691,11 +771,25 @@ async function generate(request: GenerateRequest) {
       stats.outputTokens + drafts.length < maxTokens - 1 &&
       engine.position < engine.contextLength - 1
     const all = onGpu
-      ? await distributions(batch.length, drafts, guessLast)
+      ? await distributions(batch.length, drafts, guessLast, preview?.masks)
       : null
     let kept = 1
     let next = -1
+    let constrainedRow = -1
     for (let i = 0; i < batch.length && going; i++) {
+      // A natural close accepted from a draft activates the answer grammar.
+      // Its precomputed thinking distributions cannot select answer tokens.
+      if (!answeringAtBatchStart && structured?.answering && drafts.length > 0) {
+        constrainedRow = kept - 1
+        break
+      }
+      // A drafted thinking token may have just used the remaining budget.
+      // Stop before accepting another; accept(kept) below rewinds its cache.
+      const forced = thinkingBudget?.forcedToken
+      if (forced !== undefined && forced !== null) {
+        next = forced
+        break
+      }
       const last = i + 1 === batch.length
       const d = all ? all[i] : await distribution(i, last && guessLast)
       if (last) {
@@ -728,6 +822,10 @@ async function generate(request: GenerateRequest) {
       engine.accept(kept)
     }
     model.cached.push(...batch.slice(0, kept))
+    if (constrainedRow >= 0 && going) {
+      engine.dropGuess()
+      next = draw(await distribution(constrainedRow, false))
+    }
     if (!going || next < 0) break
     token = next
     going = emit(token)
@@ -736,8 +834,9 @@ async function generate(request: GenerateRequest) {
   engine.dropGuess()
   const rest = decoder.flush()
   if (rest) post({ type: "token", id, text: rest })
-  engine.snapshot()
+  if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
+  if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)
   // Programs the warm-up missed compile mid-request: worth knowing.
   const compiled = engine.gpu.compiled.count - compiledBefore
   if (compiled > 0) {
@@ -762,7 +861,16 @@ async function generate(request: GenerateRequest) {
     model.claimed = engine.gpu.bytes
     void claimMemory(model.model, model.claimed)
   }
+  if (structured && !stopped.has(id) && !structured.complete) {
+    throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
+  }
   post({ type: "done", id, stats })
+  } finally {
+    structured?.dispose()
+    engine.setAllowedTokens(null)
+    engine.dropGuess()
+  }
+  })
 }
 
 /**

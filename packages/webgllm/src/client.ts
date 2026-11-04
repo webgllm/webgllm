@@ -6,7 +6,7 @@
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import type { WebGlTextModel } from "./model-meta.js"
 import { claimMemory, releaseMemory, touchMemory } from "./model-memory.js"
-import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { GenerationPhase, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import type { Sampling } from "./sampler.js"
 import { createStore } from "./store.js"
 import type { Store } from "./store.js"
@@ -39,6 +39,7 @@ export function modelStatus(model: WebGlTextModel): Store<ModelStatus> {
 }
 
 type Generation = {
+  onPhase?: (phase: GenerationPhase) => void
   onToken: (text: string) => void
   onEnd: (error?: string, stats?: RunTimings) => void
 }
@@ -126,6 +127,8 @@ function handleMessage({ data }: MessageEvent<WorkerResponse>) {
       loaded = null
       releaseMemory(OWNER)
     }
+  } else if (data.type === "phase") {
+    generations.get(data.id)?.onPhase?.(data.phase)
   } else if (data.type === "token") {
     generations.get(data.id)?.onToken(data.text)
   } else if (data.type === "log") {
@@ -266,8 +269,13 @@ export async function* generate(request: {
   /** The context the model is loaded for (see loadModel). */
   contextLength?: number
   chat: Array<ChatMessage>
+  /** False resets retained prompt state before/after this generation, keeping model weights. */
+  cachePrompt?: boolean
   tools: Array<ChatTool>
   thinking?: boolean
+  /** Thinking content ceiling; must be a nonnegative safe integer. */
+  thinkingBudgetTokens?: number
+  outputSchema?: object
   sampling: Sampling
   maxTokens?: number
   /** Speculative decoding by prompt lookup (default on). */
@@ -275,6 +283,8 @@ export async function* generate(request: {
   /** Reading the likeliest next token ahead (default on). */
   pipeline?: boolean
   signal?: AbortSignal
+  /** Worker-measured prefill and decode boundaries; never sent to the worker. */
+  onPhase?: (phase: GenerationPhase) => void
 }): AsyncGenerator<string, GenerationEnd> {
   const { id, signal } = request
   // Stopped before it started (say, while the model downloaded).
@@ -284,6 +294,11 @@ export async function* generate(request: {
   let finished = false
   let end: GenerationEnd = {}
   generations.set(id, {
+    ...(request.onPhase && {
+      onPhase: (phase: GenerationPhase) => {
+        if (!signal?.aborted) request.onPhase?.(phase)
+      }
+    }),
     onToken: (text) => {
       queue.push(text)
       wake?.()
@@ -300,13 +315,19 @@ export async function* generate(request: {
   post({
     type: "generate",
     id,
+    ...(request.onPhase && { reportPhases: true }),
     model: request.model,
     ...(request.contextLength !== undefined && {
       contextLength: request.contextLength
     }),
     chat: request.chat,
+    ...(request.cachePrompt !== undefined && { cachePrompt: request.cachePrompt }),
     tools: request.tools,
     ...(request.thinking !== undefined && { thinking: request.thinking }),
+    ...(request.thinkingBudgetTokens !== undefined && {
+      thinkingBudgetTokens: request.thinkingBudgetTokens
+    }),
+    ...(request.outputSchema !== undefined && { outputSchema: request.outputSchema }),
     sampling: request.sampling,
     ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
     ...(request.speculative !== undefined && {

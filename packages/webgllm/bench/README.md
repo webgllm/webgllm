@@ -1,5 +1,9 @@
 # Bench
 
+Raw run artifacts are no longer tracked. Keep only [the latest compact summary](latest.json);
+regenerate raw files locally as needed. Fixed regression fixtures remain separate.
+
+
 Pages for checking and timing the engine, served cross-origin isolated by `server.mjs`, which also bundles the package's TypeScript on request (`/bundle/<path>.js` is `<path>.ts`).
 
 ```sh
@@ -252,3 +256,9 @@ M3 Ultra, Chrome, `attnab=flashDecode:0,1`, best of 16–20 alternated rounds (m
 | Qwen3.5 2B, all across | 0.81 → 0.67 | 0.83 → 0.68 | 2.18 → 0.86 |
 
 Tried on the M3 and not kept: 16-texel chunks (124 at 7,900 tokens): the combine doubles and Qwen3.5 slows (1.42 against 0.86); 2 or 4 texels per step of the chunk loop flat. The two-loop chunk pass with the combine still a chunk at a time cost as much in the combine as in the chunks at 124 chunks. On Apple GPUs `skip=` of a kind of pass can mislead: passes left drawing into one target back to back get elided (skipping attend left the scores passes at 0.13 ms for all 11 layers on the phone).
+
+## Short shared-prefix caching
+
+See [native Chrome results and reproduction](short-prefix-results/FINDINGS.md) for
+inside-batch state extraction, preserved cold batches and long-prefix behavior,
+SDK tool/cancellation checks, bounded memory, and explicit remaining matcher failures.
