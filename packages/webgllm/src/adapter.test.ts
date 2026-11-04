@@ -12,6 +12,7 @@ import type { GenerationPhase, RunTimings, WorkerRequest, WorkerResponse } from 
  */
 class FakeWorker {
   static last: FakeWorker | null = null
+  static onLoad?: (worker: FakeWorker, request: Extract<WorkerRequest, { type: "load" }>) => void
   static onGenerate?: (worker: FakeWorker, request: Extract<WorkerRequest, { type: "generate" }>) => void
   onmessage: ((event: { data: WorkerResponse }) => void) | null = null
   onerror: ((event: { message: string }) => void) | null = null
@@ -27,6 +28,7 @@ class FakeWorker {
     this.posted.push(message)
     const send = (data: WorkerResponse) => this.onmessage?.({ data })
     if (message.type === "load") {
+      if (FakeWorker.onLoad) return FakeWorker.onLoad(this, message)
       setTimeout(() => send({ type: "ready", model: message.model }), 0)
     } else if (message.type === "generate") {
       if (FakeWorker.onGenerate) return FakeWorker.onGenerate(this, message)
@@ -471,4 +473,50 @@ test("request.signal abort blocks buffered thinking flush and rejects a late com
     assert.deepEqual(thoughts, ["before"], "cancelled flush must not publish a partial reasoning delimiter")
     assert.ok(FakeWorker.last?.posted.some(message => message.type === "stop"))
   } finally { FakeWorker.onGenerate = undefined; unloadModel() }
+})
+
+
+test("cold chat load cancellation ends silently for request.signal and legacy controllers", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  for (const transport of ["request", "controller"] as const) {
+    unloadModel()
+    const controller = new AbortController()
+    FakeWorker.onLoad = () => { queueMicrotask(() => controller.abort(new Error("user cancelled"))) }
+    try {
+      const adapter = webglText("onnx-community/LFM3-1.7B-ONNX")
+      const chunks = []
+      for await (const chunk of adapter.chatStream({
+        logger: resolveDebugOption(false), threadId: "cold-load-cancel", model: adapter.model,
+        messages: [{ role: "user", content: "hello" }],
+        ...(transport === "request" ? { request: new Request("http://localhost", { signal: controller.signal }) } : { abortController: controller })
+      })) chunks.push(chunk)
+      assert.deepEqual(chunks.map(chunk => chunk.type), ["RUN_STARTED"])
+      assert.equal(FakeWorker.last?.posted.some(message => message.type === "generate"), false)
+      // The shared background load may finish normally and serve the next request.
+      FakeWorker.last?.send({ type: "ready", model: adapter.model })
+      FakeWorker.onGenerate = (worker, request) => {
+        worker.send({ type: "token", id: request.id, text: "hello" })
+        worker.send({ type: "done", id: request.id, stats: STATS })
+      }
+      const recovered = []
+      for await (const chunk of adapter.chatStream({logger:resolveDebugOption(false),threadId:"after-cancel",model:adapter.model,messages:[{role:"user",content:"hello"}]})) recovered.push(chunk)
+      assert.equal(recovered.at(-1)?.type, "RUN_FINISHED")
+      assert.equal(recovered.some(chunk => chunk.type === "RUN_ERROR"), false)
+      assert.equal((await adapter.chatStream({logger:resolveDebugOption(false),threadId:"pre-aborted",model:adapter.model,messages:[],abortController:controller})[Symbol.asyncIterator]().next()).done, true)
+    } finally { FakeWorker.onLoad = undefined; FakeWorker.onGenerate = undefined; unloadModel() }
+  }
+})
+
+test("a genuine cold model-load failure still emits RUN_ERROR", { timeout: 10_000 }, async () => {
+  const { webglText } = await import("./adapter.js")
+  const { unloadModel } = await import("./client.js")
+  unloadModel()
+  FakeWorker.onLoad = (worker) => { queueMicrotask(() => worker.onerror?.({ message: "download unavailable" })) }
+  try {
+    const adapter = webglText("onnx-community/LFM3-1.7B-ONNX"), chunks = []
+    for await (const chunk of adapter.chatStream({logger:resolveDebugOption(false),threadId:"load-error",model:adapter.model,messages:[{role:"user",content:"hello"}]})) chunks.push(chunk)
+    assert.deepEqual(chunks.map(chunk=>chunk.type),["RUN_STARTED","RUN_ERROR"])
+    assert.match(JSON.stringify(chunks.at(-1)), /Couldn't load.*download unavailable/)
+  } finally { FakeWorker.onLoad = undefined; unloadModel() }
 })
