@@ -16,7 +16,8 @@ type Tensor = { data: Float32Array; rows: number; dims: number; offset: number }
  */
 export async function attentionError(
   engine: Engine,
-  tokens: Array<number>
+  tokens: Array<number>,
+  keepCache = false
 ): Promise<number> {
   const c = engine.config
   const hd = c.headDim
@@ -26,10 +27,16 @@ export async function attentionError(
   const seen = new Map<number, Partial<Record<string, Tensor>>>()
   const want = new Float64Array(hd)
   let worst = 0
+  let succeeded = false
   engine.reset()
   try {
     await engine.forward(tokens, async (layer, name, read) => {
-      if (name !== "q" && name !== "qkvg" && name !== "attn_out" && name !== "kv")
+      if (
+        name !== "q" &&
+        name !== "qkvg" &&
+        name !== "attn_out" &&
+        name !== "kv"
+      )
         return
       const got = seen.get(layer) ?? {}
       got[name] = await read()
@@ -85,8 +92,9 @@ export async function attentionError(
         worst = Math.max(worst, Math.sqrt(err / Math.max(ref, 1e-30)))
       }
     })
+    succeeded = true
   } finally {
-    engine.reset()
+    if (!keepCache || !succeeded) engine.reset()
   }
   return worst
 }

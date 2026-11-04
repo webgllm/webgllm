@@ -3,6 +3,7 @@
  * off the main thread on an OffscreenCanvas. One worker, one model in it at
  * a time: loading another frees the previous one.
  */
+import { monitorFrames } from "./frame-pacing.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import type { WebGlTextModel } from "./model-meta.js"
 import { claimMemory, releaseMemory, touchMemory } from "./model-memory.js"
@@ -55,6 +56,7 @@ let loaded: {
   load: Pending
 } | null = null
 let worker: Worker | null = null
+let stopFrames: (() => void) | undefined
 
 /** This runtime's name in the shared memory registry. */
 const OWNER = "webgl"
@@ -77,6 +79,8 @@ export function setKeepLoaded(model: WebGlTextModel, keep: boolean) {
  * memory budget calls it too.
  */
 export function unloadModel() {
+  stopFrames?.()
+  stopFrames = undefined
   worker?.terminate()
   worker = null
   releaseMemory(OWNER)
@@ -144,11 +148,24 @@ function post(message: WorkerRequest) {
       type: "module",
       name: "webgl"
     })
+    stopFrames = monitorFrames((intervalMs, expectedMs, frames, startedAt, meanMs) =>
+      worker?.postMessage({
+        type: "frames",
+        intervalMs,
+        expectedMs,
+        frames,
+        startedAt,
+        meanMs
+      } satisfies WorkerRequest)
+    )
     worker.onmessage = handleMessage
     worker.onerror = (event) =>
       failWorker(event.message || "The model's worker stopped.")
     if (promptBatch !== undefined)
-      worker.postMessage({ type: "tune", values: { promptBatch } } satisfies WorkerRequest)
+      worker.postMessage({
+        type: "tune",
+        values: { promptBatch }
+      } satisfies WorkerRequest)
   }
   worker.postMessage(message)
 }
@@ -166,7 +183,10 @@ let promptBatch: number | undefined
  */
 export function setPromptBatch(tokens: number | undefined) {
   promptBatch = tokens
-  worker?.postMessage({ type: "tune", values: { promptBatch: tokens ?? 0 } } satisfies WorkerRequest)
+  worker?.postMessage({
+    type: "tune",
+    values: { promptBatch: tokens ?? 0 }
+  } satisfies WorkerRequest)
 }
 
 /**
@@ -174,6 +194,8 @@ export function setPromptBatch(tokens: number | undefined) {
  * and the next request starts a new one.
  */
 function failWorker(message: string) {
+  stopFrames?.()
+  stopFrames = undefined
   worker?.terminate()
   worker = null
   releaseMemory(OWNER)
@@ -201,7 +223,6 @@ function keepDownloads() {
   if (/Firefox\//.test(navigator.userAgent)) return
   navigator.storage?.persist?.().catch(() => undefined)
 }
-
 
 /**
  * Whether this browser can run the engine: WebGL 2 with float render

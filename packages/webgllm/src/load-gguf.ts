@@ -59,6 +59,8 @@ export type LoadGgufOptions = {
   header?: GgufHeader
   /** Embedding rows converted per step (default 512). */
   embeddingChunkRows?: number
+  /** Concurrent reads within the existing 24 MiB read-ahead byte cap. */
+  readAhead?: number
   /** Filled with the error of requantizing a float embedding to 8 bits. */
   requantStats?: RequantStats
 }
@@ -94,9 +96,11 @@ export async function* loadGguf(
   const kPerm = headPermutation(numKvHeads, headDim, config.ropeDimsFull)
   const normPerm = headPermutation(1, headDim, config.ropeDimsFull)
 
-  const plan = new ReadPlan()
+  const plan = new ReadPlan(options.readAhead ?? 6)
+  let largestTensorBytes = 0
   const want = (name: string) => {
     const info = tensor(name)
+    largestTensorBytes = Math.max(largestTensorBytes, info.byteLength)
     plan.add({
       key: name,
       source,
@@ -159,7 +163,10 @@ export async function* loadGguf(
   if (embK !== D)
     throw new Error(`GGUF: token_embd has ${embK} columns, expected ${D}`)
   const embRowBytes = embedding.byteLength / vocab
-  const chunkRows = options.embeddingChunkRows ?? 512
+  const nativeEmbedding = embedding.type === GgmlType.Q6_K || embedding.type === GgmlType.Q4_0 || embedding.type === GgmlType.Q8_0
+  const chunkRows =
+    options.embeddingChunkRows ??
+    defaultEmbeddingRows(embRowBytes, largestTensorBytes, nativeEmbedding)
   for (let r = 0; r < vocab; r += chunkRows) {
     const rows = Math.min(chunkRows, vocab - r)
     plan.add({
@@ -386,6 +393,20 @@ export async function* loadGguf(
     } else packRows(m, 0, embedding, bytes, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
+}
+
+/** Keep embedding I/O amortized without exceeding the existing tensor working set. */
+export function defaultEmbeddingRows(
+  rowBytes: number,
+  largestTensorBytes: number,
+  native: boolean
+) {
+  if (!native || rowBytes <= 0) return 512
+  // Current bytes + packed bytes + three prefetched pieces <= 5/3 of
+  // one existing raw tensor; loading that tensor already holds its raw
+  // bytes and packed matrix. Never enlarge a piece past 4 MiB.
+  const budget = Math.min(4 << 20, largestTensorBytes / 3)
+  return Math.max(512, Math.min(2048, Math.floor(budget / rowBytes) & ~3))
 }
 
 /** The bits a tensor gets in a QuantMatrix. */

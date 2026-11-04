@@ -3,13 +3,17 @@
  * forward pass a batch of tokens at a time, keeping the attention cache and
  * the convolutions' state on the GPU between calls.
  */
+import { expandQ6, fitsExpandedHead, headScratchBytes, fundedF16Scratch } from "./q6-expanded.js"
+import { SubmissionBudget, calibratedReadQuota } from "./gpu/submission-budget.js"
+import { releaseOwnedBuffer } from "./upload-staging.js"
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
-import { GL, Gpu, GpuError, type Program } from "./gpu/gl.js"
+import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
-import { quantsFromRaw, rawRgba4 } from "./repack.js"
+import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
+import { quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
   LayerType,
   LayerWeights,
@@ -47,6 +51,9 @@ type GpuMatrix = {
   /** Quant texels per row group in one column. */
   rowTexels: number
   quants: Texture
+  /** Q6_K embedding texture panels, including quants as the first. */
+  quantPanels?: Array<Texture>
+  q6Expanded?: boolean
   scales: Texture
   zeros: Texture | null
 }
@@ -99,31 +106,6 @@ type GpuLayer = {
 }
 
 /**
- * Q4_0 block rows (16 bytes: weight i in byte i's low nibble, weight
- * 16 + i in its high nibble) as RGBA4 texels of 4 consecutive weights
- * (UNSIGNED_SHORT_4_4_4_4: the first weight in the top nibble): word w of a
- * block row gives texels w (low nibbles) and 4 + w (high nibbles).
- */
-function toRgba4(words: Uint32Array) {
-  const out = new Uint16Array(words.length * 2)
-  // The first weight in the low nibble (kernels read .wzyx; see kernels.ts).
-  const four = (x: number) =>
-    (x & 15) |
-    (((x >>> 8) & 15) << 4) |
-    (((x >>> 16) & 15) << 8) |
-    (((x >>> 24) & 15) << 12)
-  for (let row = 0; row < words.length; row += 4) {
-    const o = row * 2
-    for (let w = 0; w < 4; w++) {
-      const x = words[row + w]
-      out[o + w] = four(x & 0x0f0f0f0f)
-      out[o + 4 + w] = four((x >>> 4) & 0x0f0f0f0f)
-    }
-  }
-  return out
-}
-
-/**
  * Knobs for A/B timing on the bench page (bench/check.html?ab=...); the
  * defaults are what the engine uses.
  */
@@ -132,6 +114,8 @@ export const TUNING = {
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
   splitFragments: 4096,
+  /** Stream activation pairs in byte-weight matvecs to reduce register pressure. */
+  streamMatvec: -1,
   /** ...into at most this many slices (the partial buffer holds 32). */
   maxSplit: 16,
   /** Pixels per row summing its squares (at most K.RMS_PARTS). */
@@ -194,11 +178,15 @@ export const TUNING = {
   fastPick: 1,
   /** Render-area hints for every pass (see Gpu.hints): 1 scissors to the pass's rect. */
   renderHints: 1,
+  /** Avoid resubmitting unchanged programs, texture bindings, and samplers. */
+  cacheState: 1,
   /**
    * 1: the f16 matmul's dots in mediump (faster where that's half
    * precision, less exact); options.matmulPrecision "mediump" turns it on.
    */
   f16Half: 0,
+  /** Write prefill norms/activations directly into existing FP16 input scratch. */
+  fusePromptInputs: 1,
   /**
    * How the f16 matmul reads (see matmulF16's `packed`), as bits: 1 the
    * activations straight from their h2 tensor, 8 halves a fetch, with no
@@ -207,7 +195,7 @@ export const TUNING = {
    * RGBA16F, 4 values a fetch. Engine.tune times 0 against 3 on a GPU
    * whose prompts take the f16 matmul, and keeps it where it's faster.
    */
-  f16Pack: 3,
+  f16Pack: -1,
   /**
    * RGBA4 weights' f16 matmul (f16Matmul 2) dequantizes at most this many
    * MiB at a time: a bigger matrix goes in chunks of K-slices (or of rows,
@@ -224,9 +212,12 @@ export const TUNING = {
   tuneLayers: 8,
   /**
    * The same for byte weights, whose prompts have no in-place kernel:
-   * 0, the whole matrix, as they always had.
+   * -1 funds the fastest scratch from the previous automatic-tuner's
+   * working-set ceiling; 0 holds a whole matrix; positive values cap MiB.
    */
-  f16ScratchBytesMiB: 0,
+  f16ScratchBytesMiB: -1,
+  /** Ordered draws can reuse one activation conversion texture. */
+  f16ActivationBuffers: 1,
   /** Their K-slices: about this many K values each (twice for over 8192 rows)... */
   quadSliceK: 512,
   /** ...and at most this many (readers add them up). */
@@ -241,6 +232,18 @@ export const TUNING = {
    * matmulQ6KHeadWords); 0: byte texels (set before the model loads).
    */
   q6Words: 1,
+  /** Exact six-bit integers expanded to normalized bytes for simpler heads. */
+  q6Expanded: -1,
+  /** Repack the lossless head on GPU using existing activation storage where it fits. */
+  q6UploadGpu: 1,
+  /** GGUF embedding rows per piece (0: derive a bounded read budget). */
+  ggufEmbeddingRows: 0,
+  /** Concurrent file slices, still bounded by ReadPlan's 24 MiB cap. */
+  ggufReadAhead: 6,
+  /** Uploaded model pieces allowed ahead of the GPU, with periodic presentation drains. */
+  uploadAhead: 1,
+  /** Packing probe rows: 0 uses the actual prompt batch; positive values are diagnostics. */
+  packingProbeRows: 0,
   /** 1: a word-texel Q6_K head reads the last add's scaled input (no norm pass; see headScaled). */
   q6FoldNorm: 1,
   /**
@@ -317,6 +320,23 @@ export const TUNING = {
    */
   paceLayers: 4,
   paceAhead: 2,
+  /**
+   * Prompt passes are fenced in bands of this many estimated reads,
+   * retaining the full prompt batch. Zero disables submission pacing.
+   */
+  submissionReads: 1 << 28,
+  /** Target milliseconds per submitted work chunk, adjusted from GPU fences. */
+  submissionMs: 4,
+  /** Message polls between 1 ms sleeps while waiting for GPU work (0: no periodic sleep). */
+  fencePolls: 32,
+  /** A full compute-queue drain after this many display frames (0 disables). */
+  presentationFrames: 4,
+  /** Decode layers per fenced submission (0 disables). */
+  decodePaceLayers: -1,
+  /** Rows per Q6_K embedding allocation (0: one texture). */
+  embeddingPanelRows: 2048,
+  /** Vocabulary rows per paced head submission. */
+  headPaceRows: 16,
   /** What an attention multiply-add costs against a matmul one, for pacing. */
   paceAttention: 4,
   /**
@@ -367,10 +387,17 @@ type HeadOut = { logits: Texture; split: number; stride: number }
 /** See Engine.tuned. */
 export type Tuned = {
   shortSplit: number | null
+  streamMatvec?: boolean
+  submissionReads?: number
+  /** Measured overlap; zero records that larger submissions missed rendering deadlines. */
+  submissionOverlap?: number
+  rmsParts?: number
   f16Matmul?: number | null
   f16Pack?: number | null
   /** Writing's attention in panels (TUNING.flashDecode) or not. */
   flashDecode?: number | null
+  /** Context length at which the attention variant was actually measured. */
+  flashDecodeFrom?: number
 }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
@@ -572,6 +599,11 @@ export class Engine {
     this.scaleBatch = options.scaleBatch ?? true
     this.precision = options.matmulPrecision ?? "highp"
     this.gpu.hints = TUNING.renderHints
+    this.gpu.cacheState = TUNING.cacheState > 0
+    this.gpu.presentationFrames = TUNING.presentationFrames
+    this.gpu.configurePacing(this.tuned.submissionReads ?? TUNING.submissionReads, TUNING.submissionMs)
+    this.gpu.pollsBeforeSleep = TUNING.fencePolls
+    this.gpu.presentationFrames = TUNING.presentationFrames
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
     this.quadMatmuls = options.quadMatmuls ?? this.baseBatch >= TUNING.quadMinBatch
@@ -584,7 +616,14 @@ export class Engine {
     onProgress?: (piece: WeightPiece) => void
   ) {
     let mark = performance.now()
-    this.loadMs = { reading: 0, uploading: 0, convert: 0 }
+    this.loadMs = {
+      reading: 0,
+      uploading: 0,
+      convert: 0,
+      scratch: 0,
+      packing: 0,
+      matvec: 0
+    }
     for await (const piece of pieces) {
       const got = performance.now()
       this.loadMs.reading += got - mark
@@ -592,6 +631,13 @@ export class Engine {
       else if (piece.kind === "embedding") {
         // Whole, or in chunks of rows: allocated with the first.
         const { value, row0 = 0, totalRows = value.N } = piece
+        if (row0 === 0) this.embeddingRows = totalRows
+        if (row0 === 0 && value.bits === 6 && TUNING.q6Expanded < 0) {
+          if (!this.canExpandHead(value.K))
+            this.headChoice = { expanded: false, split: TUNING.q6HeadSplit }
+          else if (!this.headChoice) await this.chooseHead(value)
+        }
+        if (row0 === 0) this.resizeScoreBuffers()
         if (row0 === 0)
           this.embedding = this.allocateMatrix(
             totalRows,
@@ -609,6 +655,8 @@ export class Engine {
         if (!this.layoutChoice) await this.chooseLayout(piece.value.gateUp)
         this.layers[piece.layer] = this.layer(piece.value)
       }
+      if (this.gpu.readsPerSlice > 0)
+        await this.gpu.pace(Math.max(0, TUNING.uploadAhead), true)
       onProgress?.(piece)
       if (this.gpu.isLost)
         throw new GpuError("The GPU context was lost while loading.")
@@ -625,12 +673,22 @@ export class Engine {
     // The f16 prompt matmul's scratch now, not in the middle of a prompt
     // (only 4-token matmuls on weights that take it run it: none, no
     // scratch).
+    let started = performance.now()
     if (this.quadMatmuls && this.usesF16()) this.f16Scratch()
     await this.gpu.finish()
+    this.loadMs.scratch = performance.now() - started
+    this.expandedUpload = new Uint8Array(0)
+    started = performance.now()
+    await this.choosePromptPacking()
+    this.loadMs.packing = performance.now() - started
+    started = performance.now()
+    await this.chooseMatvec()
+    this.loadMs.matvec = performance.now() - started
   }
 
   private configure(config: ModelConfig) {
     this.config = config
+    this.legacyF16 = null
     if (this.scaleBatch) {
       // Smaller models take bigger batches (fewer, fuller passes) in about
       // the same buffer memory: per token it goes with hidden + FFN width,
@@ -796,6 +854,17 @@ export class Engine {
     // Logits for one row at a time where no draft batch is read (see
     // canDraft: Gated DeltaNet models).
     const headRows = c.layerTypes.includes("linear_attention") ? 1 : SPLIT_ROWS
+    const residualWidth = D / 4 + K.RMS_PARTS + D / 8
+    const residualLarge = [0, 1].map(() =>
+      this.gpu.texture(GL.RGBA32F, residualWidth, M)
+    )
+    // The scaled MRT is only used for at most SPLIT_ROWS rows. A matching
+    // small residual target avoids reserving a full-batch integer MRT.
+    // WebGL requires attachments to have matching dimensions.
+    const smallRows = M > 2 * SPLIT_ROWS ? SPLIT_ROWS : M
+    const residualSmall = smallRows < M
+      ? [0, 1].map(() => this.gpu.texture(GL.RGBA32F, residualWidth, smallRows))
+      : residualLarge
     // Each tensor has its own texture: sharing one between tensors that are
     // never alive at once saves ~25 MB at 512 rows, but a pass that writes a
     // texture the pass before read must wait for it, and prompts read ~12%
@@ -804,10 +873,9 @@ export class Engine {
       ids: this.gpu.texture(GL.R32UI, 1, M),
       // The hidden state, and its rows' partial sums of squares in the last
       // RMS_PARTS columns (drawn with the add that writes it).
-      residual: [0, 1].map(() =>
-        // (Room for the scaled texture's columns: written alongside.)
-        this.gpu.texture(GL.RGBA32F, D / 4 + K.RMS_PARTS + D / 8, M)
-      ) as [Texture, Texture],
+      residual: residualLarge,
+      residualLarge,
+      residualSmall,
       /**
        * For a few rows, h2(residual · the next norm's weights) from column
        * D/4 + RMS_PARTS, drawn with the add (its second output; see
@@ -815,8 +883,8 @@ export class Engine {
        */
       scaled: [0, 1].map(() =>
         // (Same size as the residual: a framebuffer's textures must match.)
-        this.gpu.texture(GL.RGBA32UI, D / 4 + K.RMS_PARTS + D / 8, M)
-      ) as [Texture, Texture],
+        this.gpu.texture(GL.RGBA32UI, residualWidth, smallRows)
+      ),
       rms: this.gpu.texture(GL.RGBA32F, K.RMS_PARTS, M),
       normed: this.h2(D, M),
       opOut: this.pair(D, 2 * M),
@@ -933,9 +1001,27 @@ export class Engine {
   }
 
   /** Queries of each head per attention slice: a quarter of a batch, 32 to 128. */
-  private scoreRows() {
+  private scoreRows(expanded = TUNING.q6Expanded > 0 || this.headChoice?.expanded === true) {
     if (TUNING.scoreRows > 0) return TUNING.scoreRows
-    return Math.min(SCORE_ROWS_LARGE, Math.max(SCORE_ROWS, this.baseBatch / 4))
+    const base = Math.min(SCORE_ROWS_LARGE, Math.max(SCORE_ROWS, this.baseBatch / 4))
+    return expanded ? Math.max(SCORE_ROWS, base / 2) : base
+  }
+
+  private scoreMemorySavings(expanded: boolean) {
+    const rows = Math.min(this.capacity, this.scoreRows(false)) - Math.min(this.capacity, this.scoreRows(expanded))
+    const width = Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4))
+    return rows * this.config.numHeads * width * 16
+  }
+
+  private resizeScoreBuffers() {
+    const count = this.headGroup()
+    const height = (this.config.numHeads / count) * Math.min(this.capacity, this.scoreRows())
+    if (this.buffers.scores[0].height === height) return
+    const width = this.buffers.scores[0].width
+    for (const texture of this.buffers.scores) this.gpu.delete(texture)
+    this.buffers.scores = Array.from({ length: count }, () =>
+      this.gpu.texture(GL.RGBA32F, width, height)
+    )
   }
 
   /**
@@ -943,7 +1029,7 @@ export class Engine {
    * the positions (or as many as asked), copied into a bigger texture of the
    * same layout. Sliding layers' rings never grow.
    */
-  private reserve(end: number) {
+  private async reserve(end: number) {
     if (end <= this.kvPositions) return
     const block = 2 ** this.kvShift
     const step = TUNING.kvStep
@@ -958,6 +1044,8 @@ export class Engine {
         : step > 0
           ? Math.min(block, Math.ceil(positions / step) * step)
           : 2 ** Math.ceil(Math.log2(positions))
+    const phase = this.gpu.activePhase
+    this.gpu.setPhase("load")
     try {
       for (const layer of this.layers) {
         const a = layer.attention
@@ -982,7 +1070,12 @@ export class Engine {
         }
         this.gpu.delete(a.kv)
         a.kv = kv
+        // Cache growth also initializes textures in the GPU process.
+        // Keep at most two clears/copies in flight, rather than an
+        // uninterrupted allocation queue or an empty queue per layer.
+        if (this.gpu.readsPerSlice > 0) await this.gpu.pace(1, true)
       }
+      if (this.gpu.readsPerSlice > 0) await this.gpu.pace(0, true)
       if (this.gpu.outOfMemory()) throw new GpuError("Out of memory.")
     } catch (error) {
       // Some layers may hold a cache that didn't copy: start over.
@@ -990,8 +1083,17 @@ export class Engine {
       throw new GpuError(
         `The GPU couldn't grow the cache to ${positions} tokens (${error instanceof Error ? error.message : String(error)}). Start a new session to keep going.`
       )
+    } finally {
+      this.gpu.setPhase(phase)
     }
     this.kvPositions = positions
+  }
+
+  /** Reserve the known prompt once, avoiding copies at each prefill batch. */
+  async preparePrompt(end: number) {
+    if (!Number.isInteger(end) || end < this.position || end > this.contextLength)
+      throw new Error(`Invalid prompt cache end: ${end}.`)
+    if (end - this.position > this.batchSize) await this.reserve(end)
   }
 
   /** Back to the starting cache size, for a new sequence. */
@@ -1089,7 +1191,10 @@ export class Engine {
             ? ((v as { source?: string }).source ?? v.toString())
             : String(v))
         )
-        .join("\n") + Engine.toString()
+        .join("\n") + Engine.toString() +
+      Gpu.toString() +
+      weightPanelSource.toString() +
+      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + SubmissionBudget.toString() + q4WordsToRgba4.toString()
     // FNV-1a.
     let h = 0x811c9dc5
     for (let i = 0; i < text.length; i++) {
@@ -1127,48 +1232,62 @@ export class Engine {
    */
   async tune(
     stop: () => boolean = () => false,
-    options: { keepCache?: boolean } = {}
+    options: { keepCache?: boolean; alreadyBusy?: boolean } = {}
   ): Promise<Tuned | null> {
     const before = { ...this.tuned }
-    this.tuned = { shortSplit: null, f16Matmul: null, f16Pack: null, flashDecode: null }
+    this.tuned = {
+      shortSplit: null,
+      f16Matmul: before.f16Matmul ?? null,
+      f16Pack: before.f16Pack ?? null,
+      flashDecode: null,
+      streamMatvec: before.streamMatvec,
+      submissionReads: before.submissionReads,
+      submissionOverlap: before.submissionOverlap
+    }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
     // an attention block's (the first of each kind), one feed-forward's.
     const conv = this.layers.find((l) => l.conv)?.conv
     const attention = this.layers.find((l) => l.attention)?.attention
     const ffn = this.layers[0]
-    const run = (rows: number) => {
+    const run = async (rows: number) => {
       if (conv) {
-        this.matmul(b.normed, conv.inProj, b.bcx, rows)
-        this.matmul(b.convOut, conv.outProj, b.opOut, rows)
+        await this.matmul(b.normed, conv.inProj, b.bcx, rows)
+        await this.matmul(b.convOut, conv.outProj, b.opOut, rows)
       }
       if (attention) {
-        this.matmul(b.normed, attention.qkvg, b.qkvg, rows)
-        this.matmul(b.attnOut, attention.o, b.opOut, rows)
+        await this.matmul(b.normed, attention.qkvg, b.qkvg, rows)
+        await this.matmul(b.attnOut, attention.o, b.opOut, rows)
       }
-      this.matmul(b.normed, ffn.gateUp, b.gateUp, rows)
-      this.matmul(b.act, ffn.down, b.ffnOut, rows)
+      await this.matmul(b.normed, ffn.gateUp, b.gateUp, rows)
+      await this.matmul(b.act, ffn.down, b.ffnOut, rows)
     }
     // A full prompt batch through the first TUNING.tuneLayers layers, every
     // pass as a prompt runs them (synthetic tokens, the cache reset
     // before each): what the f16 matmul's choices change isn't only the
     // matmuls (see the f16 choices below).
-    const tokens = Array.from({ length: Math.min(this.batchSize, this.capacity) }, (_, i) => 1000 + (i % 5000))
+    const tokens = Array.from(
+      { length: Math.min(this.batchSize, this.capacity) },
+      (_, i) => 1000 + (i % 5000)
+    )
     let forwards = false
     const forward = async () => {
       forwards = true
       const all = this.layers
+      const work = this.work
+      this.work = null
       if (TUNING.tuneLayers > 0) this.layers = all.slice(0, TUNING.tuneLayers)
       try {
         this.reset()
         await this.forwardHidden(tokens)
       } finally {
         this.layers = all
+        this.work = work
       }
     }
     class Stopped extends Error {}
     const choose = async (
-      key: keyof Tuned,
+      key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode",
       candidates: Array<number>,
       sample: () => unknown
     ): Promise<number | null> => {
@@ -1187,10 +1306,16 @@ export class Engine {
       const t0 = performance.now()
       await sample()
       await this.gpu.finish()
-      const reps = Math.max(1, Math.min(16, Math.ceil(25 / (performance.now() - t0))))
+      const reps = Math.max(
+        1,
+        Math.min(16, Math.ceil(25 / (performance.now() - t0)))
+      )
       // An idle GPU clocks down: busy it ~100 ms first, so the clock has
       // come up before anything is timed.
-      for (const start = performance.now(); performance.now() - start < 100; ) {
+      for (
+        const start = performance.now();
+        !options.alreadyBusy && performance.now() - start < 100;
+      ) {
         if (stop()) throw new Stopped()
         for (let r = 0; r < reps; r++) await sample()
         await this.gpu.finish()
@@ -1212,23 +1337,35 @@ export class Engine {
       this.tuned[key] = null
       const times = rounds.map((r) => Math.min(...r))
       // How far a candidate's two rounds differ: the noise to beat.
-      const noise = Math.max(...rounds.map((r) => (Math.max(...r) - Math.min(...r)) / Math.min(...r)))
+      const noise = Math.max(
+        ...rounds.map((r) => (Math.max(...r) - Math.min(...r)) / Math.min(...r))
+      )
       const best = times.indexOf(Math.min(...times))
-      this.tuneReport[`${key}Gain`] = Math.round((1 - times[1] / times[0]) * 1000) / 10
+      this.tuneReport[`${key}Gain`] =
+        Math.round((1 - times[1] / times[0]) * 1000) / 10
       this.tuneReport[`${key}Noise`] = Math.round(noise * 1000) / 10
       // candidates[0] is TUNING's value.
-      return best > 0 && times[best] < (1 - Math.max(0.04, 2 * noise)) * times[0]
-        ? candidates[best]
-        : null
+      // The reversed pairs must independently show a useful gain.
+      // A shared clock drift between rounds is not evidence against a
+      // candidate that wins both within-round comparisons.
+      const consistent = rounds[best].every(
+        (time, round) => time < rounds[0][round] * 0.96
+      )
+      return best > 0 && consistent ? candidates[best] : null
     }
     let picked: Tuned
     try {
       const short = Math.min(40, this.capacity)
-      const shortSplit = await choose(
-        "shortSplit",
-        [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
-        () => run(short)
-      )
+      // Byte-weight f16 matmuls already use bounded weight chunks. Keep
+      // their existing split instead of timing another full-model prompt.
+      // Native RGBA4 matmuls retain the original split calibration.
+      const shortSplit = this.layerMats().some((m) => m.rgba4)
+        ? await choose(
+            "shortSplit",
+            [TUNING.quadMaxSplit, TUNING.quadMaxSplit === 2 ? 4 : 2],
+            () => run(short)
+          )
+        : (before.shortSplit ?? null)
       this.tuned.shortSplit = shortSplit
       // Then, with the picks so far in place, RGBA4 weights through the
       // f16 matmul or in place, then how the f16 matmul reads (wherever
@@ -1242,16 +1379,40 @@ export class Engine {
       // are left for another time (undefined).
       const quad = this.quadMatmuls && TUNING.quad > 0
       const free = !options.keepCache
-      let f16Matmul: number | null | undefined = null
+      let f16Matmul: number | null | undefined = this.promptMatmulMeasured
+        ? before.f16Matmul
+        : null
       let f16Pack: number | null | undefined = null
-      if (quad && TUNING.f16Matmul > 0 && this.f16Mats().some((m) => m.rgba4) && this.f16Sized())
+      if (
+        !this.promptMatmulMeasured &&
+        quad &&
+        TUNING.f16Matmul > 0 &&
+        this.f16Mats().some((m) => m.rgba4) &&
+        this.f16Sized()
+      )
         f16Matmul = free
-          ? await choose("f16Matmul", [TUNING.f16Matmul, TUNING.f16Matmul > 1 ? 1 : 2], forward)
+          ? await choose(
+              "f16Matmul",
+              [TUNING.f16Matmul, TUNING.f16Matmul > 1 ? 1 : 2],
+              forward
+            )
           : undefined
       this.tuned.f16Matmul = f16Matmul ?? null
-      if (quad && this.usesF16() && this.f16Scratch())
+      if (this.packingMeasured) f16Pack = before.f16Pack
+      else if (quad && this.usesF16() && this.f16Scratch())
         f16Pack = free
-          ? await choose("f16Pack", [TUNING.f16Pack & 3, (TUNING.f16Pack & 3) === 3 ? 0 : 3], forward)
+          ? await choose(
+              "f16Pack",
+              [
+                TUNING.f16Pack & 3,
+                (TUNING.f16Pack & 3) === 3
+                  ? this.activationCopyFits()
+                    ? 0
+                    : 1
+                  : 3
+              ],
+              forward
+            )
           : undefined
       this.tuned.f16Pack = f16Pack ?? null
       if (forwards) this.reset()
@@ -1260,23 +1421,48 @@ export class Engine {
       // shape), in panels or the old way: Apple's phone and desktop GPUs
       // disagreed on panel layouts, and other GPUs are untimed. (The
       // scratch cache leaves the model's own alone.)
-      const full = this.layers.find((l) => l.attention && l.type !== "sliding_attention")
+      const full = this.layers.find(
+        (l) => l.attention && l.type !== "sliding_attention"
+      )
       const keys = Math.min(4096, this.contextLength)
       let flashDecode: number | null = null
-      if (full?.attention && this.mrt.chunks && TUNING.attendChunkTexels > 0 && keys > 4 * TUNING.flashPast) {
+      if (
+        full?.attention &&
+        this.mrt.chunks &&
+        TUNING.attendChunkTexels > 0 &&
+        keys > 4 * TUNING.flashPast
+      ) {
         const kv = this.kvTexture(keys)
         const layer = { ...full.attention, kv }
         try {
           flashDecode = await choose(
             "flashDecode",
             [TUNING.flashDecode, TUNING.flashDecode > 0 ? 0 : 1],
-            () => void this.attention(layer, full.type, 1, keys - 1, 0, this.buffers.qkvg)
+            () =>
+              this.attention(
+                layer,
+                full.type,
+                1,
+                keys - 1,
+                0,
+                this.buffers.qkvg
+              )
           )
         } finally {
           this.gpu.delete(kv)
         }
       }
-      picked = { shortSplit, f16Matmul, f16Pack, flashDecode }
+      picked = {
+        shortSplit,
+        f16Matmul,
+        f16Pack,
+        flashDecode,
+        flashDecodeFrom: flashDecode == null ? undefined : keys,
+        streamMatvec: before.streamMatvec,
+        submissionReads: before.submissionReads,
+        submissionOverlap: before.submissionOverlap,
+        rmsParts: before.rmsParts
+      }
     } catch (error) {
       this.tuned = before
       // (A forward stopped part way leaves its batch in the cache.)
@@ -1296,7 +1482,7 @@ export class Engine {
    * The last load's milliseconds waiting on the weight pieces (reading and
    * repacking them) and turning them into textures.
    */
-  loadMs = { reading: 0, uploading: 0, convert: 0 }
+  loadMs = { reading: 0, uploading: 0, convert: 0, scratch: 0, packing: 0, matvec: 0 }
   /** 4-bit layer weights in RGBA4 (else byte texels): see chooseLayout. */
   private rgba4Layers = true
   /** The layout chooseLayout picked and its timings (ms per writing matmul). */
@@ -1366,19 +1552,22 @@ export class Engine {
     for (const gm of made) step(gm)
     await this.gpu.finish()
     const best = [Infinity, Infinity]
+    const layoutSamples = [[], []] as number[][]
     for (let round = 0; round < 3; round++) {
       for (const i of round % 2 ? [1, 0] : [0, 1]) {
         const t = performance.now()
         for (let n = 0; n < 16; n++) step(made[i])
         await this.gpu.finish()
-        best[i] = Math.min(best[i], (performance.now() - t) / 16)
+        const ms = (performance.now() - t) / 16
+        layoutSamples[i].push(ms)
+        best[i] = Math.min(best[i], ms)
       }
     }
     for (const gm of made)
       for (const t of [gm.quants, gm.scales, gm.zeros]) if (t) this.gpu.delete(t)
     this.gpu.delete(scratch)
     // Bytes only if clearly faster (timing noise shouldn't flip it).
-    this.rgba4Layers = !(best[1] < best[0] * 0.95)
+    this.rgba4Layers = !layoutSamples[1].every((ms, round) => ms < layoutSamples[0][round] * 0.95)
     this.layoutChoice = {
       layout: this.rgba4Layers ? "rgba4" : "bytes",
       rgba4Ms: best[0],
@@ -1468,24 +1657,52 @@ export class Engine {
       bits === 6
         ? TUNING.q6Words <= 0
         : this.bytes && columns * blocks * 4 * byteTexels <= max
-    const texelsPerBlockRow = bytes ? byteTexels : byteTexels / 4
+    const expanded =
+      bits === 6 &&
+      (TUNING.q6Expanded > 0 ||
+        (TUNING.q6Expanded < 0 && this.headChoice?.expanded)) &&
+      columns * K <= max
+    const texelsPerBlockRow = expanded
+      ? 64
+      : bytes
+        ? byteTexels
+        : byteTexels / 4
     const rowTexels = blocks * 4 * texelsPerBlockRow
     const unorm = bytes && bits === 4 && TUNING.unormBytes > 0
     const packed =
       layer && bytes && bits === 4 && withZeros && TUNING.packZeros > 0
-    const quantFormat = !bytes
-      ? GL.RGBA32UI
-      : bits === 8
-        ? GL.RGBA8I
-        : unorm
-          ? GL.RGBA8
-          : GL.RGBA8UI
+    const quantFormat = expanded
+      ? GL.RGBA8
+      : !bytes
+        ? GL.RGBA32UI
+        : bits === 8
+          ? GL.RGBA8I
+          : unorm
+            ? GL.RGBA8
+            : GL.RGBA8UI
     const rowsPerColumn = Math.ceil(groups / columns)
     if (columns * rowTexels > max) {
       throw new GpuError(
         `A ${N}×${K} matrix doesn't fit in this GPU's textures.`
       )
     }
+    // A single large allocation can stall the browser GPU service while
+    // it zero-initializes the embedding. Panels keep that work bounded.
+    const panelRows =
+      !layer && bits === 6 && this.gpu.readsPerSlice > 0
+        ? TUNING.embeddingPanelRows
+        : 0
+    const panelCount = panelRows > 0 ? Math.ceil(rowsPerColumn / panelRows) : 1
+    const quantPanels =
+      panelCount > 1 && panelCount + 4 <= this.gpu.limits.maxTextureUnits
+        ? Array.from({ length: panelCount }, (_, i) =>
+            this.gpu.texture(
+              quantFormat,
+              columns * rowTexels,
+              Math.min(panelRows, rowsPerColumn - i * panelRows)
+            )
+          )
+        : undefined
     return {
       N,
       K,
@@ -1498,7 +1715,11 @@ export class Engine {
       groups,
       rowsPerColumn,
       rowTexels,
-      quants: this.gpu.texture(quantFormat, columns * rowTexels, rowsPerColumn),
+      quants:
+        quantPanels?.[0] ??
+        this.gpu.texture(quantFormat, columns * rowTexels, rowsPerColumn),
+      ...(quantPanels && { quantPanels }),
+      ...(expanded && { q6Expanded: true }),
       scales: this.gpu.texture(
         packed ? GL.RGBA32UI : GL.RGBA16F,
         columns * blocks,
@@ -1509,6 +1730,582 @@ export class Engine {
           ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
           : null
     }
+  }
+
+  matvecReport: Array<{stream:boolean;ms:number}> = []
+
+  private async chooseMatvec() {
+    if (TUNING.streamMatvec >= 0 || this.tuned.streamMatvec !== undefined)
+      return
+    const layer = this.layers[0]
+    if (layer.gateUp.rgba4 || !layer.gateUp.bytes) {
+      this.tuned.streamMatvec = false
+      return
+    }
+    const b = this.buffers,
+      before = this.tuned.streamMatvec
+    const scratch = this.gpu.texture(
+      GL.RGBA32F,
+      Math.ceil(b.partial.width / 64),
+      b.partial.height
+    )
+    const checksum = this.gpu.program(`#version 300 es
+precision highp float;precision highp int;uniform sampler2D uX;uniform int uWidth;out vec4 o;
+void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){int x=p.x*64+i;if(x<uWidth)a+=texelFetch(uX,ivec2(x,p.y),0);}o=a;}`)
+    const samples = [[] as number[], [] as number[]]
+    const sample = async (index: number) => {
+      this.tuned.streamMatvec = index === 1
+      for (const w of [layer.gateUp, layer.down]) {
+        const slices = this.splitPartials(
+          w === layer.down ? b.act : b.normed,
+          w,
+          1
+        )
+        const rect = {
+          x: 0,
+          y: 0,
+          width: Math.ceil(w.groups / 64),
+          height: slices
+        }
+        this.gpu.run({
+          program: checksum,
+          inputs: { uX: b.partial },
+          uniforms: { uWidth: { int: w.groups } },
+          output: scratch,
+          rect
+        })
+        await this.gpu.read(scratch, rect)
+      }
+    }
+    try {
+      await sample(0)
+      await sample(1)
+      for (let round = 0; round < 2; round++)
+        for (let j = 0; j < 2; j++) {
+          const i = round ? 1 - j : j,
+            start = performance.now()
+          for (let n = 0; n < 2; n++) await sample(i)
+          samples[i].push((performance.now() - start) / 2)
+        }
+      this.matvecReport = samples.map((times, i) => ({
+        stream: i === 1,
+        ms: Math.min(...times)
+      }))
+      this.tuned.streamMatvec =
+        this.matvecReport[1].ms < this.matvecReport[0].ms * 0.94
+    } catch (error) {
+      this.tuned.streamMatvec = before
+      throw error
+    } finally {
+      this.gpu.delete(scratch)
+    }
+  }
+
+  private expandedUpload = new Uint8Array(0)
+  private embeddingRows = 0
+
+  rmsReport: Array<{ parts: number; ms: number }> = []
+  private packingMeasured = false
+  private promptMatmulMeasured = false
+  packingReport: Array<{pack:number;rows:number;ms:number;matmul?:number}> = []
+
+  private legacyF16: { bytes: number; kMax: number; half: boolean } | null = null
+
+  private legacyF16Layout() {
+    if (this.legacyF16) return this.legacyF16
+    const mats = this.f16Mats(),
+      max = this.gpu.limits.maxTextureSize
+    if (!mats.length) return { bytes: 0, kMax: 0, half: false }
+    let bytes = Infinity
+    for (let h = max & ~3; h >= 64; h = (h >> 1) & ~3) {
+      const w = Math.max(...mats.map((m) => Math.ceil(m.N / h) * (m.K / 4)))
+      if (w <= max) bytes = Math.min(bytes, w * h * 8)
+    }
+    return (this.legacyF16 = {
+      bytes,
+      kMax: Math.max(0, ...mats.map((m) => m.K)),
+      half: this.gpu.canRender([GL.RGBA16F])
+    })
+  }
+
+  private headGrowthBytes(K = this.config.hiddenSize) {
+    const columns = Math.ceil(
+      (this.embeddingRows || this.config.vocabSize) /
+        4 /
+        this.gpu.limits.maxTextureSize
+    )
+    const rows =
+      columns *
+      Math.ceil((this.embeddingRows || this.config.vocabSize) / 4 / columns) *
+      4
+    return rows * (K / 256) * 48
+  }
+
+  private byteF16Budget(
+    expanded = TUNING.q6Expanded >= 0
+      ? TUNING.q6Expanded > 0
+      : this.headChoice?.expanded === true
+  ) {
+    const legacy = this.legacyF16Layout()
+    const copy = legacy.half && (TUNING.f16Pack < 0 || !(TUNING.f16Pack & 1))
+    const one = (legacy.kMax / 4) * this.capacity * 8
+    // The former automatic tuner could retain two conversion textures.
+    const previous =
+      legacy.bytes +
+      (copy ? 2 * one : 0) +
+      this.residualMemorySavings() +
+      this.scoreMemorySavings(expanded)
+    const activation = copy ? Math.max(1, TUNING.f16ActivationBuffers) * one : 0
+    const extra = expanded ? this.headGrowthBytes() : 0
+    const next =
+      TUNING.f16ScratchBytesMiB < 0
+        ? fundedF16Scratch(
+            legacy.bytes,
+            previous - legacy.bytes,
+            activation,
+            extra,
+            legacy.kMax * 128
+          )
+        : TUNING.f16ScratchBytesMiB > 0
+          ? TUNING.f16ScratchBytesMiB * 2 ** 20
+          : legacy.bytes
+    return { previous, activation, next, extra }
+  }
+
+  private residualMemorySavings() {
+    if (this.capacity <= 2 * SPLIT_ROWS) return 0
+    const width = this.config.hiddenSize / 4 + K.RMS_PARTS + this.config.hiddenSize / 8
+    return 2 * width * (this.capacity - 2 * SPLIT_ROWS) * 16
+  }
+
+  private activationCopyFits() {
+    const f = this.f16Sized()
+    if (!f) return false
+    const max = this.gpu.limits.maxTextureSize
+    const previous = this.rgba4Layers
+      ? TUNING.f16ScratchMiB * 2 ** 20 + this.residualMemorySavings()
+      : this.byteF16Budget().previous
+    const columns = Math.ceil(this.embedding.N / 4 / max)
+    const rows = columns * Math.ceil(this.embedding.N / 4 / columns) * 4
+    const weightGrowth = this.embedding.q6Expanded
+      ? rows * (this.embedding.K / 256) * 48
+      : 0
+    const baseSplit = Math.max(
+      1,
+      Math.min(TUNING.q6HeadSplit, 4, this.embedding.blocks)
+    )
+    const nextSplit = Math.max(
+      1,
+      Math.min(
+        this.headChoice?.split ?? TUNING.q6HeadSplit,
+        4,
+        this.embedding.blocks
+      )
+    )
+    const head =
+      weightGrowth +
+      Math.max(
+        0,
+        headScratchBytes(
+          nextSplit,
+          this.canDraft ? SPLIT_ROWS : 1,
+          this.logitRows,
+          OUT_WIDTH
+        ) -
+          headScratchBytes(
+            baseSplit,
+            this.canDraft ? SPLIT_ROWS : 1,
+            this.logitRows,
+            OUT_WIDTH
+          )
+      )
+    const activation =
+      Math.max(1, TUNING.f16ActivationBuffers) *
+      (f.kMax / 4) *
+      this.capacity *
+      8
+    return fitsExpandedHead(head, previous, f.width * f.hd * 8, activation)
+  }
+
+  private async choosePromptPacking() {
+    if (!this.quadMatmuls) return
+    const native = this.layerMats().some((m) => m.rgba4)
+    if (
+      this.tuned.f16Pack != null &&
+      (!native || this.tuned.f16Matmul !== undefined)
+    ) {
+      this.packingMeasured = true
+      this.promptMatmulMeasured = native
+      return
+    }
+    if (!native && TUNING.f16Pack >= 0) {
+      this.tuned.f16Pack = TUNING.f16Pack & 3
+      this.packingMeasured = true
+      return
+    }
+    if (!native && !this.usesF16()) return
+    const probeRows =
+      TUNING.packingProbeRows > 0
+        ? Math.min(
+            this.batchSize,
+            Math.max(TUNING.f16MinRows, TUNING.packingProbeRows)
+          )
+        : this.batchSize
+    const options: Array<{ pack: number; matmul?: number }> = native
+      ? [
+          {
+            pack: TUNING.f16Pack >= 0 ? TUNING.f16Pack & 3 : 3,
+            matmul: TUNING.f16Matmul
+          }
+        ]
+      : this.activationCopyFits()
+        ? [{ pack: 3 }, { pack: 0 }]
+        : [{ pack: 3 }, { pack: 1 }]
+    if (native && TUNING.f16Matmul > 0) {
+      const alternate = TUNING.f16Matmul === 2 ? 1 : 2
+      options.push({ pack: options[0].pack, matmul: alternate })
+    }
+    if (options.length === 1) return
+    const all = this.layers,
+      previous = this.tuned.f16Pack,
+      previousMatmul = this.tuned.f16Matmul,
+      previousParts = this.tuned.rmsParts,
+      phase = this.gpu.activePhase,
+      lastRowOnly = TUNING.lastRowOnly,
+      quota = this.tuned.submissionReads ?? TUNING.submissionReads
+    let overlap = Math.max(quota, 2 ** 29), allowOverlap = true, trial = false, overlapFailures = 0
+    const samples = options.map(() => [] as number[]),
+      work = options.map(() => [] as number[])
+    // Isolated matmuls mispredict layouts because their conversions wait
+    // on each other. Use each operator kind's real norm/operator/FFN chain.
+    // A GPU reduction consumes every hidden value before the readback.
+    const kinds = new Set<string>()
+    this.layers = native
+      // In-place versus dequantized matmuls depend on the model's actual
+      // operator mixture. One layer of each kind can badly skew that mix.
+      ? all.slice(0, TUNING.tuneLayers > 0 ? TUNING.tuneLayers : all.length)
+      : all.filter((layer) => {
+          const kind = layer.conv ? "conv" : layer.linear ? "linear" : "attention"
+          if (kinds.has(kind)) return false
+          kinds.add(kind)
+          return true
+        })
+    this.work = null
+    TUNING.lastRowOnly = 0
+    this.gpu.configurePacing(quota, TUNING.submissionMs)
+    const sample = async (index: number, rows = probeRows) => {
+      this.tuned.f16Pack = options[index].pack
+      if (native) this.tuned.f16Matmul = options[index].matmul
+      this.gpu.resetPacing(true)
+      this.gpu.primePresentation(trial && allowOverlap ? this.gpu.presentationAdvice.cap : TUNING.presentationFrames, trial ? overlap : quota, trial && allowOverlap)
+      this.gpu.setPhase("load")
+      this.reset()
+      const tokens = Array.from(
+        { length: rows },
+        (_, i) => (i * 7919 + 13) % this.config.vocabSize
+      )
+      await this.forwardHidden(tokens)
+      const width = Math.ceil(this.config.hiddenSize / 4 / 64)
+      await this.gpu.runAsync({
+        program: this.gpu.program(`#version 300 es
+precision highp float;precision highp int;uniform sampler2D uX;uniform int uWidth;out vec4 o;
+void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){int x=p.x*64+i;if(x<uWidth)a+=texelFetch(uX,ivec2(x,p.y),0);}o=a;}`),
+        inputs: { uX: this.buffers.residual[0] },
+        uniforms: { uWidth: { int: this.config.hiddenSize / 4 } },
+        output: this.buffers.rms,
+        rect: { x: 0, y: 0, width, height: rows },
+        work: 64
+      })
+      await this.gpu.read(this.buffers.rms, { x: 0, y: 0, width, height: rows })
+      // The normal frame controller rolls the trial back immediately if
+      // this queue prevents presentation. Never retry it in later variants.
+      if (trial && (this.gpu.readsPerSlice < overlap || !this.gpu.presentationAdvice.relaxation || this.gpu.presentationAdvice.window < this.gpu.presentationAdvice.cap)) {
+        overlapFailures++
+        if (overlapFailures >= 2 || !this.gpu.presentationAdvice.relaxation) {
+          overlap = quota
+          allowOverlap = false
+        }
+      }
+    }
+    try {
+      for (let i = 0; i < options.length; i++)
+        await sample(i, Math.min(probeRows, Math.max(64, TUNING.f16MinRows)))
+      const timed = async (i: number) => {
+        const start = performance.now(),
+          beforeWork = this.gpu.submittedWork
+        await sample(i)
+        samples[i].push(performance.now() - start)
+        work[i].push(this.gpu.submittedWork - beforeWork)
+      }
+      // Warm the complete batch before its timed repetition. This avoids
+      // selecting a layout from first-touch texture allocation or a partial
+      // batch's different shader/cache behavior.
+      // Compile and first-touch every complete candidate conservatively.
+      // Shader creation must not masquerade as a failed overlap trial.
+      for (let i = 0; i < options.length; i++) await sample(i)
+      trial = true
+      for (let round = 0; round < 2; round++) {
+        for (let j = 0; j < options.length; j++)
+          await timed(round ? options.length - 1 - j : j)
+      }
+      this.packingReport = options.map((setting, i) => ({
+        ...setting,
+        rows: probeRows,
+        ms: Math.min(...samples[i])
+      }))
+      // A clock or compiler transition must not pick the next session's
+      // kernel from one favorable sample. Require both reversed pairs.
+      const eligible = this.packingReport.filter((_, i) =>
+        i === 0 || samples[i].every((ms, round) => ms < samples[0][round] * 0.98)
+      )
+      const best = eligible.reduce((a, b) => (b.ms < a.ms ? b : a))
+      const selected = this.packingReport.indexOf(best)
+      this.tuned.f16Pack = options[selected].pack
+      if (native) this.tuned.f16Matmul = options[selected].matmul
+      // Keep the original reduction shape. The alternate did not win
+      // consistently, and repeating four complete pipelines delayed ready.
+      this.tuned.rmsParts = this.parts
+      this.tuned.submissionOverlap = allowOverlap ? overlap : 0
+      this.tuned.submissionReads = calibratedReadQuota(
+        TUNING.submissionReads,
+        Math.min(...work[selected]),
+        this.packingReport[selected].ms,
+        this.gpu.expectedFrameMs
+      )
+      this.packingMeasured = true
+      this.promptMatmulMeasured = native
+    } catch (error) {
+      this.tuned.f16Pack = previous
+      this.tuned.f16Matmul = previousMatmul
+      this.tuned.rmsParts = previousParts
+      throw error
+    } finally {
+      this.layers = all
+      this.work = null
+      TUNING.lastRowOnly = lastRowOnly
+      this.reset()
+      this.gpu.configurePacing(
+        this.tuned.submissionReads ?? quota,
+        TUNING.submissionMs
+      )
+      this.gpu.setPhase(phase)
+      this.f16Trim()
+    }
+  }
+
+  /** Measured head layout, never selected by vendor or device name. */
+  headChoice: { expanded: boolean; split: number } | null = null
+  headReport: Array<{expanded:boolean;split:number;ms:number}> = []
+
+  private canExpandHead(
+    K: number,
+    split = TUNING.q6HeadSplit,
+    expanded = true
+  ) {
+    // A device using the in-place layout has no large dequantization
+    // allocation to trade for an expanded head. Preserve its memory use.
+    if (this.rgba4Layers || !this.quadMatmuls || !this.usesF16()) return false
+    const max = this.gpu.limits.maxTextureSize,
+      mats = this.f16Mats()
+    const columns = Math.ceil(
+      (this.embeddingRows || this.config.vocabSize) / 4 / max
+    )
+    if (columns * K > max || !mats.length) return false
+    const budget = this.byteF16Budget(expanded)
+    const { previous, activation, next } = budget
+    const extra = expanded ? this.headGrowthBytes(K) : 0
+    const baselineSplit = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, K / 256))
+    const nextSplit = Math.max(1, Math.min(split, 4, K / 256))
+    const extraScratch = Math.max(
+      0,
+      headScratchBytes(
+        nextSplit,
+        this.canDraft ? SPLIT_ROWS : 1,
+        this.logitRows,
+        OUT_WIDTH
+      ) -
+        headScratchBytes(
+          baselineSplit,
+          this.canDraft ? SPLIT_ROWS : 1,
+          this.logitRows,
+          OUT_WIDTH
+        )
+    )
+    return fitsExpandedHead(extra + extraScratch, previous, next, activation)
+  }
+
+  private async chooseHead(piece: QuantMatrix) {
+    if (
+      Math.ceil(
+        (this.embeddingRows || this.config.vocabSize) /
+          4 /
+          this.gpu.limits.maxTextureSize
+      ) *
+        piece.K >
+      this.gpu.limits.maxTextureSize
+    ) {
+      this.headChoice = { expanded: false, split: TUNING.q6HeadSplit }
+      return
+    }
+    const count = Math.max(1, Math.ceil(8192 / piece.N))
+    const matrix: QuantMatrix = { ...piece, N: piece.N * count }
+    const original = this.embedding,
+      originalScratch = this.headScratch,
+      vocab = this.config.vocabSize,
+      scaled = this.headScaled
+    const made: GpuMatrix[] = []
+    // Compare storage formats at the existing split. Probing larger split
+    // buffers increased startup work and memory without a measured gain.
+    const split = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, piece.K / 256))
+    const settings = [
+      { expanded: false, split },
+      { expanded: true, split }
+    ].filter(
+      (choice) =>
+        !choice.expanded || this.canExpandHead(piece.K, choice.split, true)
+    )
+    const samples = settings.map(() => [] as number[])
+    const phase = this.gpu.activePhase
+    const quota = this.tuned.submissionReads ?? TUNING.submissionReads
+    try {
+      // Measure the head as generation uses it, with identical pacing for
+      // every candidate and nonzero hidden values (clear-color inputs can
+      // bias mobile GPU timings).
+      this.gpu.setPhase("decode")
+      this.gpu.configurePacing(quota, TUNING.submissionMs)
+      const input = this.buffers.lastNormed,
+        seed = new Uint32Array(input.width * 4)
+      for (let i = 0; i < seed.length; i++)
+        seed[i] =
+          0x3000 |
+          ((i * 17) & 1023) |
+          ((0x3000 | ((i * 31) & 1023) | (i & 1 ? 0x8000 : 0)) << 16)
+      this.gpu.write(
+        input,
+        { x: 0, y: 0, width: input.width, height: 1 },
+        { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: seed }
+      )
+      for (const expanded of [false, true]) {
+        this.headChoice = { expanded, split }
+        const gm = this.allocateMatrix(matrix.N, matrix.K, 6, false)
+        for (let i = 0; i < count; i++) this.writeMatrix(gm, piece, i * piece.N)
+        // Match the panel shader used for the complete embedding.
+        gm.quantPanels ??= [gm.quants]
+        made.push(gm)
+        await this.gpu.pace(0, true)
+      }
+      this.config.vocabSize = matrix.N
+      this.headScaled = false
+      this.setSeen([], matrix.N)
+      const sample = async (index: number) => {
+        this.headChoice = settings[index]
+        this.gpu.resetPacing()
+        this.gpu.setPhase("decode")
+        this.embedding = made[settings[index].expanded ? 1 : 0]
+        await this.argmax(0, 1, 1, [], false)
+      }
+      for (let i = 0; i < settings.length; i++) await sample(i)
+      for (let round = 0; round < 2; round++)
+        for (let j = 0; j < settings.length; j++) {
+          const i = round ? settings.length - 1 - j : j
+          await this.gpu.finish()
+          const start = performance.now()
+          for (let n = 0; n < 3; n++) await sample(i)
+          await this.gpu.finish()
+          samples[i].push((performance.now() - start) / 3)
+        }
+      this.headReport = settings.map((setting, i) => ({
+        ...setting,
+        ms: Math.min(...samples[i])
+      }))
+      const best = this.headReport.reduce((a, b) => (b.ms < a.ms ? b : a))
+      const chosen = best
+      const base = this.headReport[0]
+      this.headChoice =
+        chosen.ms < base.ms * 0.94
+          ? { expanded: chosen.expanded, split: chosen.split }
+          : { expanded: false, split }
+    } finally {
+      this.gpu.configurePacing(quota, TUNING.submissionMs)
+      this.gpu.setPhase(phase)
+      this.embedding = original
+      if (this.headScratch !== originalScratch) {
+        if (this.headScratch) this.gpu.delete(this.headScratch)
+        this.headScratch = originalScratch
+      }
+      this.config.vocabSize = vocab
+      this.headScaled = scaled
+      for (const gm of made)
+        for (const t of [
+          ...(gm.quantPanels ?? [gm.quants]),
+          gm.scales,
+          gm.zeros
+        ])
+          if (t) this.gpu.delete(t)
+    }
+  }
+
+  private weightSource(w: GpuMatrix, source: string) {
+    return w.quantPanels
+      ? weightPanelSource(
+          source,
+          w.quantPanels[0].height,
+          w.quantPanels.length,
+          !!w.q6Expanded
+        )
+      : source
+  }
+
+  private headWeightSource(w: GpuMatrix, source: string) {
+    if (!w.quantPanels) return source
+    if (w.q6Expanded)
+      source = source
+        .replace("texelFetch(s,p,0)", "texelFetch(s,p-ivec2(0,uWeightRow0),0)")
+        .replace("vec4 q6bytes(", "uniform int uWeightRow0;\nvec4 q6bytes(")
+    const read = `\n${w.q6Expanded ? "" : "uniform int uWeightRow0;"}\n${w.q6Expanded ? "vec4" : "uvec4"} weightTexel(ivec2 p, int level) { return texelFetch(uW, p - ivec2(0, uWeightRow0), level); }\n`
+    return source
+      .replaceAll("texelFetch(uW,", "weightTexel(")
+      .replace(
+        w.q6Expanded ? "uniform sampler2D uW;" : "uniform usampler2D uW;",
+        `${w.q6Expanded ? "uniform sampler2D uW;" : "uniform usampler2D uW;"}${read}`
+      )
+  }
+
+  /** Draw each vocabulary region with just its own Q6_K panel bound. */
+  private async weightHead(
+    w: GpuMatrix,
+    pass: Pass,
+    rows: number,
+    split: number
+  ) {
+    if (!w.quantPanels)
+      return this.gpu.runAsync(pass, Math.max(1, this.logitRows / 4))
+    for (const { panel, row0, rect } of weightHeadRegions({
+      groups: w.groups,
+      rowsPerColumn: w.rowsPerColumn,
+      panelRows: w.quantPanels[0].height,
+      heights: w.quantPanels.map((t) => t.height),
+      planes: split * rows,
+      logitRows: this.logitRows,
+      width: OUT_WIDTH
+    })) {
+      await this.gpu.runAsync({
+        ...pass,
+        inputs: { ...pass.inputs, uW: w.quantPanels[panel] },
+        uniforms: { ...pass.uniforms, uWeightRow0: { int: row0 } },
+        rect,
+        // Vocabulary rows between fences, across panel boundaries.
+        work:
+          this.gpu.readsPerSlice /
+          (Math.max(1, TUNING.headPaceRows) * OUT_WIDTH)
+      })
+    }
+  }
+
+  private weightInputs(w: GpuMatrix): Record<string, Texture> {
+    return Object.fromEntries(
+      (w.quantPanels ?? [w.quants]).map((t, i) => [i ? `uWP${i}` : "uW", t])
+    )
   }
 
   /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
@@ -1522,53 +2319,119 @@ export class Engine {
     const groups = m.N / 4
     // Words of one row group: its quant texels' bytes over 4.
     const words = m.quants.length / groups
+    const stage = this.buffers?.act
+    const gpuExpand =
+      gm.q6Expanded &&
+      TUNING.q6UploadGpu > 0 &&
+      stage?.internal === GL.RGBA32UI &&
+      stage.width >= blocks * 52
     for (let g = g0; g < g0 + groups;) {
       const column = Math.floor(g / rowsPerColumn)
       const y = g - column * rowsPerColumn
-      const run = Math.min(g0 + groups - g, rowsPerColumn - y)
+      const panelRows = gm.quantPanels?.[0].height ?? rowsPerColumn
+      const panel = Math.floor(y / panelRows)
+      const run = Math.min(
+        g0 + groups - g,
+        rowsPerColumn - y,
+        panelRows - (y % panelRows),
+        // Keep CPU upload scratch small even for a wide embedding chunk.
+        gpuExpand
+          ? stage.height
+          : gm.q6Expanded
+            ? Math.max(1, Math.floor((128 << 10) / (blocks * 4 * 256)))
+            : Infinity
+      )
       const local = g - g0
       const quants = m.quants.subarray(local * words, (local + run) * words)
-      if (gm.rgba4) {
+      if (gpuExpand) {
+        this.gpu.write(
+          stage,
+          { x: 0, y: 0, width: blocks * 52, height: run },
+          {
+            format: GL.RGBA_INTEGER,
+            type: GL.UNSIGNED_INT,
+            pixels: quants
+          }
+        )
+        const rect = {
+          x: column * rowTexels,
+          y: gm.quantPanels ? y % panelRows : y,
+          width: rowTexels,
+          height: run
+        }
+        this.gpu.run({
+          name: "upload",
+          program: this.gpu.program(K.EXPAND_Q6_BYTES),
+          inputs: { uNative: stage },
+          uniforms: {
+            uX0: { int: rect.x },
+            uY0: { int: rect.y }
+          },
+          output: gm.quantPanels?.[panel] ?? gm.quants,
+          rect
+        })
+      } else if (gm.q6Expanded) {
+        const needed = run * blocks * 4 * 256
+        if (this.expandedUpload.length < needed)
+          this.expandedUpload = new Uint8Array(needed)
+        const data = expandQ6(m, local, run, this.expandedUpload)
+        this.gpu.write(
+          gm.quantPanels?.[panel] ?? gm.quants,
+          {
+            x: column * rowTexels,
+            y: gm.quantPanels ? y % panelRows : y,
+            width: rowTexels,
+            height: run
+          },
+          { format: GL.RGBA, type: GL.UNSIGNED_BYTE, pixels: data.quants }
+        )
+      } else if (gm.rgba4) {
         const t = performance.now()
         const pixels = m.raw
           ? rawRgba4(m.raw, m.K, local * 4, run * 4)
-          : toRgba4(quants)
+          : q4WordsToRgba4(quants)
         this.loadMs.convert += performance.now() - t
+        try {
+          this.gpu.write(
+            gm.quants,
+            { x: column * rowTexels, y, width: rowTexels, height: run },
+            { format: GL.RGBA, type: GL.UNSIGNED_SHORT_4_4_4_4, pixels }
+          )
+        } finally {
+          // This conversion is a private upload temporary, never caller data.
+          if (!m.raw) releaseOwnedBuffer(pixels.buffer)
+        }
+      } else
         this.gpu.write(
-          gm.quants,
-          { x: column * rowTexels, y, width: rowTexels, height: run },
+          gm.quantPanels?.[panel] ?? gm.quants,
           {
-            format: GL.RGBA,
-            type: GL.UNSIGNED_SHORT_4_4_4_4,
-            pixels
+            x: column * rowTexels,
+            y: gm.quantPanels ? y % panelRows : y,
+            width: rowTexels,
+            height: run
+          },
+          {
+            format: gm.unorm ? GL.RGBA : GL.RGBA_INTEGER,
+            type: !gm.bytes
+              ? GL.UNSIGNED_INT
+              : m.bits === 8
+                ? GL.BYTE
+                : GL.UNSIGNED_BYTE,
+            pixels: !gm.bytes
+              ? quants
+              : m.bits !== 8
+                ? new Uint8Array(
+                    quants.buffer,
+                    quants.byteOffset,
+                    quants.byteLength
+                  )
+                : new Int8Array(
+                    quants.buffer,
+                    quants.byteOffset,
+                    quants.byteLength
+                  )
           }
         )
-      } else
-      this.gpu.write(
-        gm.quants,
-        { x: column * rowTexels, y, width: rowTexels, height: run },
-        {
-          format: gm.unorm ? GL.RGBA : GL.RGBA_INTEGER,
-          type: !gm.bytes
-            ? GL.UNSIGNED_INT
-            : m.bits === 8
-              ? GL.BYTE
-              : GL.UNSIGNED_BYTE,
-          pixels: !gm.bytes
-            ? quants
-            : m.bits !== 8
-              ? new Uint8Array(
-                  quants.buffer,
-                  quants.byteOffset,
-                  quants.byteLength
-                )
-              : new Int8Array(
-                  quants.buffer,
-                  quants.byteOffset,
-                  quants.byteLength
-                )
-        }
-      )
       if (gm.packed && m.zeros) {
         // Each texel: 4 scales then 4 zero points, as halves.
         const n = run * blocks * 4
@@ -1588,18 +2451,18 @@ export class Engine {
           { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: texels }
         )
       } else
-      this.gpu.write(
-        gm.scales,
-        { x: column * blocks, y, width: blocks, height: run },
-        {
-          format: GL.RGBA,
-          type: GL.HALF_FLOAT,
-          pixels: m.scales.subarray(
-            local * blocks * 4,
-            (local + run) * blocks * 4
-          )
-        }
-      )
+        this.gpu.write(
+          gm.scales,
+          { x: column * blocks, y, width: blocks, height: run },
+          {
+            format: GL.RGBA,
+            type: GL.HALF_FLOAT,
+            pixels: m.scales.subarray(
+              local * blocks * 4,
+              (local + run) * blocks * 4
+            )
+          }
+        )
       if (gm.zeros && m.zeros) {
         this.gpu.write(
           gm.zeros,
@@ -2042,6 +2905,7 @@ export class Engine {
     // variants: folded embedding, last-row tail) and one of each other
     // kind only, a fraction of the GPU work of the whole model.
     const all = this.layers
+    this.work = null
     const kinds = new Set<string>()
     if (TUNING.warmSubset > 0) this.layers = all.filter((l, i) => {
       const kind = l.conv ? "conv" : `${l.type}:${l.attention?.ring ? "ring" : ""}`
@@ -2161,26 +3025,77 @@ export class Engine {
       { length: 40 },
       (_, i) => (i * 7919 + 13) % this.config.vocabSize
     )
-    let worst = await attentionError(this, tokens)
-    worst = Math.max(worst, await this.recurrenceError(tokens))
-    if (TUNING.attendChunkTexels > 0) {
-      const saved = TUNING.attendChunkTexels
-      const savedDecode = TUNING.attendChunkTexelsDecode
-      TUNING.attendChunkTexels = 1
-      TUNING.attendChunkTexelsDecode = 1
-      try {
-        worst = Math.max(worst, await attentionError(this, tokens.slice(0, 24)))
-      } finally {
-        TUNING.attendChunkTexels = saved
-        TUNING.attendChunkTexelsDecode = savedDecode
-      }
-      worst = Math.max(worst, await this.panelError(tokens))
+    let worst = 0
+    const all = this.layers,
+      config = this.config
+    // Dense attention's shaders are shared by layer type and cache layout.
+    // Validate real inputs on each distinct variant plus both model ends;
+    // recurrent models keep their full state/sequence validation below.
+    if (!config.linear) {
+      const kinds = new Set<string>()
+      this.layers = all.filter((layer, i) => {
+        const kind = `${layer.type}:${layer.attention?.ring ? "ring" : "plain"}`
+        const keep = i === 0 || i === all.length - 1 || !kinds.has(kind)
+        kinds.add(kind)
+        return keep
+      })
+      this.config = { ...config, layerTypes: this.layers.map((l) => l.type) }
+      this.work = null
     }
-    // The probes' scratch isn't read again (~29 MB for Qwen3.5 2B at a
-    // 512-token batch).
-    for (const t of [this.debug, this.kvDebug]) if (t) this.gpu.delete(t)
-    this.debug = this.kvDebug = null
-    return worst
+    try {
+      if (!this.config.linear && TUNING.attendChunkTexels > 0) {
+        // Validate chunked attention from the same real queries while the
+        // reference forward is paused, then reuse its cache for the panel
+        // check. No second/third full-model prompt is needed.
+        this.chunkErrors = []
+        try {
+          const referenceError = await attentionError(this, tokens, true)
+          const chunkError = Math.max(0, ...this.chunkErrors)
+          // The chunk comparison is relative to its GPU output. Convert
+          // the two checks into a conservative CPU-relative error bound.
+          worst =
+            chunkError < 1
+              ? (referenceError + chunkError) / (1 - chunkError)
+              : Infinity
+        } finally {
+          this.chunkErrors = null
+        }
+        try {
+          worst = Math.max(worst, await this.panelError(tokens, true))
+        } finally {
+          this.reset()
+        }
+      } else {
+        worst = await attentionError(this, tokens)
+        worst = Math.max(worst, await this.recurrenceError(tokens))
+        if (TUNING.attendChunkTexels > 0) {
+          const saved = TUNING.attendChunkTexels
+          const savedDecode = TUNING.attendChunkTexelsDecode
+          TUNING.attendChunkTexels = 1
+          TUNING.attendChunkTexelsDecode = 1
+          try {
+            worst = Math.max(
+              worst,
+              await attentionError(this, tokens.slice(0, 24))
+            )
+          } finally {
+            TUNING.attendChunkTexels = saved
+            TUNING.attendChunkTexelsDecode = savedDecode
+          }
+          worst = Math.max(worst, await this.panelError(tokens))
+        }
+      }
+      // The probes' scratch isn't read again (~29 MB for Qwen3.5 2B at a
+      // 512-token batch).
+      for (const t of [this.debug, this.kvDebug]) if (t) this.gpu.delete(t)
+      this.debug = this.kvDebug = null
+      return worst
+    } finally {
+      this.layers = all
+      this.config = config
+      this.work = null
+      this.reset()
+    }
   }
 
   /**
@@ -2191,9 +3106,13 @@ export class Engine {
    * both of the combine's loops). The largest relative error, as
    * attentionError's. Leaves the cache empty.
    */
-  private async panelError(tokens: Array<number>) {
+  private async panelError(tokens: Array<number>, reuseCache = false) {
     if (!this.mrt.chunks) return 0
-    const saved = [TUNING.flashPast, TUNING.flashChunkTexels, TUNING.flashDecode]
+    const saved = [
+      TUNING.flashPast,
+      TUNING.flashChunkTexels,
+      TUNING.flashDecode
+    ]
     const tuned = this.tuned.flashDecode
     this.tuned.flashDecode = null
     try {
@@ -2201,8 +3120,10 @@ export class Engine {
       TUNING.flashPast = 0
       TUNING.flashChunkTexels = 1
       TUNING.flashDecode = 1
-      this.reset()
-      await this.forwardHidden(tokens.slice(0, -1))
+      if (!reuseCache) {
+        this.reset()
+        await this.forwardHidden(tokens.slice(0, -1))
+      }
       this.panelErrors = []
       await this.forwardHidden(tokens.slice(-1))
       await this.gpu.finish()
@@ -2216,6 +3137,8 @@ export class Engine {
   }
   /** While panelError runs: each attention layer's error. */
   private panelErrors: Array<number> | null = null
+  /** Startup chunk comparisons on the reference forward's real inputs. */
+  private chunkErrors: Array<number> | null = null
 
   /**
    * a · wᵀ for `rows` tokens: a few rows leave a split matmul's partial
@@ -2223,7 +3146,7 @@ export class Engine {
    * read them through pf, no reduce pass); more rows write the pair tensor
    * `out` and return 0.
    */
-  private project(
+  private async project(
     a: Texture,
     w: GpuMatrix,
     out: Texture,
@@ -2232,7 +3155,7 @@ export class Engine {
   ) {
     if (rows <= SPLIT_ROWS) return this.splitPartials(a, w, rows, norm)
     if (norm) throw new Error("Only split matmuls fold the norm in.")
-    this.matmul(a, w, out, rows)
+    await this.matmul(a, w, out, rows)
     return 0
   }
 
@@ -2281,8 +3204,8 @@ export class Engine {
    * The f16 prompt matmul's scratch: one matrix's dequantized weights (rows
    * wrapped into columns uHd tall: RGBA16F, or h2 with TUNING.f16Pack's
    * bit 2) and, unless it reads them as h2 (bit 1), the activations as
-   * RGBA16F, in two textures used in turn (a matmul's conversion needn't
-   * wait for the last matmul's reads). Each texture is made when first
+   * RGBA16F. Ordered draws reuse one conversion texture by default.
+   * Each texture is made when first
    * needed (a sweep can change f16Pack). Null until sized; false where
    * there are no such matrices or no column height fits.
    */
@@ -2296,7 +3219,7 @@ export class Engine {
         mib: number
         w?: Texture
         wh2?: Texture
-        a?: [Texture, Texture]
+        a?: Array<Texture>
         /** Whether RGBA16F can be drawn into (asked when first needed). */
         halfRenders?: boolean
         next: number
@@ -2378,22 +3301,26 @@ export class Engine {
     if (!f) return false
     const pack = this.f16Pack()
     // (canRender draws and reads back: asked once, not every matmul.)
-    if ((pack & 3) !== 3 && !(f.halfRenders ??= this.gpu.canRender([GL.RGBA16F])))
+    if (
+      (pack & 3) !== 3 &&
+      !(f.halfRenders ??= this.gpu.canRender([GL.RGBA16F]))
+    )
       return false
     if (pack & 2) f.wh2 ??= this.gpu.texture(GL.RGBA32UI, f.width / 2, f.hd)
     else f.w ??= this.gpu.texture(GL.RGBA16F, f.width, f.hd)
     if (!(pack & 1))
-      f.a ??= [0, 1].map(() =>
-        this.gpu.texture(GL.RGBA16F, f.kMax / 4, this.capacity)
-      ) as [Texture, Texture]
+      f.a ??= Array.from(
+        { length: Math.max(1, TUNING.f16ActivationBuffers) },
+        () => this.gpu.texture(GL.RGBA16F, f.kMax / 4, this.capacity)
+      )
     return f
   }
 
   private f16Sized() {
-    const mib = Math.max(
-      0,
-      this.rgba4Layers ? TUNING.f16ScratchMiB : TUNING.f16ScratchBytesMiB
-    )
+    const requested = this.rgba4Layers
+      ? Math.max(0, TUNING.f16ScratchMiB)
+      : TUNING.f16ScratchBytesMiB
+    const mib = requested < 0 ? this.byteF16Budget().next / 2 ** 20 : requested
     if (this.f16 && this.f16.mib !== mib) {
       // (A sweep changed the size: the other size's scratch kept for when
       // it comes back, so no timed prompt pays for making it again.)
@@ -2415,14 +3342,24 @@ export class Engine {
       const texels = (mib * 2 ** 20) / 8
       let fewest = Infinity
       for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
-        const width = Math.min(max, Math.floor(texels / hd)) & ~1
+        const needed = this.rgba4Layers
+          ? Infinity
+          : Math.max(...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4)))
+        const width = Math.min(max, Math.floor(texels / hd), needed) & ~1
         if (width < kMax / 4) continue
         const chunks = mats.reduce((n, m) => {
           const { kbSlice, slices } = this.quadSlices(m, TUNING.quadMaxSplit)
           const plan = Engine.f16Plan({ hd, width }, m.N, kbSlice, slices)
           return n + Math.ceil(slices / plan.group) * Math.ceil(m.N / plan.rows)
         }, 0)
-        if (chunks < fewest) {
+        if (
+          chunks < fewest ||
+          (!this.rgba4Layers &&
+            chunks === fewest &&
+            chunks === mats.length &&
+            best &&
+            width * hd < best.width * best.hd)
+        ) {
           fewest = chunks
           best = { hd, width }
         }
@@ -2430,7 +3367,9 @@ export class Engine {
     } else {
       // The column height that fits every matrix in the least texture.
       for (let hd = max & ~3; hd >= 64; hd = (hd >> 1) & ~3) {
-        const width = Math.max(...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4)))
+        const width = Math.max(
+          ...mats.map((m) => Math.ceil(m.N / hd) * (m.K / 4))
+        )
         if (width <= max && (!best || width * hd < best.width * best.hd))
           best = { hd, width }
       }
@@ -2455,7 +3394,7 @@ export class Engine {
   }
 
   /** out (a pair tensor) = a · wᵀ for `rows` tokens of h2 activations. */
-  private matmul(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
+  private async matmul(a: Texture, w: GpuMatrix, out: Texture, rows: number) {
     const bits = w.bits
     if (bits === 6)
       throw new GpuError("Q6_K weights are only read as the output head.")
@@ -2499,11 +3438,11 @@ export class Engine {
         if (!wOut) throw new GpuError("The f16 matmul's scratch is missing.")
         // The activations as RGBA16F, unless the matmul reads their h2.
         let fa = a
-        if (!(pack & 1)) {
+        if (!(pack & 1) && a.internal !== GL.RGBA16F) {
           if (!f.a) throw new GpuError("The f16 matmul's scratch is missing.")
           fa = f.a[f.next]
-          f.next ^= 1
-          this.gpu.run({
+          f.next = (f.next + 1) % f.a.length
+          await this.gpu.runAsync({
             name: "dequant",
             program: this.gpu.program(K.H2_TO_F16),
             inputs: { uA: a },
@@ -2548,7 +3487,7 @@ export class Engine {
           const kqW = Math.min(kq, s1 * kqSlice) - kq0
           for (let r0 = 0; r0 < w.N; r0 += plan.rows) {
             const n = Math.min(plan.rows, w.N - r0)
-            this.gpu.run({
+            await this.gpu.runAsync({
               name: "dequant",
               program: dequant,
               inputs: {
@@ -2575,7 +3514,7 @@ export class Engine {
               },
               work: h2W ? 6 : 3
             })
-            this.gpu.run({
+            await this.gpu.runAsync({
               name: "matmul",
               program: multiply,
               inputs: { uW: wOut, uA: fa },
@@ -2604,7 +3543,7 @@ export class Engine {
         return
       }
       if (w.rgba4) {
-        this.gpu.run({
+        await this.gpu.runAsync({
           name: "matmul",
           program: this.gpu.program(
             this.scalesOf(w, K.matmulQuad({ zeros: !!w.zeros || w.packed }))
@@ -2634,7 +3573,7 @@ export class Engine {
       const slices =
         w.groups <= TUNING.sliceGroups && out.height >= 2 * pairRows ? 2 : 1
       const width = w.groups
-      this.gpu.run({
+      await this.gpu.runAsync({
         name: "matmul",
         program: this.gpu.program(
           this.scalesOf(w, K.matmulPair({ zeros: !!w.zeros || w.packed }))
@@ -2653,7 +3592,7 @@ export class Engine {
       return
     }
     this.slicing.set(out.id, { split: 1, stride: 0 })
-    this.gpu.run({
+    await this.gpu.runAsync({
       name: "matmul",
       program: this.gpu.program(
         K.matmul({
@@ -2724,14 +3663,15 @@ export class Engine {
       this.gpu.run({
         name: "matmul",
         program: this.gpu.program(
-          own
+          K.withRms(own
             ? K.matmulSplitRgba4({
                 zeros: !!w.zeros,
                 bytes: !w.rgba4,
                 unorm: w.unorm,
                 packed: w.packed,
                 normed: !norm ? false : norm === "prescaled" ? norm : "weights",
-                offset: x0 > 0
+                offset: x0 > 0,
+                stream: TUNING.streamMatvec >= 0 ? TUNING.streamMatvec > 0 : this.tuned.streamMatvec === true
               })
             : K.matmul({
                 bits,
@@ -2744,7 +3684,7 @@ export class Engine {
                 split: true,
                 normed: norm === "prescaled" ? norm : false,
                 offset: x0 > 0
-              })
+              }), this.parts)
         ),
         inputs: !norm
           ? weights
@@ -2759,7 +3699,7 @@ export class Engine {
           ...(norm && {
             uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
             uROff: { int: this.config.hiddenSize / 4 },
-            uParts: { int: TUNING.rmsParts },
+            uParts: { int: this.parts },
             uTexels: { int: this.config.hiddenSize / 4 },
             uEps: this.config.normEps
           })
@@ -2776,6 +3716,8 @@ export class Engine {
    * buffer; x is f32, a pair tensor (a matmul's output), or a split
    * matmul's partial sums over `split` slices.
    */
+  private get parts() { return this.tuned.rmsParts ?? TUNING.rmsParts }
+
   private rms(x: Texture, row0: number, rows: number, split = -1) {
     const texels = this.config.hiddenSize / 4
     this.gpu.run({
@@ -2790,12 +3732,12 @@ export class Engine {
       inputs: { uX: x, ...(split === 0 && this.quadInputs("uX", x)) },
       uniforms: {
         uTexels: { int: texels },
-        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
+        uChunk: { int: Math.ceil(texels / this.parts) },
         uSplitIn: { int: Math.max(split, 0) },
         ...this.pairIn(x)
       },
       output: this.buffers.rms,
-      rect: { x: 0, y: row0, width: TUNING.rmsParts, height: rows }
+      rect: { x: 0, y: row0, width: this.parts, height: rows }
     })
   }
 
@@ -2816,18 +3758,46 @@ export class Engine {
     if (!ownSums) this.rms(x, Math.max(rowIn, 0), rows)
     this.gpu.run({
       name: "norm",
-      program: this.gpu.program(K.NORM_TO_H2),
+      program: this.gpu.program(K.withRms(K.NORM_TO_H2, this.parts)),
       inputs: { uX: x, uR: ownSums ? x : this.buffers.rms, uNorm: norm },
       uniforms: {
         uRowIn: { int: rowIn },
         uROff: { int: ownSums ? hiddenSize / 4 : 0 },
-        uParts: { int: TUNING.rmsParts },
+        uParts: { int: this.parts },
         uTexels: { int: hiddenSize / 4 },
         uEps: this.config.normEps
       },
       output: out,
       rect: { x: 0, y: 0, width: hiddenSize / 8, height: rows }
     })
+  }
+
+  private floatInput(rows: number, mats: GpuMatrix[], allowed = true) {
+    if (!allowed || TUNING.fusePromptInputs <= 0 || !this.quadMatmuls || TUNING.quad <= 0 || rows < TUNING.f16MinRows || (this.f16Pack() & 1) || !mats.length || !mats.every(m => this.takesF16(m))) return null
+    const f = this.f16Scratch()
+    return f && f.a ? f.a[f.next] : null
+  }
+
+  private normInput(x: Texture, norm: Texture, rows: number, mats: GpuMatrix[], ownSums = true, allowed = true) {
+    const out = this.floatInput(rows, mats, allowed)
+    if (!out) {
+      this.normToH2(x, norm, this.buffers.normed, rows, -1, ownSums)
+      return this.buffers.normed
+    }
+    if (!ownSums) this.rms(x, 0, rows)
+    const { hiddenSize } = this.config
+    this.gpu.run({
+      name: "norm",
+      program: this.gpu.program(K.withRms(K.NORM_TO_F16, this.parts)),
+      inputs: { uX: x, uR: ownSums ? x : this.buffers.rms, uNorm: norm },
+      uniforms: {
+        uRowIn: { int: -1 }, uROff: { int: ownSums ? hiddenSize / 4 : 0 },
+        uParts: { int: this.parts }, uTexels: { int: hiddenSize / 4 }, uEps: this.config.normEps
+      },
+      output: out,
+      rect: { x: 0, y: 0, width: hiddenSize / 4, height: rows }
+    })
+    return out
   }
 
   /**
@@ -2852,15 +3822,15 @@ export class Engine {
     if (normed) this.rms(y, 0, rows, split)
     const read = (source: string) =>
       this.gpu.program(
-        split
+        K.withRms(split
           ? this.fromSplit(source, ["uY"], split)
-          : this.readPair(source, "uY", y)
+          : this.readPair(source, "uY", y), this.parts)
       )
     const common = {
       uTexels: { int: texels },
       uEps: this.config.normEps,
       uROff: { int: 0 },
-      uParts: { int: TUNING.rmsParts },
+      uParts: { int: this.parts },
       uSplitIn: { int: split },
       ...this.pairIn(y)
     }
@@ -2888,11 +3858,11 @@ export class Engine {
       inputs,
       uniforms: {
         ...common,
-        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) },
+        uChunk: { int: Math.ceil(texels / this.parts) },
         uBase: { int: texels }
       },
       output,
-      rect: { x: texels, y: 0, width: TUNING.rmsParts, height: rows }
+      rect: { x: texels, y: 0, width: this.parts, height: rows }
     })
     if (next) {
       const base = texels + K.RMS_PARTS
@@ -2908,7 +3878,7 @@ export class Engine {
   }
 
   /** The conv block; returns out_proj's split (see `project`). */
-  private convolve(
+  private async convolve(
     layer: NonNullable<GpuLayer["conv"]>,
     rows: number,
     input: MatIn
@@ -2916,7 +3886,7 @@ export class Engine {
     const c = this.config
     const b = this.buffers
     const dt = c.hiddenSize / 4
-    const split = this.project(input.a, layer.inProj, b.bcx, rows, input.norm)
+    const split = await this.project(input.a, layer.inProj, b.bcx, rows, input.norm)
     const bcx = split ? this.partials() : b.bcx
     const read = (source: string) =>
       this.gpu.program(
@@ -3043,7 +4013,13 @@ export class Engine {
     const pairTexels = (sliding ? c.ropeDimsSliding : c.ropeDimsFull) / 8
     const qDims = c.numHeads * c.headDim
     const kvDims = c.numKvHeads * c.headDim
-    const split = this.project(input.a, layer.qkvg, b.qkvg, rows, input.norm)
+    const split = await this.project(
+      input.a,
+      layer.qkvg,
+      b.qkvg,
+      rows,
+      input.norm
+    )
     const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
       this.gpu.program(
@@ -3065,7 +4041,12 @@ export class Engine {
     // cache's slots from qSlot0 (in runs, as the keys below), or b.q.
     const cacheShape = { kvWidth, slots: qSlots, texels: qDims / 4 }
     if (inCache)
-      for (const { s0, row0, block, run } of slotRuns(qSlot0, qSlots * rows, blockRows, layer.ring)) {
+      for (const { s0, row0, block, run } of slotRuns(
+        qSlot0,
+        qSlots * rows,
+        blockRows,
+        layer.ring
+      )) {
         const x0 = block * kvWidth
         this.gpu.run({
           name: "heads",
@@ -3095,26 +4076,26 @@ export class Engine {
         })
       }
     else
-    this.gpu.run({
-      name: "heads",
-      program: read(
-        K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim })
-      ),
-      inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
-      uniforms: {
-        uSplitIn: { int: split },
-        ...this.pairIn(qkvgIn),
-        uBase: { int: 0 },
-        uPairTexels: { int: pairTexels },
-        uPos0: { int: pos0 },
-        uRowOffset: { int: 0 },
-        uXOff: { int: 0 },
-        uEps: c.normEps,
-        uScale: 1 / Math.sqrt(c.headDim)
-      },
-      output: b.q,
-      rect: { x: 0, y: 0, width: qDims / 4, height: rows }
-    })
+      this.gpu.run({
+        name: "heads",
+        program: read(
+          K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim })
+        ),
+        inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
+        uniforms: {
+          uSplitIn: { int: split },
+          ...this.pairIn(qkvgIn),
+          uBase: { int: 0 },
+          uPairTexels: { int: pairTexels },
+          uPos0: { int: pos0 },
+          uRowOffset: { int: 0 },
+          uXOff: { int: 0 },
+          uEps: c.normEps,
+          uScale: 1 / Math.sqrt(c.headDim)
+        },
+        output: b.q,
+        rect: { x: 0, y: 0, width: qDims / 4, height: rows }
+      })
     // Keys and values into the cache at positions pos0..., in runs of rows
     // split where a ring cache wraps around or a block of rows ends. (A
     // ring is one block, however tall.)
@@ -3167,7 +4148,7 @@ export class Engine {
       m0 += run
     }
     await this.attention(layer, type, rows, pos0, split, qkvgIn, paced, inCache)
-    if (this.panelErrors) {
+    if (this.panelErrors || this.chunkErrors) {
       // panelError: this layer's output again by the one-pass kernel,
       // from the same queries and cache (that output goes on).
       const qDims = c.numHeads * c.headDim
@@ -3178,26 +4159,62 @@ export class Engine {
           output: this.debugTexture(),
           rect: { x: 0, y: 0, width: qDims / 4, height: rows }
         })
-        return this.gpu.read(this.debugTexture(), { x: 0, y: 0, width: qDims / 4, height: rows })
+        return this.gpu.read(this.debugTexture(), {
+          x: 0,
+          y: 0,
+          width: qDims / 4,
+          height: rows
+        })
       }
       const got = await read()
-      const saved = TUNING.attendChunkTexels
-      TUNING.attendChunkTexels = 0
+      const saved = TUNING.attendChunkTexels,
+        savedDecode = TUNING.attendChunkTexelsDecode
+      TUNING.attendChunkTexels = this.chunkErrors ? 1 : 0
+      if (this.chunkErrors) TUNING.attendChunkTexelsDecode = 1
       try {
-        await this.attention(layer, type, rows, pos0, split, qkvgIn, false, inCache)
+        await this.attention(
+          layer,
+          type,
+          rows,
+          pos0,
+          split,
+          qkvgIn,
+          false,
+          inCache
+        )
       } finally {
         TUNING.attendChunkTexels = saved
+        TUNING.attendChunkTexelsDecode = savedDecode
       }
       const want = await read()
-      let err = 0
-      let ref = 0
-      for (let i = 0; i < want.length; i++) {
-        err += (got[i] - want[i]) ** 2
-        ref += want[i] ** 2
+      let worst = 0
+      for (let row = 0; row < rows; row++) {
+        let err = 0,
+          ref = 0,
+          finite = true
+        for (let i = row * qDims; i < (row + 1) * qDims; i++) {
+          finite &&= Number.isFinite(got[i]) && Number.isFinite(want[i])
+          err += (got[i] - want[i]) ** 2
+          ref += want[i] ** 2
+        }
+        worst = Math.max(
+          worst,
+          finite ? Math.sqrt(err / Math.max(ref, 1e-30)) : Infinity
+        )
       }
-      this.panelErrors.push(
-        got.every(Number.isFinite) ? Math.sqrt(err / Math.max(ref, 1e-30)) : Infinity
-      )
+      ;(this.panelErrors ?? this.chunkErrors)?.push(worst)
+      // The normal attention output continues through the reference model.
+      if (this.chunkErrors)
+        await this.attention(
+          layer,
+          type,
+          rows,
+          pos0,
+          split,
+          qkvgIn,
+          false,
+          inCache
+        )
     }
     return this.project(b.attnOut, layer.o, b.opOut, rows)
   }
@@ -3327,8 +4344,8 @@ export class Engine {
         slice * n * c.numHeads * c.headDim * 2 * TUNING.paceAttention
       // Segments stack as rows: segment s of a pass at rows s · total on.
       const segRows = { uSegRows: { int: total }, uSegKeys: { int: 4 * segTexels } }
-      const scores = (sj0: number, sKeys: number, n: number) =>
-        this.gpu.run({
+      const scores = async (sj0: number, sKeys: number, n: number) =>
+        await this.gpu.runAsync({
           name: "scores",
           program: this.gpu.program(
             K.scores(c.headDim, G, inCache ? { kvWidth, slots: qSlots } : undefined)
@@ -3362,7 +4379,7 @@ export class Engine {
       const fitSegments = Math.max(1, Math.floor((panels * panelRows) / total))
       if (
         rows <= SPLIT_ROWS &&
-        (this.tuned.flashDecode ?? TUNING.flashDecode) > 0 &&
+        ((this.tuned.flashDecode != null && keys >= (this.tuned.flashDecodeFrom ?? 0) ? this.tuned.flashDecode : TUNING.flashDecode)) > 0 &&
         TUNING.attendChunkTexels > 0 &&
         this.mrt.chunks &&
         kt > (TUNING.flashPast >= 0 ? TUNING.flashPast : chunkPast) &&
@@ -3386,8 +4403,8 @@ export class Engine {
         })
         const bufs = this.panelBuffers(lay.width, lay.height, G)
         const outPanels = { uOutPanels: { int: lay.across }, uOutPanelW: { int: panelW } }
-        scores(j0, keys, segments)
-        this.gpu.run({
+        await scores(j0, keys, segments)
+        await this.gpu.runAsync({
           name: "attend",
           program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll, TUNING.flashOnline > 0)),
           inputs: { ...sIn, uV: layer.kv },
@@ -3407,7 +4424,7 @@ export class Engine {
           rect: { x: 0, y: 0, width: lay.width, height: lay.height },
           work: lay.chunkTexels * (2 * G + 8)
         })
-        this.gpu.run({
+        await this.gpu.runAsync({
           name: "attend",
           program: read(K.attendPanelCombine(c.headDim, this.gate(), G)),
           inputs: {
@@ -3449,8 +4466,8 @@ export class Engine {
           const n = Math.min(perPass, segments - s0)
           const gj0 = j0 + 4 * s0 * segTexels
           const gKeys = Math.min(keys - 4 * s0 * segTexels, 4 * n * segTexels)
-          scores(gj0, gKeys, n)
-          this.gpu.run({
+          await scores(gj0, gKeys, n)
+          await this.gpu.runAsync({
             name: "attend",
             program: this.gpu.program(K.attendChunk(c.headDim, G)),
             inputs: { ...sIn, uV: layer.kv },
@@ -3478,7 +4495,7 @@ export class Engine {
           chunk0 += n * segChunks
           if (paced) await this.charge(attentionWork(gKeys))
         }
-        this.gpu.run({
+        await this.gpu.runAsync({
           name: "attend",
           program: read(K.attendCombine(c.headDim, this.gate(), G)),
           inputs: {
@@ -3501,8 +4518,8 @@ export class Engine {
         continue
       }
       if (paced) await this.charge(attentionWork(keys))
-      scores(j0, keys, 1)
-      this.gpu.run({
+      await scores(j0, keys, 1)
+      await this.gpu.runAsync({
         name: "attend",
         program: read(K.attend(c.headDim, this.gate(), G)),
         inputs: { ...sIn, uV: layer.kv, ...qkvgInputs },
@@ -3578,7 +4595,7 @@ export class Engine {
       rows >= Math.max(2, TUNING.linChunkMin) &&
       lin.l.numKeyHeads === lin.l.numValueHeads
     // beta and decay (its log, for chunks).
-    const baSplit = this.project(input.a, layer.ba, t.ba, rows, input.norm)
+    const baSplit = await this.project(input.a, layer.ba, t.ba, rows, input.norm)
     const baIn = baSplit ? this.partials() : t.ba
     this.gpu.run({
       name: "linear",
@@ -3593,7 +4610,7 @@ export class Engine {
       rect: { x: 0, y: 0, width: 2 * H4, height: rows }
     })
     // q|k|v|z, then silu(conv(q|k|v)) and the conv state after the batch.
-    const split = this.project(input.a, layer.inProj, t.inProj, rows, input.norm)
+    const split = await this.project(input.a, layer.inProj, t.inProj, rows, input.norm)
     const inTex = split ? this.partials() : t.inProj
     const read = reader("uIn", inTex, split)
     const inInputs = pairInputs("uIn", inTex, split)
@@ -3702,7 +4719,7 @@ export class Engine {
    * in_proj (one target), the convolution and its state, delta, the output,
    * k-hat and the decay (linDeltaFused), the state, the gated norm, out_proj.
    */
-  private linearFused(
+  private async linearFused(
     layer: NonNullable<GpuLayer["linear"]>,
     rows: number,
     input: MatIn
@@ -4168,7 +5185,7 @@ export class Engine {
   ): Promise<Int32Array> {
     const c = this.config
     const b = this.buffers
-    const head = this.head(row0, rows, false)
+    const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     type Ivec4 = [number, number, number, number]
     const picking = {
@@ -4245,7 +5262,7 @@ export class Engine {
   ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
-    const head = this.head(row0, rows, false)
+    const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
     type Ivec4 = [number, number, number, number]
@@ -4358,7 +5375,7 @@ export class Engine {
    * into the logits texture, logitRows rows per token (only RGBA4 heads take
    * more than one).
    */
-  private head(row0: number, rows = 1, sum = true): HeadOut {
+  private async head(row0: number, rows = 1, sum = true): Promise<HeadOut> {
     if (this.lastRowOnly && (row0 !== 0 || rows !== 1))
       throw new Error(
         "The last batch kept only its last token's hidden state (row 0; see TUNING.lastRowOnly)."
@@ -4373,21 +5390,13 @@ export class Engine {
     }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) return this.headRgba4(e, rows, undefined, sum)
-    if (e.bits === 6 && (TUNING.q6HeadSplit > 1 || !e.bytes))
-      return this.headQ6K(e, rows, sum)
+    if (e.bits === 6) return this.headQ6K(e, rows, sum)
     this.gpu.run({
       name: "head",
-      program: this.gpu.program(
-        e.bits === 6
-          ? K.MATMUL_Q6_K_HEAD
-          : K.matmul({
-              bits: e.bits,
-              zeros: !!e.zeros,
-              wrap: true,
-              precision: this.precision,
-              bytes: e.bytes
-            })
-      ),
+      program: this.gpu.program(K.matmul({
+        bits: e.bits, zeros: !!e.zeros, wrap: true,
+        precision: this.precision, bytes: e.bytes
+      })),
       inputs: {
         uA: b.lastNormed,
         uW: e.quants,
@@ -4470,55 +5479,73 @@ export class Engine {
    * `scaledRow0` (word texels only; see headScaled), reads the last add's
    * scaled input from that row on instead of lastNormed.
    */
-  private headQ6K(
+  private async headQ6K(
     e: GpuMatrix,
     rows: number,
     sum: boolean,
     scaledRow0?: number
-  ): HeadOut {
+  ): Promise<HeadOut> {
     const b = this.buffers
-    const split = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, e.blocks))
+    const split = Math.max(
+      1,
+      Math.min(
+        (TUNING.q6Expanded < 0 ? this.headChoice?.split : undefined) ??
+          TUNING.q6HeadSplit,
+        4,
+        e.blocks
+      )
+    )
     const sliceRows = this.logitRows
     const target = this.headTarget(split, rows)
     const prescaled = scaledRow0 !== undefined
     if (prescaled && e.bytes)
       throw new Error("Only word-texel Q6_K heads read the scaled input.")
-    this.gpu.run({
-      name: "head",
-      program: this.gpu.program(
-        !e.bytes
-          ? K.matmulQ6KHeadWords({ split: split > 1, prescaled })
-          : split > 1
-            ? K.MATMUL_Q6_K_HEAD_SPLIT
-            : K.MATMUL_Q6_K_HEAD
-      ),
-      inputs: {
-        ...(prescaled && { uR: b.residual[0] }),
-        uA: prescaled ? b.scaled[0] : b.lastNormed,
-        uW: e.quants,
-        uS: e.scales
+    await this.weightHead(
+      e,
+      {
+        name: "head",
+        program: this.gpu.program(
+          K.withRms(this.headWeightSource(
+            e,
+            e.q6Expanded
+              ? K.q6ExpandedHead({ split: split > 1, prescaled })
+              : !e.bytes
+                ? K.matmulQ6KHeadWords({ split: split > 1, prescaled })
+                : split > 1
+                  ? K.MATMUL_Q6_K_HEAD_SPLIT
+                  : K.MATMUL_Q6_K_HEAD
+          ), this.parts)
+        ),
+        inputs: {
+          ...(prescaled && { uR: b.residual[0] }),
+          uA: prescaled ? b.scaled[0] : b.lastNormed,
+          uW: e.quants,
+          uS: e.scales
+        },
+        uniforms: {
+          uKb: { int: e.blocks },
+          uH: { int: e.rowsPerColumn },
+          uRowTexels: { int: e.rowTexels },
+          uG: { int: e.groups },
+          uOutW: { int: OUT_WIDTH },
+          uLogitRows: { int: sliceRows },
+          uKbSlice: { int: Math.ceil(e.blocks / split) },
+          uRows: { int: rows },
+          ...(prescaled && {
+            uRowA0: { int: scaledRow0 },
+            uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+            uROff: { int: this.config.hiddenSize / 4 },
+            uParts: { int: this.parts },
+            uTexels: { int: this.config.hiddenSize / 4 },
+            uEps: this.config.normEps
+          })
+        },
+        output: target,
+        rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * rows * sliceRows }
       },
-      uniforms: {
-        uKb: { int: e.blocks },
-        uH: { int: e.rowsPerColumn },
-        uRowTexels: { int: e.rowTexels },
-        uG: { int: e.groups },
-        uOutW: { int: OUT_WIDTH },
-        uLogitRows: { int: sliceRows },
-        uKbSlice: { int: Math.ceil(e.blocks / split) },
-        uRows: { int: rows },
-        ...(prescaled && {
-          uRowA0: { int: scaledRow0 },
-          uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
-          uROff: { int: this.config.hiddenSize / 4 },
-          uParts: { int: TUNING.rmsParts },
-          uTexels: { int: this.config.hiddenSize / 4 },
-          uEps: this.config.normEps
-        })
-      },
-      output: target,
-      rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * rows * sliceRows }
-    })
+      rows,
+      split
+    )
     return this.headSlices(target, split, rows, sum)
   }
 
@@ -4530,51 +5557,54 @@ export class Engine {
    * With `scaledRow0`, reads the last add's scaled input from that row on
    * (see headScaled) instead of lastNormed.
    */
-  private headRgba4(
+  private async headRgba4(
     e: GpuMatrix,
     rows: number,
     scaledRow0?: number,
     sum = true
-  ): HeadOut {
+  ): Promise<HeadOut> {
     const b = this.buffers
     // (At most 4: the pick passes add up to 4 slices themselves.)
     const split = Math.max(1, Math.min(TUNING.headSplit, 4, e.blocks))
     const sliceRows = this.logitRows
     const height = split * rows * sliceRows
     const target = this.headTarget(split, rows)
-    this.gpu.run({
-      name: "head",
-      program: this.gpu.program(
-        K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined })
-      ),
-      inputs: {
-        ...(scaledRow0 !== undefined && { uR: b.residual[0] }),
-        uA: scaledRow0 !== undefined ? b.scaled[0] : b.lastNormed,
-        uW: e.quants,
-        uS: e.scales,
-        ...(e.zeros && { uZ: e.zeros })
+    await this.gpu.runAsync(
+      {
+        name: "head",
+        program: this.gpu.program(
+          K.withRms(K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined }), this.parts)
+        ),
+        inputs: {
+          ...(scaledRow0 !== undefined && { uR: b.residual[0] }),
+          uA: scaledRow0 !== undefined ? b.scaled[0] : b.lastNormed,
+          uW: e.quants,
+          uS: e.scales,
+          ...(e.zeros && { uZ: e.zeros })
+        },
+        uniforms: {
+          uKb: { int: e.blocks },
+          uH: { int: e.rowsPerColumn },
+          uRowTexels: { int: e.rowTexels },
+          uG: { int: e.groups },
+          uOutW: { int: OUT_WIDTH },
+          uSliceRows: { int: sliceRows },
+          uKbSlice: { int: Math.ceil(e.blocks / split) },
+          uRows: { int: rows },
+          ...(scaledRow0 !== undefined && {
+            uRowA0: { int: scaledRow0 },
+            uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+            uROff: { int: this.config.hiddenSize / 4 },
+            uParts: { int: this.parts },
+            uTexels: { int: this.config.hiddenSize / 4 },
+            uEps: this.config.normEps
+          })
+        },
+        output: target,
+        rect: { x: 0, y: 0, width: OUT_WIDTH, height }
       },
-      uniforms: {
-        uKb: { int: e.blocks },
-        uH: { int: e.rowsPerColumn },
-        uRowTexels: { int: e.rowTexels },
-        uG: { int: e.groups },
-        uOutW: { int: OUT_WIDTH },
-        uSliceRows: { int: sliceRows },
-        uKbSlice: { int: Math.ceil(e.blocks / split) },
-        uRows: { int: rows },
-        ...(scaledRow0 !== undefined && {
-          uRowA0: { int: scaledRow0 },
-          uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
-          uROff: { int: this.config.hiddenSize / 4 },
-          uParts: { int: TUNING.rmsParts },
-          uTexels: { int: this.config.hiddenSize / 4 },
-          uEps: this.config.normEps
-        })
-      },
-      output: target,
-      rect: { x: 0, y: 0, width: OUT_WIDTH, height }
-    })
+      Math.max(1, sliceRows / 4)
+    )
     return this.headSlices(target, split, rows, sum)
   }
 
@@ -4582,7 +5612,7 @@ export class Engine {
   async logits(row: number): Promise<Float32Array> {
     const c = this.config
     const b = this.buffers
-    this.head(row)
+    await this.head(row)
     const all = await this.gpu.read(b.logits, {
       x: 0,
       y: 0,
@@ -4602,10 +5632,25 @@ export class Engine {
     const c = this.config
     const b = this.buffers
     const rows = batch.length
+    b.residual = rows <= SPLIT_ROWS ? b.residualSmall : b.residualLarge
+    this.gpu.setPhase(rows <= SPLIT_ROWS ? "decode" : "prompt")
+    if (rows <= SPLIT_ROWS) this.gpu.decodeWork()
+    const decodeLayers =
+      TUNING.decodePaceLayers < 0
+        ? this.gpu.decodeLayers
+        : TUNING.decodePaceLayers
     const pos0 = this.position
     this.gpu.hints = TUNING.renderHints
+    this.gpu.cacheState = TUNING.cacheState > 0
+    this.gpu.presentationFrames = TUNING.presentationFrames
+    this.gpu.configurePacing(
+      this.tuned.submissionReads ?? TUNING.submissionReads,
+      TUNING.submissionMs
+    )
+    this.gpu.pollsBeforeSleep = TUNING.fencePolls
+    this.gpu.presentationFrames = TUNING.presentationFrames
     // (Writing: room past the batch for its queries too, see queryInCache.)
-    this.reserve(
+    await this.reserve(
       rows <= SPLIT_ROWS && TUNING.qInCache > 0
         ? Math.min(this.contextLength, pos0 + rows * (1 + this.querySlots()))
         : pos0 + rows
@@ -4665,12 +5710,12 @@ export class Engine {
         uH: { int: e.rowsPerColumn },
         uRowTexels: { int: e.rowTexels },
         uTexels: { int: texels },
-        uChunk: { int: Math.ceil(texels / TUNING.rmsParts) }
+        uChunk: { int: Math.ceil(texels / this.parts) }
       }
       const output = [b.residual[0], b.scaled[0]]
       const parts: Array<["values" | "rms" | "scaled", number, number]> = [
         ["values", 0, texels],
-        ["rms", texels, TUNING.rmsParts],
+        ["rms", texels, this.parts],
         ["scaled", texels + K.RMS_PARTS, texels / 2]
       ]
       for (const [part, x, width] of parts) {
@@ -4683,33 +5728,38 @@ export class Engine {
         })
       }
     } else
-    this.gpu.run({
-      program: this.gpu.program(
-        e.bits === 6
-          ? e.bytes
-            ? K.EMBED_Q6_K
-            : K.EMBED_Q6_K_WORDS
-          : K.embed({
-              bits: e.bits,
-              zeros: !!e.zeros,
-              bytes: e.bytes,
-              rgba4: e.rgba4
-            })
-      ),
-      inputs: {
-        uIds: b.ids,
-        uW: e.quants,
-        uS: e.scales,
-        ...(e.zeros && { uZ: e.zeros })
-      },
-      uniforms: {
-        uKb: { int: e.blocks },
-        uH: { int: e.rowsPerColumn },
-        uRowTexels: { int: e.rowTexels }
-      },
-      output: b.residual[0],
-      rect: { x: 0, y: 0, width: c.hiddenSize / 4, height: rows }
-    })
+      this.gpu.run({
+        program: this.gpu.program(
+          this.weightSource(
+            e,
+            e.bits === 6
+              ? e.q6Expanded
+                ? K.EMBED_Q6_EXPANDED
+                : e.bytes
+                  ? K.EMBED_Q6_K
+                  : K.EMBED_Q6_K_WORDS
+              : K.embed({
+                  bits: e.bits,
+                  zeros: !!e.zeros,
+                  bytes: e.bytes,
+                  rgba4: e.rgba4
+                })
+          )
+        ),
+        inputs: {
+          uIds: b.ids,
+          ...this.weightInputs(e),
+          uS: e.scales,
+          ...(e.zeros && { uZ: e.zeros })
+        },
+        uniforms: {
+          uKb: { int: e.blocks },
+          uH: { int: e.rowsPerColumn },
+          uRowTexels: { int: e.rowTexels }
+        },
+        output: b.residual[0],
+        rect: { x: 0, y: 0, width: c.hiddenSize / 4, height: rows }
+      })
     const look = async (
       layer: number,
       name: string,
@@ -4728,7 +5778,10 @@ export class Engine {
                 : K.H2_TO_F32
             ),
             uniforms: this.pairIn(tex),
-            inputs: { uX: tex, ...(h2 === "pair" && this.quadInputs("uX", tex)) },
+            inputs: {
+              uX: tex,
+              ...(h2 === "pair" && this.quadInputs("uX", tex))
+            },
             output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
           })
@@ -4751,6 +5804,14 @@ export class Engine {
     this.lastRowOnly = lastRowOnly
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
+      if (
+        !paced &&
+        this.gpu.readsPerSlice > 0 &&
+        decodeLayers > 0 &&
+        i > 0 &&
+        i % decodeLayers === 0
+      )
+        await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
       // (From layer 0: batches follow each other with no wait between.)
       if (paced) await this.charge(0)
       else if (TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
@@ -4764,7 +5825,20 @@ export class Engine {
           ? { a: h, norm: prescaled ? "prescaled" : layer.operatorNorm }
           : { a: b.normed }
       if (!opIn.norm) {
-        this.normToH2(h, layer.operatorNorm, b.normed, rows, -1, i > 0)
+        const mats = [
+          layer.conv?.inProj,
+          layer.attention?.qkvg,
+          layer.linear?.inProj,
+          layer.linear?.ba
+        ].filter((m): m is GpuMatrix => !!m)
+        opIn.a = this.normInput(
+          h,
+          layer.operatorNorm,
+          rows,
+          mats,
+          i > 0,
+          !probe
+        )
         await look(i, "operator_norm", b.normed, c.hiddenSize, true)
       }
       let opSplit = 0
@@ -4784,7 +5858,7 @@ export class Engine {
           await look(i, "lin_out", b.lin.out, lin.V, true)
         }
       } else if (layer.conv) {
-        opSplit = this.convolve(layer.conv, rows, opIn)
+        opSplit = await this.convolve(layer.conv, rows, opIn)
         await look(i, "in_proj", b.bcx, 3 * c.hiddenSize, "pair")
         await look(i, "conv", b.convOut, c.hiddenSize, true)
       } else if (layer.attention) {
@@ -4847,7 +5921,10 @@ export class Engine {
       const base = tail ? h : next
       const dest = tail ? next : h
       if (tail) this.copyRow(next, rows - 1, h)
-      if (!ffnFold) this.normToH2(base, layer.ffnNorm, b.normed, fr)
+      const ffnInput = !ffnFold
+        ? this.normInput(base, layer.ffnNorm, fr, [layer.gateUp], true, !probe)
+        : b.normed
+      let downInput = b.act
       if (fr <= SPLIT_ROWS) {
         // A few rows: the split matmul's slices are summed and through
         // SwiGLU in one pass.
@@ -4858,7 +5935,7 @@ export class Engine {
               rows,
               prescaled ? "prescaled" : layer.ffnNorm
             )
-          : this.splitPartials(b.normed, layer.gateUp, fr)
+          : this.splitPartials(ffnInput, layer.gateUp, fr)
         this.gpu.run({
           name: "swiglu",
           program: this.gpu.program(K.withSplit(K.REDUCE_SWIGLU, slices)),
@@ -4871,20 +5948,29 @@ export class Engine {
           rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: fr }
         })
       } else {
-        this.matmul(b.normed, layer.gateUp, b.gateUp, rows)
+        await this.matmul(ffnInput, layer.gateUp, b.gateUp, rows)
+        downInput = this.floatInput(fr, [layer.down], !probe) ?? b.act
+        const floating = downInput.internal === GL.RGBA16F
         this.gpu.run({
           name: "swiglu",
-          program: this.gpu.program(this.readPair(K.SWIGLU, "uGU", b.gateUp)),
+          program: this.gpu.program(
+            this.readPair(floating ? K.SWIGLU_F16 : K.SWIGLU, "uGU", b.gateUp)
+          ),
           inputs: { uGU: b.gateUp, ...this.quadInputs("uGU", b.gateUp) },
           uniforms: {
             uHalf: { int: c.intermediateSize / 4 },
             ...this.pairIn(b.gateUp)
           },
-          output: b.act,
-          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+          output: downInput,
+          rect: {
+            x: 0,
+            y: 0,
+            width: c.intermediateSize / (floating ? 4 : 8),
+            height: rows
+          }
         })
       }
-      const downSplit = this.project(b.act, layer.down, b.ffnOut, fr)
+      const downSplit = await this.project(downInput, layer.down, b.ffnOut, fr)
       await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
       this.addNormed(
         base,

@@ -159,10 +159,9 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     (files.tokenizerJson as { added_tokens?: Array<AddedTokenJson> })
       .added_tokens ?? []
   const specialIds = new Set(added.filter((t) => t.special).map((t) => t.id))
-  let vocabSize = 0
-  for (const id of hf.get_vocab(true).values()) {
-    vocabSize = Math.max(vocabSize, id + 1)
-  }
+  // Added tokens have already extended the public id-indexed vocabulary.
+  // Avoid building a second large token-to-id Map just to find its limit.
+  const vocabSize = hf.model?.vocab.length ?? 0
 
   // The named special tokens, as the template sees them: transformers
   // passes its special_tokens_map (bos_token, image_token, ...).
