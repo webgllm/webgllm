@@ -36,7 +36,14 @@ export function monitorFrames(
           const fast = ordered.filter(
             (value) => value <= ordered[Math.floor(ordered.length * 0.1)] * 1.25
           )
-          expected = fast[Math.floor(fast.length / 2)]
+          // Whole-millisecond clocks alternate 8/9 or 16/17 ms at a
+          // healthy cadence. Their median alone underestimates the period.
+          const rounded = fast.length >= 12 && fast.every(
+            value => Math.abs(value - Math.round(value)) < 1e-6
+          )
+          expected = rounded
+            ? fast.reduce((sum, value) => sum + value, 0) / fast.length
+            : fast[Math.floor(fast.length / 2)]
         }
         if (!Number.isFinite(expected)) {
           frame = requestAnimationFrame(tick)

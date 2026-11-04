@@ -76,3 +76,27 @@ test("short catch-up callbacks remain in the mean instead of inventing a slowdow
     Reflect.set(globalThis, "document", previous.document)
   }
 })
+
+
+for (const fps of [60, 120])
+  test(`whole-millisecond timestamps retain healthy ${fps} Hz cadence`, () => {
+    const frames: FrameRequestCallback[] = [], sent: number[][] = []
+    const previous = { raf: globalThis.requestAnimationFrame, cancel: globalThis.cancelAnimationFrame, document: globalThis.document }
+    Reflect.set(globalThis, "requestAnimationFrame", (fn: FrameRequestCallback) => { frames.push(fn); return frames.length })
+    Reflect.set(globalThis, "cancelAnimationFrame", () => undefined)
+    Reflect.set(globalThis, "document", { visibilityState: "visible" })
+    try {
+      const stop = monitorFrames((...values) => sent.push(values as number[]))
+      for (let i = 0; i <= 120; i++) frames.shift()?.(Math.floor(100 + i * 1000 / fps))
+      assert.equal(sent.length, 5)
+      for (const sample of sent) {
+        assert.ok(Math.abs(sample[1] - 1000 / fps) < 0.1)
+        assert.ok(sample[4] <= sample[1] * 1.03)
+      }
+      stop()
+    } finally {
+      Reflect.set(globalThis, "requestAnimationFrame", previous.raf)
+      Reflect.set(globalThis, "cancelAnimationFrame", previous.cancel)
+      Reflect.set(globalThis, "document", previous.document)
+    }
+  })
