@@ -434,6 +434,7 @@ export class WebGlTextAdapter<
     try {
       await waitForModel(model, this.contextLength, signal)
     } catch (error) {
+      if (signal?.aborted) return
       const message = `Couldn't load ${model}: ${errorText(error)}`
       yield {
         type: EventType.RUN_ERROR,
