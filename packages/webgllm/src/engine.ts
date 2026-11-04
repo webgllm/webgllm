@@ -1564,7 +1564,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
           best[i] = Math.min(best[i], ms)
         }
       }
-      prefill = await this.layoutPrefill(made)
+      // The final rule requires a clear decode win as well. Do not run
+      // full-batch candidates after decode has already ruled native storage out.
+      if (layoutSamples[0].every((ms, round) => ms < layoutSamples[1][round] * 0.95))
+        prefill = await this.layoutPrefill(made)
     } finally {
       for (const gm of made)
         for (const texture of [gm.quants, gm.scales, gm.zeros]) if (texture) this.gpu.delete(texture)

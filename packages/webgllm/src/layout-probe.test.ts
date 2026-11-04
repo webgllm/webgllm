@@ -3,7 +3,10 @@ import test from "node:test"
 import { Engine } from "./engine.js"
 import { GL } from "./gpu/gl.js"
 
-test("layout timing consumes all output groups and awaits bounded dependent steps", async () => {
+for (const [decodeWins, prefillWins] of [[false, true], [true, false], [true, true]])
+test(`dependent storage timing: decode win ${decodeWins}, prefill win ${prefillWins}`, async (t) => {
+  let clock = 0, prefillCalls = 0
+  t.mock.method(performance, "now", () => clock)
   let pending = false,
     previous: unknown,
     last: unknown,
@@ -12,7 +15,7 @@ test("layout timing consumes all output groups and awaits bounded dependent step
   const deleted: unknown[] = []
   const state = {
     buffers: { normed: {}, partial: {} },
-    layoutPrefill: async () => ({ rgba4: 10, bytes: 8 }),
+    layoutPrefill: async () => { prefillCalls++; return { rgba4: prefillWins ? 6 : 10, bytes: 8 } },
     allocateMatrix: (
       _N: number,
       _K: number,
@@ -21,7 +24,8 @@ test("layout timing consumes all output groups and awaits bounded dependent step
       rgba4: boolean
     ) => ({ groups: 256, quants: {}, scales: {}, zeros: null, rgba4 }),
     writeMatrix: () => undefined,
-    splitPartials() {
+    splitPartials(_input: unknown, gm: { rgba4: boolean }) {
+      clock += gm.rgba4 ? decodeWins ? 2 : 4 : 3
       assert.equal(pending, false)
       pending = true
       return 4
@@ -77,7 +81,8 @@ test("layout timing consumes all output groups and awaits bounded dependent step
     scales: new Uint16Array(4096),
     zeros: null
   })
-  assert.equal(Reflect.get(state, "rgba4Layers"), false)
+  assert.equal(Reflect.get(state, "rgba4Layers"), decodeWins && prefillWins)
+  assert.equal(prefillCalls, decodeWins ? 1 : 0)
   assert.equal(uploads, 1)
   assert.ok(reads >= 3)
   assert.equal(deleted.length, 6)
