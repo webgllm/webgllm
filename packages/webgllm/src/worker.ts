@@ -330,6 +330,9 @@ async function load(
     for (const key of Object.keys(repackTime) as Array<keyof typeof repackTime>) repackTime[key] = 0
     if (engine.layoutChoice?.ms)
       timings.layoutProbe = Math.round(engine.layoutChoice.ms)
+    if (engine.layoutChoice) { timings.layoutRgba4DecodeMs = engine.layoutChoice.rgba4Ms; timings.layoutBytesDecodeMs = engine.layoutChoice.bytesMs }
+    if (engine.layoutChoice?.rgba4PrefillMs != null) timings.layoutRgba4PrefillMs = engine.layoutChoice.rgba4PrefillMs
+    if (engine.layoutChoice?.bytesPrefillMs != null) timings.layoutBytesPrefillMs = engine.layoutChoice.bytesPrefillMs
     // Resolve all kernel choices during initial loading, then warm the
     // selected variants. No calibration work races with user generations.
     if (!note?.calibrated) {
@@ -388,7 +391,7 @@ async function load(
     engine.gpu.setPhase("load")
     const overlap = engine.tuned.submissionOverlap
     if (overlap != null && Number.isFinite(overlap) && overlap >= 0 && overlap <= 2 ** 34)
-      engine.gpu.primePresentation(TUNING.presentationFrames, Math.max(TUNING.submissionReads, overlap), overlap > 0)
+      engine.gpu.primePresentation(engine.tuned.submissionWindow ?? TUNING.presentationFrames, Math.max(TUNING.submissionReads, overlap), overlap > 0)
     const pacing = overlap === 0 ? undefined : note?.pacing
     if (pacing && Number.isFinite(pacing.reads) && pacing.reads > 0 && pacing.reads <= 2 ** 34 && pacing.window >= 2 && pacing.window <= 128 && pacing.frameMs >= 4 && pacing.frameMs <= 100 && pacing.window * pacing.frameMs <= 450) {
       const scale = Math.min(1, engine.gpu.expectedFrameMs / pacing.frameMs)

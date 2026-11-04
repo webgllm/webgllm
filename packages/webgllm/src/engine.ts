@@ -114,8 +114,8 @@ export const TUNING = {
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
   splitFragments: 4096,
-  /** Stream activation pairs in byte-weight matvecs to reduce register pressure. */
-  streamMatvec: -1,
+  /** Experimental activation streaming; full-model timing keeps the standard kernel. */
+  streamMatvec: 0,
   /** ...into at most this many slices (the partial buffer holds 32). */
   maxSplit: 16,
   /** Pixels per row summing its squares (at most K.RMS_PARTS). */
@@ -391,6 +391,8 @@ export type Tuned = {
   submissionReads?: number
   /** Measured overlap; zero records that larger submissions missed rendering deadlines. */
   submissionOverlap?: number
+  /** Startup validated a larger presentation window on a fast complete pipeline. */
+  submissionWindow?: number
   rmsParts?: number
   f16Matmul?: number | null
   f16Pack?: number | null
@@ -1046,6 +1048,10 @@ export class Engine {
           : 2 ** Math.ceil(Math.log2(positions))
     const phase = this.gpu.activePhase
     this.gpu.setPhase("load")
+    // Reuse the measured load quota for allocation overlap too. Slow pipelines
+    // retain two clears/copies in flight; fast ones can issue the original batch.
+    const growthBatch = Math.max(1, Math.floor(this.gpu.readsPerSlice / Math.max(1, TUNING.submissionReads)))
+    let growthPending = 0
     try {
       for (const layer of this.layers) {
         const a = layer.attention
@@ -1073,7 +1079,10 @@ export class Engine {
         // Cache growth also initializes textures in the GPU process.
         // Keep at most two clears/copies in flight, rather than an
         // uninterrupted allocation queue or an empty queue per layer.
-        if (this.gpu.readsPerSlice > 0) await this.gpu.pace(1, true)
+        if (this.gpu.readsPerSlice > 0 && ++growthPending >= growthBatch) {
+          await this.gpu.pace(1, true)
+          growthPending = 0
+        }
       }
       if (this.gpu.readsPerSlice > 0) await this.gpu.pace(0, true)
       if (this.gpu.outOfMemory()) throw new GpuError("Out of memory.")
@@ -1461,6 +1470,7 @@ export class Engine {
         streamMatvec: before.streamMatvec,
         submissionReads: before.submissionReads,
         submissionOverlap: before.submissionOverlap,
+        submissionWindow: before.submissionWindow,
         rmsParts: before.rmsParts
       }
     } catch (error) {
@@ -1492,16 +1502,11 @@ export class Engine {
     bytesMs: number
     /** How long choosing took. */
     ms?: number
+    rgba4PrefillMs?: number
+    bytesPrefillMs?: number
   } | null = null
 
-  /**
-   * Picks how 4-bit layer weights are stored by timing both layouts on this
-   * GPU: RGBA4 has the texture unit split the nibbles (free where weight
-   * fetches are cheap, as on Apple GPUs), byte texels take half the
-   * fetches and split them in the shader (faster where fetches are the
-   * limit, as on PowerVR). A random matrix of `m`'s shape in each, the
-   * writing matmul on each in turn, best of a few rounds.
-   */
+  /** Choose storage from real weights, dependent matvecs and a full-batch projection. */
   private async chooseLayout(m: QuantMatrix) {
     if (m.bits !== 4 || TUNING.layerRgba4 >= 0 || this.preferLayout) {
       this.rgba4Layers =
@@ -1516,63 +1521,125 @@ export class Engine {
       return
     }
     const started = performance.now()
-    let seed = 1
-    const quants = new Uint32Array(m.N * (m.K / 32) * 4)
-    for (let i = 0; i < quants.length; i++) {
-      seed = (seed * 1664525 + 1013904223) >>> 0
-      quants[i] = seed
-    }
-    const fake: QuantMatrix = {
-      N: m.N,
-      K: m.K,
-      bits: 4,
-      quants,
-      // Small scales (half 2^-7) and zero points 0 .. 15.
-      scales: new Uint16Array(m.scales.length).fill(0x2000),
-      zeros: m.zeros
-        ? Uint8Array.from({ length: m.zeros.length }, (_, i) => quants[i] & 15)
-        : null
-    }
     const made = [true, false].map((rgba4) => {
-      const gm = this.allocateMatrix(m.N, m.K, 4, !!fake.zeros, rgba4, true)
-      this.writeMatrix(gm, fake, 0)
+      const gm = this.allocateMatrix(m.N, m.K, 4, !!m.zeros, rgba4, true)
+      this.writeMatrix(gm, m, 0)
       return gm
     })
-    // Each matmul's output gets a texel read, so no GPU skips one.
-    const scratch = this.gpu.texture(GL.RGBA32F, 1, 1)
-    const step = (gm: GpuMatrix) => {
-      this.splitPartials(this.buffers.normed, gm, 1)
-      this.gpu.run({
-        program: this.gpu.program(K.COPY),
-        inputs: { uX: this.buffers.partial },
-        output: scratch,
-        rect: { x: 0, y: 0, width: 1, height: 1 }
-      })
+    // Nonzero activations and a dependency through every output prevent
+    // tiled/deferred GPUs from timing an unused or overwritten result.
+    this.gpu.write(this.buffers.normed, { x: 0, y: 0, width: m.K / 8, height: 1 }, {
+      format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT,
+      pixels: new Uint32Array(m.K / 2).fill(0x3c003800)
+    })
+    const width = Math.ceil(m.N / 4 / 64)
+    const height = Math.max(1, Math.min(TUNING.maxSplit, m.K / 32))
+    const scratch = Array.from({ length: 2 }, () => this.gpu.texture(GL.RGBA32F, width, height))
+    const checksum = this.gpu.program(`#version 300 es
+precision highp float;precision highp int;uniform sampler2D uX,uPrev;uniform int uWidth;out vec4 o;
+void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(int i=0;i<64;i++){int x=p.x*64+i;if(x<uWidth)s+=texelFetch(uX,ivec2(x,p.y),0);}o=s;}`)
+    let slices = 1
+    const step = async (gm: GpuMatrix) => {
+      slices = this.splitPartials(this.buffers.normed, gm, 1)
+      this.gpu.run({ program: checksum, inputs: { uX: this.buffers.partial, uPrev: scratch[0] },
+        uniforms: { uWidth: { int: gm.groups } }, output: scratch[1],
+        rect: { x: 0, y: 0, width, height: slices }, work: 64 })
+      scratch.reverse()
+      await this.gpu.pace(1, true)
     }
-    for (const gm of made) step(gm)
-    await this.gpu.finish()
+    const consume = () => this.gpu.read(scratch[0], { x: 0, y: 0, width, height: slices })
     const best = [Infinity, Infinity]
     const layoutSamples = [[], []] as number[][]
-    for (let round = 0; round < 3; round++) {
-      for (const i of round % 2 ? [1, 0] : [0, 1]) {
-        const t = performance.now()
-        for (let n = 0; n < 16; n++) step(made[i])
-        await this.gpu.finish()
-        const ms = (performance.now() - t) / 16
-        layoutSamples[i].push(ms)
-        best[i] = Math.min(best[i], ms)
+    let prefill: { rgba4: number; bytes: number } | undefined
+    try {
+      for (const gm of made) await step(gm)
+      await consume()
+      for (let round = 0; round < 2; round++) {
+        for (const i of round % 2 ? [1, 0] : [0, 1]) {
+          const t = performance.now()
+          for (let n = 0; n < 8; n++) await step(made[i])
+          await consume()
+          const ms = (performance.now() - t) / 8
+          layoutSamples[i].push(ms)
+          best[i] = Math.min(best[i], ms)
+        }
       }
+      prefill = await this.layoutPrefill(made)
+    } finally {
+      for (const gm of made)
+        for (const texture of [gm.quants, gm.scales, gm.zeros]) if (texture) this.gpu.delete(texture)
+      for (const texture of scratch) this.gpu.delete(texture)
     }
-    for (const gm of made)
-      for (const t of [gm.quants, gm.scales, gm.zeros]) if (t) this.gpu.delete(t)
-    this.gpu.delete(scratch)
-    // Bytes only if clearly faster (timing noise shouldn't flip it).
-    this.rgba4Layers = !layoutSamples[1].every((ms, round) => ms < layoutSamples[0][round] * 0.95)
+    // Native storage must win in both phases and both decode rounds.
+    // Prefer bytes when results disagree: a single projection cannot establish
+    // a whole-model win, and native storage adds conversion work at load.
+    this.rgba4Layers = !!prefill && prefill.rgba4 < prefill.bytes * 0.98 &&
+      layoutSamples[0].every((ms, round) => ms < layoutSamples[1][round] * 0.95)
     this.layoutChoice = {
       layout: this.rgba4Layers ? "rgba4" : "bytes",
       rgba4Ms: best[0],
       bytesMs: best[1],
+      rgba4PrefillMs: prefill?.rgba4,
+      bytesPrefillMs: prefill?.bytes,
       ms: performance.now() - started
+    }
+  }
+
+  /** Storage must be competitive for prefill, not just a one-token matvec. */
+  private async layoutPrefill(made: GpuMatrix[]) {
+    const rows = this.batchSize
+    if (!this.quadMatmuls || rows < TUNING.f16MinRows || !this.quads.has(this.buffers.gateUp.id))
+      return { rgba4: 1, bytes: 1 }
+    const matrix = made[0]
+    const probe = Object.create(Engine.prototype) as Engine
+    Object.assign(probe, this, {
+      layers: [{ gateUp: matrix, down: { ...matrix, N: matrix.K, K: matrix.N / 2,
+        blocks: matrix.N / 2 / 32, groups: matrix.K / 4 } }] as unknown as GpuLayer[],
+      tuned: { ...this.tuned }, f16: null, f16Kept: new Map(), legacyF16: null
+    })
+    this.gpu.write(this.buffers.normed, { x: 0, y: 0, width: matrix.K / 8, height: rows }, {
+      format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT,
+      pixels: new Uint32Array(matrix.K / 2 * rows).fill(0x3c003800)
+    })
+    const choices = [
+      { layout: 1, mode: 1, pack: 3 },
+      ...(this.gpu.canRender([GL.RGBA16F]) ? [{ layout: 1, mode: 1, pack: 0 }] : []),
+      { layout: 0, mode: 1, pack: 3 }, { layout: 0, mode: 2, pack: 3 }
+    ]
+    const samples = choices.map(() => [] as number[])
+    const run = async (index: number, count = rows) => {
+      const choice = choices[index], weight = made[choice.layout]
+      probe.layers[0].gateUp = weight
+      probe.rgba4Layers = choice.layout === 0
+      probe.tuned.f16Matmul = choice.mode
+      probe.tuned.f16Pack = choice.pack
+      const output = this.buffers.gateUp
+      await probe.matmul(this.buffers.normed, weight, output, count)
+      this.gpu.run({ name: "layout-checksum", program: this.gpu.program(probe.readPair(K.rmsPartial("pair"), "uX", output)),
+        inputs: { uX: output, ...probe.quadInputs("uX", output) },
+        uniforms: { uTexels: { int: weight.N / 4 }, uChunk: { int: Math.ceil(weight.N / 4 / K.RMS_PARTS) },
+          uSplitIn: { int: 0 }, ...probe.pairIn(output) },
+        output: this.buffers.rms, rect: { x: 0, y: 0, width: K.RMS_PARTS, height: count } })
+      await this.gpu.read(this.buffers.rms, { x: 0, y: 0, width: K.RMS_PARTS, height: count })
+    }
+    try {
+      for (let i = 0; i < choices.length; i++) await run(i, Math.min(rows, Math.max(64, TUNING.f16MinRows)))
+      for (let index = 0; index < choices.length; index++) {
+        const began = performance.now()
+        await run(index)
+        samples[index].push(performance.now() - began)
+      }
+      const best = (layout: number) => Math.min(...choices.flatMap((choice, i) => choice.layout === layout ? samples[i] : []))
+      return { rgba4: best(0), bytes: best(1) }
+    } finally {
+      const textures = new Set<Texture>()
+      for (const scratch of [probe.f16, ...probe.f16Kept.values()]) {
+        if (!scratch) continue
+        if (scratch.w) textures.add(scratch.w)
+        if (scratch.wh2) textures.add(scratch.wh2)
+        for (const texture of scratch.a ?? []) textures.add(texture)
+      }
+      for (const texture of textures) this.gpu.delete(texture)
     }
   }
 
@@ -2066,6 +2133,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // consistently, and repeating four complete pipelines delayed ready.
       this.tuned.rmsParts = this.parts
       this.tuned.submissionOverlap = allowOverlap ? overlap : 0
+      this.tuned.submissionWindow = allowOverlap && this.packingReport[selected].ms <= this.gpu.expectedFrameMs * 2
+        ? this.gpu.presentationAdvice.cap : TUNING.presentationFrames
       this.tuned.submissionReads = calibratedReadQuota(
         TUNING.submissionReads,
         Math.min(...work[selected]),
@@ -2294,9 +2363,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         inputs: { ...pass.inputs, uW: w.quantPanels[panel] },
         uniforms: { ...pass.uniforms, uWeightRow0: { int: row0 } },
         rect,
-        // Vocabulary rows between fences, across panel boundaries.
+        // Stable work cost across panel boundaries: raising a measured
+        // GPU quota must also increase head work between fences.
         work:
-          this.gpu.readsPerSlice /
+          Math.max(1, TUNING.submissionReads) /
           (Math.max(1, TUNING.headPaceRows) * OUT_WIDTH)
       })
     }

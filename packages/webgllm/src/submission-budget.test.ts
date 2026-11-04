@@ -97,6 +97,7 @@ test("fast complete-layer fences scale decode without device limits", () => {
 test("whole-workload calibration bounds invalid estimates and scales fast workloads", () => {
   const base = 2 ** 28
   assert.equal(calibratedReadQuota(base, 3e9, 200, 16.7), base)
+  assert.equal(calibratedReadQuota(base, 3e9, 20, 16.7), Math.round(3e9 / 20 * 16.7 * 2))
   assert.ok(calibratedReadQuota(base, 3e9, 2, 16.7) > base)
   assert.equal(calibratedReadQuota(base, 3e9, 0.01, 16.7), 2 ** 34)
   for (const ms of [0, NaN, Infinity])

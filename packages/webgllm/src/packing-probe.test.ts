@@ -16,6 +16,7 @@ function fixture(native = false, fail = false) {
       f16Matmul?: number
       submissionReads?: number
       submissionOverlap?: number
+      submissionWindow?: number
     },
     batchSize: 512,
     config: { vocabSize: 128000, hiddenSize: 2048 },
@@ -158,4 +159,16 @@ test("a failed presentation trial is not repeated by later packing candidates", 
   }
   await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
   assert.equal(state.tuned.submissionOverlap, 0)
+  assert.equal(state.tuned.submissionWindow, TUNING.presentationFrames)
+})
+
+
+test("a fast successful complete pipeline retains its tested presentation window", async (t) => {
+  const { state } = fixture(false)
+  let clock = 0
+  t.mock.method(performance, "now", () => clock)
+  const forward = state.forwardHidden.bind(state)
+  state.forwardHidden = async tokens => { await forward(tokens); clock += 5 }
+  await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
+  assert.equal(state.tuned.submissionWindow, 24)
 })

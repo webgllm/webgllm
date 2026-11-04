@@ -312,7 +312,10 @@ export function calibratedReadQuota(
   elapsedMs: number,
   frameMs: number
 ) {
-  const estimate = ((work / elapsedMs) * frameMs) / 4
+  // A complete pipeline that finishes within two frames can queue two frames
+  // of work. Slower pipelines keep the quarter-frame starting budget.
+  const frameShare = elapsedMs <= frameMs * 2 ? 2 : 0.25
+  const estimate = (work / elapsedMs) * frameMs * frameShare
   return work > 0 && elapsedMs > 0 && frameMs >= 4 && Number.isFinite(estimate)
     ? Math.max(base, Math.min(2 ** 34, Math.round(estimate)))
     : base

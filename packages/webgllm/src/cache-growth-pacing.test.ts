@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { Engine } from "./engine.js"
+import { Engine, TUNING } from "./engine.js"
 
 test("cache growth bounds overlap and drains before returning without changing capacity", async () => {
   let pending = 0,
@@ -78,4 +78,25 @@ test("invalid prompt reservations fail before allocating memory", async () => {
       Engine.prototype.preparePrompt.call(state as unknown as Engine, end),
       /Invalid prompt/
     )
+})
+
+
+test("fast calibrated allocation overlap retains the original cache capacity", async () => {
+  let copies = 0, fences = 0
+  const state = {
+    kvPositions: 512, kvShift: 12, contextLength: 4096,
+    layers: Array.from({ length: 3 }, () => ({ attention: { kv: { width: 256, height: 512 }, ring: 0 } })),
+    kvTexture: (positions: number) => ({ width: 256, height: positions }),
+    gpu: {
+      readsPerSlice: TUNING.submissionReads * 8, activePhase: "prompt",
+      setPhase(phase: string) { this.activePhase = phase },
+      program: () => ({}), run: () => { copies++ }, delete: () => undefined,
+      async pace(ahead: number) { assert.equal(ahead, 0); assert.equal(copies, 3); fences++ },
+      outOfMemory: () => false
+    }
+  }
+  await Reflect.get(Engine.prototype, "reserve").call(state, 1536)
+  assert.equal(fences, 1)
+  assert.equal(state.kvPositions, 1536)
+  assert.equal(state.gpu.activePhase, "prompt")
 })

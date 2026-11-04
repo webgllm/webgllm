@@ -116,3 +116,13 @@ test("a delayed load-frame window cannot reduce the new prompt's budget", () => 
   gpu.observeFrames(16.7, 16.7, 24, 1001)
   assert.equal(observed, 1)
 })
+
+
+test("a small projection starts a new chunk instead of splitting across its boundary", async () => {
+  const h = harness(1024 * 128 * 1024)
+  Object.assign(h.gpu, { sliceReads: 1000 * 128 * 1024 })
+  await h.gpu.runAsync({ ...pass, name: "matmul", work: 1024,
+    rect: { x: 0, y: 0, width: 128, height: 64 } })
+  assert.deepEqual(h.passes.map(p => p.rect), [{ x: 0, y: 0, width: 128, height: 64 }])
+  assert.equal(h.finishes(), 1)
+})

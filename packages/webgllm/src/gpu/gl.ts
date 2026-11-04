@@ -800,12 +800,14 @@ export class Gpu {
         Math.floor((this.readsPerSlice - this.sliceReads) / perRow)
       )
       // End paced matrix draws on raster-tile boundaries. Flushing
-      // arbitrary bands makes the GPU store/reload the same boundary
+      // A small projection also starts a new chunk rather than splitting.
+      // Arbitrary bands make the GPU store/reload the same boundary
       // tiles repeatedly, unlike the original uninterrupted render pass.
       const quantum = pass.name === "matmul" && rect.height >= 32 ? 32 : 1
       if (
         quantum > 1 &&
-        rows < quantum &&
+        (rows < quantum ||
+          (y === rect.y && rect.height * perRow <= this.readsPerSlice / 8 && rows < rect.height)) &&
         this.sliceReads > 0 &&
         this.readsPerSlice >= perRow * quantum
       ) {
