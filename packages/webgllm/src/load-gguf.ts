@@ -61,6 +61,8 @@ export type LoadGgufOptions = {
   embeddingChunkRows?: number
   /** Concurrent reads within the existing 24 MiB read-ahead byte cap. */
   readAhead?: number
+  /** Worker-owned fresh ByteSource reads may be retired after conversion. */
+  releaseReadBuffers?: boolean
   /** Filled with the error of requantizing a float embedding to 8 bits. */
   requantStats?: RequantStats
 }
@@ -96,7 +98,7 @@ export async function* loadGguf(
   const kPerm = headPermutation(numKvHeads, headDim, config.ropeDimsFull)
   const normPerm = headPermutation(1, headDim, config.ropeDimsFull)
 
-  const plan = new ReadPlan(options.readAhead ?? 6)
+  const plan = new ReadPlan(options.readAhead ?? 6, 24 << 20, options.releaseReadBuffers === true)
   let largestTensorBytes = 0
   const want = (name: string) => {
     const info = tensor(name)
@@ -177,12 +179,17 @@ export async function* loadGguf(
     })
   }
 
+  const readFloats = async (name: string) => {
+    const bytes = await plan.take(name)
+    try { return toFloats(tensor(name), bytes) }
+    finally { plan.release(bytes) }
+  }
   const norm = async (
     name: string,
     length = D,
     perm?: Int32Array
   ): Promise<Float32Array> => {
-    const values = toFloats(tensor(name), await plan.take(name))
+    const values = await readFloats(name)
     if (values.length !== length)
       throw new Error(
         `GGUF: ${name} has ${values.length} values, expected ${length}`
@@ -218,7 +225,8 @@ export async function* loadGguf(
     let row0 = 0
     // A tensor two parts read (Qwen3.5's q and gate) is taken once.
     const taken = new Map<string, Uint8Array>()
-    for (let p = 0; p < parts.length; p++) {
+    const lastUse = new Map(parts.map((part, index) => [part.name, index]))
+    try { for (let p = 0; p < parts.length; p++) {
       const { name, rows, perm, tensorRows = rows } = parts[p]
       const info = infos[p]
       if (
@@ -233,8 +241,9 @@ export async function* loadGguf(
       let bytes = taken.get(name)
       if (!bytes) taken.set(name, (bytes = await plan.take(name)))
       packRows(m, row0, info, bytes, rows, perm)
+      if (lastUse.get(name) === p) { plan.release(bytes); taken.delete(name) }
       row0 += rows
-    }
+    } } finally { for (const bytes of taken.values()) plan.release(bytes) }
     return m
   }
 
@@ -277,7 +286,7 @@ export async function* loadGguf(
       // ggml [width, channels]: each channel's taps contiguous, oldest first.
       if (convInfo.dims[0] !== l.convKernel || convInfo.dims[1] !== channels)
         throw new Error(`GGUF: ${convInfo.name} is [${convInfo.dims}]`)
-      const convKernel = toFloats(convInfo, await plan.take(convInfo.name))
+      const convKernel = await readFloats(convInfo.name)
       linear = {
         inProj,
         ba,
@@ -324,7 +333,7 @@ export async function* loadGguf(
       if (convInfo.dims[0] !== config.convKernel || convInfo.dims[1] !== D) {
         throw new Error(`GGUF: ${convInfo.name} is [${convInfo.dims}]`)
       }
-      const kernel = toFloats(convInfo, await plan.take(convInfo.name))
+      const kernel = await readFloats(convInfo.name)
       conv = { inProj, outProj, kernel }
     } else {
       const kv = numKvHeads * headDim
@@ -391,6 +400,7 @@ export async function* loadGguf(
       rowsToFloats(embedding, bytes, rows, values)
       quantizeQ8(m, 0, values, rows, options.requantStats)
     } else packRows(m, 0, embedding, bytes, rows)
+    plan.release(bytes)
     yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
 }

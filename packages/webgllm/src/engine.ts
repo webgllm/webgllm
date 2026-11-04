@@ -1763,16 +1763,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
         ? TUNING.embeddingPanelRows
         : 0
     const panelCount = panelRows > 0 ? Math.ceil(rowsPerColumn / panelRows) : 1
-    const quantPanels =
-      panelCount > 1 && panelCount + 4 <= this.gpu.limits.maxTextureUnits
-        ? Array.from({ length: panelCount }, (_, i) =>
-            this.gpu.texture(
-              quantFormat,
-              columns * rowTexels,
-              Math.min(panelRows, rowsPerColumn - i * panelRows)
-            )
-          )
-        : undefined
+    // Allocate later panels only when their file chunk is uploaded. This
+    // spreads initialization across the existing paced upload boundaries.
+    const quantPanels = panelCount > 1 && panelCount + 4 <= this.gpu.limits.maxTextureUnits
+      ? new Array<Texture>(panelCount) : undefined
+    if (quantPanels) quantPanels[0] = this.gpu.texture(
+      quantFormat, columns * rowTexels, Math.min(panelRows, rowsPerColumn)
+    )
     return {
       N,
       K,
@@ -1877,7 +1874,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   rmsReport: Array<{ parts: number; ms: number }> = []
   private packingMeasured = false
   private promptMatmulMeasured = false
-  packingReport: Array<{pack:number;rows:number;ms:number;matmul?:number}> = []
+  packingReport: Array<{pack:number;rows:number;ms:number;matmul?:number;verificationRows?:number;verificationMs?:number}> = []
 
   private legacyF16: { bytes: number; kMax: number; half: boolean } | null = null
 
@@ -2100,33 +2097,66 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     try {
       for (let i = 0; i < options.length; i++)
         await sample(i, Math.min(probeRows, Math.max(64, TUNING.f16MinRows)))
+      const verification = options.map(() => NaN)
+      const verificationRows = Math.min(probeRows, Math.max(64, TUNING.f16MinRows))
       const timed = async (i: number) => {
-        const start = performance.now(),
-          beforeWork = this.gpu.submittedWork
+        const start = performance.now(), beforeWork = this.gpu.submittedWork,
+          beforeCompile = this.gpu.compiled?.count ?? 0
         await sample(i)
         samples[i].push(performance.now() - start)
         work[i].push(this.gpu.submittedWork - beforeWork)
+        return (this.gpu.compiled?.count ?? 0) !== beforeCompile
       }
-      // Warm the complete batch before its timed repetition. This avoids
-      // selecting a layout from first-touch texture allocation or a partial
-      // batch's different shader/cache behavior.
-      // Compile and first-touch every complete candidate conservatively.
-      // Shader creation must not masquerade as a failed overlap trial.
-      for (let i = 0; i < options.length; i++) await sample(i)
+      // The short warm-up compiles the same kernels and touches their full
+      // weight scratch. Observe compilation rather than always repeating
+      // every full-batch candidate before measuring it.
       trial = true
-      for (let round = 0; round < 2; round++) {
-        for (let j = 0; j < options.length; j++)
-          await timed(round ? options.length - 1 - j : j)
+      let compiled = false
+      for (let i = 0; i < options.length; i++) compiled = await timed(i) || compiled
+      let verifiedWinner = -1
+      if (compiled) {
+        // An unanticipated full-batch specialization gets the conservative
+        // complete warm-up and two reversed full-size pairs.
+        trial = false
+        for (let i = 0; i < options.length; i++) await sample(i)
+        overlap = Math.max(quota, 2 ** 29)
+        allowOverlap = true
+        overlapFailures = 0
+        for (const row of samples) row.length = 0
+        for (const row of work) row.length = 0
+        trial = true
+        for (let i = 0; i < options.length; i++) await timed(i)
+      } else if (options.length === 2 && verificationRows < probeRows) {
+        const winner = samples[1][0] < samples[0][0] ? 1 : 0, other = 1 - winner
+        if (samples[winner][0] < samples[other][0] * 0.8) {
+          let shortCompiled = false
+          // Verify a large full-batch win at the shorter size, in reverse
+          // order. A disagreement or a close result retains both full pairs.
+          for (let i = options.length - 1; i >= 0; i--) {
+            const start = performance.now(), before = this.gpu.compiled?.count ?? 0
+            await sample(i, verificationRows)
+            verification[i] = performance.now() - start
+            shortCompiled ||= (this.gpu.compiled?.count ?? 0) !== before
+          }
+          if (!shortCompiled && verification[winner] < verification[other] * 0.9)
+            verifiedWinner = winner
+        }
       }
+      if (verifiedWinner < 0)
+        for (let i = options.length - 1; i >= 0; i--) await timed(i)
       this.packingReport = options.map((setting, i) => ({
         ...setting,
         rows: probeRows,
-        ms: Math.min(...samples[i])
+        ms: Math.min(...samples[i]),
+        ...(Number.isFinite(verification[i]) && { verificationRows, verificationMs: verification[i] })
       }))
       // A clock or compiler transition must not pick the next session's
-      // kernel from one favorable sample. Require both reversed pairs.
+      // kernel from one favorable sample. Require reversed verification;
+      // close results retain both full-size pairs.
       const eligible = this.packingReport.filter((_, i) =>
-        i === 0 || samples[i].every((ms, round) => ms < samples[0][round] * 0.98)
+        i === 0 || (verifiedWinner >= 0
+          ? i === verifiedWinner
+          : samples[i].every((ms, round) => ms < samples[0][round] * 0.98))
       )
       const best = eligible.reduce((a, b) => (b.ms < a.ms ? b : a))
       const selected = this.packingReport.indexOf(best)
@@ -2403,6 +2433,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const y = g - column * rowsPerColumn
       const panelRows = gm.quantPanels?.[0].height ?? rowsPerColumn
       const panel = Math.floor(y / panelRows)
+      if (gm.quantPanels && !gm.quantPanels[panel])
+        gm.quantPanels[panel] = this.gpu.texture(
+          gm.quants.internal, gm.quants.width,
+          Math.min(panelRows, rowsPerColumn - panel * panelRows)
+        )
       const run = Math.min(
         g0 + groups - g,
         rowsPerColumn - y,
@@ -5183,8 +5218,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.guessAt = null
   }
 
-  /** The penalty mask on the CPU side, mirrored to the GPU's. */
+  /** Seen-token bits; the GPU retains its byte mask including padding bans. */
   private maskData: Uint8Array | null = null
+  private maskLimit = 0
+  private maskUpdate: Uint8Array | null = null
 
   /**
    * Sets which tokens the repetition penalty applies to, and bans every id
@@ -5192,10 +5229,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   setSeen(tokens: Iterable<number>, vocabLimit: number) {
     const mask = this.buffers.mask
-    const data = new Uint8Array(mask.width * mask.height)
-    data.fill(2, Math.min(vocabLimit, data.length))
-    for (const t of tokens) if (t < vocabLimit) data[t] = 1
-    this.maskData = data
+    const size = mask.width * mask.height, bytes = Math.ceil(size / 8)
+    const bits = this.maskData?.length === bytes ? this.maskData : new Uint8Array(bytes)
+    bits.fill(0)
+    this.maskLimit = Math.min(vocabLimit, size)
+    const data = new Uint8Array(size)
+    data.fill(2, this.maskLimit)
+    for (const t of tokens) if (Number.isInteger(t) && t >= 0 && t < this.maskLimit) {
+      data[t] = 1
+      bits[t >> 3] |= 1 << (t & 7)
+    }
+    this.maskData = bits
     this.gpu.write(
       mask,
       { x: 0, y: 0, width: mask.width, height: mask.height },
@@ -5205,13 +5249,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         pixels: data
       }
     )
+    releaseOwnedBuffer(data.buffer)
   }
 
   /** Adds one token to those the repetition penalty applies to. */
   markSeen(token: number) {
     const data = this.maskData
-    if (!data || data[token] !== 0) return
-    data[token] = 1
+    if (!data || !Number.isInteger(token) || token < 0 || token >= this.maskLimit) return
+    const index = token >> 3, bit = 1 << (token & 7)
+    if (data[index] & bit) return
+    data[index] |= bit
+    const update = this.maskUpdate ??= new Uint8Array([1])
     const width = this.buffers.mask.width
     this.gpu.write(
       this.buffers.mask,
@@ -5219,7 +5267,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       {
         format: GL.RED_INTEGER,
         type: GL.UNSIGNED_BYTE,
-        pixels: data.subarray(token, token + 1)
+        pixels: update
       }
     )
   }

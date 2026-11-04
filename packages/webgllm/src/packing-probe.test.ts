@@ -38,6 +38,7 @@ function fixture(native = false, fail = false) {
     gpu: {
       activePhase: "load",
       submittedWork: 0,
+      compiled: { count: 0 },
       readsPerSlice: 2 ** 30,
       presentationAdvice: { relaxation: true, cap: 24 },
       primePresentation(_window: number, reads: number, allow = true) {
@@ -86,7 +87,7 @@ for (const fail of [false, true])
     if (fail) await assert.rejects(result, /probe failed/)
     else {
       await result
-      assert.equal(calls(), 8)
+      assert.ok(calls() >= 6)
     }
     assert.equal(state.layers, layers)
     assert.equal(state.work, null)
@@ -171,4 +172,37 @@ test("a fast successful complete pipeline retains its tested presentation window
   state.forwardHidden = async tokens => { await forward(tokens); clock += 5 }
   await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
   assert.equal(state.tuned.submissionWindow, 24)
+})
+
+
+test("a large packing win requires agreement from the reversed short pair", async (t) => {
+  const { state, calls } = fixture(false)
+  let clock=0
+  t.mock.method(performance,"now",()=>clock)
+  const forward=state.forwardHidden.bind(state)
+  state.forwardHidden=async tokens=>{await forward(tokens);clock+=tokens.length*(state.tuned.f16Pack===3?1:0.6)}
+  await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
+  assert.equal(state.tuned.f16Pack,0)
+  assert.equal(calls(),6)
+})
+
+test("a short-size disagreement rejects a misleading first full-batch win", async (t) => {
+  const { state } = fixture(false)
+  let clock=0,full=0
+  t.mock.method(performance,"now",()=>clock)
+  const forward=state.forwardHidden.bind(state)
+  state.forwardHidden=async tokens=>{await forward(tokens);if(state.tuned.f16Pack===3)clock+=10;else if(tokens.length===512)clock+=++full===1?6:12;else clock+=12}
+  await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
+  assert.equal(state.tuned.f16Pack,3)
+})
+
+test("new full-batch compilation retains complete warm-up and full reversed pairs", async (t) => {
+  const { state, calls }=fixture(false)
+  let clock=0,compiled=false
+  t.mock.method(performance,"now",()=>clock)
+  const forward=state.forwardHidden.bind(state)
+  state.forwardHidden=async tokens=>{await forward(tokens);clock+=10;if(tokens.length===512&&!compiled){state.gpu.compiled.count++;compiled=true}}
+  await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
+  assert.equal(calls(),10)
+  assert.equal(state.tuned.f16Pack,3)
 })

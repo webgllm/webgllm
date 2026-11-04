@@ -273,7 +273,8 @@ async function load(
       meta.files.kind === "gguf"
         ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
-            readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead)
+            readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
+            releaseReadBuffers: canReleaseStaging
           }))
         : loadOnnx({
             config: JSON.parse(await weightFiles[0].text()) as Record<

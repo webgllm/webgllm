@@ -15,13 +15,17 @@ export type PlannedRead = {
  * flight ahead of the one in use (bounded in count and bytes), so network
  * latency overlaps the repacking without holding more than a few tensors.
  */
+type ReadLease = { length: number; remaining: number; borrowed: number }
+
 export class ReadPlan {
+  private owned = new WeakMap<ArrayBufferLike, ReadLease>()
+  private released = new WeakSet<Uint8Array>()
   private reads: Array<PlannedRead> = []
   private pending: Array<{
     key: string
     promise: Promise<Uint8Array>
     length: number
-    lease: { length: number }
+    lease: ReadLease
   }> = []
   private next = 0
   private started = false
@@ -29,7 +33,8 @@ export class ReadPlan {
 
   constructor(
     private ahead = 3,
-    private maxBytesAhead = 24 << 20
+    private maxBytesAhead = 24 << 20,
+    private retireConsumed = false
   ) {}
 
   add(read: PlannedRead): void {
@@ -64,8 +69,15 @@ export class ReadPlan {
         }
       }
       this.next += batch.length
-      const lease = { length }
-      const read = first.bytes ? Promise.resolve(first.bytes) : first.source.read(first.offset, length)
+      const lease = { length, remaining: batch.length, borrowed: 0 }
+      const incoming = first.bytes ? Promise.resolve(first.bytes) : first.source.read(first.offset, length)
+      const read = this.retireConsumed ? incoming.then(data => {
+        // Only a complete, newly owned read can be retired. Inline tensors
+        // and slices of an external backing store retain their ownership.
+        if (!first.bytes && data.byteOffset === 0 && data.byteLength === length && data.buffer.byteLength === length)
+          this.owned.set(data.buffer, lease)
+        return data
+      }) : incoming
       let offset = 0
       for (const item of batch) {
         const from = offset
@@ -87,6 +99,22 @@ export class ReadPlan {
     if (p.key !== key)
       throw new Error(`loader took ${key} but ${p.key} was planned next`)
     this.fill()
-    return p.promise
+    if (!this.retireConsumed) return p.promise
+    const bytes = await p.promise
+    p.lease.remaining--
+    p.lease.borrowed++
+    return bytes
+  }
+
+  /** The converter has finished all uses of this returned view. */
+  release(bytes: Uint8Array): void {
+    if (!this.retireConsumed || this.released.has(bytes)) return
+    const buffer = bytes.buffer, lease = this.owned.get(buffer)
+    if (!lease) return
+    this.released.add(bytes)
+    lease.borrowed--
+    if (lease.remaining || lease.borrowed) return
+    this.owned.delete(buffer)
+    ;(buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
   }
 }
