@@ -207,7 +207,7 @@ export function naturalPromptPlan(
 /**
  * Reads prompt[start..] into `engine` (whose cache holds prompt[..start])
  * as promptPlan says, appending each batch to `cached` once it's read.
- * Stops after a batch if `stop` says so. Returns the last batch's row of
+ * Checks `stop` before and after every batch. Returns the last batch's row of
  * the last token read (see Engine.forwardHidden).
  */
 export async function readPrompt(
@@ -217,6 +217,7 @@ export async function readPrompt(
   cached: Array<number>,
   options: { stop?: () => boolean; anchor?: number; prefix?: number; observedPrefix?: number; checkpoints?: boolean } = {}
 ): Promise<number> {
+  if (options.stop?.()) return 0
   const few = engine.snapshotLimit < 4
   // Rewind may select an ordinary retained checkpoint. Promoting it is metadata
   // only: don't lose that verified fallback to a later long dynamic tail.
@@ -228,6 +229,7 @@ export async function readPrompt(
     ? engine.batchSizes(prompt.length - start).map(size => ({ size, snapshot: null }))
     : naturalPromptPlan(n => engine.batchSizes(n), prompt.length, start, options.anchor, few, engine.canSaveInside, engine.snapshotLimit >= 2 ? options.prefix : undefined)
   for (const { size, snapshot, saveAt, prefix: alsoPrefix } of plan) {
+    if (options.stop?.()) break
     const batch = prompt.slice(i, i + size)
     i += size
     const observed = options.checkpoints === false || engine.snapshotLimit < 2 ? undefined : options.observedPrefix

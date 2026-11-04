@@ -479,8 +479,9 @@ async function generate(request: GenerateRequest) {
     tokenizer.vocabSize
   )
   const schemaMs = performance.now() - schemaAt
-  engine.setAllowedTokens(null)
   try {
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  engine.setAllowedTokens(null)
   const room = engine.contextLength - prompt.length
   if (room <= 0) {
     throw new Error(

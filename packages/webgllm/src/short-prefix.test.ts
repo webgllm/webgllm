@@ -109,7 +109,10 @@ test("interrupted in-batch extraction frees every partial texture and clears tra
 test("stop after a batch retains only committed prefix state and reset frees it", async () => {
   const { engine, snapshots, live } = harness(2)
   const cached: number[] = []
-  await readPrompt(engine, Array(800).fill(1), 0, cached, { prefix: 256, observedPrefix: 256, anchor: 800, stop: () => true })
+  const forward = engine.forwardHidden.bind(engine)
+  let stopped = false
+  engine.forwardHidden = async (...args) => { const row = await forward(...args); stopped = true; return row }
+  await readPrompt(engine, Array(800).fill(1), 0, cached, { prefix: 256, observedPrefix: 256, anchor: 800, stop: () => stopped })
   assert.equal(cached.length, 512)
   assert.equal(engine.snapshotPosition("prefix"), 256)
   assert.ok(snapshots.size <= 2)
