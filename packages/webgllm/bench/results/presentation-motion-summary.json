@@ -4,6 +4,24 @@
     {
       "mode": "before",
       "id": "pixel-presentation-before",
+      "phaseWindowsSeconds": {
+        "idle": [
+          0.22750999999046329,
+          5.235
+        ],
+        "prefill": [
+          12.279,
+          17.006
+        ],
+        "decode": [
+          17.006,
+          23.07
+        ]
+      },
+      "clock": {
+        "recordHostStartMs": 1793793483708,
+        "deviceMinusHostMs": 1528
+      },
       "videoFile": "webgl-performance-motion-before.mp4",
       "recording": {
         "width": 720,
@@ -41,6 +59,24 @@
     {
       "mode": "after",
       "id": "pixel-presentation-after",
+      "phaseWindowsSeconds": {
+        "idle": [
+          0.44797000002860976,
+          5.454
+        ],
+        "prefill": [
+          14.286,
+          19.046
+        ],
+        "decode": [
+          19.046,
+          24.049
+        ]
+      },
+      "clock": {
+        "recordHostStartMs": 1793793515130,
+        "deviceMinusHostMs": 1530
+      },
       "videoFile": "webgl-performance-motion-after.mp4",
       "recording": {
         "width": 720,

@@ -1,10 +1,10 @@
 {
   "baselineCommit": "2c10f9e659426eac4d9c493692272edf85840610",
   "branch": "perf/webgl-performance",
-  "engineCommit": "6a6e6415fcfbab10644e869f5125b0fbfc76f8c0",
+  "engineCommit": "21594fd2cf3128b40a1e979b688d370bced3c210",
   "clientCadenceGuardCommit": "6a6e641",
   "clientCadenceGuardCoverage": "Rounded-millisecond 60/120 Hz paths were unit-tested after timing runs; measured fractional-ms estimator unchanged.",
-  "recordedAt": "2026-11-04T12:13:33.188Z",
+  "recordedAt": "2026-11-04T12:15:24.221Z",
   "node": "v24.20.0",
   "modelMeasurements": "Physical Pixel and iPhone, followed by the user-authorized M3 Ultra Chrome benchmark.",
   "baselineWorkerSha256": "06884bd0b0ed1e8724d293c71080f8245d883498fd0139aa6cca8b284f351df0",
@@ -20,13 +20,13 @@
     "after": "135399ab4913b4d8552067fcb0c2f386a8b329421250a79081b8157d27ed8b00"
   },
   "selectedResultsSha256": "c8868daebc86e4d6070170ee233967b5f1be4f9631cf56b8d464fdf7eb48e08e",
-  "presentationMotionSummarySha256": "7203ba6d0cc59e273ea0585e5fc02aad8286e9183d128e93ee74d0b34aa186b5",
+  "presentationMotionSummarySha256": "7473eb6d12c8a6308eeeb2140eb30c2a5a0640071e61e899a799ea5111c5c630",
   "presentationFramesSha256": "f897be387b8f18304813faa63820c36c7e7800063031aaaf06d25a7e25890572",
   "reportSha256": "0265b411f7e8dd6420a229bcf34f0f15f79fa900df515888c88cc6fb61d34907",
   "optimizedWorkerSha256": "6dce0640d580bcb2f00249ab7470d72c090716aedef4bcc45a554df9a00741ab",
   "buildCommand": "node packages/webgl/bench/build-workers.mjs CHECKOUT current-worker.js",
   "sources": {
-    "packages/webgl/bench/analyze-screen-motion.mjs": "70f7b2c30d04598b1d354533bd19099955a1e8d738d54eb7720b569744e03522",
+    "packages/webgl/bench/analyze-screen-motion.mjs": "ece516d2a8f6e486189c1ea5f3632c5ba8c45ee1c298f778cafba4daef85053b",
     "packages/webgl/bench/build-workers.mjs": "240b33fe46844f4d08a332f723dc570ec53c0f64312d68601c745de1a8911141",
     "packages/webgl/bench/calibration-cdp.mjs": "7b8ae08ba5dd67483d36795c8295648c2cb81f0bd28c8c0b602fed680047763f",
     "packages/webgl/bench/collect-results.mjs": "bd17aa83cf23080e1d2b18406d23f4065ffb7ceb8a4f42aafb167ade47e97370",

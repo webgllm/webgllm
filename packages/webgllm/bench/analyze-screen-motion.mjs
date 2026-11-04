@@ -61,7 +61,7 @@ for (const capture of captures) {
     phases[phase]={frames:chosen.length,spanSeconds:valid.at(-1).t-valid[0].t,motionEventsPerSecond:motion/(valid.at(-1).t-valid[0].t),longestPositionHoldMs:longest*1000}
   }
   allFrames.push(...frames)
-  results.push({mode:capture.mode,id:capture.id,videoFile:capture.video.split('/').at(-1),recording:info,roi:{x:0,y:y0,width:info.width,height},phases})
+  results.push({mode:capture.mode,id:capture.id,phaseWindowsSeconds:windows,clock:{recordHostStartMs:capture.recordHostStartMs,deviceMinusHostMs:capture.deviceMinusHostMs},videoFile:capture.video.split('/').at(-1),recording:info,roi:{x:0,y:y0,width:info.width,height},phases})
 }
 fs.writeFileSync(output,JSON.stringify({method:'Green-ball centroid in 720x1600 Android screenrecord frames; 0.25 px motion threshold; discard 350 ms at phase edges. This recording adds compositor/encoder work, so these are diagnostic motion events, not primary model throughput or an exact display FPS counter.',results},null,2)+'\n')
 fs.writeFileSync(frameOutput,allFrames.map(JSON.stringify).join('\n')+'\n')
