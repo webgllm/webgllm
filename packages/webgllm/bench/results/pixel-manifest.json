@@ -1,0 +1,60 @@
+{
+  "metadata": {
+    "device": "Pixel 10 Pro",
+    "os": "Android 17",
+    "browser": "Chrome 156.0.8078.73",
+    "renderer": "ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)",
+    "baselineCommit": "2c10f9e",
+    "branch": "perf/webgl-performance",
+    "model": "LiquidAI/LFM3-1.7B-GGUF",
+    "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+    "promptBatch": 512,
+    "maxOutputTokens": 64,
+    "thinking": false,
+    "speculative": true,
+    "benchmarkTabs": 1,
+    "idleMs": 60000,
+    "restBetweenRoundsMs": 60000,
+    "optimizedEngineCode": 3321799229,
+    "optimizedCommit": "51b0400",
+    "fileBytes": 1049615680,
+    "presentationMotionFile": "presentation-motion-summary.json"
+  },
+  "runs": {
+    "beforeShort": "pixel-rested-before-short",
+    "afterShort": "pixel-final-short-3321799229",
+    "beforeLong": "pixel-rested-before-long",
+    "afterLong": "pixel-final-long-3321799229",
+    "sampled": "pixel-final-sampled-3321799229"
+  },
+  "files": {
+    "loadBefore": "pixel-load-final-before.json",
+    "loadAfter": "pixel-load-release-after.json",
+    "memoryBeforeShort": "pixel-memory-cached-before-short.json",
+    "memoryAfterShort": "pixel-memory-release-after-short.json",
+    "memoryBeforeLong": "pixel-memory-cached-before-long.json",
+    "memoryAfterLong": "pixel-memory-release-after-long.json"
+  },
+  "qualityRun": "pixel-final-quality-3321799229",
+  "interrupted": [
+    {
+      "id": "load-final-cold-1",
+      "loadMs": 34183,
+      "frameGapMs": 30085.935,
+      "reason": "User confirmed closing other tabs during this run; retained in raw data, excluded from controlled comparison."
+    }
+  ],
+  "controls": [
+    {
+      "name": "Timer-free polling",
+      "ids": [
+        "pixel-fence-poll-control"
+      ],
+      "interpretation": "Rejected: the second long run fell below the 12 generated tokens/s target."
+    }
+  ],
+  "evidenceRunIds": [
+    "pixel-presentation-before",
+    "pixel-presentation-after"
+  ]
+}

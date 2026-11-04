@@ -1,0 +1,1612 @@
+{
+  "url": "https://mold-filters-instructional-olive.trycloudflare.com/webgl-perf.html?id=iphone-adjacent-memory-after-long&production=1&hold=1&rounds=1&len=2048&idleMs=3000",
+  "complete": true,
+  "tracking": true,
+  "samples": [
+    {
+      "at": 1793781404002,
+      "phase": "loading",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 94671705
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 104278183
+        },
+        {
+          "type": "other",
+          "size": 115310592
+        }
+      ]
+    },
+    {
+      "at": 1793781404493,
+      "phase": "loading",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145629251
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 104552381
+        },
+        {
+          "type": "other",
+          "size": 115392512
+        }
+      ]
+    },
+    {
+      "at": 1793781405013,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145632323
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103484349
+        },
+        {
+          "type": "other",
+          "size": 115392512
+        }
+      ]
+    },
+    {
+      "at": 1793781405519,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145635395
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103366589
+        },
+        {
+          "type": "other",
+          "size": 115392512
+        }
+      ]
+    },
+    {
+      "at": 1793781406020,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145638467
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103396285
+        },
+        {
+          "type": "other",
+          "size": 115392512
+        }
+      ]
+    },
+    {
+      "at": 1793781406526,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145691715
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103408573
+        },
+        {
+          "type": "other",
+          "size": 115441664
+        }
+      ]
+    },
+    {
+      "at": 1793781407028,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145694787
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103421885
+        },
+        {
+          "type": "other",
+          "size": 115441664
+        }
+      ]
+    },
+    {
+      "at": 1793781407531,
+      "phase": "idle",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145751107
+        },
+        {
+          "type": "jit",
+          "size": 851968
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 103496637
+        },
+        {
+          "type": "other",
+          "size": 115441664
+        }
+      ]
+    },
+    {
+      "at": 1793781408020,
+      "phase": "load",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145761347
+        },
+        {
+          "type": "jit",
+          "size": 1769472
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 323031997
+        },
+        {
+          "type": "other",
+          "size": 126009344
+        }
+      ]
+    },
+    {
+      "at": 1793781408526,
+      "phase": "load",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145910851
+        },
+        {
+          "type": "jit",
+          "size": 1884160
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 265866173
+        },
+        {
+          "type": "other",
+          "size": 129155072
+        }
+      ]
+    },
+    {
+      "at": 1793781409037,
+      "phase": "load",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145967171
+        },
+        {
+          "type": "jit",
+          "size": 1966080
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 206237629
+        },
+        {
+          "type": "other",
+          "size": 124420096
+        }
+      ]
+    },
+    {
+      "at": 1793781409535,
+      "phase": "load",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 145996867
+        },
+        {
+          "type": "jit",
+          "size": 2048000
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 221035453
+        },
+        {
+          "type": "other",
+          "size": 117948416
+        }
+      ]
+    },
+    {
+      "at": 1793781410034,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146003011
+        },
+        {
+          "type": "jit",
+          "size": 3260416
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 227369917
+        },
+        {
+          "type": "other",
+          "size": 117997568
+        }
+      ]
+    },
+    {
+      "at": 1793781410538,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146026563
+        },
+        {
+          "type": "jit",
+          "size": 3342336
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 227772349
+        },
+        {
+          "type": "other",
+          "size": 117997568
+        }
+      ]
+    },
+    {
+      "at": 1793781411038,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146048067
+        },
+        {
+          "type": "jit",
+          "size": 3358720
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220951485
+        },
+        {
+          "type": "other",
+          "size": 117997568
+        }
+      ]
+    },
+    {
+      "at": 1793781411543,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146055235
+        },
+        {
+          "type": "jit",
+          "size": 3424256
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220977085
+        },
+        {
+          "type": "other",
+          "size": 117997568
+        }
+      ]
+    },
+    {
+      "at": 1793781412048,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146060355
+        },
+        {
+          "type": "jit",
+          "size": 3440640
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 221316029
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781412550,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146083907
+        },
+        {
+          "type": "jit",
+          "size": 3440640
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 224782269
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781413050,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146236483
+        },
+        {
+          "type": "jit",
+          "size": 3457024
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 214275005
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781413555,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146554947
+        },
+        {
+          "type": "jit",
+          "size": 3522560
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 215037885
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781414061,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 146838595
+        },
+        {
+          "type": "jit",
+          "size": 3522560
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 215507901
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781414570,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 147157059
+        },
+        {
+          "type": "jit",
+          "size": 3522560
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 214681533
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781415071,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 147507267
+        },
+        {
+          "type": "jit",
+          "size": 3538944
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 213036989
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781415578,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 147775555
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 218273725
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781416078,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 148125763
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 211419069
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781416579,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 148410435
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 214607805
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781417081,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 148726851
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 216159165
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781417587,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 149061699
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 216938429
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781418088,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 149329987
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220471229
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781418589,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 149631043
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 214501309
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781419096,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 149981251
+        },
+        {
+          "type": "jit",
+          "size": 3571712
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 211742653
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781419597,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 150298691
+        },
+        {
+          "type": "jit",
+          "size": 3588096
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 216094653
+        },
+        {
+          "type": "other",
+          "size": 118030336
+        }
+      ]
+    },
+    {
+      "at": 1793781420100,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 150583363
+        },
+        {
+          "type": "jit",
+          "size": 3604480
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220954557
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781420604,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 150917187
+        },
+        {
+          "type": "jit",
+          "size": 3604480
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 219162557
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781421109,
+      "phase": "prefill",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 151218243
+        },
+        {
+          "type": "jit",
+          "size": 3604480
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 214781885
+        },
+        {
+          "type": "other",
+          "size": 117932032
+        }
+      ]
+    },
+    {
+      "at": 1793781421606,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 151537731
+        },
+        {
+          "type": "jit",
+          "size": 3784704
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 229306301
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781422108,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 151822403
+        },
+        {
+          "type": "jit",
+          "size": 3932160
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 221779901
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781422611,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 152158275
+        },
+        {
+          "type": "jit",
+          "size": 4063232
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220231613
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781423122,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 152509507
+        },
+        {
+          "type": "jit",
+          "size": 4243456
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 224009149
+        },
+        {
+          "type": "other",
+          "size": 118505472
+        }
+      ]
+    },
+    {
+      "at": 1793781423630,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 152794179
+        },
+        {
+          "type": "jit",
+          "size": 4292608
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 219218877
+        },
+        {
+          "type": "other",
+          "size": 118505472
+        }
+      ]
+    },
+    {
+      "at": 1793781424129,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 153095235
+        },
+        {
+          "type": "jit",
+          "size": 4292608
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 221965245
+        },
+        {
+          "type": "other",
+          "size": 117981184
+        }
+      ]
+    },
+    {
+      "at": 1793781424633,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 153494595
+        },
+        {
+          "type": "jit",
+          "size": 4374528
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 222565309
+        },
+        {
+          "type": "other",
+          "size": 118259712
+        }
+      ]
+    },
+    {
+      "at": 1793781425131,
+      "phase": "decode",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 153796675
+        },
+        {
+          "type": "jit",
+          "size": 4456448
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 220706749
+        },
+        {
+          "type": "other",
+          "size": 118259712
+        }
+      ]
+    },
+    {
+      "at": 1793781425636,
+      "phase": "retained",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95524687
+        },
+        {
+          "type": "jit",
+          "size": 4489216
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 285074609
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781426142,
+      "phase": "retained",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95525711
+        },
+        {
+          "type": "jit",
+          "size": 4243456
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 213033137
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781426648,
+      "phase": "retained",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95525711
+        },
+        {
+          "type": "jit",
+          "size": 4243456
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 207315121
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781427154,
+      "phase": "retained",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95525711
+        },
+        {
+          "type": "jit",
+          "size": 4243456
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 207331505
+        },
+        {
+          "type": "other",
+          "size": 118177792
+        }
+      ]
+    },
+    {
+      "at": 1793781427650,
+      "phase": "unloaded",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95567262
+        },
+        {
+          "type": "jit",
+          "size": 4243456
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 215170658
+        },
+        {
+          "type": "other",
+          "size": 115998720
+        }
+      ]
+    },
+    {
+      "at": 1793781428164,
+      "phase": "unloaded",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95567262
+        },
+        {
+          "type": "jit",
+          "size": 884736
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 106135138
+        },
+        {
+          "type": "other",
+          "size": 115998720
+        }
+      ]
+    },
+    {
+      "at": 1793781428666,
+      "phase": "unloaded",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95567262
+        },
+        {
+          "type": "jit",
+          "size": 884736
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 105496162
+        },
+        {
+          "type": "other",
+          "size": 115998720
+        }
+      ]
+    },
+    {
+      "at": 1793781429171,
+      "phase": "unloaded",
+      "timestamp": 0,
+      "categories": [
+        {
+          "type": "javascript",
+          "size": 95567262
+        },
+        {
+          "type": "jit",
+          "size": 884736
+        },
+        {
+          "type": "images",
+          "size": 0
+        },
+        {
+          "type": "layers",
+          "size": 0
+        },
+        {
+          "type": "page",
+          "size": 105512546
+        },
+        {
+          "type": "other",
+          "size": 115998720
+        }
+      ]
+    }
+  ],
+  "errors": [],
+  "memoryPressure": [
+    {
+      "at": 1793781409646,
+      "phase": "load",
+      "method": "Memory.memoryPressure",
+      "timestamp": 0,
+      "severity": "non-critical"
+    }
+  ],
+  "state": {
+    "url": "https://mold-filters-instructional-olive.trycloudflare.com/webgl-perf.html?id=iphone-adjacent-memory-after-long&production=1&hold=1&rounds=1&len=2048&idleMs=3000",
+    "phase": "complete",
+    "text": "BEGIN idle\n{\"phase\":\"idle\",\"foregroundValid\":true,\"visibilityHistory\":[{\"name\":\"visible\",\"startTime\":0}],\"durationMs\":3004.6,\"frames\":361,\"fps\":120.14910470611728,\"p50\":8.320000000000164,\"p95\":8.759999999999764,\"p99\":9.299999999999727,\"max\":10.860000000000127,\"over34\":0,\"over100\":0,\"gpuEvents\":[],\"stalls\":[]}\nBEGIN load\nloading 0% cached=true\nloading 10% cached=true\nloading 20% cached=true\nloading 30% cached=true\nloading 40% cached=true\nloading 50% cached=true\nloading 60% cached=true\nloading 70% cached=true\nloading 80% cached=true\nloading 90% cached=true\nloading 100% cached=true\nload tuning: {\"head\":{\"expanded\":false,\"split\":2},\"headReport\":[],\"packing\":[],\"rms\":[],\"matvec\":[]}\n{\"phase\":\"load\",\"foregroundValid\":true,\"visibilityHistory\":[{\"name\":\"visible\",\"startTime\":0}],\"durationMs\":2251.22,\"frames\":270,\"fps\":119.93496859480638,\"p50\":8.320000000000164,\"p95\":8.779999999999745,\"p99\":9.479999999999563,\"max\":16.780000000000655,\"over34\":0,\"over100\":0,\"timings\":{\"context\":2,\"files\":3,\"calibrationCached\":1,\"engineCode\":446196241,\"weights\":1681,\"headExpanded\":0,\"headSplit\":2,\"promptPacking\":3,\"weightsReading\":925,\"weightsUploading\":605,\"f16Init\":1,\"packingProbe\":0,\"matvecProbe\":0,\"packingProbeRows\":0,\"rmsParts\":64,\"toRgba4\":241,\"repackOnnx\":0,\"repackGgufQ4\":495,\"repackGgufQ8\":0,\"repackGgufQ6\":64,\"warmUp\":287,\"programs\":65,\"compileMs\":146,\"warm_batch9\":21,\"warm_pick\":16,\"warm_logits\":2,\"warm_argmax\":1,\"warm_batchF16\":11,\"warm_draft\":1,\"warm_token\":0,\"warm_chunked\":5,\"tunedShortSplit\":2,\"tunedF16Matmul\":2,\"tunedF16Pack\":3,\"tunedFlashDecode\":-1,\"selfCheck\":0,\"total\":1973},\"gpuBytes\":1351582080,\"stageEvents\":[],\"gpuEvents\":[],\"stalls\":[]}\nBEGIN prefill\n{\"phase\":\"prefill\",\"foregroundValid\":true,\"visibilityHistory\":[{\"name\":\"visible\",\"startTime\":0}],\"durationMs\":11538.800000000001,\"frames\":1383,\"fps\":119.8564842097965,\"p50\":8.320000000003347,\"p95\":8.819999999999709,\"p99\":9.040000000000873,\"max\":14.040000000000873,\"over34\":0,\"over100\":0,\"gpuEvents\":[],\"stalls\":[]}\nBEGIN decode\n1 programs compiled during request run0: uP0,uP1,uP2,uP3\n{\"phase\":\"decode\",\"foregroundValid\":true,\"visibilityHistory\":[{\"name\":\"visible\",\"startTime\":0}],\"durationMs\":3930.800000000003,\"frames\":472,\"fps\":120.07733794647392,\"p50\":8.319999999999709,\"p95\":8.7599999999984,\"p99\":8.799999999999272,\"max\":8.920000000001892,\"over34\":0,\"over100\":0,\"round\":0,\"stats\":{\"inputTokens\":2085,\"cachedTokens\":0,\"outputTokens\":64,\"firstTokenMs\":11531.64,\"promptMs\":11525.42,\"decodeMs\":4009.959999999999,\"draftBatches\":1,\"draftsChecked\":4,\"draftsKept\":0},\"promptTps\":180.90447029262273,\"decodeTps\":15.710879909026527,\"reply\":\"The river flows by the historic old mill, its gentle current cutting through the landscape as it passes directly beneath the miller’s modest structure. Each morning, the miller’s daughter steps out to count sacks of grain, her routine beginning with the river’s steady presence at the mill’s edge. She pauses at\",\"gpuEvents\":[],\"stalls\":[]}\nBEGIN complete\nALL DONE\n",
+    "visible": "visible",
+    "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Mobile/15E148 Safari/604.1"
+  },
+  "workerTargets": 1,
+  "workerErrors": [],
+  "workerGpu": {
+    "gpuBytes": 1387836800,
+    "peakGpuBytes": 1387836800
+  },
+  "gcCollected": true
+}

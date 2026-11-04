@@ -1,0 +1,754 @@
+{
+  "device": "Pixel 10 Pro",
+  "os": "Android 17",
+  "browser": "Chrome 156.0.8078.73",
+  "renderer": "ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)",
+  "baselineCommit": "2c10f9e",
+  "branch": "perf/webgl-performance",
+  "model": "LiquidAI/LFM3-1.7B-GGUF",
+  "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+  "promptBatch": 512,
+  "maxOutputTokens": 64,
+  "thinking": false,
+  "speculative": true,
+  "benchmarkTabs": 1,
+  "idleMs": 60000,
+  "restBetweenRoundsMs": 60000,
+  "optimizedEngineCode": 3321799229,
+  "optimizedCommit": "51b0400",
+  "fileBytes": 1049615680,
+  "presentationMotionFile": "presentation-motion-summary.json",
+  "runs": {
+    "beforeShort": {
+      "id": "pixel-rested-before-short",
+      "rounds": 3,
+      "inputTokens": [
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 116.42012368567069,
+      "aggregatePromptTps": 116.27084600473195,
+      "aggregateDecodeTps": 10.5731515236086,
+      "decodeTps": 10.593772543268132,
+      "promptTpsRange": [
+        115.87534519437415,
+        116.42012368567069,
+        116.51913954433857
+      ],
+      "decodeTpsRange": [
+        10.503641262327228,
+        10.593772543268132,
+        10.622772695425267
+      ],
+      "prefillFps": 6.137085561547718,
+      "decodeFps": 36.53346263136215,
+      "worstPrefillFrameMs": 1333.3699999999953,
+      "worstDecodeFrameMs": 283.375,
+      "framesOver100": 41,
+      "loadMs": 7034.135000020266,
+      "loadFps": 58.713686899499386,
+      "loadWorstFrameMs": 133.33499999999913,
+      "gpuBytes": 1413546368,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 4720.189999997616,
+      "compiledDuringLoad": 56,
+      "kernelChoices": {
+        "context": 23,
+        "files": 9,
+        "weights": 6196,
+        "weightsReading": 4334,
+        "weightsUploading": 1169,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 727,
+        "programs": 56,
+        "compileMs": 238,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 6955
+      }
+    },
+    "afterShort": {
+      "id": "pixel-final-short-3321799229",
+      "rounds": 3,
+      "inputTokens": [
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 121.48540290856172,
+      "aggregatePromptTps": 121.25203792327468,
+      "aggregateDecodeTps": 13.135567746779893,
+      "decodeTps": 13.159708731852161,
+      "promptTpsRange": [
+        120.33839684253009,
+        121.48540290856172,
+        121.94362110260654
+      ],
+      "decodeTpsRange": [
+        13.237101705164234,
+        13.011891423091015,
+        13.159708731852161
+      ],
+      "prefillFps": 60.04612334095889,
+      "decodeFps": 60.108638454703964,
+      "worstPrefillFrameMs": 24.99000000000524,
+      "worstDecodeFrameMs": 17.34999999999127,
+      "framesOver100": 0,
+      "loadMs": 4724.365000009537,
+      "engineCode": 3321799229,
+      "loadFps": 60.11389890481085,
+      "loadWorstFrameMs": 16.885000000002037,
+      "gpuBytes": 1392804224,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 4530.97000002861,
+      "compiledDuringLoad": 59,
+      "kernelChoices": {
+        "context": 26,
+        "files": 18,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 3997,
+        "headExpanded": 1,
+        "headSplit": 2,
+        "promptPacking": 0,
+        "weightsReading": 2098,
+        "weightsUploading": 1232,
+        "f16Init": 12,
+        "packingProbe": 0,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 556,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 167,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 591,
+        "programs": 59,
+        "compileMs": 225,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 2,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 4633
+      }
+    },
+    "beforeLong": {
+      "id": "pixel-rested-before-long",
+      "rounds": 2,
+      "inputTokens": [
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0
+      ],
+      "promptTps": 118.88220598787044,
+      "aggregatePromptTps": 118.8818435637567,
+      "aggregateDecodeTps": 10.287343465028915,
+      "decodeTps": 10.287343466784446,
+      "promptTpsRange": [
+        119.08977712782762,
+        118.67463484791325
+      ],
+      "decodeTpsRange": [
+        10.287477853366314,
+        10.28720908020258
+      ],
+      "prefillFps": 7.145709713027101,
+      "decodeFps": 36.59310692277019,
+      "worstPrefillFrameMs": 1000.1749999999884,
+      "worstDecodeFrameMs": 291.6700000000128,
+      "framesOver100": 73,
+      "loadMs": 6945.334999978542,
+      "loadFps": 58.74446660978347,
+      "loadWorstFrameMs": 133.33000000000175,
+      "gpuBytes": 1413546368,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 17564.017499998212,
+      "compiledDuringLoad": 56,
+      "kernelChoices": {
+        "context": 30,
+        "files": 14,
+        "weights": 6160,
+        "weightsReading": 4311,
+        "weightsUploading": 1150,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 669,
+        "programs": 56,
+        "compileMs": 216,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 6874
+      }
+    },
+    "afterLong": {
+      "id": "pixel-final-long-3321799229",
+      "rounds": 2,
+      "inputTokens": [
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0
+      ],
+      "promptTps": 120.29011623593111,
+      "aggregatePromptTps": 120.28903985135996,
+      "aggregateDecodeTps": 12.819971480622756,
+      "decodeTps": 12.821308209709718,
+      "promptTpsRange": [
+        120.64994734239566,
+        119.93028512946655
+      ],
+      "decodeTpsRange": [
+        12.952222745254153,
+        12.690393674165284
+      ],
+      "prefillFps": 59.60246091965915,
+      "decodeFps": 60.044667221767654,
+      "worstPrefillFrameMs": 33.379999999990105,
+      "worstDecodeFrameMs": 16.885000000009313,
+      "framesOver100": 0,
+      "loadMs": 4911.905000030994,
+      "engineCode": 3321799229,
+      "loadFps": 59.854577805992754,
+      "loadWorstFrameMs": 25.010000000002037,
+      "gpuBytes": 1392804224,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 17363.509999990463,
+      "compiledDuringLoad": 59,
+      "kernelChoices": {
+        "context": 27,
+        "files": 14,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 4171,
+        "headExpanded": 1,
+        "headSplit": 2,
+        "promptPacking": 0,
+        "weightsReading": 2084,
+        "weightsUploading": 1397,
+        "f16Init": 14,
+        "packingProbe": 1,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 555,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 175,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 603,
+        "programs": 59,
+        "compileMs": 232,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 2,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 4814
+      }
+    },
+    "sampled": {
+      "id": "pixel-final-sampled-3321799229",
+      "rounds": 1,
+      "inputTokens": [
+        548
+      ],
+      "cachedTokens": [
+        0
+      ],
+      "promptTps": 121.44959398692728,
+      "aggregatePromptTps": 121.44959398692728,
+      "aggregateDecodeTps": 12.304807664022746,
+      "decodeTps": 12.304807664022746,
+      "promptTpsRange": [
+        121.44959398692728
+      ],
+      "decodeTpsRange": [
+        12.304807664022746
+      ],
+      "prefillFps": 60.08491120427984,
+      "decodeFps": 60.07116574238358,
+      "worstPrefillFrameMs": 24.889999999999418,
+      "worstDecodeFrameMs": 17.25,
+      "framesOver100": 0,
+      "loadMs": 5057.100000023842,
+      "engineCode": 3321799229,
+      "loadFps": 60.113503786471846,
+      "loadWorstFrameMs": 17.025000000001455,
+      "gpuBytes": 1392804224,
+      "idleMs": "30000",
+      "firstTokenMs": 4528.77999997139,
+      "compiledDuringLoad": 59,
+      "kernelChoices": {
+        "context": 29,
+        "files": 16,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 4273,
+        "headExpanded": 1,
+        "headSplit": 2,
+        "promptPacking": 0,
+        "weightsReading": 2170,
+        "weightsUploading": 1381,
+        "f16Init": 15,
+        "packingProbe": 1,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 556,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 171,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 647,
+        "programs": 59,
+        "compileMs": 269,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 2,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 4965
+      }
+    }
+  },
+  "short": {
+    "promptGainPct": 4.3508622586307055,
+    "decodeGainPct": 24.221175016774986,
+    "matchedReplies": [
+      true,
+      true,
+      true
+    ]
+  },
+  "long": {
+    "promptGainPct": 1.184290143643807,
+    "decodeGainPct": 24.631866828466297,
+    "matchedReplies": [
+      true,
+      true
+    ]
+  },
+  "load": {
+    "before": {
+      "file": "pixel-load-final-before.json",
+      "cold": {
+        "ids": [
+          "pixel-before-control-mw1nj3ry-cold-1",
+          "pixel-before-control-mw1nj3ry-cold-2",
+          "pixel-before-control-mw1nj3ry-cold-3"
+        ],
+        "trials": 3,
+        "medianMs": 9943.879999995232,
+        "minMs": 9880.439999997616,
+        "maxMs": 10037.280000001192,
+        "fps": 55.29386447323718,
+        "worstFrameMs": 558.3649999999998,
+        "allUnder10s": false,
+        "fullyCalibratedMedianMs": null,
+        "fullyCalibratedRangeMs": null,
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      },
+      "cached": {
+        "ids": [
+          "pixel-tuned-load-before-cached-1",
+          "pixel-tuned-load-before-cached-2",
+          "pixel-tuned-load-before-cached-3"
+        ],
+        "trials": 3,
+        "medianMs": 6220.655000001192,
+        "minMs": 6090.430000007153,
+        "maxMs": 6388.020000010729,
+        "fps": 58.54709283931044,
+        "worstFrameMs": 141.66499999999996,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 6220.655000001192,
+        "fullyCalibratedRangeMs": [
+          6388.020000010729,
+          6220.655000001192,
+          6090.430000007153
+        ],
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      }
+    },
+    "after": {
+      "file": "pixel-load-release-after.json",
+      "cold": {
+        "ids": [
+          "pixel-layout-validation-mw2146et-cold-1",
+          "pixel-layout-validation-mw2146et-cold-2",
+          "pixel-layout-validation-mw2146et-cold-3",
+          "pixel-layout-validation-mw2146et-cold-4",
+          "pixel-layout-validation-mw2146et-cold-5",
+          "pixel-layout-validation-mw2146et-cold-6"
+        ],
+        "trials": 6,
+        "medianMs": 8366.767500013113,
+        "minMs": 8251.164999961853,
+        "maxMs": 8448.699999988079,
+        "fps": 58.46352419637245,
+        "worstFrameMs": 75.00500000000011,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 8366.767500013113,
+        "fullyCalibratedRangeMs": [
+          8397.485000014305,
+          8251.164999961853,
+          8448.699999988079,
+          8323.165000021458,
+          8336.050000011921,
+          8404.944999992847
+        ],
+        "headExpanded": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "engineCodes": [
+          3321799229
+        ]
+      },
+      "cached": {
+        "ids": [
+          "pixel-layout-validation-mw215vx7-cached-1",
+          "pixel-layout-validation-mw215vx7-cached-2",
+          "pixel-layout-validation-mw215vx7-cached-3"
+        ],
+        "trials": 3,
+        "medianMs": 4543.245000004768,
+        "minMs": 4490.5150000452995,
+        "maxMs": 4656.824999988079,
+        "fps": 59.9120645505713,
+        "worstFrameMs": 25.00500000000011,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 4543.245000004768,
+        "fullyCalibratedRangeMs": [
+          4656.824999988079,
+          4490.5150000452995,
+          4543.245000004768
+        ],
+        "headExpanded": [
+          1,
+          1,
+          1
+        ],
+        "engineCodes": [
+          3321799229
+        ]
+      }
+    }
+  },
+  "memory": {
+    "before": {
+      "file": "pixel-memory-cached-before-short.json",
+      "kind": "v8-worker",
+      "complete": true,
+      "samples": 125,
+      "gpuBytes": 1420506496,
+      "peakGpuBytes": 1442906368,
+      "peakWorkerBytes": 282233886,
+      "peakJsHeapCapacityBytes": 107855872,
+      "retainedWorkerBytes": 51089478,
+      "retainedTrackedTotalBytes": 1471595974
+    },
+    "after": {
+      "file": "pixel-memory-release-after-short.json",
+      "kind": "v8-worker",
+      "complete": true,
+      "samples": 131,
+      "gpuBytes": 1399764352,
+      "peakGpuBytes": 1399764352,
+      "peakWorkerBytes": 221079875,
+      "peakJsHeapCapacityBytes": 109314048,
+      "retainedWorkerBytes": 51579260,
+      "retainedTrackedTotalBytes": 1451343612
+    },
+    "beforeLong": {
+      "file": "pixel-memory-cached-before-long.json",
+      "kind": "v8-worker",
+      "complete": true,
+      "samples": 205,
+      "gpuBytes": 1449801088,
+      "peakGpuBytes": 1449801088,
+      "peakWorkerBytes": 282222606,
+      "peakJsHeapCapacityBytes": 109416448,
+      "retainedWorkerBytes": 51163222,
+      "retainedTrackedTotalBytes": 1500964310
+    },
+    "afterLong": {
+      "file": "pixel-memory-release-after-long.json",
+      "kind": "v8-worker",
+      "complete": true,
+      "samples": 251,
+      "gpuBytes": 1429058944,
+      "peakGpuBytes": 1429058944,
+      "peakWorkerBytes": 231875094,
+      "peakJsHeapCapacityBytes": 109678592,
+      "retainedWorkerBytes": 51641464,
+      "retainedTrackedTotalBytes": 1480700408
+    }
+  },
+  "quality": [
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:20.972Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "fused-prefill-inputs-vs-original-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:56.101Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "prepared-vs-incremental-cache-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:57.000Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "upload-byte-exact",
+      "groups": 148,
+      "bytesChecked": 1212416,
+      "mismatches": 0
+    },
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:57.096Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "expanded-unsplit-vs-split-full-vocabulary",
+      "maxAbs": 0.000003814697265625,
+      "relativeRms": 1.2790849393153393e-7,
+      "kl": 3.3946486408417895e-14,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:57.159Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "native-vs-expanded-real-hidden-state",
+      "maxAbs": 0.0000019073486328125,
+      "relativeRms": 1.0361111581328303e-7,
+      "kl": 5.005759300302472e-14,
+      "top1": true,
+      "logits": 8192
+    },
+    {
+      "id": "pixel-final-quality-3321799229",
+      "at": "2026-11-04T11:34:57.411Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "streamed-vs-original-full-model",
+      "maxAbs": 0.00873565673828125,
+      "relativeRms": 0.0006483190517673516,
+      "kl": 0.0000013663025881106382,
+      "top1": true,
+      "logits": 128000
+    }
+  ],
+  "controls": [
+    {
+      "name": "Timer-free polling",
+      "ids": [
+        "pixel-fence-poll-control"
+      ],
+      "interpretation": "Rejected: the second long run fell below the 12 generated tokens/s target.",
+      "metrics": {
+        "id": [
+          "pixel-fence-poll-control"
+        ],
+        "rounds": 2,
+        "inputTokens": [
+          2085,
+          2085
+        ],
+        "cachedTokens": [
+          0,
+          0
+        ],
+        "promptTps": 117.49971630123144,
+        "aggregatePromptTps": 117.36132893566183,
+        "aggregateDecodeTps": 11.508583485157637,
+        "decodeTps": 11.563411763748594,
+        "promptTpsRange": [
+          121.53214437797419,
+          113.46728822448868
+        ],
+        "decodeTpsRange": [
+          12.359654165059112,
+          10.767169362438073
+        ],
+        "prefillFps": 59.69164486610096,
+        "decodeFps": 59.99718347872749,
+        "worstPrefillFrameMs": 41.70000000001164,
+        "worstDecodeFrameMs": 17.35999999998603,
+        "framesOver100": 0,
+        "loadMs": 4842.985000014305,
+        "engineCode": 964478755,
+        "loadFps": 60.086909209741606,
+        "loadWorstFrameMs": 17.160000000003492,
+        "gpuBytes": 1392804224,
+        "idleMs": "60000",
+        "restMs": "60000",
+        "firstTokenMs": 17799.009999990463,
+        "compiledDuringLoad": 59,
+        "kernelChoices": {
+          "context": 23,
+          "files": 15,
+          "calibrationCached": 1,
+          "engineCode": 964478755,
+          "weights": 4111,
+          "headExpanded": 1,
+          "headSplit": 2,
+          "promptPacking": 0,
+          "weightsReading": 2115,
+          "weightsUploading": 1332,
+          "f16Init": 19,
+          "packingProbe": 1,
+          "matvecProbe": 0,
+          "packingProbeRows": 0,
+          "rmsParts": 64,
+          "toRgba4": 0,
+          "repackOnnx": 0,
+          "repackGgufQ4": 562,
+          "repackGgufQ8": 0,
+          "repackGgufQ6": 165,
+          "warmUp": 628,
+          "programs": 59,
+          "compileMs": 254,
+          "warm_batch9": 23,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 2,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 5,
+          "tunedShortSplit": 0,
+          "tunedF16Matmul": -1,
+          "tunedF16Pack": 0,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 4777
+        }
+      }
+    }
+  ],
+  "interrupted": [
+    {
+      "id": "load-final-cold-1",
+      "loadMs": 34183,
+      "frameGapMs": 30085.935,
+      "reason": "User confirmed closing other tabs during this run; retained in raw data, excluded from controlled comparison."
+    }
+  ],
+  "methods": {
+    "fps": "requestAnimationFrame with a repainted canvas and CSS spinner; not a system-wide presentation trace",
+    "load": "Cached GGUF files. Cold means derived calibration notes reset, not a network download or an empty OS/driver cache.",
+    "memory": "Source-map-free workers; texture allocation bytes and worker V8 used + backing storage + embedder GC heap. Peaks are simultaneous sums within a worker sample. Excludes driver allocation overhead, main-page and whole Chrome/phone RSS."
+  }
+}

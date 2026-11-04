@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><title>WebGL performance pacing</title>
+  <style>
+    body {
+      background: #13171c;
+      color: #eef3f8;
+      font: 15px system-ui;
+      margin: 20px;
+    }
+    canvas {
+      width: 100%;
+      height: 140px;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    button {
+      padding: 16px;
+      touch-action: manipulation;
+    }
+    #spinner {
+      width: 32px;
+      height: 32px;
+      border: 5px solid #758b9d;
+      border-top-color: #71e4ba;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+  <h1>WebGL performance pacing</h1>
+  <div id="spinner"></div>
+  <canvas width="700" height="180"></canvas
+  ><button id="tap">Test touch response: 0</button>
+  <button id="release" disabled>Release model</button>
+  <pre id="out"></pre>
+  <script type="module" src="/bundle/bench/webgl-perf.js"></script>
+</html>
