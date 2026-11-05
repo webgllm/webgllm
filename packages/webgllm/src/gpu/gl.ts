@@ -725,13 +725,16 @@ export class Gpu {
   private budgets = {
     load: new SubmissionBudget(),
     prompt: new SubmissionBudget(),
-    decode: new SubmissionBudget()
+    decode: new SubmissionBudget(true)
   }
   private submissionBudget = this.budgets.load
   private phase: "load" | "prompt" | "decode" = "load"
   private phaseAt = performance.timeOrigin + performance.now()
   private lastObservedFrame = -Infinity
   private lastFrameHealthy = false
+  private canRecoverPacing = false
+  private sampledPromptPacing = false
+  private promptFrameBudgetMs = 0
 
   /** The same feedback controller is used on every GPU. Zero ms fixes the quota. */
   configurePacing(reads: number, targetMs: number) {
@@ -741,6 +744,36 @@ export class Gpu {
   }
 
   get activePhase() { return this.phase }
+
+  get groupsDecode() { return this.budgets.decode.recovery }
+
+  allowPacingRecovery() {
+    this.canRecoverPacing = true
+  }
+
+  /** A slow empty fence makes frequent pacing boundaries expensive. */
+  calibratePromptPacing() {
+    if (!this.canRecoverPacing || this.sampledPromptPacing ||
+      this.expectedFrameMs > 12 || performance.now() - this.lastObservedFrame > 500)
+      return
+    this.sampledPromptPacing = true
+    return this.measurePromptPacing()
+  }
+
+  private async measurePromptPacing() {
+    let slow = 0
+    for (let i = 0; i < 3; i++) {
+      const start = performance.now()
+      await this.finish()
+      if (performance.now() - start >= 3) slow++
+    }
+    if (slow < 2) return
+    // Budget for presentation during prefill on high-refresh displays.
+    // A real long stall still triggers the controller's immediate backoff.
+    this.promptFrameBudgetMs = 1000 / 75
+    this.budgets.prompt.enableRecovery(160 * 2 ** 20)
+    this.budgets.decode.enableRecovery()
+  }
 
   setPhase(phase: "load" | "prompt" | "decode") {
     if (this.phase === phase) return
@@ -800,6 +833,8 @@ export class Gpu {
       return
     const now = performance.now()
     this.lastObservedFrame = now
+    if (this.phase === "prompt")
+      expectedMs = Math.max(expectedMs, this.promptFrameBudgetMs || 0)
     this.expectedFrameMs = expectedMs
     this.lastFrameHealthy =
       intervalMs < expectedMs * 1.8 &&
@@ -815,6 +850,15 @@ export class Gpu {
         intervalMs, expectedMs, frames, now, meanMs,
         startedAt == null ? undefined : startedAt - performance.timeOrigin
       )
+    // A high-refresh session can lose occasional callbacks yet have
+    // ample presentation headroom. Recover from a proven quota collapse
+    // during real inference without retuning healthy queues.
+    if (this.canRecoverPacing && this.phase !== "load" &&
+      !this.submissionBudget.recovery && this.submissionBudget.quotaCollapsed &&
+      expectedMs <= 12 && intervalMs <= 100) {
+      this.budgets.prompt.enableRecovery()
+      this.budgets.decode.enableRecovery()
+    }
     this.readsPerSlice = this.submissionBudget.reads
   }
 

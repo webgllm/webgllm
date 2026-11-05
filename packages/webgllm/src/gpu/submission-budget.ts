@@ -24,9 +24,13 @@ export class SubmissionBudget {
   private relaxedReadsAllowed = true
   private computeFrames = 0
   private recoveryFrames = 0
+  private missedTime = 0
   private recentMisses = 0
+  recovery = false
   private lastMissAt = -Infinity
   private fastMatrixAt = -Infinity
+
+  constructor(private readonly decoding = false) {}
 
   reset(presentation = false) {
     if (presentation) {
@@ -38,12 +42,12 @@ export class SubmissionBudget {
       this.presentationSmooth = 0
       this.relaxedReadsAllowed = true
     }
-    this.computeFrames = this.recoveryFrames = this.recentMisses = 0
+    this.computeFrames = this.recoveryFrames = this.missedTime = this.recentMisses = 0
     this.lastMissAt = this.fastMatrixAt = -Infinity
     this.reads = Math.max(0, this.initial)
     this.healthyFrame = false
     this.ahead = 2
-    this.layers = 1
+    this.layers = this.recovery && this.decoding ? 2 : 1
     this.activeWorkAt = this.decodeAt = this.lastFrame = -Infinity
     this.submissionIndex = 0
     this.pendingSince = Infinity
@@ -61,6 +65,19 @@ export class SubmissionBudget {
     this.initial = initialReads
     this.target = targetMs
     this.reads = Math.max(0, initialReads)
+  }
+
+  get quotaCollapsed() {
+    return this.initial > 0 && this.reads <= this.initial / 4
+  }
+
+  enableRecovery(startingReads?: number) {
+    this.recovery = true
+    this.reads = startingReads === undefined
+      ? Math.max(this.reads, Math.min(this.initial, 3 * 2 ** 25))
+      : Math.min(this.initial, startingReads)
+    this.ahead = Math.max(this.ahead, 1)
+    if (this.decoding) this.layers = Math.max(this.layers, 2)
   }
 
   heartbeat(now = performance.now(), healthy = true, frameMs = this.frameMs) {
@@ -120,21 +137,33 @@ export class SubmissionBudget {
     this.lastFrame = now
     this.setCadence(expectedMs)
     const average = meanMs ?? intervalMs
-    this.healthyFrame =
-      intervalMs < expectedMs * 1.8 && average <= expectedMs * 1.03
-    if (intervalMs > expectedMs * 1.8 || average > expectedMs * 1.03) {
+    // A missed refresh at 120 Hz is still about 17 ms. During decode,
+    // keep the head and layer submissions intact through such jitter.
+    const decodeRecovery = this.recovery && this.decoding
+    const severeMs = decodeRecovery ? Math.max(32, expectedMs * 1.8) : expectedMs * 1.8
+    const meanLimit = expectedMs * (decodeRecovery ? 1.12 : 1.03)
+    this.healthyFrame = intervalMs < severeMs && average <= meanLimit
+    if (intervalMs > severeMs || average > meanLimit) {
       const span = average * frames
       const start = startedAt ?? now - span
       if (!this.overlaps(start, start + span)) return
       const previousWindow = this.presentationWindow
-      const severe = intervalMs > expectedMs * 1.8
+      const severe = intervalMs > severeMs
+      let sustained = false
       if (severe) {
-        this.recentMisses =
-          now - this.lastMissAt < 500 ? this.recentMisses + 1 : 1
+        // Charge only the time beyond a normal frame. Isolated misses
+        // drain away between samples, independent of the refresh rate.
+        if (this.recovery) {
+          const recent = Math.max(0, this.missedTime - (now - this.lastMissAt) * 0.18)
+          this.missedTime = recent + Math.min(intervalMs - expectedMs, 2 * expectedMs)
+          sustained = recent > 0 && this.missedTime >= Math.max(20, 2 * expectedMs)
+        } else {
+          this.recentMisses = now - this.lastMissAt < 500 ? this.recentMisses + 1 : 1
+          sustained = this.recentMisses >= 3
+        }
         this.lastMissAt = now
       }
-      const sustained = severe && this.recentMisses >= 3
-      this.recoveryFrames = 0
+      if (!this.recovery || sustained || intervalMs > 100) this.recoveryFrames = 0
       const wasRelaxed = this.reads > this.initial
       if (wasRelaxed && (sustained || intervalMs > 100)) {
         this.reads = this.initial
@@ -155,23 +184,24 @@ export class SubmissionBudget {
       if (
         !wasRelaxed &&
         (intervalMs > 100 ||
-          (previousWindow <= this.presentationBase && sustained))
+          (!decodeRecovery && previousWindow <= this.presentationBase && sustained && (!this.recovery || now >= this.growAfter)))
       ) {
         this.reads = Math.max(
-          Math.min(this.initial, 1 << 25),
+          Math.min(this.initial, this.recovery && intervalMs <= 100 ? 3 * 2 ** 25 : 2 ** 25),
           Math.round(this.reads * (intervalMs > 100 ? 0.5 : 0.8))
         )
         this.growAfter = now + 1000
       }
       this.smoothFrames = 0
-      if (severe) this.ahead = Math.max(0, this.ahead - 1)
-      if (severe)
+      if (severe && (!decodeRecovery || sustained || intervalMs > 100)) {
+        this.ahead = Math.max(0, this.ahead - 1)
         this.layers = Math.max(
           1,
           Math.floor(this.layers / (intervalMs > 100 ? 4 : 2))
         )
+      }
       this.decodeSmooth = 0
-    } else if (intervalMs < expectedMs * 1.8) {
+    } else if (intervalMs < severeMs) {
       if (now - this.decodeAt < 250) {
         this.decodeSmooth += frames
         if (this.decodeSmooth >= 96) {
@@ -192,6 +222,10 @@ export class SubmissionBudget {
           this.presentationCap,
           this.presentationMax + 4
         )
+        // Frame evidence can restore the starting tile size even when
+        // fences on very small submissions are dominated by scheduling.
+        if (this.recovery && now >= this.growAfter && this.reads < this.initial)
+          this.reads = Math.min(this.initial, Math.round(this.reads * 1.25))
         this.recoveryFrames = 0
       }
       this.presentationSmooth += frames

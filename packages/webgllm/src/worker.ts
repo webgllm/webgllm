@@ -392,6 +392,7 @@ async function load(
     }
     engine.gpu.resetPacing(true)
     engine.gpu.setPhase("load")
+    engine.gpu.allowPacingRecovery()
     const overlap = engine.tuned.submissionOverlap
     if (overlap != null && Number.isFinite(overlap) && overlap >= 0 && overlap <= 2 ** 34)
       engine.gpu.primePresentation(engine.tuned.submissionWindow ?? TUNING.presentationFrames, Math.max(TUNING.submissionReads, overlap), overlap > 0)
@@ -499,6 +500,11 @@ async function generate(request: GenerateRequest) {
   // lost, or loaded if another was asked for since.
   const model = await startLoad(request.model, request.contextLength)
   if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  const calibration = model.engine.gpu.calibratePromptPacing()
+  if (calibration) {
+    await calibration
+    if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  }
   return withPromptCachePolicy(model, request.cachePrompt, async () => {
   if (request.reportPhases) post({ type: "phase", id, phase: "processing" })
   const { engine, tokenizer } = model

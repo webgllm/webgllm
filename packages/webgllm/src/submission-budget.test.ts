@@ -328,3 +328,47 @@ test("a visible long stall overlapping a pending GPU fence revokes overlap", () 
   assert.equal(b.reads, 2 ** 28)
   assert.equal(b.relaxationAllowed, false)
 })
+
+test("scattered 120 Hz misses do not collapse the matrix quota", () => {
+  const b = new SubmissionBudget()
+  b.configure(2 ** 28, 4)
+  b.enableRecovery()
+  for (let at = 100; at <= 1000; at += 60) {
+    b.submitted(at - 8, at - 2)
+    b.frame(16.68, 8.34, 1, at)
+  }
+  assert.equal(b.reads, 2 ** 28)
+  assert.equal(b.relaxationAllowed, true)
+})
+
+test("decode retains its layer and head budget through missed refreshes", () => {
+  const b = new SubmissionBudget(true)
+  b.configure(2 ** 28, 4)
+  b.enableRecovery()
+  b.reset()
+  for (const at of [100, 140, 180, 220]) {
+    b.submitted(at - 8, at - 2)
+    b.frame(25.02, 8.34, 1, at)
+  }
+  assert.equal(b.reads, 2 ** 28)
+  assert.equal(b.layers, 2)
+  b.submitted(598, 599)
+  b.frame(120, 8.34, 1, 600)
+  assert.equal(b.reads, 2 ** 27)
+  assert.equal(b.layers, 1)
+})
+
+test("smooth active frames restore the starting quota without fast fence samples", () => {
+  const b = new SubmissionBudget()
+  b.configure(2 ** 28, 4)
+  b.enableRecovery()
+  b.submitted(98, 99)
+  b.frame(120, 8.34, 1, 100)
+  assert.equal(b.reads, 2 ** 27)
+  for (const at of [1200, 1400, 1600, 1800]) {
+    b.work(at - 5)
+    b.frame(8.34, 8.34, 24, at)
+  }
+  assert.ok(b.reads > 2 ** 27)
+  assert.ok(b.reads <= 2 ** 28)
+})

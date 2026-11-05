@@ -126,3 +126,62 @@ test("a small projection starts a new chunk instead of splitting across its boun
   assert.deepEqual(h.passes.map(p => p.rect), [{ x: 0, y: 0, width: 128, height: 64 }])
   assert.equal(h.finishes(), 1)
 })
+
+test("pacing recovery is limited to a collapsed quota during high-refresh inference", () => {
+  for (const [phase, cadence, quotaCollapsed, expected] of [
+    ["prompt", 16.7, true, false],
+    ["prompt", 8.34, false, false],
+    ["load", 8.34, true, false],
+    ["prompt", 8.34, true, true]
+  ] as const) {
+    const budget = {
+      reads: 2 ** 25,
+      recovery: false,
+      quotaCollapsed,
+      heartbeat() { return undefined },
+      frame() { return undefined },
+      enableRecovery() { this.recovery = true }
+    }
+    const gpu = Object.create(Gpu.prototype) as Gpu
+    Object.assign(gpu, {
+      phase,
+      phaseAt: -Infinity,
+      canRecoverPacing: true,
+      submissionBudget: budget,
+      budgets: { load: budget, prompt: budget, decode: budget }
+    })
+    gpu.observeFrames(cadence, cadence, 24)
+    assert.equal(budget.recovery, expected)
+  }
+})
+
+test("prompt pacing calibrates only a high-refresh session with repeated slow empty fences", async (t) => {
+  let now = 100
+  t.mock.method(performance, "now", () => now)
+  for (const [expectedFrameMs, costs, qualifies] of [
+    [16.7, [5, 5, 5], false],
+    [8.34, [0.2, 5, 0.2], false],
+    [8.34, [5, 0.2, 5], true]
+  ] as const) {
+    const gpu = Object.create(Gpu.prototype) as Gpu
+    const starts: number[] = []
+    let finishes = 0, decode = false
+    Object.assign(gpu, {
+      expectedFrameMs,
+      lastObservedFrame: now,
+      canRecoverPacing: true,
+      budgets: {
+        prompt: { enableRecovery: (reads: number) => starts.push(reads) },
+        decode: { enableRecovery: () => { decode = true } }
+      },
+      finish: async () => { now += costs[finishes++] }
+    })
+    await gpu.calibratePromptPacing()
+    assert.equal(finishes, expectedFrameMs > 12 ? 0 : 3)
+    assert.equal(decode, qualifies)
+    assert.deepEqual(starts, qualifies ? [160 * 2 ** 20] : [])
+    if (expectedFrameMs <= 12) {
+      assert.equal(gpu.calibratePromptPacing(), undefined)
+    }
+  }
+})

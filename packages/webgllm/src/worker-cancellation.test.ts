@@ -44,7 +44,7 @@ function probe() {
   const cached = [9, 9], stopped = new Set<string>(), messages: WorkerResponse[] = []
   const engine = {
     contextLength: 8192, snapshotLimit: 2, canSaveInside: false,
-    gpu: { compiled: { count: 0 } },
+    gpu: { compiled: { count: 0 }, calibratePromptPacing: (): Promise<void> | undefined => undefined },
     setAllowedTokens() { calls.masks++ }, dropGuess() { calls.drops++ },
     reset() { cached.length = 0 }, canResume() { return false },
     rewind() { calls.rewinds++; return 0 }, snapshotPosition() { return undefined },
@@ -119,5 +119,21 @@ test("stop during prompt reservation performs zero forwards", async () => {
   assert.equal(state.calls.snapshots, 0)
   assert.equal(state.calls.disposed, 1)
   assert.equal(state.messages.some(message => message.type === "token"), false)
+  assert.ok(state.messages.some(message => message.type === "done"))
+})
+
+test("stop during pacing calibration performs zero forwards", async () => {
+  const state = probe(), entered = gate(), pending = gate()
+  state.model.engine.gpu.calibratePromptPacing = () => {
+    entered.release()
+    return pending.promise
+  }
+  const job = makeGenerate(state)(request("cancelled", true))
+  await entered.promise
+  state.stopped.add("cancelled")
+  pending.release()
+  await job
+  assert.equal(state.calls.forwards, 0)
+  assert.deepEqual(state.model.cached, [9, 9])
   assert.ok(state.messages.some(message => message.type === "done"))
 })

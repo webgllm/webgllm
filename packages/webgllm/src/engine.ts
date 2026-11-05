@@ -6093,18 +6093,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.lastRowOnly = lastRowOnly
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
-      if (
-        !paced &&
-        this.gpu.readsPerSlice > 0 &&
-        decodeLayers > 0 &&
-        i > 0 &&
-        i % decodeLayers === 0
-      )
-        await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
-      // (From layer 0: batches follow each other with no wait between.)
+      const groupEnd = i > 0 && decodeLayers > 0 &&
+        this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
       if (paced) await this.charge(0)
-      else if (TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
-        this.gpu.flush()
+      else {
+        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        // Grouped decode's fence flushes its own layers.
+        if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
+          TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
+          this.gpu.flush()
+      }
       const [h, next] = b.residual
       const fold = foldAt(i)
       const ffnFold = foldFfn(i)
