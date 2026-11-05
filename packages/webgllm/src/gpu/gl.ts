@@ -7,6 +7,8 @@
  * front along with the texture size the model needs.
  */
 
+import { SubmissionBudget } from "./submission-budget.js"
+
 export type GpuLimits = {
   maxTextureSize: number
   maxDrawBuffers: number
@@ -59,6 +61,8 @@ export type Program = {
   program: WebGLProgram
   uniforms: Map<string, WebGLUniformLocation | null>
   samplers: Array<string>
+  samplersBound?: boolean
+  uniformValues?: Map<string, NonNullable<Pass["uniforms"]>[string]>
 }
 
 export type Uniform =
@@ -157,6 +161,11 @@ export class Gpu {
    * (Windows resets a GPU after 2 s).
    */
   maxReadsPerDraw = 1 << 28
+
+  cacheState = false
+  private boundProgram: WebGLProgram | null = null
+  private textureUnit = 0
+  private boundTextures = new Map<number, WebGLTexture>()
 
   constructor(canvas: OffscreenCanvas | HTMLCanvasElement) {
     canvas.addEventListener("webglcontextlost", (event) => {
@@ -325,6 +334,7 @@ export class Gpu {
     const tex = gl.createTexture()
     if (!tex) throw new GpuError("Couldn't create a texture.")
     gl.bindTexture(gl.TEXTURE_2D, tex)
+    this.boundTextures.set(this.textureUnit, tex)
     gl.texStorage2D(gl.TEXTURE_2D, 1, internal, width, height)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
@@ -332,6 +342,7 @@ export class Gpu {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     if (data) {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+      this.markGpuWork()
       gl.texSubImage2D(
         gl.TEXTURE_2D,
         0,
@@ -369,12 +380,32 @@ export class Gpu {
       for (const p of this.programs.values()) gl.deleteProgram(p.program)
       this.programs.clear()
       gl.deleteShader(this.vertexShader)
-      for (const fence of this.paced) gl.deleteSync(fence)
+      for (const fence of this.paced) gl.deleteSync(fence.sync)
       gl.finish()
     }
     this.lastOutput = null
     this.paced.length = 0
     gl.getExtension("WEBGL_lose_context")?.loseContext()
+  }
+
+  /** Release an idle context in bounded batches so other rendering can run. */
+  async disposePaced() {
+    try {
+      let bytes = 0
+      for (const texture of this.live) {
+        if (this.isLost) break
+        this.delete(texture)
+        bytes += texture.bytes
+        if (bytes >= 64 * 2 ** 20) {
+          await this.finish()
+          bytes = 0
+        }
+      }
+    } catch (error) {
+      if (!this.isLost) throw error
+    } finally {
+      this.dispose()
+    }
   }
 
   /** Writes `pixels` into a rectangle of a texture. */
@@ -385,6 +416,7 @@ export class Gpu {
   ) {
     const gl = this.gl
     gl.bindTexture(gl.TEXTURE_2D, target.tex)
+    this.boundTextures.set(this.textureUnit, target.tex)
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
     gl.texSubImage2D(
       gl.TEXTURE_2D,
@@ -479,6 +511,8 @@ export class Gpu {
       }
     }
     this.gl.deleteTexture(texture.tex)
+    for (const [unit, bound] of this.boundTextures)
+      if (bound === texture.tex) this.boundTextures.delete(unit)
     this.live.delete(texture)
     this.bytes -= texture.bytes
     if (this.lastOutput === texture) this.lastOutput = null
@@ -534,21 +568,34 @@ export class Gpu {
       )
     }
     this.lastOutput = outputs[0]
-    gl.useProgram(program.program)
+    if (!this.cacheState || this.boundProgram !== program.program) {
+      gl.useProgram(program.program)
+      this.boundProgram = program.program
+    }
     let unit = 0
     for (const name of program.samplers) {
       const input = pass.inputs[name]
       if (!input) throw new GpuError(`Pass is missing input ${name}.`)
       if (outputs.some((o) => o.tex === input.tex))
         throw new GpuError(`Pass reads and writes ${name}.`)
-      gl.activeTexture(gl.TEXTURE0 + unit)
-      gl.bindTexture(gl.TEXTURE_2D, input.tex)
-      gl.uniform1i(this.uniform(program, name), unit)
+      if (!this.cacheState || this.boundTextures.get(unit) !== input.tex) {
+        if (!this.cacheState || this.textureUnit !== unit)
+          gl.activeTexture(gl.TEXTURE0 + unit)
+        this.textureUnit = unit
+        gl.bindTexture(gl.TEXTURE_2D, input.tex)
+        this.boundTextures.set(unit, input.tex)
+      }
+      if (!this.cacheState || !program.samplersBound)
+        gl.uniform1i(this.uniform(program, name), unit)
       unit++
     }
+    program.samplersBound = true
+    if (!this.cacheState) program.uniformValues?.clear()
     for (const [name, value] of Object.entries(pass.uniforms ?? {})) {
       const loc = this.uniform(program, name)
       if (loc === null) continue
+      if (this.cacheState && !this.uniformChanged(program, name, value))
+        continue
       if (typeof value === "number") gl.uniform1f(loc, value)
       else if ("int" in value) gl.uniform1i(loc, value.int)
       else if ("ivec4" in value) gl.uniform4i(loc, ...value.ivec4)
@@ -562,8 +609,8 @@ export class Gpu {
       this.passes++
       this.trace?.push(`${pass.name ?? ""}(${program.samplers.join(",")})`)
       this.boundFb = fb
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    } else if (!this.cacheState) gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
     const rect = pass.rect ?? {
       x: 0,
       y: 0,
@@ -600,12 +647,241 @@ export class Gpu {
       for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
         const height = Math.min(rowsPerBand, rect.y + rect.height - y)
         gl.viewport(rect.x, y, rect.width, height)
+        this.markGpuWork()
         gl.drawArrays(gl.TRIANGLES, 0, 3)
         this.draws++
         if (this.drawTrace) {
           const key = `${pass.name ?? ""}(${program.samplers.join(",")})`
           this.drawTrace.set(key, (this.drawTrace.get(key) ?? 0) + 1)
         }
+      }
+    }
+  }
+
+  private sameUniformArray(a: ReadonlyArray<number>, b: ReadonlyArray<number>) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false
+    return true
+  }
+
+  private uniformChanged(
+    program: Program,
+    name: string,
+    value: NonNullable<Pass["uniforms"]>[string]
+  ) {
+    const values = (program.uniformValues ??= new Map())
+    const old = values.get(name)
+    if (typeof value === "number") {
+      if (typeof old === "number" && Object.is(old, value)) return false
+      values.set(name, value)
+    } else if ("int" in value) {
+      if (
+        old &&
+        typeof old === "object" &&
+        "int" in old &&
+        old.int === value.int
+      )
+        return false
+      values.set(name, { int: value.int })
+    } else if ("ivec4" in value) {
+      if (
+        old &&
+        typeof old === "object" &&
+        "ivec4" in old &&
+        this.sameUniformArray(old.ivec4, value.ivec4)
+      )
+        return false
+      values.set(name, { ivec4: [...value.ivec4] })
+    } else {
+      if (Array.isArray(old) && this.sameUniformArray(old, value)) return false
+      values.set(name, [...value] as Uniform)
+    }
+    return true
+  }
+
+  /** Texel reads per async submission; zero keeps ordinary submission. */
+  readsPerSlice = 0
+  submittedWork = 0
+  expectedFrameMs = 16.7
+  /** Drain the compute queue periodically so rendering can obtain the GPU. */
+  presentationFrames = 2
+  private lastPresentationDrain = -Infinity
+
+  private workStartedAt: number | undefined
+
+  private markGpuWork() {
+    this.workStartedAt ??= performance.now()
+  }
+
+  private submitGpuWork() {
+    if (this.workStartedAt === undefined) return
+    this.submissionBudget.submitted(this.workStartedAt, performance.now())
+    this.workStartedAt = undefined
+  }
+
+  private sliceReads = 0
+  private sliceMatrixReads = 0
+  private sliceCalibrates = true
+  private budgets = {
+    load: new SubmissionBudget(),
+    prompt: new SubmissionBudget(),
+    decode: new SubmissionBudget()
+  }
+  private submissionBudget = this.budgets.load
+  private phase: "load" | "prompt" | "decode" = "load"
+  private phaseAt = performance.timeOrigin + performance.now()
+  private lastObservedFrame = -Infinity
+  private lastFrameHealthy = false
+
+  /** The same feedback controller is used on every GPU. Zero ms fixes the quota. */
+  configurePacing(reads: number, targetMs: number) {
+    for (const budget of Object.values(this.budgets))
+      budget.configure(reads, targetMs, this.presentationFrames)
+    this.readsPerSlice = this.submissionBudget.reads
+  }
+
+  get activePhase() { return this.phase }
+
+  setPhase(phase: "load" | "prompt" | "decode") {
+    if (this.phase === phase) return
+    this.submitGpuWork()
+    this.phase = phase
+    this.phaseAt = performance.timeOrigin + performance.now()
+    this.submissionBudget = this.budgets[phase]
+    this.readsPerSlice = this.submissionBudget.reads
+    this.sliceReads = this.sliceMatrixReads = 0
+    this.sliceCalibrates = true
+  }
+
+  resetPacing(presentation = false) {
+    for (const budget of Object.values(this.budgets)) {
+      budget.reset(presentation)
+      budget.heartbeat(this.lastObservedFrame, this.lastFrameHealthy)
+    }
+    this.submissionBudget = this.budgets[this.phase]
+    this.readsPerSlice = this.submissionBudget.reads
+    this.sliceReads = this.sliceMatrixReads = 0
+    this.sliceCalibrates = true
+  }
+
+  get presentationAdvice() {
+    return { window: this.budgets.prompt.presentationWindow, max: this.budgets.prompt.presentationMax, relaxation: this.budgets.prompt.relaxationAllowed, cap: this.budgets.prompt.maxPresentationFrames }
+  }
+
+  get validatedPresentation() { return this.budgets.prompt.validatedPresentation }
+
+  primePresentation(window: number, reads: number, allowRelaxation = true) {
+    this.budgets.prompt.primePresentation(window, reads, allowRelaxation)
+    this.readsPerSlice = this.submissionBudget.reads
+  }
+
+  get decodeLayers() {
+    return this.submissionBudget.layers
+  }
+  decodeWork() {
+    this.submissionBudget.decode()
+  }
+
+  /** Main-thread frame feedback takes precedence over fence-age estimation. */
+  observeFrames(
+    intervalMs: number,
+    expectedMs: number,
+    frames: number,
+    startedAt?: number,
+    meanMs?: number
+  ) {
+    if (
+      !Number.isFinite(intervalMs) ||
+      !Number.isFinite(expectedMs) ||
+      intervalMs < 4 ||
+      expectedMs < 4 ||
+      frames < 1
+    )
+      return
+    const now = performance.now()
+    this.lastObservedFrame = now
+    this.expectedFrameMs = expectedMs
+    this.lastFrameHealthy =
+      intervalMs < expectedMs * 1.8 &&
+      (meanMs == null || meanMs <= expectedMs * 1.03)
+    // Cadence remains fresh across phase changes, but only active work
+    // adjusts its quota. An idle phase must not trigger fence fallback.
+    for (const budget of Object.values(this.budgets))
+      budget.heartbeat(now, this.lastFrameHealthy, expectedMs)
+    // Delayed messages describe the original frame window, not the moment
+    // the worker can finally receive them.
+    if (startedAt == null || startedAt >= this.phaseAt)
+      this.submissionBudget.frame(
+        intervalMs, expectedMs, frames, now, meanMs,
+        startedAt == null ? undefined : startedAt - performance.timeOrigin
+      )
+    this.readsPerSlice = this.submissionBudget.reads
+  }
+
+  /** A compute pass in bounded bands, letting the compositor run between them. */
+  async runAsync(pass: Pass, maxRows = Infinity) {
+    const output = Array.isArray(pass.output) ? pass.output[0] : pass.output
+    const rect = pass.rect ?? {
+      x: 0,
+      y: 0,
+      width: output.width,
+      height: output.height
+    }
+    this.submittedWork += rect.width * rect.height * Math.max(1, pass.work ?? 1)
+    if (this.readsPerSlice <= 0) return this.run(pass)
+    if (pass.name === "matmul" && rect.height > 8) this.submissionBudget?.work()
+    const perRow = rect.width * Math.max(1, pass.work ?? 1)
+    this.sliceCalibrates &&= pass.name !== "head" && maxRows === Infinity
+    for (let y = rect.y; y < rect.y + rect.height;) {
+      const rows = Math.max(
+        1,
+        Math.floor((this.readsPerSlice - this.sliceReads) / perRow)
+      )
+      // End paced matrix draws on raster-tile boundaries. Flushing
+      // A small projection also starts a new chunk rather than splitting.
+      // Arbitrary bands make the GPU store/reload the same boundary
+      // tiles repeatedly, unlike the original uninterrupted render pass.
+      const quantum = pass.name === "matmul" && rect.height >= 32 ? 32 : 1
+      if (
+        quantum > 1 &&
+        (rows < quantum ||
+          (y === rect.y && rect.height * perRow <= this.readsPerSlice / 8 && rows < rect.height)) &&
+        this.sliceReads > 0 &&
+        this.readsPerSlice >= perRow * quantum
+      ) {
+        const work =
+          this.sliceCalibrates &&
+          this.sliceMatrixReads >= this.sliceReads * 0.75
+            ? this.sliceReads
+            : 0
+        this.sliceReads = this.sliceMatrixReads = 0
+        this.sliceCalibrates = true
+        await this.pace(1, true, work)
+        continue
+      }
+      const bandRows =
+        quantum > 1 && rows >= quantum
+          ? Math.floor((y + rows) / quantum) * quantum - y
+          : rows
+      const height = Math.min(bandRows, maxRows, rect.y + rect.height - y)
+      this.run({ ...pass, rect: { ...rect, y, height } })
+      this.sliceReads += height * perRow
+      if (pass.name === "matmul" && rect.height > 8)
+        this.sliceMatrixReads += height * perRow
+      y += height
+      if (
+        this.sliceReads + perRow > this.readsPerSlice ||
+        maxRows < Infinity ||
+        (quantum > 1 && y < rect.y + rect.height)
+      ) {
+        const work =
+          this.sliceCalibrates &&
+          this.sliceMatrixReads >= this.sliceReads * 0.75
+            ? this.sliceReads
+            : 0
+        this.sliceReads = this.sliceMatrixReads = 0
+        this.sliceCalibrates = true
+        await this.pace(1, true, work)
       }
     }
   }
@@ -627,7 +903,14 @@ export class Gpu {
   }
 
   /** Fences after paced chunks of passes, oldest first (see pace). */
-  private paced: Array<WebGLSync> = []
+  private paced: Array<{
+    sync: WebGLSync
+    at: number
+    reads: number
+    chunks: number
+    budget: SubmissionBudget
+    layers: number
+  }> = []
 
   /**
    * Ends a chunk of passes, and waits (without blocking) until at most
@@ -635,16 +918,47 @@ export class Gpu {
    * seconds of work at once, and the browser's GPU process (which draws
    * every page, and the browser itself) stalls until the queue drains.
    */
-  async pace(ahead: number) {
+  async pace(ahead: number, messages = false, reads = 0, layers = 0) {
     const gl = this.gl
+    if (messages && reads === 0)
+      ahead = Math.min(ahead, this.submissionBudget.ahead)
+    if (
+      messages &&
+      (reads > 0 || this.phase === "load") &&
+      this.presentationFrames > 0 &&
+      performance.now() - this.lastPresentationDrain >=
+        this.expectedFrameMs *
+          (this.submissionBudget.presentationWindow || this.presentationFrames)
+    ) {
+      ahead = 0
+      this.lastPresentationDrain = performance.now()
+    }
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
-    if (sync) this.paced.push(sync)
+    this.submitGpuWork()
+    if (sync)
+      this.paced.push({
+        sync,
+        at: performance.now(),
+        reads,
+        chunks: ahead + 1,
+        budget: this.submissionBudget,
+        layers
+      })
     while (this.paced.length > ahead && !this.isLost) {
       const oldest = this.paced[0]
-      if (gl.getSyncParameter(oldest, gl.SYNC_STATUS) === gl.SIGNALED) {
-        gl.deleteSync(oldest)
+      if (this.fenceReady(oldest.sync)) {
+        gl.deleteSync(oldest.sync)
         this.paced.shift()
+        const elapsed = performance.now() - oldest.at
+        oldest.budget.sample(oldest.reads, elapsed, oldest.chunks)
+        if (oldest.layers > 0)
+          oldest.budget.layerSample(oldest.layers, elapsed, oldest.chunks)
+        this.readsPerSlice = this.submissionBudget.reads
+        continue
+      }
+      if (messages) {
+        await this.wait(oldest.sync, oldest.budget, oldest.at)
         continue
       }
       // A page the browser counts as hidden has its timers throttled (a
@@ -653,7 +967,7 @@ export class Gpu {
       // GPU has done the queue. The queue stays bounded either way.
       if (performance.now() < this.throttledUntil) {
         this.readBack()
-        for (const f of this.paced) gl.deleteSync(f)
+        for (const f of this.paced) gl.deleteSync(f.sync)
         this.paced = []
         break
       }
@@ -691,6 +1005,7 @@ export class Gpu {
   /** Flushes issued passes to the GPU, so it starts on them. */
   flush() {
     this.gl.flush()
+    this.submitGpuWork()
   }
 
   /**
@@ -719,9 +1034,11 @@ export class Gpu {
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
+    this.submitGpuWork()
+    const budget = this.submissionBudget, at = performance.now()
     return async () => {
       try {
-        await this.wait(sync)
+        await this.wait(sync, budget, at)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
         gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
@@ -746,6 +1063,7 @@ export class Gpu {
     this.boundFb = this.framebuffer(texture)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.boundFb)
     gl.readPixels(rect.x, rect.y, rect.width, rect.height, gl.RGBA, gl.FLOAT, out)
+    this.submitGpuWork()
     return out
   }
 
@@ -767,28 +1085,52 @@ export class Gpu {
     })
   }
 
+  /** Bound active polling as well as GPU work, to avoid heating a CPU core. */
+  pollsBeforeSleep = 32
+  private polls = 0
+
+  /** A zero-timeout fence check avoids a synchronous parameter-query round trip. */
+  private fenceReady(sync: WebGLSync) {
+    const gl = this.gl, status = gl.clientWaitSync(sync, 0, 0)
+    if (status === gl.WAIT_FAILED) throw new GpuError("Waiting on the GPU failed.")
+    return status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED
+  }
+
   /** Resolves once the GPU passes `sync`, polling without blocking. */
-  private async wait(sync: WebGLSync | null) {
-    const gl = this.gl
-    for (let spins = 0; ; spins++) {
-      if (this.isLost) throw new GpuError("The GPU context was lost.")
-      const status = sync ? gl.clientWaitSync(sync, 0, 0) : gl.ALREADY_SIGNALED
-      if (status === gl.WAIT_FAILED)
-        throw new GpuError("Waiting on the GPU failed.")
-      if (status !== gl.TIMEOUT_EXPIRED) return
-      // Spin on messages at first; back off to timers on long waits. With
-      // timers throttled (a hidden page: a 1 ms wait can take a second),
-      // block on a pixel of the last pass instead, as pace does.
-      if (spins < 2000) await this.yieldOnce()
-      else if (performance.now() < this.throttledUntil) {
-        this.readBack()
-        return
-      } else {
-        const t = performance.now()
-        await new Promise((resolve) => setTimeout(resolve, 1))
-        if (performance.now() - t > 50)
-          this.throttledUntil = performance.now() + 2000
+  private async wait(
+    sync: WebGLSync | null,
+    budget = this.submissionBudget,
+    at = performance.now()
+  ) {
+    if (this.isLost) throw new GpuError("The GPU context was lost.")
+    if (!sync || this.fenceReady(sync)) return
+    budget.waiting(at)
+    const began = performance.now()
+    try {
+      for (let spins = 0; ; spins++) {
+        // Spin on messages at first; back off to timers on long waits. With
+        // timers throttled (a hidden page: a 1 ms wait can take a second),
+        // block on a pixel of the last pass instead, as pace does.
+        const sleep =
+          this.phase !== "load" &&
+          this.pollsBeforeSleep > 0 &&
+          performance.now() - began >= 2 &&
+          ++this.polls % this.pollsBeforeSleep === 0
+        if (spins < 2000 && !sleep) await this.yieldOnce()
+        else if (performance.now() < this.throttledUntil) {
+          this.readBack()
+          return
+        } else {
+          const t = performance.now()
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          if (performance.now() - t > 50)
+            this.throttledUntil = performance.now() + 2000
+        }
+        if (this.isLost) throw new GpuError("The GPU context was lost.")
+        if (this.fenceReady(sync)) return
       }
+    } finally {
+      budget.completed(performance.now())
     }
   }
 
@@ -797,6 +1139,7 @@ export class Gpu {
     const gl = this.gl
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
+    this.submitGpuWork()
     try {
       await this.wait(sync)
     } finally {

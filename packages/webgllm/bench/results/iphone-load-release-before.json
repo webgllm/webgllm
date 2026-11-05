@@ -1,0 +1,267 @@
+{
+  "mode": "baseline",
+  "complete": true,
+  "results": [
+    {
+      "id": "iphone-final-before-mw1p1q8z-cold-1",
+      "cold": true,
+      "loadMs": 3506.66,
+      "engineLoadMs": 3187,
+      "fullyCalibratedMs": 12627.439999999999,
+      "fps": 120.05726246627846,
+      "maxFrameMs": 19.019999999999527,
+      "timings": {
+        "context": 4,
+        "files": 3,
+        "weights": 2161,
+        "weightsReading": 1200,
+        "weightsUploading": 805,
+        "toRgba4": 568,
+        "repackOnnx": 0,
+        "layoutProbe": 118,
+        "warmUp": 316,
+        "programs": 55,
+        "compileMs": 187,
+        "warm_batch9": 20,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 703,
+        "total": 3187
+      },
+      "gpuBytes": 1333059968,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "iphone-final-before-mw1p1q8z-cold-2",
+      "cold": true,
+      "loadMs": 3539.3599999999997,
+      "engineLoadMs": 3226,
+      "fullyCalibratedMs": 15882.220000000001,
+      "fps": 119.795669273541,
+      "maxFrameMs": 15.159999999999854,
+      "timings": {
+        "context": 3,
+        "files": 4,
+        "weights": 2283,
+        "weightsReading": 1239,
+        "weightsUploading": 881,
+        "toRgba4": 616,
+        "repackOnnx": 0,
+        "layoutProbe": 128,
+        "warmUp": 262,
+        "programs": 55,
+        "compileMs": 146,
+        "warm_batch9": 20,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 674,
+        "total": 3226
+      },
+      "gpuBytes": 1333059968,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "iphone-final-before-mw1p1q8z-cold-3",
+      "cold": true,
+      "loadMs": 3679.06,
+      "engineLoadMs": 3275,
+      "fullyCalibratedMs": 10227.099999999999,
+      "fps": 119.86757486966779,
+      "maxFrameMs": 16.720000000000255,
+      "timings": {
+        "context": 4,
+        "files": 4,
+        "weights": 2346,
+        "weightsReading": 1283,
+        "weightsUploading": 908,
+        "toRgba4": 637,
+        "repackOnnx": 0,
+        "layoutProbe": 124,
+        "warmUp": 253,
+        "programs": 55,
+        "compileMs": 145,
+        "warm_batch9": 20,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 669,
+        "total": 3275
+      },
+      "gpuBytes": 1333059968,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "iphone-final-load-before-cached-1",
+      "cold": false,
+      "loadMs": 2410.1000000000004,
+      "engineLoadMs": 2019,
+      "fullyCalibratedMs": 2410.1000000000004,
+      "fps": 120.32695738766024,
+      "maxFrameMs": 9.679999999999382,
+      "timings": {
+        "context": 3,
+        "files": 4,
+        "weights": 1705,
+        "weightsReading": 1090,
+        "weightsUploading": 453,
+        "toRgba4": 298,
+        "repackOnnx": 0,
+        "warmUp": 307,
+        "programs": 66,
+        "compileMs": 180,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 2019
+      },
+      "gpuBytes": 1366503808,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "iphone-final-load-before-cached-2",
+      "cold": false,
+      "loadMs": 2232.56,
+      "engineLoadMs": 1814,
+      "fullyCalibratedMs": 2232.56,
+      "fps": 120.04156663202781,
+      "maxFrameMs": 9.400000000000546,
+      "timings": {
+        "context": 2,
+        "files": 4,
+        "weights": 1535,
+        "weightsReading": 955,
+        "weightsUploading": 423,
+        "toRgba4": 282,
+        "repackOnnx": 0,
+        "warmUp": 272,
+        "programs": 66,
+        "compileMs": 152,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1814
+      },
+      "gpuBytes": 1366503808,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "iphone-final-load-before-cached-3",
+      "cold": false,
+      "loadMs": 2217.96,
+      "engineLoadMs": 1783,
+      "fullyCalibratedMs": 2217.96,
+      "fps": 120.38089054807119,
+      "maxFrameMs": 9.039999999999964,
+      "timings": {
+        "context": 3,
+        "files": 3,
+        "weights": 1512,
+        "weightsReading": 950,
+        "weightsUploading": 403,
+        "toRgba4": 267,
+        "repackOnnx": 0,
+        "warmUp": 265,
+        "programs": 66,
+        "compileMs": 146,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1783
+      },
+      "gpuBytes": 1366503808,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    }
+  ]
+}

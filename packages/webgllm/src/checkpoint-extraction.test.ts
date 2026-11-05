@@ -30,6 +30,11 @@ function fixture(scenario: Scenario) {
   const faultError = new Error("injected checkpoint failure")
   const bounds = () => assert.ok(state.snapshots.size + Number(state.saving !== null) + Number(state.prefixSaving !== null) <= engine.snapshotLimit)
   const gpu = {
+    readsPerSlice: 0,
+    decodeLayers: 1,
+    setPhase: () => undefined,
+    decodeWork: () => undefined,
+    configurePacing: () => undefined,
     texture(internal: number, width: number, height: number): Texture {
       if (recording) {
         bounds()
@@ -55,6 +60,7 @@ function fixture(scenario: Scenario) {
         if (fault && "draw" in fault && fault.draw === draws.length) throw faultError
       }
     },
+    async runAsync(pass: Pass) { this.run(pass) },
     write(tex: Texture, _rect: unknown, data: { pixels: ArrayLike<number> }) {
       assert.ok(live.has(tex))
       if (Array.from(data.pixels).every(value => value === 0)) zeroed.add(tex)
@@ -74,7 +80,9 @@ function fixture(scenario: Scenario) {
   } })
   const lin = Object.fromEntries(["ba", "gates", "inProj", "qkv", "qk", "delta", "o", "out"].map(name => [name, tex()]))
   const chunks = Object.fromEntries(["cum", "a", "t", "p", "u", "w", "oi", "qp"].map(name => [name, tex()]))
+  const residual = [tex(), tex()]
   Object.assign(engine, {
+    tuned: {},
     gpu, position: 0, contextLength: 4096, capacity: 12, batchSize: 12, kvPositions: 256, kvShift: 8,
     guessAt: null, draft: null, snapshots: new Map(), saving: null, prefixSaving: null, work: null, unpaced: 0,
     keepPrefixes: false, slicing: new Map(), quads: new Map(), mrt: {}, chunkedRecurrence: !!scenario.chunked,
@@ -82,7 +90,7 @@ function fixture(scenario: Scenario) {
       ...(scenario.kind === "linear" && { linear: { numKeyHeads: 4, numValueHeads: 4, keyHeadDim: 4, valueHeadDim: 4, convKernel: 4 } }) },
     layers: scenario.kind === "conv" ? [conv(), conv()] : scenario.kind === "window" ? [conv(), attention(), attention()] : [linear(), linear()],
     embedding: matrix,
-    buffers: { ids: tex(), residual: [tex(), tex()], normed: tex(), rms: tex(), bcx: tex(), convOut: tex(), opOut: tex(), gateUp: tex(), act: tex(), ffnOut: tex(), qkvg: tex(), q: tex(), attnOut: tex(), lin },
+    buffers: { ids: tex(), residual, residualSmall: residual, residualLarge: residual, normed: tex(), rms: tex(), bcx: tex(), convOut: tex(), opOut: tex(), gateUp: tex(), act: tex(), ffnOut: tex(), qkvg: tex(), q: tex(), attnOut: tex(), lin },
     linChunks: { chunk: 4, textures: chunks },
     // Matrix multiplication and attention computation are unrelated to checkpoint ownership.
     project: () => 0, matmul: () => undefined, attend: async () => 0

@@ -1,0 +1,115 @@
+{
+  "method": "Green-ball centroid in 720x1600 Android screenrecord frames; 0.25 px motion threshold; discard 350 ms at phase edges. This recording adds compositor/encoder work, so these are diagnostic motion events, not primary model throughput or an exact display FPS counter.",
+  "results": [
+    {
+      "mode": "before",
+      "id": "pixel-presentation-before",
+      "phaseWindowsSeconds": {
+        "idle": [
+          0.22750999999046329,
+          5.235
+        ],
+        "prefill": [
+          12.279,
+          17.006
+        ],
+        "decode": [
+          17.006,
+          23.07
+        ]
+      },
+      "clock": {
+        "recordHostStartMs": 1793793483708,
+        "deviceMinusHostMs": 1528
+      },
+      "videoFile": "webgl-performance-motion-before.mp4",
+      "recording": {
+        "width": 720,
+        "height": 1600,
+        "avg_frame_rate": "34740000/386159",
+        "duration": "30.034589"
+      },
+      "roi": {
+        "x": 0,
+        "y": 622,
+        "width": 720,
+        "height": 120
+      },
+      "phases": {
+        "idle": {
+          "frames": 517,
+          "spanSeconds": 4.303289,
+          "motionEventsPerSecond": 58.32747928386868,
+          "longestPositionHoldMs": 51.07799999999996
+        },
+        "prefill": {
+          "frames": 68,
+          "spanSeconds": 3.835756,
+          "motionEventsPerSecond": 12.25312558984461,
+          "longestPositionHoldMs": 393.0340000000001
+        },
+        "decode": {
+          "frames": 306,
+          "spanSeconds": 5.345932999999999,
+          "motionEventsPerSecond": 38.533965913901284,
+          "longestPositionHoldMs": 199.65600000000094
+        }
+      }
+    },
+    {
+      "mode": "after",
+      "id": "pixel-presentation-after",
+      "phaseWindowsSeconds": {
+        "idle": [
+          0.44797000002860976,
+          5.454
+        ],
+        "prefill": [
+          14.286,
+          19.046
+        ],
+        "decode": [
+          19.046,
+          24.049
+        ]
+      },
+      "clock": {
+        "recordHostStartMs": 1793793515130,
+        "deviceMinusHostMs": 1530
+      },
+      "videoFile": "webgl-performance-motion-after.mp4",
+      "recording": {
+        "width": 720,
+        "height": 1600,
+        "avg_frame_rate": "313830000/2698781",
+        "duration": "29.986456"
+      },
+      "roi": {
+        "x": 0,
+        "y": 622,
+        "width": 720,
+        "height": 120
+      },
+      "phases": {
+        "idle": {
+          "frames": 516,
+          "spanSeconds": 4.301655,
+          "motionEventsPerSecond": 58.34963519854567,
+          "longestPositionHoldMs": 49.76700000000012
+        },
+        "prefill": {
+          "frames": 462,
+          "spanSeconds": 4.052644000000001,
+          "motionEventsPerSecond": 56.99982529923673,
+          "longestPositionHoldMs": 66.6329999999995
+        },
+        "decode": {
+          "frames": 516,
+          "spanSeconds": 4.295632999999999,
+          "motionEventsPerSecond": 57.9658457787246,
+          "longestPositionHoldMs": 67.8219999999996
+        }
+      }
+    }
+  ]
+}

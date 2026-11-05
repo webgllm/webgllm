@@ -1,0 +1,1150 @@
+{
+  "device": "Mac M3 Ultra",
+  "hardware": "Apple M3 Ultra, Mac15,14, 512 GiB OS-reported RAM",
+  "os": "macOS 27.2",
+  "browser": "Chrome 156.0.8078.80",
+  "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Ultra, Unspecified Version)",
+  "baselineCommit": "2c10f9e",
+  "branch": "perf/webgl-performance",
+  "model": "LiquidAI/LFM3-1.7B-GGUF",
+  "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+  "fileBytes": 1049615680,
+  "promptBatch": 512,
+  "maxOutputTokens": 64,
+  "thinking": false,
+  "speculative": true,
+  "benchmarkTabs": 1,
+  "idleMs": 10000,
+  "restBetweenRoundsMs": 5000,
+  "memoryKind": "ua-page",
+  "optimizedEngineCode": 3321799229,
+  "optimizedCommit": "51b0400",
+  "runs": {
+    "beforeShort": {
+      "id": "mac-final-before-short",
+      "rounds": 5,
+      "inputTokens": [
+        548,
+        548,
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "promptTps": 2799.4891443167307,
+      "aggregatePromptTps": 2837.804947614247,
+      "aggregateDecodeTps": 85.33625192411345,
+      "decodeTps": 85.22439040612547,
+      "promptTpsRange": [
+        3165.434380689152,
+        2741.576406564503,
+        2799.4891443167307,
+        2801.7792315889387,
+        2723.793429936104
+      ],
+      "decodeTpsRange": [
+        85.07994813955438,
+        85.7522033607908,
+        85.07707577991462,
+        85.22439040612547,
+        85.55191168005184
+      ],
+      "prefillFps": 62.26053637713975,
+      "decodeFps": 60.20593164865619,
+      "worstPrefillFrameMs": 18.584999999999127,
+      "worstDecodeFrameMs": 18.590000000000146,
+      "framesOver100": 0,
+      "loadMs": 1423.9650000333786,
+      "loadFps": 60.3947428468987,
+      "loadWorstFrameMs": 18.590000000000146,
+      "gpuBytes": 1395863936,
+      "idleMs": "10000",
+      "restMs": "5000",
+      "firstTokenMs": 200.77999997138977,
+      "compiledDuringLoad": 56,
+      "kernelChoices": {
+        "context": 7,
+        "files": 6,
+        "weights": 1265,
+        "weightsReading": 956,
+        "weightsUploading": 105,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 123,
+        "programs": 56,
+        "compileMs": 78,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1401
+      }
+    },
+    "afterShort": {
+      "id": "mac-optimized-after-short",
+      "rounds": 5,
+      "inputTokens": [
+        548,
+        548,
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "promptTps": 2764.0472092043774,
+      "aggregatePromptTps": 2802.0800841849496,
+      "aggregateDecodeTps": 88.61831389054538,
+      "decodeTps": 88.75364524854031,
+      "promptTpsRange": [
+        3029.2142289415247,
+        2737.878144829414,
+        2789.655875447605,
+        2764.0472092043774,
+        2711.7302120224444
+      ],
+      "decodeTpsRange": [
+        89.76085144457122,
+        87.61804097535119,
+        88.22170253705728,
+        88.75364524854031,
+        88.76552515901034
+      ],
+      "prefillFps": 62.08213945310484,
+      "decodeFps": 60.22071592949588,
+      "worstPrefillFrameMs": 18.284999999999854,
+      "worstDecodeFrameMs": 18.56499999999869,
+      "framesOver100": 0,
+      "loadMs": 974.7649999856949,
+      "engineCode": 3321799229,
+      "loadFps": 60.5274091713037,
+      "loadWorstFrameMs": 18.43499999999949,
+      "gpuBytes": 1380942208,
+      "idleMs": "10000",
+      "restMs": "5000",
+      "firstTokenMs": 201.95500004291534,
+      "compiledDuringLoad": 55,
+      "kernelChoices": {
+        "context": 6,
+        "files": 4,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 813,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 428,
+        "weightsUploading": 198,
+        "f16Init": 1,
+        "packingProbe": 0,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 188,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 51,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 126,
+        "programs": 55,
+        "compileMs": 76,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 949
+      }
+    },
+    "beforeLong": {
+      "id": "mac-final-before-long",
+      "rounds": 3,
+      "inputTokens": [
+        2085,
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 3071.008792946236,
+      "aggregatePromptTps": 3091.652291590555,
+      "aggregateDecodeTps": 83.66515346375903,
+      "decodeTps": 83.63646018744872,
+      "promptTpsRange": [
+        3158.373097137471,
+        3047.7554778564872,
+        3071.008792946236
+      ],
+      "decodeTpsRange": [
+        83.16172975717421,
+        84.20377313741679,
+        83.63646018744872
+      ],
+      "prefillFps": 60.715576436573905,
+      "decodeFps": 60.178529630250985,
+      "worstPrefillFrameMs": 18.645000000000437,
+      "worstDecodeFrameMs": 18.459999999999127,
+      "framesOver100": 0,
+      "loadMs": 1489.5,
+      "loadFps": 60.42296072507553,
+      "loadWorstFrameMs": 18.6299999999992,
+      "gpuBytes": 1395863936,
+      "idleMs": "10000",
+      "restMs": "5000",
+      "firstTokenMs": 686.3999999761581,
+      "compiledDuringLoad": 56,
+      "kernelChoices": {
+        "context": 6,
+        "files": 4,
+        "weights": 1307,
+        "weightsReading": 996,
+        "weightsUploading": 115,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 146,
+        "programs": 56,
+        "compileMs": 99,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1462
+      }
+    },
+    "afterLong": {
+      "id": "mac-optimized-after-long",
+      "rounds": 3,
+      "inputTokens": [
+        2085,
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 3105.2662936263728,
+      "aggregatePromptTps": 3090.5906216993067,
+      "aggregateDecodeTps": 87.25781915451509,
+      "decodeTps": 87.07069310175139,
+      "promptTpsRange": [
+        3111.2669647006883,
+        3105.2662936263728,
+        3055.8405395657537
+      ],
+      "decodeTpsRange": [
+        88.1476403116585,
+        87.07069310175139,
+        86.56997395859977
+      ],
+      "prefillFps": 60.59687925905051,
+      "decodeFps": 60.20006020287335,
+      "worstPrefillFrameMs": 18.56999999999971,
+      "worstDecodeFrameMs": 18.57499999999891,
+      "framesOver100": 0,
+      "loadMs": 974.3550000190735,
+      "engineCode": 3321799229,
+      "loadFps": 60.55287856976671,
+      "loadWorstFrameMs": 18.575000000000728,
+      "gpuBytes": 1380942208,
+      "idleMs": "10000",
+      "restMs": "5000",
+      "firstTokenMs": 682.4349999427795,
+      "compiledDuringLoad": 55,
+      "kernelChoices": {
+        "context": 7,
+        "files": 6,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 797,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 445,
+        "weightsUploading": 174,
+        "f16Init": 1,
+        "packingProbe": 0,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 189,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 52,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 125,
+        "programs": 55,
+        "compileMs": 79,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 934
+      }
+    },
+    "sampled": {
+      "id": "mac-optimized-sampled",
+      "rounds": 1,
+      "inputTokens": [
+        548
+      ],
+      "cachedTokens": [
+        0
+      ],
+      "promptTps": 3019.4501072852736,
+      "aggregatePromptTps": 3019.4501072852736,
+      "aggregateDecodeTps": 86.58603629502129,
+      "decodeTps": 86.58603629502129,
+      "promptTpsRange": [
+        3019.4501072852736
+      ],
+      "decodeTpsRange": [
+        86.58603629502129
+      ],
+      "prefillFps": 60.69188750891964,
+      "decodeFps": 60.184893598938665,
+      "worstPrefillFrameMs": 16.67500000000109,
+      "worstDecodeFrameMs": 17.545000000000073,
+      "framesOver100": 0,
+      "loadMs": 942.0049999952316,
+      "engineCode": 3321799229,
+      "loadFps": 60.50923296616104,
+      "loadWorstFrameMs": 18.265000000001237,
+      "gpuBytes": 1380942208,
+      "idleMs": "10000",
+      "firstTokenMs": 184.8200000524521,
+      "compiledDuringLoad": 55,
+      "kernelChoices": {
+        "context": 6,
+        "files": 4,
+        "calibrationCached": 1,
+        "engineCode": 3321799229,
+        "weights": 785,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 432,
+        "weightsUploading": 173,
+        "f16Init": 1,
+        "packingProbe": 0,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "repackGgufQ4": 187,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 51,
+        "layoutRgba4DecodeMs": null,
+        "layoutBytesDecodeMs": null,
+        "warmUp": 123,
+        "programs": 55,
+        "compileMs": 77,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 919
+      }
+    }
+  },
+  "short": {
+    "promptGainPct": -1.2660143792414535,
+    "decodeGainPct": 4.141132398362313,
+    "matchedReplies": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "long": {
+    "promptGainPct": 1.1155129467171232,
+    "decodeGainPct": 4.106143309515686,
+    "matchedReplies": [
+      true,
+      true,
+      true
+    ]
+  },
+  "load": {
+    "before": {
+      "file": "mac-load-before.json",
+      "cold": {
+        "ids": [
+          "mac-baseline-calibrate",
+          "mac-before-cold2",
+          "mac-before-cold3"
+        ],
+        "trials": 3,
+        "medianMs": 1858.0749999284744,
+        "minMs": 1845.2099999189377,
+        "maxMs": 2159.25,
+        "fps": 60.20609007757323,
+        "worstFrameMs": 18.625,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 2676.4499999284744,
+        "fullyCalibratedRangeMs": [
+          2653.6200000047684,
+          2980.2549999952316,
+          2676.4499999284744
+        ],
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      },
+      "cached": {
+        "ids": [
+          "mac-final-before-short",
+          "mac-final-before-long",
+          "mac-memory-before-short"
+        ],
+        "trials": 3,
+        "medianMs": 1428.0800000429153,
+        "minMs": 1423.9650000333786,
+        "maxMs": 1489.5,
+        "fps": 60.3947428468987,
+        "worstFrameMs": 18.6299999999992,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 1428.0800000429153,
+        "fullyCalibratedRangeMs": [
+          1423.9650000333786,
+          1489.5,
+          1428.0800000429153
+        ],
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      }
+    },
+    "after": {
+      "file": "mac-load-after.json",
+      "cold": {
+        "ids": [
+          "mac-optimized-calibrate",
+          "mac-optimized-cold2",
+          "mac-optimized-cold3"
+        ],
+        "trials": 3,
+        "medianMs": 1292.9400000572205,
+        "minMs": 1291.6899999380112,
+        "maxMs": 1326.9649999141693,
+        "fps": 60.3276254091822,
+        "worstFrameMs": 18.585000000000036,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 1292.9400000572205,
+        "fullyCalibratedRangeMs": [
+          1291.6899999380112,
+          1326.9649999141693,
+          1292.9400000572205
+        ],
+        "headExpanded": [
+          0,
+          0,
+          0
+        ],
+        "engineCodes": [
+          3321799229
+        ]
+      },
+      "cached": {
+        "ids": [
+          "mac-optimized-after-short",
+          "mac-optimized-after-long",
+          "mac-optimized-memory-short"
+        ],
+        "trials": 3,
+        "medianMs": 974.3550000190735,
+        "minMs": 943.6749999523163,
+        "maxMs": 974.7649999856949,
+        "fps": 60.5274091713037,
+        "worstFrameMs": 18.659999999999854,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 974.3550000190735,
+        "fullyCalibratedRangeMs": [
+          974.7649999856949,
+          974.3550000190735,
+          943.6749999523163
+        ],
+        "headExpanded": [
+          0,
+          0,
+          0
+        ],
+        "engineCodes": [
+          3321799229
+        ]
+      }
+    }
+  },
+  "memory": {
+    "before": {
+      "file": "mac-memory-before-short.json",
+      "kind": "ua-page",
+      "id": "mac-memory-before-short",
+      "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-short&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000",
+      "complete": true,
+      "retainedPageBytes": 54301219,
+      "breakdown": [
+        {
+          "attribution": [],
+          "bytes": 879251,
+          "types": [
+            "Shared"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-short&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 504000,
+          "types": [
+            "Canvas"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "DedicatedWorkerGlobalScope",
+              "url": "http://localhost:8788/dist/baseline-worker.js"
+            }
+          ],
+          "bytes": 51925997,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-short&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 959771,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [],
+          "bytes": 0,
+          "types": []
+        },
+        {
+          "attribution": [],
+          "bytes": 32200,
+          "types": [
+            "DOM"
+          ]
+        }
+      ],
+      "gpuBytes": 1403180416,
+      "peakGpuBytes": 1403180416,
+      "scope": "measureUserAgentSpecificMemory after GC: this page plus its dedicated worker; GPU texture bytes separate. Not natural CPU peak or process/phone RSS."
+    },
+    "after": {
+      "file": "mac-memory-after-short.json",
+      "kind": "ua-page",
+      "id": "mac-optimized-memory-short",
+      "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-short&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000",
+      "complete": true,
+      "retainedPageBytes": 55119999,
+      "breakdown": [
+        {
+          "attribution": [],
+          "bytes": 0,
+          "types": []
+        },
+        {
+          "attribution": [],
+          "bytes": 1024505,
+          "types": [
+            "Shared"
+          ]
+        },
+        {
+          "attribution": [],
+          "bytes": 32200,
+          "types": [
+            "DOM"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "DedicatedWorkerGlobalScope",
+              "url": "http://localhost:8788/dist/current-worker.js"
+            }
+          ],
+          "bytes": 52487528,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-short&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 1071766,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-short&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=512&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 504000,
+          "types": [
+            "Canvas"
+          ]
+        }
+      ],
+      "gpuBytes": 1387902336,
+      "peakGpuBytes": 1387902336,
+      "scope": "measureUserAgentSpecificMemory after GC: this page plus its dedicated worker; GPU texture bytes separate. Not natural CPU peak or process/phone RSS."
+    },
+    "beforeLong": {
+      "file": "mac-memory-before-long.json",
+      "kind": "ua-page",
+      "id": "mac-memory-before-long",
+      "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-long&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000",
+      "complete": true,
+      "retainedPageBytes": 54426471,
+      "breakdown": [
+        {
+          "attribution": [],
+          "bytes": 32200,
+          "types": [
+            "DOM"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-long&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 987284,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "DedicatedWorkerGlobalScope",
+              "url": "http://localhost:8788/dist/baseline-worker.js"
+            }
+          ],
+          "bytes": 51979913,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-memory-before-long&baseline=1&restoreCalibration=mac-before&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 504000,
+          "types": [
+            "Canvas"
+          ]
+        },
+        {
+          "attribution": [],
+          "bytes": 0,
+          "types": []
+        },
+        {
+          "attribution": [],
+          "bytes": 923074,
+          "types": [
+            "Shared"
+          ]
+        }
+      ],
+      "gpuBytes": 1433212288,
+      "peakGpuBytes": 1433212288,
+      "scope": "measureUserAgentSpecificMemory after GC: this page plus its dedicated worker; GPU texture bytes separate. Not natural CPU peak or process/phone RSS."
+    },
+    "afterLong": {
+      "file": "mac-memory-after-long.json",
+      "kind": "ua-page",
+      "id": "mac-optimized-memory-long",
+      "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000",
+      "complete": true,
+      "retainedPageBytes": 55176354,
+      "breakdown": [
+        {
+          "attribution": [],
+          "bytes": 968553,
+          "types": [
+            "Shared"
+          ]
+        },
+        {
+          "attribution": [],
+          "bytes": 0,
+          "types": []
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 1046425,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "DedicatedWorkerGlobalScope",
+              "url": "http://localhost:8788/dist/current-worker.js"
+            }
+          ],
+          "bytes": 52625176,
+          "types": [
+            "JavaScript"
+          ]
+        },
+        {
+          "attribution": [],
+          "bytes": 32200,
+          "types": [
+            "DOM"
+          ]
+        },
+        {
+          "attribution": [
+            {
+              "scope": "Window",
+              "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+            }
+          ],
+          "bytes": 504000,
+          "types": [
+            "Canvas"
+          ]
+        }
+      ],
+      "gpuBytes": 1417196928,
+      "peakGpuBytes": 1417196928,
+      "scope": "measureUserAgentSpecificMemory after GC: this page plus its dedicated worker; GPU texture bytes separate. Not natural CPU peak or process/phone RSS."
+    }
+  },
+  "quality": [
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:17.284Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "fused-prefill-inputs-vs-original-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:18.673Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "prepared-vs-incremental-cache-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:18.863Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "upload-byte-exact",
+      "groups": 148,
+      "bytesChecked": 1212416,
+      "mismatches": 0
+    },
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:19.012Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "expanded-unsplit-vs-split-full-vocabulary",
+      "maxAbs": 0.000003814697265625,
+      "relativeRms": 1.2779424297844645e-7,
+      "kl": 4.0606791352885245e-14,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:19.024Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "native-vs-expanded-real-hidden-state",
+      "maxAbs": 0.0000019073486328125,
+      "relativeRms": 1.0341112229542104e-7,
+      "kl": 5.01698511144533e-14,
+      "top1": true,
+      "logits": 8192
+    },
+    {
+      "id": "mac-optimized-quality",
+      "at": "2026-11-04T11:37:19.078Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "streamed-vs-original-full-model",
+      "maxAbs": 0.012923657894134521,
+      "relativeRms": 0.0012046851643278565,
+      "kl": 0.0000021924189792619478,
+      "top1": true,
+      "logits": 128000
+    }
+  ],
+  "controls": [
+    {
+      "name": "Earlier original-engine control",
+      "ids": "mac-before-short",
+      "interpretation": "Earlier three-trial baseline; final five-trial baseline is contemporaneous with the revised controller.",
+      "metrics": {
+        "id": "mac-before-short",
+        "rounds": 3,
+        "inputTokens": [
+          548,
+          548,
+          548
+        ],
+        "cachedTokens": [
+          0,
+          0,
+          0
+        ],
+        "promptTps": 2884.817855811502,
+        "aggregatePromptTps": 3000.109492942767,
+        "aggregateDecodeTps": 86.48401304124006,
+        "decodeTps": 86.79359655960985,
+        "promptTpsRange": [
+          3268.227226216438,
+          2884.817855811502,
+          2878.9828990392793
+        ],
+        "decodeTpsRange": [
+          86.79359655960985,
+          87.09717555785353,
+          85.57631574250591
+        ],
+        "prefillFps": 61.51953243200285,
+        "decodeFps": 60.23024378813081,
+        "worstPrefillFrameMs": 17.154999999998836,
+        "worstDecodeFrameMs": 17.63500000000022,
+        "framesOver100": 0,
+        "loadMs": 1426.304999947548,
+        "loadFps": 60.295659065320976,
+        "loadWorstFrameMs": 17.594999999999345,
+        "gpuBytes": 1395863936,
+        "idleMs": "10000",
+        "restMs": "5000",
+        "firstTokenMs": 194.24500000476837,
+        "compiledDuringLoad": 56,
+        "kernelChoices": {
+          "context": 6,
+          "files": 5,
+          "weights": 1271,
+          "weightsReading": 978,
+          "weightsUploading": 101,
+          "toRgba4": 0,
+          "repackOnnx": 0,
+          "warmUp": 119,
+          "programs": 56,
+          "compileMs": 78,
+          "warm_batch9": 22,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 0,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 6,
+          "tunedShortSplit": 0,
+          "tunedF16Matmul": -1,
+          "tunedF16Pack": -1,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 1402
+        }
+      }
+    },
+    {
+      "name": "Rejected initial storage/controller selection",
+      "ids": "mac-after-short",
+      "interpretation": "Native RGBA4 and over-conservative submission pacing regressed whole-model speed; rejected.",
+      "metrics": {
+        "id": "mac-after-short",
+        "rounds": 3,
+        "inputTokens": [
+          548,
+          548,
+          548
+        ],
+        "cachedTokens": [
+          0,
+          0,
+          0
+        ],
+        "promptTps": 2353.951889311135,
+        "aggregatePromptTps": 2377.767010340649,
+        "aggregateDecodeTps": 70.88195529262357,
+        "decodeTps": 70.89445166669728,
+        "promptTpsRange": [
+          2531.0024711276646,
+          2353.951889311135,
+          2263.620967096714
+        ],
+        "decodeTpsRange": [
+          70.47176934290088,
+          71.2843055747488,
+          70.89445166669728
+        ],
+        "prefillFps": 61.9135145422138,
+        "decodeFps": 60.16403212857944,
+        "worstPrefillFrameMs": 18.49500000000262,
+        "worstDecodeFrameMs": 18.664999999997235,
+        "framesOver100": 0,
+        "loadMs": 1293.4350000619888,
+        "engineCode": 3638057984,
+        "loadFps": 60.30453791358808,
+        "loadWorstFrameMs": 18.5,
+        "gpuBytes": 1351582080,
+        "idleMs": "10000",
+        "restMs": "5000",
+        "firstTokenMs": 237.77500009536743,
+        "compiledDuringLoad": 56,
+        "kernelChoices": {
+          "context": 6,
+          "files": 11,
+          "calibrationCached": 1,
+          "engineCode": 3638057984,
+          "weights": 1099,
+          "headExpanded": 0,
+          "headSplit": 2,
+          "promptPacking": 3,
+          "weightsReading": 436,
+          "weightsUploading": 480,
+          "f16Init": 1,
+          "packingProbe": 0,
+          "matvecProbe": 0,
+          "packingProbeRows": 0,
+          "rmsParts": 64,
+          "toRgba4": 284,
+          "repackOnnx": 0,
+          "repackGgufQ4": 187,
+          "repackGgufQ8": 0,
+          "repackGgufQ6": 51,
+          "warmUp": 139,
+          "programs": 56,
+          "compileMs": 81,
+          "warm_batch9": 21,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 2,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 5,
+          "tunedShortSplit": 0,
+          "tunedF16Matmul": 2,
+          "tunedF16Pack": 3,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 1255
+        }
+      }
+    },
+    {
+      "name": "Submission pacing disabled (diagnostic only)",
+      "ids": "mac-quota-control",
+      "interpretation": "Restored speed and identified fence overhead. Final runs use automatic pacing with no overrides.",
+      "metrics": {
+        "id": "mac-quota-control",
+        "rounds": 2,
+        "inputTokens": [
+          548,
+          548
+        ],
+        "cachedTokens": [
+          0,
+          0
+        ],
+        "promptTps": 3052.2827936438125,
+        "aggregatePromptTps": 3032.0635181709463,
+        "aggregateDecodeTps": 89.58885116822577,
+        "decodeTps": 89.58978677452559,
+        "promptTpsRange": [
+          3300.707725214245,
+          2803.85786207338
+        ],
+        "decodeTpsRange": [
+          89.30026860772738,
+          89.87930494132381
+        ],
+        "prefillFps": 61.44457206969676,
+        "decodeFps": 60.19374980346363,
+        "worstPrefillFrameMs": 18.654999999998836,
+        "worstDecodeFrameMs": 18.649999999999636,
+        "framesOver100": 0,
+        "loadMs": 992.0199999809265,
+        "engineCode": 3617694451,
+        "loadFps": 60.48265156060726,
+        "loadWorstFrameMs": 18.654999999998836,
+        "gpuBytes": 1380942208,
+        "idleMs": "10000",
+        "restMs": "5000",
+        "firstTokenMs": 184.86750000715256,
+        "compiledDuringLoad": 55,
+        "kernelChoices": {
+          "context": 7,
+          "files": 3,
+          "calibrationCached": 1,
+          "engineCode": 3617694451,
+          "weights": 814,
+          "headExpanded": 0,
+          "headSplit": 2,
+          "promptPacking": 3,
+          "weightsReading": 429,
+          "weightsUploading": 203,
+          "f16Init": 1,
+          "packingProbe": 0,
+          "matvecProbe": 0,
+          "packingProbeRows": 0,
+          "rmsParts": 64,
+          "toRgba4": 0,
+          "repackOnnx": 0,
+          "repackGgufQ4": 187,
+          "repackGgufQ8": 0,
+          "repackGgufQ6": 52,
+          "layoutRgba4DecodeMs": null,
+          "layoutBytesDecodeMs": null,
+          "warmUp": 135,
+          "programs": 55,
+          "compileMs": 75,
+          "warm_batch9": 22,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 0,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 5,
+          "tunedShortSplit": 0,
+          "tunedF16Matmul": -1,
+          "tunedF16Pack": 3,
+          "tunedFlashDecode": -1,
+          "selfCheck": 0,
+          "total": 959
+        }
+      }
+    }
+  ],
+  "interrupted": [],
+  "methods": {
+    "fps": "requestAnimationFrame with a repainted canvas and CSS spinner; not a system-wide presentation trace",
+    "load": "Cached GGUF files. Cold means derived calibration notes reset, not a network download or an empty OS/driver cache.",
+    "memory": "measureUserAgentSpecificMemory after GC includes this page and its dedicated worker. Retained CPU measurement only; natural CPU peak not captured. GPU texture peak separate, excluding driver overhead and browser RSS."
+  }
+}

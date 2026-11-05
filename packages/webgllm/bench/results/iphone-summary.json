@@ -1,0 +1,996 @@
+{
+  "device": "iPhone 16 Pro Max",
+  "os": "iOS 27.2 (24B119), as reported by CoreDevice",
+  "browser": "Safari 27.2",
+  "renderer": "Apple GPU",
+  "baselineCommit": "2c10f9e",
+  "branch": "perf/webgl-performance",
+  "model": "LiquidAI/LFM3-1.7B-GGUF",
+  "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+  "fileBytes": 1049615680,
+  "promptBatch": 512,
+  "maxOutputTokens": 64,
+  "thinking": false,
+  "speculative": true,
+  "benchmarkTabs": 1,
+  "pageRenderingPreference": "Prefer Page Rendering Updates near 60fps disabled by user; Safari reopened; idle 120 Hz verified",
+  "idleMs": 60000,
+  "restBetweenRoundsMs": 60000,
+  "memoryKind": "webkit",
+  "optimizedEngineCode": 446196241,
+  "optimizedCommit": "70d3ea0",
+  "versionLimitation": "Physical iPhone results use checkpoint 70d3ea0 (engine 446196241). Subsequent startup storage selection and fast-workload pacing refinements were tested on Pixel and Mac after the iPhone was returned; final branch needs an iPhone recheck.",
+  "runs": {
+    "beforeShort": {
+      "id": "iphone-rested-before-short",
+      "rounds": 3,
+      "inputTokens": [
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 305.7728576370664,
+      "aggregatePromptTps": 298.8091256743195,
+      "aggregateDecodeTps": 26.432679182796665,
+      "decodeTps": 26.45458210158557,
+      "promptTpsRange": [
+        285.6576903428935,
+        305.7728576370664,
+        305.9264883212007
+      ],
+      "decodeTpsRange": [
+        26.146937488067866,
+        26.45458210158557,
+        26.70238286978566
+      ],
+      "prefillFps": 120.23466489769658,
+      "decodeFps": 120.2068595741733,
+      "worstPrefillFrameMs": 9.419999999998254,
+      "worstDecodeFrameMs": 9.079999999987194,
+      "framesOver100": 0,
+      "loadMs": 2527.239999999998,
+      "loadFps": 119.49795033316988,
+      "loadWorstFrameMs": 24.07999999999447,
+      "gpuBytes": 1366503808,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 1797.199999999997,
+      "compiledDuringLoad": 66,
+      "kernelChoices": {
+        "context": 3,
+        "files": 5,
+        "weights": 1795,
+        "weightsReading": 1207,
+        "weightsUploading": 417,
+        "toRgba4": 258,
+        "repackOnnx": 0,
+        "warmUp": 278,
+        "programs": 66,
+        "compileMs": 153,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 2081
+      }
+    },
+    "afterShort": {
+      "id": "iphone-refresh-short",
+      "rounds": 3,
+      "inputTokens": [
+        548,
+        548,
+        548
+      ],
+      "cachedTokens": [
+        0,
+        0,
+        0
+      ],
+      "promptTps": 300.1325402823875,
+      "aggregatePromptTps": 300.84654264371636,
+      "aggregateDecodeTps": 28.76362086808304,
+      "decodeTps": 28.67886049327652,
+      "promptTpsRange": [
+        300.1325402823875,
+        302.4215800975682,
+        299.9978102349629
+      ],
+      "decodeTpsRange": [
+        28.655641067627318,
+        28.67886049327652,
+        28.958327587633306
+      ],
+      "prefillFps": 120.4634557680084,
+      "decodeFps": 120.16207908341451,
+      "worstPrefillFrameMs": 9.440000000002328,
+      "worstDecodeFrameMs": 8.920000000012806,
+      "framesOver100": 0,
+      "loadMs": 2337.519999999997,
+      "engineCode": 446196241,
+      "loadFps": 120.21287518395582,
+      "loadWorstFrameMs": 9.360000000000582,
+      "gpuBytes": 1351582080,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 1833.9199999999837,
+      "compiledDuringLoad": 65,
+      "kernelChoices": {
+        "context": 3,
+        "files": 4,
+        "calibrationCached": 1,
+        "engineCode": 446196241,
+        "weights": 1636,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 1014,
+        "weightsUploading": 473,
+        "f16Init": 1,
+        "packingProbe": 0,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 208,
+        "repackOnnx": 0,
+        "repackGgufQ4": 414,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 49,
+        "warmUp": 262,
+        "programs": 65,
+        "compileMs": 131,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 1905
+      }
+    },
+    "beforeLong": {
+      "id": "iphone-rested-before-long",
+      "rounds": 2,
+      "inputTokens": [
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0
+      ],
+      "promptTps": 285.1465758278241,
+      "aggregatePromptTps": 285.1258656339229,
+      "aggregateDecodeTps": 26.013064338979124,
+      "decodeTps": 26.013231537711345,
+      "promptTpsRange": [
+        282.71646453908403,
+        287.5766871165642
+      ],
+      "decodeTpsRange": [
+        25.947281713344317,
+        26.079181362078373
+      ],
+      "prefillFps": 120.06490963523387,
+      "decodeFps": 120.18362990024534,
+      "worstPrefillFrameMs": 12.540000000000873,
+      "worstDecodeFrameMs": 8.85999999998603,
+      "framesOver100": 0,
+      "loadMs": 2247.019999999997,
+      "loadFps": 120.60417797794429,
+      "loadWorstFrameMs": 10.080000000001746,
+      "gpuBytes": 1366503808,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 7320.5799999999945,
+      "compiledDuringLoad": 66,
+      "kernelChoices": {
+        "context": 7,
+        "files": 16,
+        "weights": 1669,
+        "weightsReading": 1155,
+        "weightsUploading": 355,
+        "toRgba4": 226,
+        "repackOnnx": 0,
+        "warmUp": 260,
+        "programs": 66,
+        "compileMs": 141,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1951
+      }
+    },
+    "afterLong": {
+      "id": "iphone-refresh-long",
+      "rounds": 2,
+      "inputTokens": [
+        2085,
+        2085
+      ],
+      "cachedTokens": [
+        0,
+        0
+      ],
+      "promptTps": 285.88170663861365,
+      "aggregatePromptTps": 285.87137296410907,
+      "aggregateDecodeTps": 28.130776855961482,
+      "decodeTps": 28.130856150083062,
+      "promptTpsRange": [
+        284.1629255288701,
+        287.6004877483572
+      ],
+      "decodeTpsRange": [
+        28.178085500362304,
+        28.083626799803824
+      ],
+      "prefillFps": 120.02868804467153,
+      "decodeFps": 120.24793112891378,
+      "worstPrefillFrameMs": 16.860000000015134,
+      "worstDecodeFrameMs": 8.880000000004657,
+      "framesOver100": 0,
+      "loadMs": 2181.779999999999,
+      "engineCode": 446196241,
+      "loadFps": 120.0854348284429,
+      "loadWorstFrameMs": 8.940000000002328,
+      "gpuBytes": 1351582080,
+      "idleMs": "60000",
+      "restMs": "60000",
+      "firstTokenMs": 7301.799999999996,
+      "compiledDuringLoad": 65,
+      "kernelChoices": {
+        "context": 3,
+        "files": 4,
+        "calibrationCached": 1,
+        "engineCode": 446196241,
+        "weights": 1629,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 1020,
+        "weightsUploading": 452,
+        "f16Init": 2,
+        "packingProbe": 1,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 191,
+        "repackOnnx": 0,
+        "repackGgufQ4": 413,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 50,
+        "warmUp": 266,
+        "programs": 65,
+        "compileMs": 128,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 1902
+      }
+    },
+    "sampled": {
+      "id": "iphone-refresh-sampled",
+      "rounds": 1,
+      "inputTokens": [
+        548
+      ],
+      "cachedTokens": [
+        0
+      ],
+      "promptTps": 293.79597263622907,
+      "aggregatePromptTps": 293.79597263622907,
+      "aggregateDecodeTps": 28.380935219389137,
+      "decodeTps": 28.380935219389137,
+      "promptTpsRange": [
+        293.79597263622907
+      ],
+      "decodeTpsRange": [
+        28.380935219389137
+      ],
+      "prefillFps": 120.447253696025,
+      "decodeFps": 120.28349895445895,
+      "worstPrefillFrameMs": 9.459999999999127,
+      "worstDecodeFrameMs": 9.360000000000582,
+      "framesOver100": 0,
+      "loadMs": 2134.6399999999994,
+      "engineCode": 446196241,
+      "loadFps": 120.39500805756478,
+      "loadWorstFrameMs": 10.06000000000131,
+      "gpuBytes": 1351582080,
+      "idleMs": "30000",
+      "firstTokenMs": 1869.8600000000001,
+      "compiledDuringLoad": 65,
+      "kernelChoices": {
+        "context": 3,
+        "files": 5,
+        "calibrationCached": 1,
+        "engineCode": 446196241,
+        "weights": 1506,
+        "headExpanded": 0,
+        "headSplit": 2,
+        "promptPacking": 3,
+        "weightsReading": 828,
+        "weightsUploading": 525,
+        "f16Init": 1,
+        "packingProbe": 1,
+        "matvecProbe": 0,
+        "packingProbeRows": 0,
+        "rmsParts": 64,
+        "toRgba4": 220,
+        "repackOnnx": 0,
+        "repackGgufQ4": 436,
+        "repackGgufQ8": 0,
+        "repackGgufQ6": 47,
+        "warmUp": 265,
+        "programs": 65,
+        "compileMs": 132,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 11,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 2,
+        "tunedF16Matmul": 2,
+        "tunedF16Pack": 3,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 1779
+      }
+    }
+  },
+  "short": {
+    "promptGainPct": -1.8446102110782014,
+    "decodeGainPct": 8.407913544616674,
+    "matchedReplies": [
+      false,
+      true,
+      true
+    ]
+  },
+  "long": {
+    "promptGainPct": 0.2578080443909725,
+    "decodeGainPct": 8.140567269782695,
+    "matchedReplies": [
+      true,
+      true
+    ]
+  },
+  "load": {
+    "before": {
+      "file": "iphone-load-release-before.json",
+      "cold": {
+        "ids": [
+          "iphone-final-before-mw1p1q8z-cold-1",
+          "iphone-final-before-mw1p1q8z-cold-2",
+          "iphone-final-before-mw1p1q8z-cold-3"
+        ],
+        "trials": 3,
+        "medianMs": 3539.3599999999997,
+        "minMs": 3506.66,
+        "maxMs": 3679.06,
+        "fps": 119.86757486966779,
+        "worstFrameMs": 19.019999999999527,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 12627.439999999999,
+        "fullyCalibratedRangeMs": [
+          12627.439999999999,
+          15882.220000000001,
+          10227.099999999999
+        ],
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      },
+      "cached": {
+        "ids": [
+          "iphone-final-load-before-cached-1",
+          "iphone-final-load-before-cached-2",
+          "iphone-final-load-before-cached-3"
+        ],
+        "trials": 3,
+        "medianMs": 2232.56,
+        "minMs": 2217.96,
+        "maxMs": 2410.1000000000004,
+        "fps": 120.32695738766024,
+        "worstFrameMs": 9.679999999999382,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 2232.56,
+        "fullyCalibratedRangeMs": [
+          2410.1000000000004,
+          2232.56,
+          2217.96
+        ],
+        "headExpanded": [
+          null,
+          null,
+          null
+        ],
+        "engineCodes": [
+          null
+        ]
+      }
+    },
+    "after": {
+      "file": "iphone-load-release-after.json",
+      "cold": {
+        "ids": [
+          "iphone-refresh-calibration-mw1ukrp0-cold-1",
+          "iphone-refresh-calibration-mw1ukrp0-cold-2",
+          "iphone-refresh-calibration-mw1ukrp0-cold-3"
+        ],
+        "trials": 3,
+        "medianMs": 6775.5599999999995,
+        "minMs": 6764.5599999999995,
+        "maxMs": 6818.200000000001,
+        "fps": 120.03737124070155,
+        "worstFrameMs": 19.779999999999745,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 6775.5599999999995,
+        "fullyCalibratedRangeMs": [
+          6775.5599999999995,
+          6764.5599999999995,
+          6818.200000000001
+        ],
+        "headExpanded": [
+          0,
+          0,
+          0
+        ],
+        "engineCodes": [
+          446196241
+        ]
+      },
+      "cached": {
+        "ids": [
+          "iphone-refresh-calibration-mw1ukrp0-cached-1",
+          "iphone-refresh-calibration-mw1ukrp0-cached-2",
+          "iphone-refresh-calibration-mw1ukrp0-cached-3"
+        ],
+        "trials": 3,
+        "medianMs": 2142.2,
+        "minMs": 2127.2,
+        "maxMs": 2284.4,
+        "fps": 120.381719488706,
+        "worstFrameMs": 10.2199999999998,
+        "allUnder10s": true,
+        "fullyCalibratedMedianMs": 2142.2,
+        "fullyCalibratedRangeMs": [
+          2284.4,
+          2142.2,
+          2127.2
+        ],
+        "headExpanded": [
+          0,
+          0,
+          0
+        ],
+        "engineCodes": [
+          446196241
+        ]
+      }
+    }
+  },
+  "memory": {
+    "before": {
+      "file": "iphone-memory-release-before-short.json",
+      "kind": "webkit",
+      "idlePageBytes": 351214592,
+      "incrementalPeakPageBytes": 195665920,
+      "incrementalRetainedPageBytes": 64872448,
+      "unloadedPageBytes": 314153984,
+      "retainedOverUnloadedBytes": 101933056,
+      "complete": true,
+      "samples": 30,
+      "gpuBytes": 1373820288,
+      "peakGpuBytes": 1373820288,
+      "workerGcTargets": 1,
+      "gcCollected": true,
+      "memoryPressure": [
+        {
+          "at": 1793781355223,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781355487,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781355495,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781355503,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781355553,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        }
+      ],
+      "peakPageBytes": 546880512,
+      "retainedPageBytes": 416087040
+    },
+    "after": {
+      "file": "iphone-memory-release-after-short.json",
+      "kind": "webkit",
+      "idlePageBytes": 365107200,
+      "incrementalPeakPageBytes": 227501056,
+      "incrementalRetainedPageBytes": 55550976,
+      "unloadedPageBytes": 315988992,
+      "retainedOverUnloadedBytes": 104669184,
+      "complete": true,
+      "samples": 34,
+      "gpuBytes": 1358542208,
+      "peakGpuBytes": 1358542208,
+      "workerGcTargets": 1,
+      "gcCollected": true,
+      "memoryPressure": [
+        {
+          "at": 1793781392065,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781392078,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781392100,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781392111,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781392120,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        },
+        {
+          "at": 1793781392125,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        }
+      ],
+      "peakPageBytes": 592608256,
+      "retainedPageBytes": 420658176
+    },
+    "beforeLong": {
+      "file": "iphone-memory-release-before-long.json",
+      "kind": "webkit",
+      "idlePageBytes": 363314176,
+      "incrementalPeakPageBytes": 230457344,
+      "incrementalRetainedPageBytes": 58982400,
+      "unloadedPageBytes": 314760192,
+      "retainedOverUnloadedBytes": 107536384,
+      "complete": true,
+      "samples": 40,
+      "gpuBytes": 1403852160,
+      "peakGpuBytes": 1403852160,
+      "workerGcTargets": 1,
+      "gcCollected": true,
+      "memoryPressure": [
+        {
+          "at": 1793781370144,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        }
+      ],
+      "peakPageBytes": 593771520,
+      "retainedPageBytes": 422296576
+    },
+    "afterLong": {
+      "file": "iphone-memory-release-after-long.json",
+      "kind": "webkit",
+      "idlePageBytes": 365377536,
+      "incrementalPeakPageBytes": 231194624,
+      "incrementalRetainedPageBytes": 62751744,
+      "unloadedPageBytes": 318274560,
+      "retainedOverUnloadedBytes": 109854720,
+      "complete": true,
+      "samples": 51,
+      "gpuBytes": 1387836800,
+      "peakGpuBytes": 1387836800,
+      "workerGcTargets": 1,
+      "gcCollected": true,
+      "memoryPressure": [
+        {
+          "at": 1793781409646,
+          "phase": "load",
+          "method": "Memory.memoryPressure",
+          "timestamp": 0,
+          "severity": "non-critical"
+        }
+      ],
+      "peakPageBytes": 596572160,
+      "retainedPageBytes": 428129280
+    }
+  },
+  "quality": [
+    {
+      "id": "iphone-refresh-quality",
+      "at": "2026-11-04T08:29:39.115Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "fused-prefill-inputs-vs-original-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "iphone-refresh-quality",
+      "at": "2026-11-04T08:30:17.985Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "prepared-vs-incremental-cache-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    },
+    {
+      "id": "iphone-refresh-quality",
+      "at": "2026-11-04T08:30:18.035Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "native-vs-expanded-real-hidden-state",
+      "maxAbs": 0.0000019073486328125,
+      "relativeRms": 1.0174546260557175e-7,
+      "kl": 6.16205640809835e-14,
+      "top1": true,
+      "logits": 8192
+    },
+    {
+      "id": "iphone-refresh-quality",
+      "at": "2026-11-04T08:30:18.159Z",
+      "phase": "profile",
+      "stage": "quality",
+      "kind": "streamed-vs-original-full-model",
+      "maxAbs": 0,
+      "relativeRms": 0,
+      "kl": 0,
+      "top1": true,
+      "logits": 128000
+    }
+  ],
+  "controls": [
+    {
+      "name": "Original, paired control",
+      "ids": [
+        "iphone-paired-before-long-1",
+        "iphone-paired-before-long-2"
+      ],
+      "interpretation": "Same-session reference on an earlier build; shows run-to-run variation.",
+      "metrics": {
+        "id": [
+          "iphone-paired-before-long-1",
+          "iphone-paired-before-long-2"
+        ],
+        "rounds": 2,
+        "inputTokens": [
+          2085,
+          2085
+        ],
+        "cachedTokens": [
+          0,
+          0
+        ],
+        "promptTps": 283.7715483845105,
+        "aggregatePromptTps": 283.72210746332024,
+        "aggregateDecodeTps": 24.93903790733762,
+        "decodeTps": 24.97857256948388,
+        "promptTpsRange": [
+          287.51720276788745,
+          280.0258940011335
+        ],
+        "decodeTpsRange": [
+          25.972312690154435,
+          23.98483244881332
+        ],
+        "prefillFps": 120.03320808257149,
+        "decodeFps": 119.36257134014272,
+        "worstPrefillFrameMs": 9.360000000000582,
+        "worstDecodeFrameMs": 43.74000000000524,
+        "framesOver100": 0,
+        "loadMs": 2381.0599999999977,
+        "loadFps": 120.11457082139898,
+        "loadWorstFrameMs": 10.69999999999709,
+        "gpuBytes": 1366503808,
+        "idleMs": "60000",
+        "firstTokenMs": 7355.17,
+        "compiledDuringLoad": 66,
+        "kernelChoices": {
+          "context": 3,
+          "files": 4,
+          "weights": 1768,
+          "weightsReading": 1259,
+          "weightsUploading": 345,
+          "toRgba4": 222,
+          "repackOnnx": 0,
+          "warmUp": 262,
+          "programs": 66,
+          "compileMs": 148,
+          "warm_batch9": 21,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 11,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 6,
+          "tunedShortSplit": 2,
+          "tunedF16Matmul": 2,
+          "tunedF16Pack": -1,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 2038
+        }
+      }
+    },
+    {
+      "name": "Optimized, normal polling",
+      "ids": [
+        "iphone-paired-normal-long-1",
+        "iphone-paired-normal-long-2"
+      ],
+      "interpretation": "Earlier 24-frame drain ceiling; superseded by the cadence-independent ceiling.",
+      "metrics": {
+        "id": [
+          "iphone-paired-normal-long-1",
+          "iphone-paired-normal-long-2"
+        ],
+        "rounds": 2,
+        "inputTokens": [
+          2085,
+          2085
+        ],
+        "cachedTokens": [
+          0,
+          0
+        ],
+        "promptTps": 278.70721891120183,
+        "aggregatePromptTps": 278.69487923221897,
+        "aggregateDecodeTps": 27.979357451835536,
+        "decodeTps": 27.97947832383142,
+        "promptTpsRange": [
+          280.56171550369237,
+          276.85272231871124
+        ],
+        "decodeTpsRange": [
+          28.0376327337137,
+          27.921323913949138
+        ],
+        "prefillFps": 120.04429053201301,
+        "decodeFps": 120.12226313768824,
+        "worstPrefillFrameMs": 8.89999999999418,
+        "worstDecodeFrameMs": 8.84000000001106,
+        "framesOver100": 0,
+        "loadMs": 2211.279999999999,
+        "engineCode": 964478755,
+        "loadFps": 120.29231938063029,
+        "loadWorstFrameMs": 12.660000000003492,
+        "gpuBytes": 1351582080,
+        "idleMs": "60000",
+        "firstTokenMs": 7487.26,
+        "compiledDuringLoad": 65,
+        "kernelChoices": {
+          "context": 3,
+          "files": 5,
+          "calibrationCached": 1,
+          "engineCode": 964478755,
+          "weights": 1518,
+          "headExpanded": 0,
+          "headSplit": 2,
+          "promptPacking": 3,
+          "weightsReading": 886,
+          "weightsUploading": 480,
+          "f16Init": 1,
+          "packingProbe": 0,
+          "matvecProbe": 0,
+          "packingProbeRows": 0,
+          "rmsParts": 64,
+          "toRgba4": 205,
+          "repackOnnx": 0,
+          "repackGgufQ4": 419,
+          "repackGgufQ8": 0,
+          "repackGgufQ6": 41,
+          "warmUp": 260,
+          "programs": 65,
+          "compileMs": 126,
+          "warm_batch9": 21,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 11,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 5,
+          "tunedShortSplit": 2,
+          "tunedF16Matmul": 2,
+          "tunedF16Pack": 3,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 1786
+        }
+      }
+    },
+    {
+      "name": "Optimized, timer-free polling",
+      "ids": [
+        "iphone-paired-poll-free-long-1",
+        "iphone-paired-poll-free-long-2"
+      ],
+      "interpretation": "No consistent paired gain; periodic backoff retained.",
+      "metrics": {
+        "id": [
+          "iphone-paired-poll-free-long-1",
+          "iphone-paired-poll-free-long-2"
+        ],
+        "rounds": 2,
+        "inputTokens": [
+          2085,
+          2085
+        ],
+        "cachedTokens": [
+          0,
+          0
+        ],
+        "promptTps": 279.1490266120463,
+        "aggregatePromptTps": 279.14523987077655,
+        "aggregateDecodeTps": 27.90784210363112,
+        "decodeTps": 27.907938248744234,
+        "promptTpsRange": [
+          280.1771633439581,
+          278.1208898801346
+        ],
+        "decodeTpsRange": [
+          27.959737977312674,
+          27.856138520175794
+        ],
+        "prefillFps": 120.02618649900015,
+        "decodeFps": 120.29253168163517,
+        "worstPrefillFrameMs": 9.039999999993597,
+        "worstDecodeFrameMs": 8.860000000000582,
+        "framesOver100": 0,
+        "loadMs": 2372.3600000000006,
+        "engineCode": 964478755,
+        "loadFps": 120.1335379116154,
+        "loadWorstFrameMs": 9.739999999997963,
+        "gpuBytes": 1351582080,
+        "idleMs": "60000",
+        "firstTokenMs": 7474.94,
+        "compiledDuringLoad": 65,
+        "kernelChoices": {
+          "context": 2,
+          "files": 3,
+          "calibrationCached": 1,
+          "engineCode": 964478755,
+          "weights": 1449,
+          "headExpanded": 0,
+          "headSplit": 2,
+          "promptPacking": 3,
+          "weightsReading": 801,
+          "weightsUploading": 496,
+          "f16Init": 1,
+          "packingProbe": 0,
+          "matvecProbe": 0,
+          "packingProbeRows": 0,
+          "rmsParts": 64,
+          "toRgba4": 206,
+          "repackOnnx": 0,
+          "repackGgufQ4": 419,
+          "repackGgufQ8": 0,
+          "repackGgufQ6": 54,
+          "warmUp": 260,
+          "programs": 65,
+          "compileMs": 127,
+          "warm_batch9": 21,
+          "warm_pick": 16,
+          "warm_logits": 2,
+          "warm_argmax": 1,
+          "warm_batchF16": 11,
+          "warm_draft": 1,
+          "warm_token": 0,
+          "warm_chunked": 5,
+          "tunedShortSplit": 2,
+          "tunedF16Matmul": 2,
+          "tunedF16Pack": 3,
+          "tunedFlashDecode": 1,
+          "selfCheck": 0,
+          "total": 1714
+        }
+      }
+    }
+  ],
+  "interrupted": [],
+  "methods": {
+    "fps": "requestAnimationFrame with a repainted canvas and CSS spinner; not a system-wide presentation trace",
+    "load": "Cached GGUF files. Cold means derived calibration notes reset, not a network download or an empty OS/driver cache.",
+    "memory": "WebKit resource categories share the WebContent process and main VM; adjacent captures include pre-load and post-unload baselines, plus page and worker GC. GPU texture counters remain separate. Excludes whole-phone RSS and is not a worker heap counter."
+  }
+}

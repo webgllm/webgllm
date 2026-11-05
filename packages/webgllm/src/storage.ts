@@ -57,7 +57,11 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
  */
 export type GpuNote = {
   layout: "rgba4" | "bytes"
+  calibrated?: boolean
+  /** Proven during real prompt processing, never inferred from startup probes. */
+  pacing?: { reads: number; window: number; frameMs: number }
   selfCheck: number
+  head?: { expanded: boolean; split: number }
   /** Engine.tune's picks (older notes have none: tuned again). */
   tuned?: Tuned
 }
@@ -74,7 +78,9 @@ async function readNotes(): Promise<Record<string, GpuNote> | null> {
   try {
     file = await (await (await dir()).getFileHandle(NOTES)).getFile()
   } catch (error) {
-    return error instanceof DOMException && error.name === "NotFoundError" ? {} : null
+    return error instanceof DOMException && error.name === "NotFoundError"
+      ? {}
+      : null
   }
   try {
     return JSON.parse(await file.text()) as Record<string, GpuNote>
@@ -101,10 +107,11 @@ async function writeNote(key: string, note: GpuNote) {
     // Notes for this GPU, browser and model from older engine code (the
     // key's last part) are stale: dropped.
     const prefix = key.slice(0, key.lastIndexOf("|") + 1)
-    for (const k of Object.keys(notes)) if (k.startsWith(prefix)) delete notes[k]
+    for (const k of Object.keys(notes))
+      if (k.startsWith(prefix)) delete notes[k]
     notes[key] = note
     const handle = await (await dir()).getFileHandle(NOTES, { create: true })
-    const access = await openAccess(handle)
+    const access = await openAccess(handle, undefined, 1)
     try {
       const bytes = new TextEncoder().encode(JSON.stringify(notes))
       access.truncate(0)
@@ -139,7 +146,8 @@ const sleep = (ms: number, signal?: AbortSignal) =>
  */
 async function openAccess(
   handle: FileSystemFileHandle,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  retries = 10
 ): Promise<SyncAccessHandle> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -149,7 +157,7 @@ async function openAccess(
         }
       ).createSyncAccessHandle()) as SyncAccessHandle
     } catch (error) {
-      if (signal?.aborted || attempt >= 10) throw error
+      if (signal?.aborted || attempt >= retries) throw error
       await sleep(250 * (attempt + 1), signal)
     }
   }

@@ -63,20 +63,26 @@ export function packQ4_0(
   srcRows?: ArrayLike<number>
 ): void {
   check(m, row0, rows, 4)
-  const blocks = m.K / 32
+  const started = performance.now(),
+    blocks = m.K / 32
   if (src.length < rows * blocks * 18) throw new Error("Q4_0 data is too short")
-  const q = quantBytes(m)
-  const scales = m.scales
+  const input = new DataView(src.buffer, src.byteOffset, src.byteLength)
+  const q = m.quants,
+    scales = m.scales
   for (let i = 0; i < rows; i++) {
     const n = row0 + i
     let p = (srcRows ? srcRows[i] : i) * blocks * 18
     let si = (n >> 2) * blocks * 4 + (n & 3)
-    let qi = si * 16
-    for (let b = 0; b < blocks; b++, p += 18, si += 4, qi += 64) {
-      scales[si] = src[p] | (src[p + 1] << 8)
-      for (let j = 0; j < 16; j++) q[qi + j] = src[p + 2 + j]
+    let qi = si * 4
+    for (let b = 0; b < blocks; b++, p += 18, si += 4, qi += 16) {
+      scales[si] = input.getUint16(p, true)
+      q[qi] = input.getUint32(p + 2, true)
+      q[qi + 1] = input.getUint32(p + 6, true)
+      q[qi + 2] = input.getUint32(p + 10, true)
+      q[qi + 3] = input.getUint32(p + 14, true)
     }
   }
+  repackTime.ggufQ4Ms += performance.now() - started
 }
 
 /**
@@ -91,20 +97,24 @@ export function packQ8_0(
   srcRows?: ArrayLike<number>
 ): void {
   check(m, row0, rows, 8)
-  const blocks = m.K / 32
+  const started = performance.now(),
+    blocks = m.K / 32
   if (src.length < rows * blocks * 34) throw new Error("Q8_0 data is too short")
-  const q = quantBytes(m)
-  const scales = m.scales
+  const input = new DataView(src.buffer, src.byteOffset, src.byteLength)
+  const q = m.quants,
+    scales = m.scales
   for (let i = 0; i < rows; i++) {
     const n = row0 + i
     let p = (srcRows ? srcRows[i] : i) * blocks * 34
     let si = (n >> 2) * blocks * 4 + (n & 3)
-    let qi = si * 32
-    for (let b = 0; b < blocks; b++, p += 34, si += 4, qi += 128) {
-      scales[si] = src[p] | (src[p + 1] << 8)
-      for (let j = 0; j < 32; j++) q[qi + j] = src[p + 2 + j]
+    let qi = si * 8
+    for (let b = 0; b < blocks; b++, p += 34, si += 4, qi += 32) {
+      scales[si] = input.getUint16(p, true)
+      for (let j = 0; j < 8; j++)
+        q[qi + j] = input.getUint32(p + 2 + j * 4, true)
     }
   }
+  repackTime.ggufQ8Ms += performance.now() - started
 }
 
 /**
@@ -193,7 +203,7 @@ export function packMatMulNBitsScales(
 }
 
 /** Milliseconds spent in packMatMulNBits (load profiling). */
-export const repackTime = { ms: 0 }
+export const repackTime = { ms: 0, ggufQ4Ms: 0, ggufQ8Ms: 0, ggufQ6Ms: 0 }
 
 export function packMatMulNBits(
   m: QuantMatrix,
@@ -360,9 +370,11 @@ export function dequantizeQ5_K(
       const d2 = d * s2
       const min2 = dmin * m2
       for (let l = 0; l < 32; l++)
-        out[y++] = d1 * ((src[ql + l] & 15) + (src[qh + l] & u1 ? 16 : 0)) - min1
+        out[y++] =
+          d1 * ((src[ql + l] & 15) + (src[qh + l] & u1 ? 16 : 0)) - min1
       for (let l = 0; l < 32; l++)
-        out[y++] = d2 * ((src[ql + l] >> 4) + (src[qh + l] & u2 ? 16 : 0)) - min2
+        out[y++] =
+          d2 * ((src[ql + l] >> 4) + (src[qh + l] & u2 ? 16 : 0)) - min2
     }
   }
 }
@@ -450,6 +462,7 @@ export function packQ6_K(
   src: Uint8Array,
   rows: number
 ): void {
+  const started = performance.now()
   check(m, row0, rows, 6)
   const superBlocks = m.K / 256
   const bytes = quantBytes(m)
@@ -464,4 +477,25 @@ export function packQ6_K(
       m.scales[at] = src[from + 208] | (src[from + 209] << 8)
     }
   }
+  repackTime.ggufQ6Ms += performance.now() - started
+}
+
+/** Q4_0 bytes to RGBA4 upload order: four low-nibble texels then four high.
+ * Each word is compacted with whole-word masks/shifts; shaders read .wzyx.
+ */
+export function q4WordsToRgba4(words: Uint32Array) {
+  const out = new Uint16Array(words.length * 2)
+  const four = (value: number) => {
+    let packed = value & 0x0f0f0f0f
+    packed = (packed | (packed >>> 4)) & 0x00ff00ff
+    return (packed | (packed >>> 8)) & 0xffff
+  }
+  for (let row = 0; row < words.length; row += 4) {
+    const at = row * 2
+    for (let word = 0; word < 4; word++) {
+      out[at + word] = four(words[row + word])
+      out[at + 4 + word] = four(words[row + word] >>> 4)
+    }
+  }
+  return out
 }

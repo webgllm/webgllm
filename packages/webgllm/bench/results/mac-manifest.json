@@ -1,0 +1,67 @@
+{
+  "metadata": {
+    "device": "Mac M3 Ultra",
+    "hardware": "Apple M3 Ultra, Mac15,14, 512 GiB OS-reported RAM",
+    "os": "macOS 27.2",
+    "browser": "Chrome 156.0.8078.80",
+    "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Ultra, Unspecified Version)",
+    "baselineCommit": "2c10f9e",
+    "branch": "perf/webgl-performance",
+    "model": "LiquidAI/LFM3-1.7B-GGUF",
+    "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+    "fileBytes": 1049615680,
+    "promptBatch": 512,
+    "maxOutputTokens": 64,
+    "thinking": false,
+    "speculative": true,
+    "benchmarkTabs": 1,
+    "idleMs": 10000,
+    "restBetweenRoundsMs": 5000,
+    "memoryKind": "ua-page",
+    "optimizedEngineCode": 3321799229,
+    "optimizedCommit": "51b0400"
+  },
+  "runs": {
+    "beforeShort": "mac-final-before-short",
+    "afterShort": "mac-optimized-after-short",
+    "beforeLong": "mac-final-before-long",
+    "afterLong": "mac-optimized-after-long",
+    "sampled": "mac-optimized-sampled"
+  },
+  "files": {
+    "loadBefore": "mac-load-before.json",
+    "loadAfter": "mac-load-after.json",
+    "memoryBeforeShort": "mac-memory-before-short.json",
+    "memoryBeforeLong": "mac-memory-before-long.json",
+    "memoryAfterShort": "mac-memory-after-short.json",
+    "memoryAfterLong": "mac-memory-after-long.json"
+  },
+  "qualityRun": "mac-optimized-quality",
+  "controls": [
+    {
+      "name": "Earlier original-engine control",
+      "ids": "mac-before-short",
+      "interpretation": "Earlier three-trial baseline; final five-trial baseline is contemporaneous with the revised controller."
+    },
+    {
+      "name": "Rejected initial storage/controller selection",
+      "ids": "mac-after-short",
+      "interpretation": "Native RGBA4 and over-conservative submission pacing regressed whole-model speed; rejected."
+    },
+    {
+      "name": "Submission pacing disabled (diagnostic only)",
+      "ids": "mac-quota-control",
+      "interpretation": "Restored speed and identified fence overhead. Final runs use automatic pacing with no overrides."
+    }
+  ],
+  "evidenceRunIds": [
+    "mac-baseline-calibrate",
+    "mac-joint-calibrate",
+    "mac-diagnostic-profile",
+    "mac-adaptive-release-calibrate",
+    "mac-boundary-case",
+    "mac-before-long",
+    "mac-final-after-short",
+    "mac-final-after-long"
+  ]
+}

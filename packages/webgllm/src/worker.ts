@@ -1,10 +1,12 @@
 import { adaptivePrefixFor } from "./checkpoint-policy.js"
+import type { GpuNote } from "./storage.js"
 /**
  * The WebGL 2 worker: downloads a model to the Origin Private File System,
  * uploads its weights to the GPU on an OffscreenCanvas, and runs
  * generations one at a time, streaming each one's text back. One model at a
  * time: loading another frees the previous one.
  */
+import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource } from "./byte-source.js"
 import { Engine, MAX_CHUNKS, TUNING } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
@@ -19,7 +21,6 @@ import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, verify } from "./sampler.js"
 import { download, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
-import type { GpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -69,16 +70,12 @@ type Loaded = {
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
   claimed: number
-  /**
-   * Engine.tune not run yet on this GPU: it runs when the worker is idle
-   * (see tuneWhenIdle), then its picks join this note.
-   */
-  untuned?: { key: string; note: GpuNote }
-  /** The last tuning left choices for an empty cache (tried again once it's empty). */
-  tunedPartly?: boolean
+  noteKey: string
+  note?: GpuNote
 }
 
 let current: Loaded | null = null
+let pacingEngine: Engine | null = null
 let loading: {
   model: string
   contextLength: number | undefined
@@ -105,12 +102,16 @@ const GUESS_WINDOW = 16
 /** FNV-1a of a string, as hex (for note keys). */
 function hash(text: string) {
   let h = 0x811c9dc5
-  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193)
+  for (let i = 0; i < text.length; i++)
+    h = Math.imul(h ^ text.charCodeAt(i), 0x01000193)
   return (h >>> 0).toString(16)
 }
 
 /** Frees an engine's GPU memory now (see Gpu.dispose). */
-const release = (engine: Engine) => engine.gpu.dispose()
+const release = (engine: Engine) => {
+  if (pacingEngine === engine) pacingEngine = null
+  engine.gpu.dispose()
+}
 
 /**
  * Prompt tokens per forward batch, the same on every device and model (the
@@ -217,8 +218,12 @@ async function load(
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
-    ...(plain && { noMrt: ["scaled", "quad", "conv", "chunks"], chunkedRecurrence: false })
+    ...(plain && {
+      noMrt: ["scaled", "quad", "conv", "chunks"],
+      chunkedRecurrence: false
+    })
   })
+  pacingEngine = engine
   lap("context")
   try {
     // Before a gigabyte downloads: the weight textures' width.
@@ -261,10 +266,20 @@ async function load(
       `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}`
     ].join("|")
     const note = (await readGpuNotes())[noteKey]
-    if (note) engine.preferLayout = note.layout
+    timings.calibrationCached = note ? 1 : 0
+    timings.engineCode = parseInt(Engine.fingerprint, 16)
+    if (note) {
+      engine.preferLayout = note.layout
+      engine.headChoice = note.head ?? null
+      if (note.tuned) engine.tuned = note.tuned
+    }
     const pieces =
       meta.files.kind === "gguf"
-        ? loadGguf(blobSource(weightFiles[0]))
+        ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
+            embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
+            readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
+            releaseReadBuffers: canReleaseStaging
+          }))
         : loadOnnx({
             config: JSON.parse(await weightFiles[0].text()) as Record<
               string,
@@ -292,24 +307,53 @@ async function load(
           cached
         })
       }
-    })
+    }, signal)
     if (signal.aborted) throw new Superseded()
     lap("weights")
+    timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
+    timings.headSplit = engine.headChoice?.split ?? TUNING.q6HeadSplit
+    timings.promptPacking = engine.tuned.f16Pack ?? TUNING.f16Pack & 3
+    post({
+      type: "log",
+      text: `load tuning: ${JSON.stringify({ head: engine.headChoice, headReport: engine.headReport, packing: engine.packingReport, rms: engine.rmsReport, matvec: engine.matvecReport })}`
+    })
     timings.weightsReading = Math.round(engine.loadMs.reading)
     timings.weightsUploading = Math.round(engine.loadMs.uploading)
+    timings.f16Init = Math.round(engine.loadMs.scratch)
+    timings.packingProbe = Math.round(engine.loadMs.packing)
+    timings.matvecProbe = Math.round(engine.loadMs.matvec)
+    timings.packingProbeRows = engine.packingReport[0]?.rows ?? 0
+    for (const sample of engine.rmsReport) timings[`rmsProbe${sample.parts}Ms`] = Math.round(sample.ms)
+    timings.rmsParts = engine.tuned.rmsParts ?? TUNING.rmsParts
+    for (const sample of engine.packingReport)
+      timings[`packingProbe${sample.matmul == null ? "" : `Mode${sample.matmul}`}Pack${sample.pack}Ms`] = Math.round(sample.ms)
     timings.toRgba4 = Math.round(engine.loadMs.convert)
     timings.repackOnnx = Math.round(repackTime.ms)
-    repackTime.ms = 0
-    if (engine.layoutChoice?.ms) timings.layoutProbe = Math.round(engine.layoutChoice.ms)
-    // How this GPU splits prompt matmuls, if timed on an earlier load (else
-    // timed when the worker is next idle: see tuneWhenIdle); before the
-    // warm-up, which compiles the programs those splits read with.
-    if (note?.tuned) engine.tuned = note.tuned
+    timings.repackGgufQ4 = Math.round(repackTime.ggufQ4Ms)
+    timings.repackGgufQ8 = Math.round(repackTime.ggufQ8Ms)
+    timings.repackGgufQ6 = Math.round(repackTime.ggufQ6Ms)
+    for (const key of Object.keys(repackTime) as Array<keyof typeof repackTime>) repackTime[key] = 0
+    if (engine.layoutChoice?.ms)
+      timings.layoutProbe = Math.round(engine.layoutChoice.ms)
+    if (engine.layoutChoice) { timings.layoutRgba4DecodeMs = engine.layoutChoice.rgba4Ms; timings.layoutBytesDecodeMs = engine.layoutChoice.bytesMs }
+    if (engine.layoutChoice?.rgba4PrefillMs != null) timings.layoutRgba4PrefillMs = engine.layoutChoice.rgba4PrefillMs
+    if (engine.layoutChoice?.bytesPrefillMs != null) timings.layoutBytesPrefillMs = engine.layoutChoice.bytesPrefillMs
+    // Resolve all kernel choices during initial loading, then warm the
+    // selected variants. No calibration work races with user generations.
+    if (!note?.calibrated) {
+      // tune warms its measured variants itself. Warm the final choices
+      // once, instead of running a second complete startup warm-up.
+      await engine.tune(() => signal.aborted, { alreadyBusy: true })
+      if (signal.aborted) throw new Superseded()
+      post({ type: "log", text: `startup tuning: ${JSON.stringify(engine.tuneReport)}` })
+      lap("initialTuning")
+    }
     await engine.warmUp()
     lap("warmUp")
     timings.programs = engine.gpu.compiled.count
     timings.compileMs = Math.round(engine.gpu.compiled.ms)
-    for (const [k, v] of Object.entries(engine.warmCounts)) timings[`warm_${k}`] = v
+    for (const [k, v] of Object.entries(engine.warmCounts))
+      timings[`warm_${k}`] = v
     if (signal.aborted) throw new Superseded()
     timings.tunedShortSplit = engine.tuned.shortSplit ?? 0
     timings.tunedF16Matmul = engine.tuned.f16Matmul ?? -1
@@ -324,11 +368,17 @@ async function load(
         ? note.selfCheck
         : await engine.selfCheck()
     lap("selfCheck")
-    const fresh =
-      !note && engine.layoutChoice && error <= SELF_CHECK_MAX
-        ? { layout: engine.layoutChoice.layout, selfCheck: error }
+    const measured =
+      engine.layoutChoice && error <= SELF_CHECK_MAX
+        ? {
+            layout: engine.layoutChoice.layout,
+            selfCheck: error,
+            calibrated: true,
+            pacing: note?.pacing,
+            head: engine.headChoice ?? undefined,
+            tuned: { ...engine.tuned }
+          }
         : null
-    if (fresh) void writeGpuNote(noteKey, fresh)
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
@@ -340,12 +390,22 @@ async function load(
       release(engine)
       return await load(model, signal, contextLength, true)
     }
-    // (A note whose tuning left choices for later is tuned again.)
-    const tunedAll = note?.tuned && "f16Matmul" in note.tuned && "f16Pack" in note.tuned
-    const base = fresh ?? (tunedAll ? null : note)
+    engine.gpu.resetPacing(true)
+    engine.gpu.setPhase("load")
+    const overlap = engine.tuned.submissionOverlap
+    if (overlap != null && Number.isFinite(overlap) && overlap >= 0 && overlap <= 2 ** 34)
+      engine.gpu.primePresentation(engine.tuned.submissionWindow ?? TUNING.presentationFrames, Math.max(TUNING.submissionReads, overlap), overlap > 0)
+    const pacing = overlap === 0 ? undefined : note?.pacing
+    if (pacing && Number.isFinite(pacing.reads) && pacing.reads > 0 && pacing.reads <= 2 ** 34 && pacing.window >= 2 && pacing.window <= 128 && pacing.frameMs >= 4 && pacing.frameMs <= 100 && pacing.window * pacing.frameMs <= 450) {
+      const scale = Math.min(1, engine.gpu.expectedFrameMs / pacing.frameMs)
+      const window = Math.max(TUNING.presentationFrames, Math.min(engine.gpu.presentationAdvice.cap, Math.round(pacing.window * pacing.frameMs / engine.gpu.expectedFrameMs)))
+      engine.gpu.primePresentation(window, Math.max(TUNING.submissionReads, Math.round(pacing.reads * scale)))
+    }
     // What it took, in place of the estimate.
     await claimMemory(model, engine.gpu.bytes)
     if (signal.aborted) throw new Superseded()
+    if (measured && JSON.stringify(measured) !== JSON.stringify(note))
+      void writeGpuNote(noteKey, measured)
     return {
       model,
       contextLength,
@@ -353,8 +413,9 @@ async function load(
       tokenizer,
       cached: [],
       claimed: engine.gpu.bytes,
-      timings,
-      ...(base && { untuned: { key: noteKey, note: base } })
+      noteKey,
+      note: measured ?? note,
+      timings
     }
   } catch (error) {
     // A failed or superseded load frees its textures now.
@@ -401,7 +462,6 @@ function startLoad(
       loading = null
       current = loaded
       post({ type: "ready", model, timings: loaded.timings })
-      tuneWhenIdle()
     },
     (error: unknown) => {
       if (loading !== entry) return
@@ -524,6 +584,7 @@ async function generate(request: GenerateRequest) {
   // where the next question's prompt will stop sharing it (see anchorFor).
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix
+  if (!stopped.has(id)) await engine.preparePrompt(prompt.length)
   let row = await readPrompt(engine, prompt, start, model.cached, {
     stop: () => stopped.has(id),
     // After a changed request reveals a shorter common boundary, retain it
@@ -584,7 +645,10 @@ async function generate(request: GenerateRequest) {
   // While guessing is off, what it would have guessed (the likeliest
   // token) is still scored against the token drawn, so it comes back on
   // when guesses would hit again.
-  const scoreGuess = (d: { ids: Int32Array; p: Float32Array }, drawn: number) => {
+  const scoreGuess = (
+    d: { ids: Int32Array; p: Float32Array },
+    drawn: number
+  ) => {
     if (!onGpu || guessing()) return
     let best = 0
     for (let j = 1; j < d.p.length; j++) if (d.p[j] > d.p[best]) best = j
@@ -624,7 +688,14 @@ async function generate(request: GenerateRequest) {
   const distribution = async (r: number, guess = false) => {
     const mask = updateAllowed()
     if (greedy) {
-      const [token] = await engine.argmax(r, 1, sampling.repetition_penalty, [], guess, sampling.presence_penalty)
+      const [token] = await engine.argmax(
+        r,
+        1,
+        sampling.repetition_penalty,
+        [],
+        guess,
+        sampling.presence_penalty
+      )
       if (guess && engine.guessing) guessed = engine.guessedToken
       return { ids: Int32Array.of(token), p: Float32Array.of(1) }
     }
@@ -808,13 +879,17 @@ async function generate(request: GenerateRequest) {
     const stepMs = performance.now() - stepStart
     // (A reply that ended mid-batch judged only the drafts it wrote.)
     if (drafts.length) {
-      policy.checkedBatch(drafts.length, kept - 1, stepMs, going ? drafts.length : kept - 1)
+      policy.checkedBatch(
+        drafts.length,
+        kept - 1,
+        stepMs,
+        going ? drafts.length : kept - 1
+      )
       stats.draftBatches = (stats.draftBatches ?? 0) + 1
       stats.draftsChecked =
         (stats.draftsChecked ?? 0) + (going ? drafts.length : kept - 1)
       stats.draftsKept = (stats.draftsKept ?? 0) + kept - 1
-    }
-    else policy.alone(stepMs)
+    } else policy.alone(stepMs)
     // A draft turned down: the guess (made for all drafts kept) goes first,
     // then the batch back to the tokens kept.
     if (drafts.length) {
@@ -864,6 +939,16 @@ async function generate(request: GenerateRequest) {
   if (structured && !stopped.has(id) && !structured.complete) {
     throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
   }
+  // Extend the startup-tested overlap only from completed real inference.
+  // Persist in the background so OPFS never delays completion.
+  const pacing = engine.gpu.validatedPresentation
+  const recommendation = pacing ?? (engine.gpu.presentationAdvice.relaxation ? model.note?.pacing : undefined)
+  const overlapFailed = !engine.gpu.presentationAdvice.relaxation && engine.tuned.submissionOverlap !== 0
+  if (overlapFailed) engine.tuned.submissionOverlap = 0
+  if (model.note && (overlapFailed || JSON.stringify(model.note.pacing) !== JSON.stringify(recommendation))) {
+    model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
+    void writeGpuNote(model.noteKey, model.note)
+  }
   post({ type: "done", id, stats })
   } finally {
     structured?.dispose()
@@ -878,58 +963,16 @@ async function generate(request: GenerateRequest) {
  * so one must finish (or stop) before the next reads its prompt.
  */
 let queue: Promise<void> = Promise.resolve()
-/** Generations queued or running. */
-let pending = 0
-/** A background Engine.tune, while it runs. */
-let tuning: Promise<void> | null = null
-
-/**
- * Times how this GPU splits prompt matmuls (Engine.tune) while nothing
- * waits on the worker, not during the load: it gives way to the first
- * generation that arrives (and runs again once the queue is empty), and
- * its picks are remembered with the GPU's note.
- */
-function tuneWhenIdle() {
-  const loaded = current
-  const untuned = loaded?.untuned
-  if (!loaded || !untuned || tuning || pending > 0) return
-  if (loaded.tunedPartly && loaded.cached.length > 0) return
-  tuning = (async () => {
-    // (Its prompt-batch timings reset the cache: not while it holds a chat.)
-    const picked = await loaded.engine.tune(() => pending > 0 || current !== loaded, {
-      keepCache: loaded.cached.length > 0
-    })
-    post({
-      type: "log",
-      text: `tuned in the background: ${picked ? JSON.stringify({ ...picked, ...loaded.engine.tuneReport }) : "stopped for a request"}`
-    })
-    if (!picked || current !== loaded) return
-    // Choices left for an empty cache (undefined) are tried again then.
-    const complete = picked.f16Matmul !== undefined && picked.f16Pack !== undefined
-    if (complete) loaded.untuned = undefined
-    else loaded.tunedPartly = true
-    // A new pick reads short batches' results with programs the warm-up
-    // didn't compile: compiled now while the cache is empty (else on the
-    // first short prompt).
-    if (picked.shortSplit !== null && loaded.cached.length === 0 && pending === 0)
-      await loaded.engine.warmUp({ shortOnly: true })
-    // (Not awaited: a request needn't wait on storage.)
-    void writeGpuNote(untuned.key, { ...untuned.note, tuned: picked })
-  })()
-    .catch((error: unknown) => {
-      // Not tried again after every reply: TUNING's splits stay.
-      if (current === loaded) loaded.untuned = undefined
-      post({ type: "log", text: `background tuning failed: ${errorMessage(error)}` })
-    })
-    .finally(() => {
-      tuning = null
-      // Another model may have loaded meanwhile, waiting on this one.
-      tuneWhenIdle()
-    })
-}
-
 onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
-  if (data.type === "claimed") {
+  if (data.type === "frames") {
+    pacingEngine?.gpu.observeFrames(
+      data.intervalMs,
+      data.expectedMs,
+      data.frames,
+      data.startedAt,
+      data.meanMs
+    )
+  } else if (data.type === "claimed") {
     claims.shift()?.()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
@@ -938,10 +981,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else {
-    pending++
     queue = queue
-      // (A background tune stops at its next step.)
-      .then(() => tuning)
       .then(() => generate(data))
       .catch((error: unknown) => {
         // A lost GPU context can't be used again: the next generation
@@ -960,8 +1000,6 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
       })
       .finally(() => {
         stopped.delete(data.id)
-        pending--
-        tuneWhenIdle()
       })
   }
 }

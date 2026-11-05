@@ -257,6 +257,58 @@ M3 Ultra, Chrome, `attnab=flashDecode:0,1`, best of 16–20 alternated rounds (m
 
 Tried on the M3 and not kept: 16-texel chunks (124 at 7,900 tokens): the combine doubles and Qwen3.5 slows (1.42 against 0.86); 2 or 4 texels per step of the chunk loop flat. The two-loop chunk pass with the combine still a chunk at a time cost as much in the combine as in the chunks at 124 chunks. On Apple GPUs `skip=` of a kind of pass can mislead: passes left drawing into one target back to back get elided (skipping attend left the scores passes at 0.13 ms for all 11 layers on the phone).
 
+## WebGL performance — 2026-11-03
+
+The hardware-neutral `webgl-perf.html` harness measures cached-file loading,
+prompt and generation throughput, painted frame cadence, and GPU texture memory.
+`baseline=1` uses an untouched worker; `production=1` uses the optimized worker.
+Reuse one tab for every run. Wait for `ALL DONE` or an error before navigation.
+
+```sh
+node packages/webgl/bench/build-workers.mjs /path/to/original/checkout baseline-worker.js
+node packages/webgl/bench/build-workers.mjs /path/to/optimized/checkout current-worker.js
+RESULTS_FILE=/tmp/webgl-perf.jsonl node packages/webgl/bench/server.mjs 8788
+# Same tab: /webgl-perf.html?id=before&baseline=1&rounds=3&len=512
+# Same tab: /webgl-perf.html?id=after&production=1&rounds=3&len=512
+```
+
+Use `load-suite-cdp.mjs` and `memory-profile.mjs` for Chrome; `safari-bench.mjs`
+reuses an explicitly selected iPhone tab through WebKit Inspector and can record
+WebKit page-memory tracking. `summarize-bench.mjs` accepts raw results, an output
+path and a device manifest. Device names belong in result metadata.
+
+Fixed tuning values in benchmark query parameters are diagnostic controls;
+the production engine uses the same adaptive pacing policy across GPUs.
+
+`collect-results.mjs` keeps the exact captures referenced by manifests, and
+`write-report.mjs` renders their summaries. Navigation events after `ALL DONE`
+remain in raw evidence but do not invalidate a completed foreground capture.
+Startup tables distinguish first ready from completion of the original background
+tuner. Memory profiling runs separately and collects both the page and worker.
+
+Calibration belongs to the exact bundled worker fingerprint. Complete the
+original background tuner before measuring its throughput. Instrumented workers
+can have different fingerprints; do not transfer their notes into primary runs.
+`inferenceTune` is a benchmark-only control applied after ready, for isolating
+scheduling changes without altering startup calibration. It is recorded in the
+raw query metadata and must be omitted from primary comparisons.
+
+For an existing desktop Chrome profile, use its single benchmark tab and the page's
+`Release model` button before navigating. `restoreCalibration` and `saveCalibration`
+snapshot only this model's notes; `cold=1` removes only these derived notes.
+`uaMemory=1` measures retained page plus worker memory after GC, separately from
+natural throughput. It is not a CPU peak measurement. The helpers never create or
+close browser tabs.
+
+The final comparison is in [WEBGL-PERFORMANCE.md](WEBGL-PERFORMANCE.md).
+Validation in a worktree with linked dependencies used:
+
+```sh
+NX_DAEMON=false NX_ISOLATE_PLUGINS=false pnpm --config.verify-deps-before-run=false exec nx run-many -t test typecheck build lint -p webgl --output-style=static
+```
+
+The pnpm option avoids automatic dependency installation into the linked worktree.
+
 ## Short shared-prefix caching
 
 See [native Chrome results and reproduction](short-prefix-results/FINDINGS.md) for

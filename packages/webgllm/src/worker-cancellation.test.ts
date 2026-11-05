@@ -50,6 +50,7 @@ function probe() {
     rewind() { calls.rewinds++; return 0 }, snapshotPosition() { return undefined },
     snapshot() { calls.snapshots++; return undefined },
     batchSizes(count: number) { const sizes = []; for (; count; count -= Math.min(256, count)) sizes.push(Math.min(256, count)); return sizes },
+    preparePrompt: async () => undefined,
     async forwardHidden() { calls.forwards++; return 0 }
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
@@ -100,4 +101,23 @@ test("readPrompt checks stop again between planning and the first forward", asyn
   const before = [...state.model.cached]
   await readPrompt(state.model.engine as unknown as Engine, Array(512).fill(10), 0, state.model.cached, { checkpoints: false, stop: () => stopped })
   assert.equal(state.calls.forwards, 0); assert.deepEqual(state.model.cached, before)
+})
+
+
+test("stop during prompt reservation performs zero forwards", async () => {
+  const state = probe(), entered = gate(), pending = gate()
+  state.model.engine.preparePrompt = async () => {
+    entered.release()
+    await pending.promise
+  }
+  const job = makeGenerate(state)(request("cancelled", true))
+  await entered.promise
+  state.stopped.add("cancelled")
+  pending.release()
+  await job
+  assert.equal(state.calls.forwards, 0)
+  assert.equal(state.calls.snapshots, 0)
+  assert.equal(state.calls.disposed, 1)
+  assert.equal(state.messages.some(message => message.type === "token"), false)
+  assert.ok(state.messages.some(message => message.type === "done"))
 })

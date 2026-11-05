@@ -730,6 +730,8 @@ function matmulSplitRgba4Source(o: {
   normed?: false | "weights" | "prescaled"
   /** Output texel x holds row group x - uGx0 (a region of a shared target). */
   offset?: boolean
+  /** Stream a weight column at a time, keeping two activation vectors live. */
+  stream?: boolean
 }) {
   const L: Array<string> = []
   const line = (s: string) => L.push(`    ${s}`)
@@ -745,24 +747,28 @@ function matmulSplitRgba4Source(o: {
         : `const vec4 z = vec4(8.0);`
     )
   }
-  if (o.normed === "weights") {
-    // x · norm weights from the f32 residual; the row's 1 / RMS is applied
-    // to the sums at the end (it's the same for the whole row).
-    for (let j = 0; j < 8; j++)
-      line(
-        `vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
-      )
-  } else if (o.normed === "prescaled") {
-    for (const j of [0, 1, 2, 3]) {
-      line(`uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, m), 0);`)
-      line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
-    }
-  } else
-  for (const j of [0, 1, 2, 3]) {
-    line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
-    line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
-  }
-  line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
+  if (!o.stream || !o.bytes) {
+    if (o.normed === "weights") {
+      // x · norm weights from the f32 residual; the row's 1 / RMS is applied
+      // to the sums at the end (it's the same for the whole row).
+      for (let j = 0; j < 8; j++)
+        line(
+          `vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
+        )
+    } else if (o.normed === "prescaled") {
+      for (const j of [0, 1, 2, 3]) {
+        line(
+          `uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, m), 0);`
+        )
+        line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+      }
+    } else
+      for (const j of [0, 1, 2, 3]) {
+        line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
+        line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+      }
+    line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
+  } else line(`float sa = 0.0;`)
   line(`vec4 b = vec4(0.0);`)
   if (o.bytes) {
     // Byte texel kb · 16 + r · 4 + w: row r's weights 4w + i (low
@@ -776,10 +782,25 @@ function matmulSplitRgba4Source(o: {
     line(`vec4 bb = vec4(0.0);`)
     for (const w of [0, 1, 2, 3]) {
       line(`{`)
+      if (o.stream) {
+        for (const j of [w, w + 4]) {
+          if (o.normed === "weights")
+            line(
+              `  vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
+            )
+          else
+            line(
+              `  vec4 A${j} = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(${o.normed === "prescaled" ? "uAOff + " : ""}kb * 4 + ${j >> 1}, m), 0));`
+            )
+        }
+        line(`  sa += dot(A${w} + A${w + 4}, vec4(1.0));`)
+      }
       line(`  vec4 C = A${w + 4} - 16.0 * A${w};`)
       for (const r of [0, 1, 2, 3]) {
         const fetch = `texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0)`
-        line(o.unorm ? `  { vec4 B = ${fetch};` : `  { vec4 B = vec4(${fetch});`)
+        line(
+          o.unorm ? `  { vec4 B = ${fetch};` : `  { vec4 B = vec4(${fetch});`
+        )
         line(`    bb.${"xyzw"[r]} += dot(B, A${w});`)
         line(
           `    b.${"xyzw"[r]} += dot(floor(${o.unorm ? "B * 15.9375 + 0.03125" : "B * 0.0625"}), C); }`
@@ -793,7 +814,8 @@ function matmulSplitRgba4Source(o: {
     for (const r of [0, 1, 2, 3]) {
       const terms = Array.from(
         { length: 8 },
-        (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
+        (_, j) =>
+          `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
       )
       line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
     }
@@ -1149,13 +1171,28 @@ float rmsScale(int m) {
   // A constant bound (RMS_PARTS), so the loop unrolls and the reads go out
   // together.
   vec4 s = vec4(0.0);
-  for (int p = 0; p < 64; p++) {
-    if (p >= uParts) break;
+  for (int p = 0; p < 64/* RMS_REDUCTION */; p++)
     s += texelFetch(uR, ivec2(uROff + p, m), 0);
-  }
   return inversesqrt(dot(s, vec4(1.0)) / float(uTexels * 4) + uEps);
 }
 `
+
+const rmsVariants = new Map<string, Map<number, string>>()
+
+/** Fixed loop bounds retain compiler unrolling for each measured RMS shape. */
+export function withRms(source: string, parts: number) {
+  let variants = rmsVariants.get(source)
+  if (!variants) {
+    variants = new Map()
+    rmsVariants.set(source, variants)
+  }
+  let variant = variants.get(parts)
+  if (variant === undefined) {
+    variant = source.replace("64/* RMS_REDUCTION */", String(parts))
+    variants.set(parts, variant)
+  }
+  return variant
+}
 
 /** h2 out = x · rms(x) · w, from f32 x, its RMS_PARTIAL sums and f32 weights. */
 export const NORM_TO_H2 = `${HEADER}${RMS_SCALE}
@@ -1171,6 +1208,28 @@ void main() {
   vec4 a = texelFetch(uX, ivec2(2 * x, m), 0) * r * texelFetch(uNorm, ivec2(2 * x, 0), 0);
   vec4 b = texelFetch(uX, ivec2(2 * x + 1, m), 0) * r * texelFetch(uNorm, ivec2(2 * x + 1, 0), 0);
   o = packH2(a, b);
+}`
+
+/** Norm directly into FP16 input storage, avoiding the packed intermediate. */
+export const NORM_TO_F16 = `${HEADER}${RMS_SCALE}
+uniform sampler2D uX;
+uniform sampler2D uNorm;
+uniform int uRowIn;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y) + max(uRowIn, 0);
+  o = clamp(texelFetch(uX, ivec2(x, m), 0) * rmsScale(m) * texelFetch(uNorm, ivec2(x, 0), 0), -65504.0, 65504.0);
+}`
+
+export const SWIGLU_F16 = `${HEADER}
+uniform usampler2D uGU;
+uniform int uHalf;
+out vec4 o;
+vec4 silu(vec4 x) { return x / (1.0 + exp(-x)); }
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  o = clamp(silu(pf(uGU, p.x, p.y)) * pf(uGU, uHalf + p.x, p.y), -65504.0, 65504.0);
 }`
 
 /**
@@ -2250,14 +2309,17 @@ const scoreAt = (G: number) => {
  * head's keys). With uRing > 0 the cache is a ring of that many rows
  * (position j at row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
- * (later than the query, outside the sliding window, past uKeys) get -1e30.
+ * (later than the query, outside the sliding window, past uKeys) get a
+ * sentinel representable in the score texture.
  */
 function scoresSource(
   headDim: number,
   G: number,
   /** Queries as headPrep's "cache" left them (uK's slots from uQSlot0), not uQ. */
-  cache?: { kvWidth: number; slots: number }
+  cache?: { kvWidth: number; slots: number },
+  halfScores = false
 ) {
+  const mask = halfScores ? "-65504.0" : "-1e30"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   // A head's query texels never straddle a cache row (kvWidth is a whole
@@ -2301,7 +2363,7 @@ void main() {
   int x = int(gl_FragCoord.x) - panel * uKt;
   int y = panel * uPanelRows + int(gl_FragCoord.y);
   if (y >= uTotalRows) {
-    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
     return;
   }
   // Key segment s of a long range: its rows follow segment s - 1's.
@@ -2323,7 +2385,7 @@ void main() {
   bvec4 live = bvec4(liveInt);
   ivec4 row = (uRing > 0 ? j - (j / uRing) * uRing : j) * liveInt;
   if (!any(live)) {
-    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
     return;
   }
 ${members.map(query).join("\n")}
@@ -2350,7 +2412,7 @@ ${members
   )
   .join("\n")}
   }
-  ${members.map((i) => `o${i} = mix(vec4(-1e30), acc${i}, live);`).join("\n  ")}
+  ${members.map((i) => `o${i} = mix(vec4(${mask}), ${halfScores ? `clamp(acc${i}, -65000.0, 65000.0)` : `acc${i}`}, live);`).join("\n  ")}
 }`
 }
 
@@ -2456,7 +2518,8 @@ void main() {
  * 4..7, relative to the chunk's own max) and (max, sum of weights) at
  * locations 3i..3i+2; attendCombine adds chunks.
  */
-function attendChunkSource(headDim: number, G: number) {
+function attendChunkSource(headDim: number, G: number, halfScores = false) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   const names = sNames(G)
@@ -2528,7 +2591,7 @@ ${members
   .join("\n")}
 ${
   G === 1
-    ? `  if (mx0 < -1e29) {
+    ? `  if (mx0 ${empty}) {
     // Every key in the chunk masked: it adds nothing.
     o0 = vec4(0.0);
     o1 = vec4(0.0);
@@ -2593,7 +2656,7 @@ ${members
 }
 ${members
   .map(
-    (i) => `  bool dead${i} = mx${i} < -1e29;
+    (i) => `  bool dead${i} = mx${i} ${empty};
   o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
   o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
   o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
@@ -2666,7 +2729,10 @@ void main() {
  * (a shorter chain of dependent steps a key). `unroll` score texels a
  * step. Outputs as attendChunk's.
  */
-function attendPanelSource(headDim: number, G: number, unroll = 1, online = true) {
+function attendPanelSource(
+  headDim: number, G: number, unroll = 1, online = true, halfScores = false
+) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   const names = sNames(G)
@@ -2798,7 +2864,7 @@ ${step(1)}
   }
 ${members
   .map(
-    (i) => `  bool dead${i} = mx${i} < -1e29;
+    (i) => `  bool dead${i} = mx${i} ${empty};
   o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
   o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
   o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
@@ -3242,6 +3308,39 @@ void main() {
  * qh texel 32 + 8n + w. The bits come apart with float math (exact on
  * integers up to 255), which mobile GPUs run faster than integer shifts.
  */
+/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
+export const EXPAND_Q6_BYTES = `${HEADER}
+uniform usampler2D uNative;
+uniform int uX0;
+uniform int uY0;
+out vec4 o;
+uint nativeWord(int base, int y, int word) {
+  return comp(texelFetch(uNative, ivec2(base + (word >> 2), y), 0), word & 3);
+}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int block = p.x >> 8;
+  int row = (p.x >> 6) & 3;
+  int j = (p.x & 63) * 4;
+  int base = (block * 4 + row) * 13;
+  int n = j >> 7;
+  int part = (j >> 5) & 3;
+  int lane = j & 31;
+  uint ql = nativeWord(base, p.y, (n * 64 + lane + (part & 1) * 32) >> 2);
+  uint qh = nativeWord(base, p.y, (128 + n * 32 + lane) >> 2);
+  uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
+  uvec4 lo = (uvec4(ql) >> shifts) & 255u;
+  uvec4 hi = (uvec4(qh) >> shifts) & 255u;
+  uvec4 q = ((lo >> uint((part >> 1) * 4)) & 15u) | (((hi >> uint(part * 2)) & 3u) << 4u);
+  if ((j & 15) == 0) {
+    int at = 192 + (j >> 4);
+    uint scale = (nativeWord(base, p.y, at >> 2) >> uint((at & 3) * 8)) & 255u;
+    q |= ((uvec4(scale) >> uvec4(0u, 2u, 4u, 6u)) & 3u) << 6u;
+  }
+  o = vec4(q) / 255.0;
+}
+`
+
 const Q6_K_UNPACK = `
 // Low nibbles (lo) and high nibbles (hi) of 4 bytes.
 void nibbles(vec4 B, out vec4 lo, out vec4 hi) { hi = floor(B * 0.0625); lo = B - 16.0 * hi; }
@@ -3714,3 +3813,61 @@ export const attendPanel = memo(attendPanelSource)
 export const attendPanelCombine = memo(attendPanelCombineSource)
 
 export const embedFold = memo(embedFoldSource)
+
+/** Six-bit values and signed subscales share normalized bytes without loss. */
+const Q6_EXPANDED = `
+vec4 q6bytes(sampler2D s,ivec2 p){return floor(255.0*texelFetch(s,p,0)+0.5);}
+float q6scale(vec4 b){float s=dot(floor(b/64.0),vec4(1.0,4.0,16.0,64.0));return s>=128.0?s-256.0:s;}
+vec4 q6values(vec4 b){return b-64.0*floor(b/64.0)-32.0;}`
+
+export function q6ExpandedHead(o: { split: boolean; prescaled: boolean }) {
+  const body: string[] = []
+  for (let j = 0; j < 4; j++)
+    body.push(
+      `uvec4 a${j}=texelFetch(uA,ivec2(${o.prescaled ? "uAOff + " : ""}q*4+${j},${o.prescaled ? "uRowA0 + m" : "m"}),0);vec4 A${2 * j}=h2lo(a${j}),A${2 * j + 1}=h2hi(a${j});`
+    )
+  body.push(`vec4 d=texelFetch(uS,ivec2(col*uKb+(q>>3),gr),0);`)
+  for (let r = 0; r < 4; r++) {
+    body.push(`{ int t=wx+((q>>3)*4+${r})*64+(q&7)*8;`)
+    for (let half = 0; half < 2; half++) {
+      body.push(
+        `{ vec4 B=q6bytes(uW,ivec2(t+${half * 4},gr));float sc=q6scale(B);`
+      )
+      const terms = Array.from(
+        { length: 4 },
+        (_, j) =>
+          `dot(${j === 0 ? "q6values(B)" : `q6bytes(uW,ivec2(t+${half * 4 + j},gr))-32.0`},A${half * 4 + j})`
+      )
+      body.push(
+        `acc.${"xyzw"[r]} += d.${"xyzw"[r]} * sc * (${terms.join("+")}); }`
+      )
+    }
+    body.push("}")
+  }
+  return `${HEADER}${Q6_EXPANDED}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels,uG,uOutW,uLogitRows;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+${o.prescaled ? `${RMS_SCALE}\nuniform int uAOff,uRowA0;` : ""}
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),m=y/uLogitRows;y-=m*uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+int g=y*uOutW+x;if(g>=uG){o=vec4(0);return;}int col=g/uH,gr=g-col*uH,wx=col*uRowTexels;
+vec4 acc=vec4(0);for(int q=sb0*8;q<sb1*8;q++){
+${body.join("\n")}
+}o=${o.prescaled ? `acc*(rmsScale(uRowA0+m)*${PRESCALE}.0)` : "acc"};}`
+}
+
+export const EMBED_Q6_EXPANDED = `${HEADER}${Q6_EXPANDED}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels;
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),id=int(texelFetch(uIds,ivec2(0,y),0).x);
+int g=id>>2,r=id&3,col=g/uH,gr=g-col*uH,sb=x>>6,q=x&63,base=col*uRowTexels+(sb*4+r)*64;
+vec4 quant=q6values(q6bytes(uW,ivec2(base+q,gr)));
+float scale=q6scale(q6bytes(uW,ivec2(base+(q&~3),gr)));
+float d=comp(texelFetch(uS,ivec2(col*uKb+sb,gr),0),r);o=(d*scale)*quant;}`
