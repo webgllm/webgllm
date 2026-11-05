@@ -2309,14 +2309,17 @@ const scoreAt = (G: number) => {
  * head's keys). With uRing > 0 the cache is a ring of that many rows
  * (position j at row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
  * in the cache (uK: row = position, 16 texels per KV head). Masked keys
- * (later than the query, outside the sliding window, past uKeys) get -1e30.
+ * (later than the query, outside the sliding window, past uKeys) get a
+ * sentinel representable in the score texture.
  */
 function scoresSource(
   headDim: number,
   G: number,
   /** Queries as headPrep's "cache" left them (uK's slots from uQSlot0), not uQ. */
-  cache?: { kvWidth: number; slots: number }
+  cache?: { kvWidth: number; slots: number },
+  halfScores = false
 ) {
+  const mask = halfScores ? "-65504.0" : "-1e30"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   // A head's query texels never straddle a cache row (kvWidth is a whole
@@ -2360,7 +2363,7 @@ void main() {
   int x = int(gl_FragCoord.x) - panel * uKt;
   int y = panel * uPanelRows + int(gl_FragCoord.y);
   if (y >= uTotalRows) {
-    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
     return;
   }
   // Key segment s of a long range: its rows follow segment s - 1's.
@@ -2382,7 +2385,7 @@ void main() {
   bvec4 live = bvec4(liveInt);
   ivec4 row = (uRing > 0 ? j - (j / uRing) * uRing : j) * liveInt;
   if (!any(live)) {
-    ${members.map((i) => `o${i} = vec4(-1e30);`).join(" ")}
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
     return;
   }
 ${members.map(query).join("\n")}
@@ -2409,7 +2412,7 @@ ${members
   )
   .join("\n")}
   }
-  ${members.map((i) => `o${i} = mix(vec4(-1e30), acc${i}, live);`).join("\n  ")}
+  ${members.map((i) => `o${i} = mix(vec4(${mask}), ${halfScores ? `clamp(acc${i}, -65000.0, 65000.0)` : `acc${i}`}, live);`).join("\n  ")}
 }`
 }
 
@@ -2515,7 +2518,8 @@ void main() {
  * 4..7, relative to the chunk's own max) and (max, sum of weights) at
  * locations 3i..3i+2; attendCombine adds chunks.
  */
-function attendChunkSource(headDim: number, G: number) {
+function attendChunkSource(headDim: number, G: number, halfScores = false) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   const names = sNames(G)
@@ -2587,7 +2591,7 @@ ${members
   .join("\n")}
 ${
   G === 1
-    ? `  if (mx0 < -1e29) {
+    ? `  if (mx0 ${empty}) {
     // Every key in the chunk masked: it adds nothing.
     o0 = vec4(0.0);
     o1 = vec4(0.0);
@@ -2652,7 +2656,7 @@ ${members
 }
 ${members
   .map(
-    (i) => `  bool dead${i} = mx${i} < -1e29;
+    (i) => `  bool dead${i} = mx${i} ${empty};
   o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
   o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
   o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
@@ -2725,7 +2729,10 @@ void main() {
  * (a shorter chain of dependent steps a key). `unroll` score texels a
  * step. Outputs as attendChunk's.
  */
-function attendPanelSource(headDim: number, G: number, unroll = 1, online = true) {
+function attendPanelSource(
+  headDim: number, G: number, unroll = 1, online = true, halfScores = false
+) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
   const U = headDim / 8
   const members = Array.from({ length: G }, (_, i) => i)
   const names = sNames(G)
@@ -2857,7 +2864,7 @@ ${step(1)}
   }
 ${members
   .map(
-    (i) => `  bool dead${i} = mx${i} < -1e29;
+    (i) => `  bool dead${i} = mx${i} ${empty};
   o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
   o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
   o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`

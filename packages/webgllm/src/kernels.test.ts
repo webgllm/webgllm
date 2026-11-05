@@ -52,3 +52,13 @@ describe("the f16 prompt matmul's h2 reads (TUNING.f16Pack)", () => {
     )
   })
 })
+
+test("half-float attention preserves the empty-chunk mask after storage rounding", () => {
+  const scores = K.scores(128, 2, undefined, true)
+  assert.match(scores, /mix\(vec4\(-65504\.0\), clamp\(acc0, -65000\.0, 65000\.0\), live\)/)
+  assert.match(K.attendChunk(128, 1, true), /mx0 <= -65504\.0/)
+  assert.match(K.attendChunk(128, 2, true), /dead1 = mx1 <= -65504\.0/)
+  assert.match(K.attendPanel(128, 2, 2, true, true), /dead1 = mx1 <= -65504\.0/)
+  assert.match(K.scores(128, 2), /mix\(vec4\(-1e30\), acc0, live\)/)
+  assert.match(K.attendChunk(128, 1), /mx0 < -1e29/)
+})

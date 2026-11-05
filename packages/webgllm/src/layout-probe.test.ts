@@ -14,6 +14,7 @@ test(`dependent storage timing: decode win ${decodeWins}, prefill win ${prefillW
     uploads = 0
   const deleted: unknown[] = []
   const state = {
+    config: { layerTypes: [] },
     buffers: { normed: {}, partial: {} },
     layoutPrefill: async () => { prefillCalls++; return { rgba4: prefillWins ? 6 : 10, bytes: 8 } },
     allocateMatrix: (
@@ -86,4 +87,19 @@ test(`dependent storage timing: decode win ${decodeWins}, prefill win ${prefillW
   assert.equal(uploads, 1)
   assert.ok(reads >= 3)
   assert.equal(deleted.length, 6)
+})
+
+test("quad prefill calibrates byte packing on sequence operators after loading", async () => {
+  const chooseLayout = Reflect.get(Engine.prototype, "chooseLayout")
+  for (const config of [
+    { layerTypes: ["conv", "full_attention"] },
+    { layerTypes: ["linear_attention", "full_attention"], linear: {} }
+  ]) {
+    const state = { config, quadMatmuls: true, contextLength: 512 }
+    await chooseLayout.call(state, { bits: 4 })
+    assert.equal(Reflect.get(state, "layoutChoice").layout, "bytes")
+    const cached = { ...state, preferLayout: "rgba4" }
+    await chooseLayout.call(cached, { bits: 4 })
+    assert.equal(Reflect.get(cached, "layoutChoice").layout, "rgba4")
+  }
 })

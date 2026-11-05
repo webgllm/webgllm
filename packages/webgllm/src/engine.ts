@@ -644,7 +644,7 @@ export class Engine {
             this.headChoice = { expanded: false, split: TUNING.q6HeadSplit }
           else if (!this.headChoice) await this.chooseHead(value)
         }
-        if (row0 === 0) this.resizeScoreBuffers()
+        if (row0 === 0) this.resizeScoreBuffers(value.bits)
         if (row0 === 0)
           this.embedding = this.allocateMatrix(
             totalRows,
@@ -910,7 +910,7 @@ export class Engine {
        * One per head of a group (see headGroup), member i's scores: rows
        * for scoreRows queries of every head, between them.
        */
-      scores: Array.from({ length: this.headGroup() }, () =>
+      scores: lin ? [] as Texture[] : Array.from({ length: this.headGroup() }, () =>
         this.gpu.texture(
           GL.RGBA32F,
           Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)),
@@ -1021,15 +1021,39 @@ export class Engine {
     return rows * this.config.numHeads * width * 16
   }
 
-  private resizeScoreBuffers() {
+  private resizeScoreBuffers(embeddingBits: number) {
+    const first = this.buffers.scores[0]
+    // Recurrent models back their attention panels when first needed.
+    if (!first) return
     const count = this.headGroup()
     const height = (this.config.numHeads / count) * Math.min(this.capacity, this.scoreRows())
-    if (this.buffers.scores[0].height === height) return
-    const width = this.buffers.scores[0].width
+    const expanded = TUNING.q6Expanded >= 0
+      ? TUNING.q6Expanded > 0
+      : this.headChoice?.expanded === true
+    // Keep the full attention tiles alongside a compact Q6 head. Only
+    // the stored scores are rounded. Softmax and its sums remain f32.
+    const format = embeddingBits === 6 && !expanded && this.mrt.chunks &&
+      this.gpu.canRender(new Array(count).fill(GL.RGBA16F))
+      ? GL.RGBA16F : GL.RGBA32F
+    if (first.height === height && first.internal === format) return
     for (const texture of this.buffers.scores) this.gpu.delete(texture)
     this.buffers.scores = Array.from({ length: count }, () =>
-      this.gpu.texture(GL.RGBA32F, width, height)
+      this.gpu.texture(format, first.width, height)
     )
+  }
+
+  /** Grow recurrent attention storage without changing its logical panel geometry. */
+  private growScoreBuffers(width: number, height: number, count: number) {
+    const current = this.buffers.scores
+    const first = current[0]
+    if (first && first.width >= width && first.height >= height) return current
+    const max = this.gpu.limits.maxTextureSize
+    const w = Math.max(width, Math.min(Math.ceil(width / 64) * 64, max), first?.width ?? 0)
+    const h = Math.max(height, Math.min(Math.ceil(height / 64) * 64, max), first?.height ?? 0)
+    for (const texture of current) this.gpu.delete(texture)
+    return (this.buffers.scores = Array.from({ length: count }, () =>
+      this.gpu.texture(GL.RGBA32F, w, h)
+    ))
   }
 
   /**
@@ -1161,7 +1185,9 @@ export class Engine {
     const have = this.chunkBufs.get(G)
     if (have && have[0].height >= rows) return have
     const c = this.config
-    const height = Math.max(rows, this.scoreRows() * ATTEND_CHUNKS)
+    const height = c.linear
+      ? Math.max(rows, Math.min(Math.ceil(rows / 256) * 256, this.gpu.limits.maxTextureSize))
+      : Math.max(rows, this.scoreRows() * ATTEND_CHUNKS)
     have?.forEach((t) => this.gpu.delete(t))
     const bufs = Array.from({ length: 3 * G }, () =>
       this.gpu.texture(GL.RGBA32F, (c.numHeads * c.headDim) / 8 / G, height)
@@ -1514,11 +1540,20 @@ export class Engine {
 
   /** Choose storage from real weights, dependent matvecs and a full-batch projection. */
   private async chooseLayout(m: QuantMatrix) {
-    if (m.bits !== 4 || TUNING.layerRgba4 >= 0 || this.preferLayout) {
+    // An isolated FFN projection misses sequence operators and the input
+    // conversions they share with adjacent matmuls. The byte path can
+    // calibrate its packing on those real operators after loading.
+    const sequenceQuadPrefill =
+      (this.config.linear !== undefined || this.config.layerTypes.includes("conv")) &&
+      this.quadMatmuls && TUNING.quad > 0 && TUNING.f16Matmul > 0 &&
+      this.contextLength >= TUNING.f16MinRows
+    if (m.bits !== 4 || TUNING.layerRgba4 >= 0 || this.preferLayout || sequenceQuadPrefill) {
       this.rgba4Layers =
         TUNING.layerRgba4 >= 0
           ? TUNING.layerRgba4 !== 0
-          : this.preferLayout !== "bytes"
+          : this.preferLayout
+            ? this.preferLayout === "rgba4"
+            : m.bits !== 4 || !sequenceQuadPrefill
       this.layoutChoice = {
         layout: this.rgba4Layers ? "rgba4" : "bytes",
         rgba4Ms: NaN,
@@ -4415,12 +4450,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const group = c.numHeads / c.numKvHeads
     const G = this.headGroup()
     const rowGroups = c.numHeads / G
-    const scoreTex = b.scores
-    const sIn = Object.fromEntries(
-      scoreTex.map((t, i) => [i === 0 ? "uS" : `uS${i}`, t])
+    const growScores = !!c.linear
+    let scoreTex = b.scores
+    const halfScores = scoreTex[0]?.internal === GL.RGBA16F
+    const scoreInputs = (textures: Texture[]) => Object.fromEntries(
+      textures.map((t, i) => [i === 0 ? "uS" : `uS${i}`, t])
     )
-    const panelRows = scoreTex[0].height
-    const scoreWidth = scoreTex[0].width
+    let sIn = scoreInputs(scoreTex)
+    const panelRows = growScores ? rowGroups * Math.min(this.capacity, this.scoreRows()) : scoreTex[0].height
+    const scoreWidth = growScores ? Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)) : scoreTex[0].width
     for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
       const widest = Math.ceil((pos0 + rows - j0) / 4)
@@ -4491,11 +4529,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         slice * n * c.numHeads * c.headDim * 2 * TUNING.paceAttention
       // Segments stack as rows: segment s of a pass at rows s · total on.
       const segRows = { uSegRows: { int: total }, uSegKeys: { int: 4 * segTexels } }
-      const scores = async (sj0: number, sKeys: number, n: number) =>
+      const scores = async (sj0: number, sKeys: number, n: number) => {
+        const width = Math.ceil((n * total) / panelRows) * Math.min(kt, segTexels)
+        const height = Math.min(panelRows, n * total)
+        if (growScores) {
+          const next = this.growScoreBuffers(width, height, G)
+          if (next !== scoreTex) {
+            scoreTex = next
+            sIn = scoreInputs(next)
+          }
+        }
         await this.gpu.runAsync({
           name: "scores",
           program: this.gpu.program(
-            K.scores(c.headDim, G, inCache ? { kvWidth, slots: qSlots } : undefined)
+            K.scores(c.headDim, G, inCache ? { kvWidth, slots: qSlots } : undefined, halfScores)
           ),
           inputs: inCache ? { uK: layer.kv } : { uQ: b.q, uK: layer.kv },
           uniforms: {
@@ -4510,14 +4557,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             uTotalRows: { int: n * total }
           },
           output: G === 1 ? scoreTex[0] : scoreTex,
-          rect: {
-            x: 0,
-            y: 0,
-            width: Math.ceil((n * total) / panelRows) * Math.min(kt, segTexels),
-            height: Math.min(panelRows, n * total)
-          },
+          rect: { x: 0, y: 0, width, height },
           work: (c.headDim / 8) * (4 + 2 * G)
         })
+      }
       const chunks = chunksOf(chunkTexels)
       const chunkPast =
         rows <= SPLIT_ROWS
@@ -4553,7 +4596,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         await scores(j0, keys, segments)
         await this.gpu.runAsync({
           name: "attend",
-          program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll, TUNING.flashOnline > 0)),
+          program: this.gpu.program(K.attendPanel(c.headDim, G, TUNING.flashUnroll, TUNING.flashOnline > 0, halfScores)),
           inputs: { ...sIn, uV: layer.kv },
           uniforms: {
             ...ring,
@@ -4616,7 +4659,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           await scores(gj0, gKeys, n)
           await this.gpu.runAsync({
             name: "attend",
-            program: this.gpu.program(K.attendChunk(c.headDim, G)),
+            program: this.gpu.program(K.attendChunk(c.headDim, G, halfScores)),
             inputs: { ...sIn, uV: layer.kv },
             uniforms: {
               ...ring,
