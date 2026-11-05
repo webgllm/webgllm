@@ -1,0 +1,14 @@
+
+import {webglText,unloadModel,modelStatus,WEBGL_MODEL_META} from '@tanstack-ai-browser/webgl';
+import {resolveDebugOption} from '@tanstack/ai/adapter-internals';
+const status=document.querySelector('#status'),output=document.querySelector('#report');let running=false;
+document.querySelector('#run').onclick=async()=>{if(running)return;running=true;output.textContent='';const model=document.querySelector('#model').value,meta=WEBGL_MODEL_META[model],thinking=model.includes('Thinking');let thinkingChars=0;
+const report={model,sampling:{...meta.sampling,top_p:meta.sampling.top_p??1,min_p:meta.sampling.min_p??0},thinking,thinkingBudgetTokens:thinking?512:null,maxTokens:1024,structured:[],tools:[]};const store=modelStatus(model);const unsub=store.subscribe(()=>{const state=store.get();if(state.state==='loading')status.textContent=(state.cached?'Loading cached model':'Downloading')+' '+Math.round(state.progress*100)+'%'});
+try{unloadModel();const adapter=webglText(model,{onThinking:delta=>thinkingChars+=delta.length});
+const opts={logger:resolveDebugOption(false),threadId:'lfm25-gguf-qa-'+model,promptCache:'long',model,systemPrompts:['Answer the user using the requested city.'],modelOptions:{maxTokens:1024},...(thinking?{reasoning:{level:'high',budgetTokens:512}}:{})};
+const schema={type:'object',properties:{city:{type:'string',enum:['Paris','London','Tokyo']}},required:['city'],additionalProperties:false};
+for(const city of ['Paris','Paris','London','Tokyo']){status.textContent='Structured '+city;const response=await adapter.structuredOutput({chatOptions:{...opts,messages:[{role:'user',content:'Set city to '+city+'.'}]},outputSchema:schema});const item={city,result:response.data,usage:response.usage};report.structured.push(item);if(response.data.city!==city)throw Error('Wrong structured city for '+city);}
+for(const toolChoice of ['required','auto']){status.textContent='Tool call '+toolChoice;const chunks=[];for await(const chunk of adapter.chatStream({...opts,messages:[{role:'user',content:'Use get_weather to check the current weather in Tokyo.'}],tools:[{name:'get_weather',description:'Get the current weather for a city.',inputSchema:schema}],toolChoice})){chunks.push(chunk);if(chunk.type==='RUN_ERROR')throw Error(JSON.stringify(chunk.error))}
+const calls=chunks.filter(c=>c.type==='TOOL_CALL_END');report.tools.push({toolChoice,calls,usage:chunks.find(c=>c.type==='RUN_FINISHED')?.usage});if(calls.length!==1||calls[0].toolCallName!=='get_weather'||calls[0].input.city!=='Tokyo')throw Error('Missing or incorrect '+toolChoice+' tool call');}
+report.thinkingChars=thinkingChars;report.pass=true;status.textContent='Passed';
+}catch(error){report.error=error.stack??String(error);report.thinkingChars=thinkingChars;report.pass=false;status.textContent='Failed'}finally{unsub();unloadModel();running=false;output.textContent=JSON.stringify(report,null,2)}};

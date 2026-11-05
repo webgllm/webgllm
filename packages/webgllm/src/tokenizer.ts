@@ -120,6 +120,8 @@ export type Tokenizer = {
   specialTokens: SpecialTokenIds
   /** One past the highest id the tokenizer knows (the model's may be more). */
   vocabSize: number
+  /** Exact tokenizer data for the schema constraint runtime. */
+  constraintTokenizer: { tokenizerJSON: object; eos_token_id: number; bos_token_id?: number; special_token_ids: number[] }
 }
 
 export type TokenizerFiles = {
@@ -296,7 +298,13 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     idToToken: (id) => hf.id_to_token(id),
     isSpecial: (id) => specialIds.has(id),
     specialTokens,
-    vocabSize
+    vocabSize,
+    constraintTokenizer: {
+      tokenizerJSON: files.tokenizerJson,
+      eos_token_id: specialTokens.eos,
+      ...(specialTokens.bos !== null && { bos_token_id: specialTokens.bos }),
+      special_token_ids: [...specialIds]
+    }
   }
 }
 

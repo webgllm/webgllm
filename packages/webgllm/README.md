@@ -21,7 +21,7 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 
 ## Models
 
-`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; Qwen3.5: temperature 0.6, top-k 20, top-p 0.95).
+`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; LFM2.5 Instruct/350M: temperature 0.1, top-k 50, repetition penalty 1.05; LFM2.5 Thinking: temperature 0.05, top-k 50, repetition penalty 1.05; Qwen3.5 text: temperature 1, top-k 20, top-p 1 and presence penalty 2 without thinking, top-p 0.95 and presence penalty 1.5 with thinking).
 
 | Model                            | Weights                                                       | Download |
 | -------------------------------- | ------------------------------------------------------------- | -------- |
@@ -31,6 +31,63 @@ It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and Offscr
 | `unsloth/Qwen3.5-2B-GGUF`        | unsloth's Q4_0 GGUF (its few Q4_1 and Q5_K matrices as 8-bit) | 1.21 GB  |
 
 LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
+
+Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. The supported models declare no default output cap in their generation configs. When neither `modelOptions.maxTokens` nor its legacy alias `max_new_tokens` is supplied, generation continues until EOS or the remaining configured model context is exhausted. An explicit value is honored in both streaming and structured-output calls and bounded by remaining context; `maxTokens` wins if both names are supplied. Thinking budgets are separate from this total output limit.
+
+### Structured output
+
+`chat({ outputSchema })` forwards the schema to the worker, where a generation-local matcher constrains answer tokens. The allowed-token bitset is applied before GPU candidate selection, argmax and top-k, and before sampling on the CPU-logits path. Model inference remains on WebGL. Unsupported schema features and constraint dead ends fail explicitly; exhausting the caller's output/context allowance before a valid answer reports truncation.
+
+Thinking and answer generation have separate states. Thinking uses its normal pipeline/speculative optimizations and caller budget, with EOS suppressed until an answer can be produced. Natural or budget-forced thinking completion activates the schema mask. Models that emit their own opening thinking marker receive that marker before constrained generation when thinking is requested. The constrained answer phase supports pipeline guesses and speculative drafts. Each proposed answer prefix uses a cloned grammar state and its own GPU mask; invalid suffixes are dropped before forwarding, and only accepted tokens advance the live matcher. A draft batch crossing the thinking boundary is rewound to its accepted prefix before selecting the first constrained token. Unconstrained text calls retain their existing decoding paths.
+
+### Prompt caching
+
+The engine reuses only matching rendered token IDs. System instructions, message
+roles, schemas and tool guidance keep their existing serialization; no extra user
+messages, layout options or application-managed cache boundaries are required.
+Changing a schema or earlier message can reduce the reusable prefix.
+
+A token-verified system/tool checkpoint shares the existing snapshot budget with
+the ordinary conversational anchor. System checkpoints tag existing legacy prefill endpoints without changing batch
+sizes or adding model forwards; no exact-prefix split is introduced. Ordinary
+conversational anchors retain their original positions and supported
+in-batch behavior. This avoids adding model passes to short requests merely to
+save speculative checkpoints.
+
+Actual reuse is reported in `promptTokensDetails.cachedTokens`. Optional
+`providerUsageDetails` fields separate prompt, tokenizer, schema and cache-restore
+work and report the selected checkpoints. Restore timing measures CPU matching and
+command submission; queued GPU restoration completes with subsequent prompt work.
+
+`chat({ promptCache: "none" })` clears owned inference-cache state before and after
+the call, including error/cancellation paths, and skips optional checkpoint work.
+Weights remain loaded and generation retains its own autoregressive KV state.
+Omitted/`"short"`/`"long"` retain existing budgets/lifetimes; no TTL is added. Cache
+keys cannot substitute for matching tokens and do not create separate GPU caches.
+
+### Tool calls
+
+Automatic tool choice retains the model's native routing and answer format. Before tool-call events are emitted, each parsed call must name a declared tool and its arguments must validate against that tool's schema. Valid arguments are retained without another model call; invalid arguments are regenerated once under the selected tool's constrained schema. Unknown tools and malformed envelopes fail explicitly. Required/named choices use constrained selection and arguments. There is no unconstrained retry loop. Tool calls still use TanStack AI's normal execution/result loop.
+
+### Thinking budget
+
+Every thinking-capable WebGL model accepts an optional thinking-token ceiling through the shared reasoning option:
+
+```ts
+const stream = chat({
+  adapter: webglText("LiquidAI/LFM3-1.7B-GGUF"),
+  messages,
+  threadId,
+  reasoning: { level: "high", budgetTokens: 512 },
+  modelOptions: { maxTokens: 8192 }
+})
+```
+
+The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `maxTokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. This applies to every LFM3, LFM2.5 Thinking, and Qwen3.5 variant.
+
+After an explicitly exhausted thinking span closes, ordinary text generation masks further actual thinking control tokens. Structured answers remain governed by their schema mask so tag-like text inside JSON strings stays data.
+
+The low-level worker/client generation option is `thinkingBudgetTokens`. Budgeted runs report `thinkingTokens`, `thinkingBudgetTokens`, and `thinkingBudgetExhausted` in `usage.providerUsageDetails`.
 
 ### Speed
 
@@ -104,3 +161,13 @@ Phones take the same 512-token batch: nothing a GPU reports tells an iPhone's ~2
 The most JavaScript memory a load takes is ~110 MiB: it streams the weights, a layer or a chunk of the embedding at a time. The worker claims the textures it measured from the page's memory budget (`setMemoryBudget`; before a load, an estimate: 1.4× the weight files), and claims again as the cache grows; if the GPU runs out of memory growing the cache, the reply stops with an error asking for a new session.
 
 **Status:** early (0.x); the API may change. See the [repository README](https://github.com/daveycodez/tanstack-ai-browser#readme).
+
+## LFM2.5 GGUF variants
+
+WebGL also supports `LiquidAI/LFM2.5-350M-GGUF`,
+`LiquidAI/LFM2.5-1.2B-Instruct-GGUF`, and
+`LiquidAI/LFM2.5-1.2B-Thinking-GGUF`. The first two use official QAD Q4_0 files;
+Thinking uses its official Q4_0 file and always reasons, with native reasoning-budget
+support. Each inherits its model-card sampling recommendations; caller overrides and
+model context/output defaults retain their existing behavior. Lofi lists them under
+WebGL. See [validation and reproduction](bench/LFM2-GGUF.md).

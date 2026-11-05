@@ -1,7 +1,7 @@
 /**
- * Loads LFM3 weights from a GGUF file (llama.cpp's `lfm3` architecture),
- * such as Liquid AI's LFM3-1.7B-QAD-Q4_0.gguf, or Qwen3.5's (`qwen35`),
- * such as unsloth's Qwen3.5-2B-Q4_0.gguf.
+ * Loads LFM3 (`lfm3`), LFM2/LFM2.5 (`lfm2`) and Qwen3.5 (`qwen35`) GGUFs.
+ * LFM2 uses token_embd_norm, no sandwich post-norms and no attention gate;
+ * its projections and short convolution use the same existing kernels.
  *
  * - Q4_0 matrices keep their blocks as they are (same nibble order); Q8_0
  *   stays 8-bit. A Q6_K embedding (Liquid AI's) is kept as it is, for the
@@ -111,11 +111,15 @@ export async function* loadGguf(
     })
   }
   const qwen = !!config.linear
+  const lfm2 = header.metadata.get("general.architecture") === "lfm2"
+  const finalNormName = lfm2 ? "token_embd_norm.weight" : "output_norm.weight"
   const layerTensors = (i: number): Array<string> => {
     const blk = `blk.${i}.`
-    const names = qwen
-      ? ["attn_norm", "post_attention_norm"]
-      : ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"]
+    const names = lfm2
+      ? ["attn_norm", "ffn_norm"]
+      : qwen
+        ? ["attn_norm", "post_attention_norm"]
+        : ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"]
     if (config.layerTypes[i] === "linear_attention") {
       names.push(
         "attn_qkv",
@@ -144,7 +148,7 @@ export async function* loadGguf(
         "attn_q",
         "attn_k",
         "attn_v",
-        "attn_gate",
+        ...(!lfm2 ? ["attn_gate"] : []),
         "attn_output",
         "attn_q_norm",
         "attn_k_norm"
@@ -158,7 +162,7 @@ export async function* loadGguf(
   }
   for (let i = 0; i < config.numLayers; i++)
     for (const name of layerTensors(i)) want(name)
-  want("output_norm.weight")
+  want(finalNormName)
 
   const embedding = tensor("token_embd.weight")
   const [embK, vocab] = embedding.dims as [number, number]
@@ -253,13 +257,13 @@ export async function* loadGguf(
     const full = type === "full_attention"
     const operatorNorm = await norm(`${blk}attn_norm.weight`)
     // Qwen3.5's post_attention_norm is the feed-forward block's norm.
-    const postOperatorNorm = qwen
+    const postOperatorNorm = qwen || lfm2
       ? undefined
       : await norm(`${blk}post_attention_norm.weight`)
     const ffnNorm = await norm(
       qwen ? `${blk}post_attention_norm.weight` : `${blk}ffn_norm.weight`
     )
-    const postFfnNorm = qwen
+    const postFfnNorm = qwen || lfm2
       ? undefined
       : await norm(`${blk}post_ffw_norm.weight`)
     let conv: ConvWeights | undefined
@@ -349,7 +353,7 @@ export async function* loadGguf(
           perm: full ? kPerm : undefined
         },
         { name: `${blk}attn_v.weight`, rows: kv },
-        { name: `${blk}attn_gate.weight`, rows: numHeads }
+        ...(!lfm2 ? [{ name: `${blk}attn_gate.weight`, rows: numHeads }] : [])
       ])
       const o = await matrix(numHeads * headDim, [
         { name: `${blk}attn_output.weight`, rows: D }
@@ -380,7 +384,7 @@ export async function* loadGguf(
     yield { kind: "layer", layer: i, value }
   }
 
-  yield { kind: "finalNorm", value: await norm("output_norm.weight") }
+  yield { kind: "finalNorm", value: await norm(finalNormName) }
 
   // The embedding (also the output head) in chunks of rows, so it's never
   // all in JavaScript memory at once: Q6_K as it is (the shader reads it
@@ -540,6 +544,9 @@ function ggufConfig(
   const meta = header.metadata
   const arch = meta.get("general.architecture")
   if (typeof arch !== "string") throw new Error("GGUF: no general.architecture")
+  if (!["lfm2", "lfm3", "qwen35"].includes(arch)) throw new Error(`GGUF: unsupported architecture ${arch}`)
+  if (arch === "lfm2" && header.tensors.has("output.weight"))
+    throw new Error("GGUF: LFM2 models with a separate output head are not supported.")
   const get = (key: string): GgufValue => {
     const value = meta.get(key) ?? meta.get(`${arch}.${key}`)
     if (value === undefined)
@@ -576,6 +583,7 @@ function ggufConfig(
   if (kvHeads.length !== numLayers)
     throw new Error("GGUF: head_count_kv doesn't have one entry per layer")
   const swa = list("attention.sliding_window_pattern")
+  const slidingWindow = num("attention.sliding_window", 0)
   const qwen = arch === "qwen35"
   // Qwen3.5: full attention every full_attention_interval-th layer, Gated
   // DeltaNet in the others.
@@ -587,7 +595,7 @@ function ggufConfig(
         : "linear_attention"
       : kv === 0
         ? "conv"
-        : swa?.[i]
+        : (swa?.[i] ?? (arch === "lfm2" && slidingWindow > 0))
           ? "sliding_attention"
           : "full_attention"
   )
@@ -659,7 +667,7 @@ function ggufConfig(
     headDim,
     vocabSize: embedding.dims[1],
     layerTypes,
-    slidingWindow: num("attention.sliding_window", 0),
+    slidingWindow,
     contextLength: num("context_length", 8192),
     ropeThetaFull: f32Decimal(num("rope.freq_base")),
     ropeThetaSliding: f32Decimal(
@@ -672,8 +680,8 @@ function ggufConfig(
     bosTokenId: tokenId("bos_token_id", -1),
     eosTokenId: tokenId("eos_token_id", -1),
     padTokenId: tokenId("padding_token_id", -1),
-    // LFM3 and Qwen3.5 both gate attention's output (Qwen3.5 per dim).
-    attentionGate: true,
+    // LFM2 has no attention output gate; Qwen3.5 gates per dimension.
+    attentionGate: arch !== "lfm2",
     ...(qwen && { gatePerDim: true, ropeFreqDims: ropeDimsSliding, linear })
   }
 }

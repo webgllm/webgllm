@@ -8,6 +8,7 @@ import { SubmissionBudget, calibratedReadQuota } from "./gpu/submission-budget.j
 import { releaseOwnedBuffer } from "./upload-staging.js"
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
+import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
@@ -411,6 +412,8 @@ type Snapshot = {
   hidden?: Texture
   /** The anchor: dropped for room only once a newer anchor is saved (see snapshot). */
   anchor?: boolean
+  /** Stable system/tool prefix, retained alongside the conversational anchor. */
+  prefix?: boolean
 }
 
 /**
@@ -922,7 +925,7 @@ export class Engine {
         OUT_WIDTH,
         Math.ceil(c.vocabSize / 4 / OUT_WIDTH) * headRows
       ),
-      /** Per token: 0, 1 seen (repetition penalty), 2 never drawn. Same rows as the logits. */
+      /** Per token: 0 unseen, 1 prompt, 2 never drawn, 3 generated. Same rows as the logits. */
       mask: this.gpu.texture(
         GL.R8UI,
         OUT_WIDTH * 4,
@@ -2746,13 +2749,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return this.canDraft ? MAX_SNAPSHOTS : Math.max(1, TUNING.linearSnapshots)
   }
 
-  /** Frees the oldest snapshots but the anchor until at most `keep` are left. */
-  private dropSnapshots(keep: number) {
-    for (const [p, old] of this.snapshots) {
-      if (this.snapshots.size <= keep) break
-      if (old.anchor) continue
-      this.freeSnapshot(old)
-      this.snapshots.delete(p)
+  /** Retains the reusable prefix and conversational anchor within the existing limit. */
+  private dropSnapshots(keep: number, replacing?: SnapshotRole) {
+    const points = [...this.snapshots].map(([position, saved]) => ({ position, anchor: saved.anchor, prefix: saved.prefix }))
+    for (const position of checkpointsToDrop(points, keep, replacing)) {
+      const saved = this.snapshots.get(position)
+      if (saved) this.freeSnapshot(saved)
+      this.snapshots.delete(position)
     }
   }
 
@@ -2760,24 +2763,27 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    * Saves what's needed to resume at the current position (see
    * `snapshots`), so a later prompt that shares the tokens so far reads only
    * what's new. Keeps the latest snapshotLimit, the oldest freed before a
-   * new one is made (so no more than that are ever held), except the
-   * anchor: the latest snapshot saved with `anchor` (where the next user
-   * turn's prompt stops sharing this chat's: see readPrompt) stays until a
-   * newer anchor replaces it. With `hiddenRow` (the row of the last batch
+   * new one is made (so no more than that are ever held). The stable prefix
+   * and latest conversational anchor have priority over discretionary batch
+   * points; with room for only one, conversational behavior is unchanged.
+   * With `hiddenRow` (the row of the last batch
    * holding the last token), keeps that token's hidden state too, so
    * `resume` can draw the next token's logits without reading it again.
    */
-  snapshot(hiddenRow?: number, anchor = false) {
+  snapshot(hiddenRow?: number, anchor: boolean | "prefix" = false) {
+    if (anchor === "prefix" && this.snapshotLimit < 2) return
     if (this.guessAt !== null)
       throw new Error("Snapshot while a guessed token is pending.")
     const at = this.position
     const had = this.snapshots.get(at)
     if (had) {
       if (hiddenRow !== undefined && !had.hidden) had.hidden = this.copyHidden(hiddenRow)
-      if (anchor) this.keepSnapshot(at, had, true)
+      if (anchor) this.keepSnapshot(at, had, anchor)
       return
     }
-    this.dropSnapshots(this.snapshotLimit - 1)
+    // Do not evict either useful anchor just to save a discretionary point.
+    if (!anchor && [...this.snapshots.values()].filter(saved => saved.anchor || saved.prefix).length >= this.snapshotLimit) return
+    this.dropSnapshots(this.snapshotLimit - 1, anchor === true ? "anchor" : anchor || undefined)
     const W = this.config.slidingWindow
     const saved: Snapshot = {
       conv: [] as Array<Texture>,
@@ -2818,21 +2824,34 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   /** Adds `saved` as the snapshot at `at` (the anchor, with `anchor`), then drops the oldest past the limit. */
-  private keepSnapshot(at: number, saved: Snapshot, anchor: boolean) {
+  private keepSnapshot(at: number, saved: Snapshot, anchor: boolean | "prefix") {
     this.snapshots.set(at, saved)
     if (anchor) {
-      for (const s of this.snapshots.values()) s.anchor = false
-      saved.anchor = true
+      const role = anchor === true ? "anchor" : "prefix"
+      for (const s of this.snapshots.values()) s[role] = false
+      saved[role] = true
     }
     // (An anchor kept past the limit goes once it's no longer the anchor.)
     this.dropSnapshots(this.snapshotLimit)
   }
 
+  /** The selected retained checkpoint, for cache diagnostics and native correctness checks. */
+  snapshotPosition(role: SnapshotRole): number | undefined {
+    for (const [position, saved] of this.snapshots) if (saved[role]) return position
+    return undefined
+  }
+
   /** A copy of an f32 texture. */
   private copyOf(from: Texture) {
     const copy = this.gpu.texture(GL.RGBA32F, from.width, from.height)
-    this.gpu.run({ program: this.gpu.program(K.COPY), inputs: { uX: from }, output: copy })
-    return copy
+    try {
+      this.gpu.run({ program: this.gpu.program(K.COPY), inputs: { uX: from }, output: copy })
+      return copy
+    } catch (error) {
+      // The caller cannot own this texture until the copy has returned.
+      this.gpu.delete(copy)
+      throw error
+    }
   }
 
   /**
@@ -2846,6 +2865,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** What a batch saving a snapshot partway has copied so far (see forwardBatch). */
   private saving: Array<Texture> | null = null
+
+  /** A learned shared boundary, extracted without splitting the forward batch. */
+  private prefixSaving: { row: number; state: Snapshot } | null = null
 
   /** Whether `resume(position)` would work: a snapshot there kept its last hidden row. */
   canResume(position: number) {
@@ -4003,6 +4025,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           : this.readPair(source, "uBCx", bcx)
       )
     const bcxIn = { uBCx: bcx, ...(!split && this.quadInputs("uBCx", bcx)) }
+    if (this.prefixSaving) {
+      const copy = this.f32(c.hiddenSize, c.convKernel - 1)
+      this.prefixSaving.state.conv.push(copy)
+      this.gpu.run({
+        name: "conv",
+        program: read(K.convState(c.convKernel)),
+        inputs: { ...bcxIn, uState: layer.state[0] },
+        uniforms: { uDt: { int: dt }, uM: { int: this.prefixSaving.row }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
+        output: copy,
+        rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
+      })
+    }
     if (rows <= SPLIT_ROWS && TUNING.fuseConv > 0 && this.mrt.conv) {
       // A few rows: the output and the new state in one pass.
       this.gpu.run({
@@ -4676,7 +4710,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const b = this.buffers
     const t = b.lin
     if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
-    if (fusable && saveAt === undefined && this.fusesLinear(layer, rows))
+    if (fusable && saveAt === undefined && !this.prefixSaving && this.fusesLinear(layer, rows))
       return this.linearFused(layer, rows, input)
     const dk = lin.l.keyHeadDim
     const dv = lin.l.valueHeadDim
@@ -4723,6 +4757,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const read = reader("uIn", inTex, split)
     const inInputs = pairInputs("uIn", inTex, split)
     const inUniforms = { uSplitIn: { int: split }, ...this.pairIn(inTex) }
+    if (this.prefixSaving) {
+      const copy = this.f32(lin.C, width - 1)
+      this.prefixSaving.state.linear.push(copy)
+      this.gpu.run({
+        name: "linear",
+        program: read(K.linConvState(width)),
+        inputs: { ...inInputs, uState: layer.convState[0] },
+        uniforms: { ...inUniforms, uM: { int: this.prefixSaving.row } },
+        output: copy,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 }
+      })
+    }
     this.gpu.run({
       name: "linear",
       program: read(K.linConv(width)),
@@ -4731,11 +4777,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       output: t.qkv,
       rect: { x: 0, y: 0, width: C4, height: rows }
     })
-    for (const [m, out] of [
-      [rows, layer.convState[1]],
-      // (The conv state after saveAt's rows, for a snapshot there.)
-      ...(saveAt ? [[saveAt, this.f32(lin.C, width - 1)] as const] : [])
-    ] as const) {
+    for (const m of [rows, ...(saveAt !== undefined ? [saveAt] : [])]) {
+      // Own the anchor copy before compiling or drawing it. Do not allocate it
+      // ahead of the full-batch state pass, which can itself be interrupted.
+      const out = m === saveAt ? this.f32(lin.C, width - 1) : layer.convState[1]
+      if (m === saveAt) this.saving?.push(out)
       this.gpu.run({
         name: "linear",
         program: read(K.linConvState(width)),
@@ -4744,7 +4790,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         output: out,
         rect: { x: 0, y: 0, width: C4, height: width - 1 }
       })
-      if (m === saveAt) this.saving?.push(out)
     }
     layer.convState.reverse()
     this.gpu.run({
@@ -4793,6 +4838,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       })
       layer.state.reverse()
       if (r + 1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (r + 1 === this.prefixSaving?.row) this.prefixSaving.state.linear.push(this.copyOf(layer.state[0]))
       // (Each token reads and writes the whole state: ~4 multiply-adds an element.)
       if (paced) await this.charge(4 * lin.V * dk)
     }
@@ -4976,6 +5022,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       else
         for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const)
           run(K.linChunkOut({ ...heads, out }), outIn, tex, V4, {}, rect, dk)
+      const prefixRow = this.prefixSaving?.row
+      if (prefixRow !== undefined && c0 < prefixRow && prefixRow < c1) {
+        const copy = this.f32(lin.V, dk)
+        this.prefixSaving!.state.linear.push(copy)
+        run(
+          K.linChunkState(heads),
+          { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
+          copy, V4, { uC0: { int: c0 }, uC1: { int: prefixRow } },
+          { x: 0, y: 0, width: V4, height: dk }, prefixRow - c0
+        )
+      }
       run(
         K.linChunkState(heads),
         { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
@@ -4987,6 +5044,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       )
       layer.state.reverse()
       if (c1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (c1 === prefixRow) this.prefixSaving!.state.linear.push(this.copyOf(layer.state[0]))
       // (Reading and writing the state: ~3 multiply-adds an element a token.)
       if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
     }
@@ -5056,6 +5114,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
        * most; see canSaveInside).
        */
       saveAt?: number
+      /** Observed shared prefix, copied inside this batch without another model pass. */
+      prefixAt?: number
     } = {}
   ): Promise<number> {
     if (options.draft) return this.forwardDraft(Array.from(tokens))
@@ -5068,23 +5128,36 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
     }
-    const { saveAt } = options
-    if (saveAt !== undefined) {
-      if (!this.canSaveInside || tokens.length > this.capacity || !(saveAt > 0 && saveAt < tokens.length))
-        throw new Error(`Can't save a snapshot after ${saveAt} of a ${tokens.length}-token batch.`)
-      // Room first, so no more than the limit are ever held.
-      this.dropSnapshots(this.snapshotLimit - 1)
+    const { saveAt, prefixAt } = options
+    if (saveAt !== undefined || prefixAt !== undefined) {
+      if (tokens.length > this.capacity ||
+        (saveAt !== undefined && (!this.canSaveInside || !(saveAt > 0 && saveAt < tokens.length))) ||
+        (prefixAt !== undefined && (this.snapshotLimit < 2 || !(prefixAt > 0 && prefixAt < tokens.length))))
+        throw new Error(`Can't save an in-batch checkpoint for ${tokens.length} tokens.`)
+      const same = prefixAt !== undefined && prefixAt === saveAt
+      const count = Number(saveAt !== undefined) + Number(prefixAt !== undefined && !same)
+      // Reserve all new state before allocating; partial copies count toward the limit.
+      this.dropSnapshots(this.snapshotLimit - count, count === 1 ? saveAt !== undefined ? "anchor" : "prefix" : undefined)
       const pos0 = this.position
-      this.saving = []
+      const learned: Snapshot | undefined = prefixAt !== undefined && !same ? { conv: [], windows: [], linear: [] } : undefined
+      this.saving = saveAt !== undefined ? [] : null
+      this.prefixSaving = learned ? { row: prefixAt!, state: learned } : null
       try {
         const last = await this.forwardBatch(Array.from(tokens), undefined, false, saveAt)
-        this.keepSnapshot(pos0 + saveAt, { conv: [], windows: [], linear: this.saving }, true)
+        if (saveAt !== undefined) {
+          const saved: Snapshot = { conv: [], windows: [], linear: this.saving! }
+          this.keepSnapshot(pos0 + saveAt, saved, true)
+          if (same) this.keepSnapshot(pos0 + saveAt, saved, "prefix")
+        }
+        if (learned) this.keepSnapshot(pos0 + prefixAt!, learned, "prefix")
         return last
       } catch (error) {
-        for (const t of this.saving) this.gpu.delete(t)
+        for (const t of this.saving ?? []) this.gpu.delete(t)
+        if (learned) this.freeSnapshot(learned)
         throw error
       } finally {
         this.saving = null
+        this.prefixSaving = null
       }
     }
     let last = 0
@@ -5218,7 +5291,38 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.guessAt = null
   }
 
-  /** Seen-token bits; the GPU retains its byte mask including padding bans. */
+  private allowedTokens: Texture | null = null
+  private allowedEnabled = false
+  private allowedRows = 0
+  private allowedStride = 0
+
+  /** One allowed-token bitset broadcast across all rows of GPU selection. */
+  setAllowedTokens(mask: Uint32Array | null) {
+    this.setAllowedTokenRows(mask === null ? null : [mask])
+  }
+
+  /** Allowed masks after each speculative prefix, before GPU ranking/top-k. */
+  setAllowedTokenRows(masks: readonly Uint32Array[] | null) {
+    this.allowedEnabled = masks !== null
+    this.allowedRows = masks?.length ?? 0
+    if (masks === null) return
+    if (masks.length === 0) throw new Error("GPU schema masks must have at least one row.")
+    const words = Math.ceil(this.config.vocabSize / 32)
+    const width = Math.min(256, words)
+    this.allowedStride = Math.ceil(words / width)
+    const height = this.allowedStride * masks.length
+    if (!this.allowedTokens || this.allowedTokens.width !== width || this.allowedTokens.height < height) {
+      if (this.allowedTokens) this.gpu.delete(this.allowedTokens)
+      this.allowedTokens = this.gpu.texture(GL.R32UI, width, height)
+    }
+    const padded = new Uint32Array(width * height)
+    for (let row = 0; row < masks.length; row++) padded.set(masks[row].subarray(0, words), row * width * this.allowedStride)
+    this.gpu.write(this.allowedTokens, { x: 0, y: 0, width, height }, {
+      format: GL.RED_INTEGER, type: GL.UNSIGNED_INT, pixels: padded
+    })
+  }
+
+  /** Generated-token bits. The GPU mask also tracks prompt tokens and padding. */
   private maskData: Uint8Array | null = null
   private maskLimit = 0
   private maskUpdate: Uint8Array | null = null
@@ -5237,7 +5341,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     data.fill(2, this.maskLimit)
     for (const t of tokens) if (Number.isInteger(t) && t >= 0 && t < this.maskLimit) {
       data[t] = 1
-      bits[t >> 3] |= 1 << (t & 7)
     }
     this.maskData = bits
     this.gpu.write(
@@ -5252,14 +5355,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     releaseOwnedBuffer(data.buffer)
   }
 
-  /** Adds one token to those the repetition penalty applies to. */
+  /** Marks a generated token for repetition and presence penalties. */
   markSeen(token: number) {
     const data = this.maskData
     if (!data || !Number.isInteger(token) || token < 0 || token >= this.maskLimit) return
     const index = token >> 3, bit = 1 << (token & 7)
     if (data[index] & bit) return
     data[index] |= bit
-    const update = this.maskUpdate ??= new Uint8Array([1])
+    const update = this.maskUpdate ??= new Uint8Array([3])
     const width = this.buffers.mask.width
     this.gpu.write(
       this.buffers.mask,
@@ -5283,9 +5386,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     row: number,
     chunks: number,
     penalty: number,
-    guess = false
+    guess = false,
+    presencePenalty = 0
   ): Promise<{ ids: Int32Array; logits: Float32Array }> {
-    return (await this.pick(row, 1, chunks, penalty, [], guess))[0]
+    return (await this.pick(row, 1, chunks, penalty, [], guess, 0, presencePenalty))[0]
   }
 
   private greedyOut: Texture | null = null
@@ -5302,7 +5406,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     rows: number,
     penalty: number,
     drafts: Array<number>,
-    guess = false
+    guess = false,
+    presencePenalty = 0
   ): Promise<Int32Array> {
     const c = this.config
     const b = this.buffers
@@ -5312,6 +5417,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uAllowedEnabled: { int: this.allowedEnabled ? 1 : 0 },
+      uAllowedWidth: { int: this.allowedTokens?.width ?? 1 },
+      uAllowedRows: { int: this.allowedRows },
+      uAllowedStride: { int: this.allowedStride },
+      uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
@@ -5322,7 +5432,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(K.CHUNK_MAX_AT),
-      inputs: { uLogits: head.logits, uMask: b.mask },
+      inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
@@ -5379,7 +5489,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     penalty: number,
     drafts: Array<number>,
     guess = false,
-    penaltyRow0 = 0
+    penaltyRow0 = 0,
+    presencePenalty = 0
   ): Promise<Array<{ ids: Int32Array; logits: Float32Array }>> {
     const c = this.config
     const b = this.buffers
@@ -5393,6 +5504,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
+      uAllowedEnabled: { int: this.allowedEnabled ? 1 : 0 },
+      uAllowedWidth: { int: this.allowedTokens?.width ?? 1 },
+      uAllowedRows: { int: this.allowedRows },
+      uAllowedStride: { int: this.allowedStride },
+      uPresencePenalty: presencePenalty,
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
@@ -5403,7 +5519,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.gpu.run({
       name: "pick",
       program: this.gpu.program(fast ? K.CHUNK_MAX_AT : K.CHUNK_MAX),
-      inputs: { uLogits: head.logits, uMask: b.mask },
+      inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
       rect: { x: 0, y: 0, width: total, height: rows }
@@ -5416,7 +5532,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         program: this.gpu.program(
           fast ? K.withChunks(K.CHUNK_ARGMAX_AT, total) : K.CHUNK_ARGMAX
         ),
-        inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask },
+        inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
         uniforms: {
           ...picking,
           uChunks: { int: total },
@@ -5452,6 +5568,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       inputs: {
         uLogits: head.logits,
         uMask: b.mask,
+        uAllowed: this.allowedTokens ?? b.mask,
         uByRank: b.chunkByRank,
         uIds: b.ids
       },
@@ -5992,6 +6109,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           paced,
           !probe
         )
+        if (this.prefixSaving && layer.attention.ring) {
+          const at = pos0 + this.prefixSaving.row
+          const window = this.gpu.texture(GL.RGBA32UI, layer.attention.kv.width, c.slidingWindow)
+          this.prefixSaving.state.windows.push(window)
+          this.copyPositions(layer.attention.kv, layer.attention.ring, window, c.slidingWindow, Math.max(0, at - c.slidingWindow), at)
+        }
         await look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)

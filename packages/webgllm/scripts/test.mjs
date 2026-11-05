@@ -27,6 +27,7 @@ try {
       bundle: true,
       format: "esm",
       platform: "node",
+      conditions: ["@tanstack-ai-browser/source"],
       logLevel: "error"
     })
     files.push(outfile)

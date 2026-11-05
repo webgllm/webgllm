@@ -11,18 +11,20 @@
  */
 import { blobSource, httpSource } from "../src/byte-source.js"
 import { Engine, TUNING } from "../src/engine.js"
+import { names } from "./memory-names.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
 import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
-import { anchorFor, readPrompt } from "../src/prompt.js"
+import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
+import { checkPrefixCache } from "./prefix-cache-check.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
 
 type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
-  mode: "chat" | "ab"
+  mode: "chat" | "ab" | "prefix"
   /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
@@ -75,87 +77,6 @@ function instrument(engine: Engine) {
     }
     return t
   }
-}
-
-// biome-ignore lint: the engine's private fields, read for naming.
-type Any = Record<string, any>
-
-/** What each of the engine's textures is, by walking its fields. */
-function names(engine: Engine) {
-  const e = engine as unknown as Any
-  const map = new Map<Texture, string>()
-  const put = (t: unknown, name: string) => {
-    if (t && typeof t === "object" && "tex" in t) map.set(t as Texture, name)
-  }
-  const matrix = (m: Any | undefined, kind: string) => {
-    if (!m) return
-    put(m.quants, `weights ${kind}`)
-    put(m.scales, `weights ${kind}`)
-    put(m.zeros, `weights ${kind}`)
-  }
-  matrix(e.embedding, "embedding/head")
-  for (const l of e.layers as Array<Any>) {
-    matrix(l.gateUp, "ffn")
-    matrix(l.down, "ffn")
-    for (const n of ["operatorNorm", "postOperatorNorm", "ffnNorm", "postFfnNorm"])
-      put(l[n], "weights norms+vectors")
-    if (l.conv) {
-      matrix(l.conv.inProj, "conv")
-      matrix(l.conv.outProj, "conv")
-      put(l.conv.kernel, "weights norms+vectors")
-      l.conv.state.forEach((t: Texture) => put(t, "state conv"))
-      put(l.conv.prefixes, "state conv prefixes")
-    }
-    if (l.attention) {
-      matrix(l.attention.qkvg, "attention")
-      matrix(l.attention.o, "attention")
-      put(l.attention.qNorm, "weights norms+vectors")
-      put(l.attention.kNorm, "weights norms+vectors")
-      put(l.attention.kv, l.attention.ring ? "KV ring (sliding)" : "KV full attention")
-    }
-    if (l.linear) {
-      matrix(l.linear.inProj, "deltanet")
-      matrix(l.linear.ba, "deltanet")
-      matrix(l.linear.outProj, "deltanet")
-      for (const n of ["kernel", "a", "dtBias", "norm"]) put(l.linear[n], "weights norms+vectors")
-      l.linear.convState.forEach((t: Texture) => put(t, "state deltanet"))
-      l.linear.state.forEach((t: Texture) => put(t, "state deltanet"))
-    }
-  }
-  put(e.finalNorm, "weights norms+vectors")
-  put(e.ropeFull, "rope tables")
-  put(e.ropeSliding, "rope tables")
-  const ids = new Map<number, string>()
-  for (const [k, v] of Object.entries((e.buffers ?? {}) as Any)) {
-    const each = (t: unknown, name: string) => {
-      put(t, `scratch ${name}`)
-      if (t && typeof t === "object" && "id" in t) ids.set((t as Texture).id, name)
-    }
-    if (Array.isArray(v)) v.forEach((t) => each(t, k))
-    else if (v && typeof v === "object" && !("tex" in v))
-      for (const [k2, t] of Object.entries(v as Any)) each(t, `${k}.${k2}`)
-    else each(v, k)
-  }
-  for (const [id, t] of e.quads as Map<number, Texture>)
-    put(t, `scratch quad partner (${ids.get(id) ?? "?"})`)
-  if (e.f16) {
-    put(e.f16.w, "scratch f16 weights")
-    e.f16.a.forEach((t: Texture) => put(t, "scratch f16 activations"))
-  }
-  for (const t of Object.values((e.linChunks?.textures ?? {}) as Any)) put(t, "scratch deltanet chunks")
-  for (const bufs of (e.chunkBufs as Map<number, Array<Texture>>).values())
-    bufs.forEach((t) => put(t, "scratch attention chunks"))
-  for (const s of (e.snapshots as Map<number, Any>).values()) {
-    s.conv.forEach((t: Texture) => put(t, "snapshots"))
-    s.windows.forEach((t: Texture) => put(t, "snapshots"))
-    s.linear.forEach((t: Texture) => put(t, "snapshots"))
-    put(s.hidden, "snapshots")
-  }
-  put(e.headScratch, "scratch head slices")
-  put(e.greedyOut, "scratch greedy")
-  put(e.debug, "debug")
-  put(e.kvDebug, "debug")
-  return map
 }
 
 /** The category of a texture name: what the summary line adds up. */
@@ -493,6 +414,34 @@ async function ab(params: Params, got: Awaited<ReturnType<typeof files>>) {
   log(`AB SUMMARY (${params.model}, ${params.length}-token prompt, ${params.reply}-token reply, median of ${params.rounds}):\n${lines.join("\n")}`)
 }
 
+/** ?mode=prefix: verify real GPU restoration after an independent task. */
+async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    // Stable context spans a natural batch so the test exercises a retained point.
+    const system: ChatMessage = { role: "system", content: "Follow the current request and reply accurately. " + padded(got.tokenizer, [], "Shared context for independent tasks.", params.length, params.thinking) }
+    const chats: Array<Array<ChatMessage>> = ["First independent task.", "Different independent task."].map(task => [
+      system,
+      { role: "user" as const, content: task + "\n" + padded(got.tokenizer, [], task, params.length, params.thinking) }
+    ])
+    const prompts = chats.map(chat => got.tokenizer.encodeChat(chat, { addGenerationPrompt: true, enableThinking: params.thinking }))
+    const prefixes = chats.map((chat,index) => systemPrefixFor(got.tokenizer, prompts[index], chat, params.thinking))
+    if (!prefixes[0] || !prefixes[1]) throw new Error("This template has no verified system-prefix checkpoint.")
+    const anchors = chats.map((chat,index) => anchorFor(got.tokenizer,prompts[index],chat,params.thinking))
+    const result = await checkPrefixCache(engine, prompts[0], prompts[1], {
+      firstPrefix: prefixes[0], secondPrefix: prefixes[1], firstAnchor: anchors[0], secondAnchor: anchors[1]
+    })
+    if (result.restoredTokens <= 0) throw new Error("Numerical cache check did not restore a nonempty selected checkpoint.")
+    const reported = { model: params.model, mode: params.mode, ...result, peakBytes: peak }
+    log(`PREFIX CACHE CHECK ${JSON.stringify(reported)}`)
+    postMessage({ type: "result", value: reported })
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
 async function run(params: Params) {
   if (params.cdp) {
     // The GPU process before any of this page's textures: what the
@@ -505,5 +454,6 @@ async function run(params: Params) {
   }
   const got = await files(params.model)
   if (params.mode === "ab") await ab(params, got)
+  else if (params.mode === "prefix") await prefixCheck(params, got)
   else await chat(params, got)
 }

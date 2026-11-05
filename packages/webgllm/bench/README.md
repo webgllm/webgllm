@@ -1,5 +1,9 @@
 # Bench
 
+Raw run artifacts are no longer tracked. Keep only [the latest compact summary](latest.json);
+regenerate raw files locally as needed. Fixed regression fixtures remain separate.
+
+
 Pages for checking and timing the engine, served cross-origin isolated by `server.mjs`, which also bundles the package's TypeScript on request (`/bundle/<path>.js` is `<path>.ts`).
 
 ```sh
@@ -304,3 +308,9 @@ NX_DAEMON=false NX_ISOLATE_PLUGINS=false pnpm --config.verify-deps-before-run=fa
 ```
 
 The pnpm option avoids automatic dependency installation into the linked worktree.
+
+## Short shared-prefix caching
+
+See [native Chrome results and reproduction](short-prefix-results/FINDINGS.md) for
+inside-batch state extraction, preserved cold batches and long-prefix behavior,
+SDK tool/cancellation checks, bounded memory, and explicit remaining matcher failures.
