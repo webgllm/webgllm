@@ -89,9 +89,9 @@ for (const name of ["texture", "write"] as const) {
 await import("../src/worker.js")
 
 const productionHandler = onmessage
-onmessage = (event) => {
+onmessage = async (event) => {
   if (event.data.type === "bench-dispose") {
-    loadedEngine?.gpu.dispose()
+    await loadedEngine?.gpu.disposePaced()
     postMessage({ type: "bench-disposed" })
   } else if (event.data.type === "bench-profile-config") {
     captureSample = true

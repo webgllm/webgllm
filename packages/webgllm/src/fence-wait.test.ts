@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { Gpu } from "./gpu/gl.js"
+import { SubmissionBudget } from "./gpu/submission-budget.js"
 
 test("short completed fences avoid timer sleeps even at the periodic polling threshold", async (t) => {
   let now = 0,
@@ -10,6 +11,7 @@ test("short completed fences avoid timer sleeps even at the periodic polling thr
   const gpu = Object.create(Gpu.prototype) as Gpu
   Object.assign(gpu, {
     lost: false,
+    submissionBudget: new SubmissionBudget(),
     phase: "prompt",
     pollsBeforeSleep: 32,
     polls: 31,

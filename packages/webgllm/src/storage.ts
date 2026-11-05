@@ -111,7 +111,7 @@ async function writeNote(key: string, note: GpuNote) {
       if (k.startsWith(prefix)) delete notes[k]
     notes[key] = note
     const handle = await (await dir()).getFileHandle(NOTES, { create: true })
-    const access = await openAccess(handle)
+    const access = await openAccess(handle, undefined, 1)
     try {
       const bytes = new TextEncoder().encode(JSON.stringify(notes))
       access.truncate(0)
@@ -146,7 +146,8 @@ const sleep = (ms: number, signal?: AbortSignal) =>
  */
 async function openAccess(
   handle: FileSystemFileHandle,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  retries = 10
 ): Promise<SyncAccessHandle> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -156,7 +157,7 @@ async function openAccess(
         }
       ).createSyncAccessHandle()) as SyncAccessHandle
     } catch (error) {
-      if (signal?.aborted || attempt >= 10) throw error
+      if (signal?.aborted || attempt >= retries) throw error
       await sleep(250 * (attempt + 1), signal)
     }
   }

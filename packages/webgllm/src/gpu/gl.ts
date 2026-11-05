@@ -342,6 +342,7 @@ export class Gpu {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
     if (data) {
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+      this.markGpuWork()
       gl.texSubImage2D(
         gl.TEXTURE_2D,
         0,
@@ -385,6 +386,26 @@ export class Gpu {
     this.lastOutput = null
     this.paced.length = 0
     gl.getExtension("WEBGL_lose_context")?.loseContext()
+  }
+
+  /** Release an idle context in bounded batches so other rendering can run. */
+  async disposePaced() {
+    try {
+      let bytes = 0
+      for (const texture of this.live) {
+        if (this.isLost) break
+        this.delete(texture)
+        bytes += texture.bytes
+        if (bytes >= 64 * 2 ** 20) {
+          await this.finish()
+          bytes = 0
+        }
+      }
+    } catch (error) {
+      if (!this.isLost) throw error
+    } finally {
+      this.dispose()
+    }
   }
 
   /** Writes `pixels` into a rectangle of a texture. */
@@ -626,6 +647,7 @@ export class Gpu {
       for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
         const height = Math.min(rowsPerBand, rect.y + rect.height - y)
         gl.viewport(rect.x, y, rect.width, height)
+        this.markGpuWork()
         gl.drawArrays(gl.TRIANGLES, 0, 3)
         this.draws++
         if (this.drawTrace) {
@@ -685,6 +707,18 @@ export class Gpu {
   presentationFrames = 2
   private lastPresentationDrain = -Infinity
 
+  private workStartedAt: number | undefined
+
+  private markGpuWork() {
+    this.workStartedAt ??= performance.now()
+  }
+
+  private submitGpuWork() {
+    if (this.workStartedAt === undefined) return
+    this.submissionBudget.submitted(this.workStartedAt, performance.now())
+    this.workStartedAt = undefined
+  }
+
   private sliceReads = 0
   private sliceMatrixReads = 0
   private sliceCalibrates = true
@@ -710,6 +744,7 @@ export class Gpu {
 
   setPhase(phase: "load" | "prompt" | "decode") {
     if (this.phase === phase) return
+    this.submitGpuWork()
     this.phase = phase
     this.phaseAt = performance.timeOrigin + performance.now()
     this.submissionBudget = this.budgets[phase]
@@ -759,7 +794,6 @@ export class Gpu {
       !Number.isFinite(intervalMs) ||
       !Number.isFinite(expectedMs) ||
       intervalMs < 4 ||
-      intervalMs >= 1000 ||
       expectedMs < 4 ||
       frames < 1
     )
@@ -774,9 +808,13 @@ export class Gpu {
     // adjusts its quota. An idle phase must not trigger fence fallback.
     for (const budget of Object.values(this.budgets))
       budget.heartbeat(now, this.lastFrameHealthy, expectedMs)
-    // A late loading sample must not penalize the next prompt or decode.
+    // Delayed messages describe the original frame window, not the moment
+    // the worker can finally receive them.
     if (startedAt == null || startedAt >= this.phaseAt)
-      this.submissionBudget.frame(intervalMs, expectedMs, frames, now, meanMs)
+      this.submissionBudget.frame(
+        intervalMs, expectedMs, frames, now, meanMs,
+        startedAt == null ? undefined : startedAt - performance.timeOrigin
+      )
     this.readsPerSlice = this.submissionBudget.reads
   }
 
@@ -897,6 +935,7 @@ export class Gpu {
     }
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
+    this.submitGpuWork()
     if (sync)
       this.paced.push({
         sync,
@@ -919,7 +958,7 @@ export class Gpu {
         continue
       }
       if (messages) {
-        await this.wait(oldest.sync)
+        await this.wait(oldest.sync, oldest.budget, oldest.at)
         continue
       }
       // A page the browser counts as hidden has its timers throttled (a
@@ -966,6 +1005,7 @@ export class Gpu {
   /** Flushes issued passes to the GPU, so it starts on them. */
   flush() {
     this.gl.flush()
+    this.submitGpuWork()
   }
 
   /**
@@ -994,9 +1034,11 @@ export class Gpu {
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
+    this.submitGpuWork()
+    const budget = this.submissionBudget, at = performance.now()
     return async () => {
       try {
-        await this.wait(sync)
+        await this.wait(sync, budget, at)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
         gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
@@ -1021,6 +1063,7 @@ export class Gpu {
     this.boundFb = this.framebuffer(texture)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.boundFb)
     gl.readPixels(rect.x, rect.y, rect.width, rect.height, gl.RGBA, gl.FLOAT, out)
+    this.submitGpuWork()
     return out
   }
 
@@ -1054,29 +1097,40 @@ export class Gpu {
   }
 
   /** Resolves once the GPU passes `sync`, polling without blocking. */
-  private async wait(sync: WebGLSync | null) {
+  private async wait(
+    sync: WebGLSync | null,
+    budget = this.submissionBudget,
+    at = performance.now()
+  ) {
+    if (this.isLost) throw new GpuError("The GPU context was lost.")
+    if (!sync || this.fenceReady(sync)) return
+    budget.waiting(at)
     const began = performance.now()
-    for (let spins = 0; ; spins++) {
-      if (this.isLost) throw new GpuError("The GPU context was lost.")
-      if (!sync || this.fenceReady(sync)) return
-      // Spin on messages at first; back off to timers on long waits. With
-      // timers throttled (a hidden page: a 1 ms wait can take a second),
-      // block on a pixel of the last pass instead, as pace does.
-      const sleep =
-        this.phase !== "load" &&
-        this.pollsBeforeSleep > 0 &&
-        performance.now() - began >= 2 &&
-        ++this.polls % this.pollsBeforeSleep === 0
-      if (spins < 2000 && !sleep) await this.yieldOnce()
-      else if (performance.now() < this.throttledUntil) {
-        this.readBack()
-        return
-      } else {
-        const t = performance.now()
-        await new Promise((resolve) => setTimeout(resolve, 1))
-        if (performance.now() - t > 50)
-          this.throttledUntil = performance.now() + 2000
+    try {
+      for (let spins = 0; ; spins++) {
+        // Spin on messages at first; back off to timers on long waits. With
+        // timers throttled (a hidden page: a 1 ms wait can take a second),
+        // block on a pixel of the last pass instead, as pace does.
+        const sleep =
+          this.phase !== "load" &&
+          this.pollsBeforeSleep > 0 &&
+          performance.now() - began >= 2 &&
+          ++this.polls % this.pollsBeforeSleep === 0
+        if (spins < 2000 && !sleep) await this.yieldOnce()
+        else if (performance.now() < this.throttledUntil) {
+          this.readBack()
+          return
+        } else {
+          const t = performance.now()
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          if (performance.now() - t > 50)
+            this.throttledUntil = performance.now() + 2000
+        }
+        if (this.isLost) throw new GpuError("The GPU context was lost.")
+        if (this.fenceReady(sync)) return
       }
+    } finally {
+      budget.completed(performance.now())
     }
   }
 
@@ -1085,6 +1139,7 @@ export class Gpu {
     const gl = this.gl
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()
+    this.submitGpuWork()
     try {
       await this.wait(sync)
     } finally {

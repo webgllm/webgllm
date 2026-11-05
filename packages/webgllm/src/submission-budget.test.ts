@@ -36,6 +36,7 @@ test("isolated presentation misses change queue drains before shrinking efficien
   b.frame(25, 16.7, 24, 20, 18)
   assert.equal(b.reads, 2 ** 28)
   assert.equal(b.presentationWindow, 4)
+  b.submitted(28, 29)
   b.frame(150, 16.7, 1, 30, 150)
   assert.ok(b.reads < 2 ** 28)
   const low = b.reads
@@ -66,6 +67,7 @@ test("decode quanta grow with smooth frames and back off on stutter", () => {
     b.frame(16.7, 16.7, 24, i * 100 + 10)
   }
   assert.equal(b.layers, 2)
+  b.submitted(448, 449)
   b.frame(50, 16.7, 1, 450)
   assert.equal(b.layers, 1)
 })
@@ -90,6 +92,7 @@ test("fast complete-layer fences scale decode without device limits", () => {
   assert.equal(b.layers, 8)
   b.layerSample(8, 20, 3)
   assert.equal(b.layers, 8)
+  b.submitted(28, 29)
   b.frame(80, 16.7, 1, 30)
   assert.equal(b.layers, 4)
 })
@@ -109,6 +112,7 @@ test("240 Hz cadence lowers the four-millisecond completion target", () => {
     normal = new SubmissionBudget()
   for (const b of [high, normal]) {
     b.configure(2 ** 28, 4)
+    b.submitted(18, 19)
     b.frame(150, 16.7, 1, 20)
   }
   high.heartbeat(2000, true, 1000 / 240)
@@ -129,6 +133,8 @@ test("presentation policy learns only from active work and startup reset discard
     b.frame(16.7, 16.7, 24, 110 + i * 100, 16.7)
   }
   assert.equal(b.presentationWindow, 12)
+  b.submitted(598, 599)
+  b.submitted(18, 19)
   b.frame(33.4, 16.7, 24, 600, 20)
   assert.equal(b.presentationWindow, 4)
   assert.equal(b.presentationMax, 11)
@@ -142,7 +148,7 @@ test("presentation policy learns only from active work and startup reset discard
 test("mean cadence detects an isolated stall hidden below p95", () => {
   const b = new SubmissionBudget()
   b.configure(2 ** 28, 4, 4)
-  b.work(10)
+  b.submitted(10, 15)
   b.frame(16.7, 16.7, 24, 20, 18)
   assert.equal(b.presentationMax, 4)
   assert.equal(b.reads, 2 ** 28)
@@ -163,6 +169,7 @@ test("larger queues require proven presentation fairness and roll back without s
   }
   assert.ok(b.reads > 2 ** 28)
   const beforeMiss = b.reads
+  b.submitted(1498, 1499)
   b.frame(33.4, 16.7, 1, 1500)
   assert.equal(b.reads, beforeMiss)
   for (let i = 0; i < 50; i++) {
@@ -184,6 +191,8 @@ test("only completed smooth real-compute history can become a persisted pacing r
   assert.ok(measured)
   assert.equal(measured.frameMs, 8.3)
   assert.equal(measured.window, 48)
+  b.submitted(1998, 1999)
+  b.submitted(18, 19)
   b.frame(20, 8.34, 1, 2000, 20)
   assert.equal(Reflect.get(b, "validatedPresentation"), null)
   b.reset(true)
@@ -195,6 +204,7 @@ test("saved overlap restores the calibrated quota immediately after a critical s
   b.configure(2 ** 28, 4, 4)
   b.primePresentation(24, 2 ** 33)
   assert.equal(b.reads, 2 ** 33)
+  b.submitted(1998, 1999)
   b.frame(150, 8.34, 1, 2000, 150)
   assert.equal(b.reads, 2 ** 28)
   assert.equal(Reflect.get(b, "validatedPresentation"), null)
@@ -215,7 +225,10 @@ test("smooth presentation alone does not increase matrix bands without a fast ma
 test("isolated missed frames preserve efficient bands and recover the drain window", () => {
   const b = new SubmissionBudget()
   b.configure(2 ** 28, 4, 4)
-  for (const at of [10, 1000, 2000]) b.frame(33.4, 16.7, 1, at)
+  for (const at of [10, 1000, 2000]) {
+    b.submitted(at - 2, at - 1)
+    b.frame(33.4, 16.7, 1, at)
+  }
   assert.equal(b.reads, 2 ** 28)
   assert.equal(b.presentationMax, 4)
   for (let i = 0; i < 24; i++) {
@@ -229,14 +242,19 @@ test("isolated missed frames preserve efficient bands and recover the drain wind
 test("repeated stalls in one burst still reduce the matrix quota", () => {
   const b = new SubmissionBudget()
   b.configure(2 ** 28, 4, 4)
-  for (const at of [10, 50, 90]) b.frame(33.4, 16.7, 1, at)
+  for (const at of [10, 50, 90]) {
+    b.submitted(at - 2, at - 1)
+    b.frame(33.4, 16.7, 1, at)
+  }
   assert.ok(b.reads < 2 ** 28)
 })
 
 test("efficient matrix samples recover even after backoff below half the initial quota", () => {
   const b = new SubmissionBudget()
   b.configure(2 ** 28, 4, 4)
+  b.submitted(8, 9)
   b.frame(150, 16.7, 1, 10)
+  b.submitted(18, 19)
   b.frame(150, 16.7, 1, 20)
   const reduced = b.reads
   assert.ok(reduced < 2 ** 27)
@@ -258,10 +276,16 @@ test("an isolated missed frame rolls back immediately without permanently disabl
   const b = new SubmissionBudget()
   b.configure(2 ** 28, 4, 4)
   b.primePresentation(24, 2 ** 30)
+  b.submitted(18, 19)
+  b.submitted(98, 99)
   b.frame(20, 8.33, 1, 100, 20)
   assert.equal(b.reads, 2 ** 30)
   assert.equal(b.relaxationAllowed, true)
+  b.submitted(18, 19)
+  b.submitted(128, 129)
   b.frame(20, 8.33, 1, 130, 20)
+  b.submitted(18, 19)
+  b.submitted(158, 159)
   b.frame(20, 8.33, 1, 160, 20)
   assert.equal(b.reads, 2 ** 28)
   assert.equal(b.relaxationAllowed, false)
@@ -280,3 +304,27 @@ for (const fps of [60, 120]) {
     assert.ok(Math.abs(b.presentationWindow * frame - 400) < frame)
   })
 }
+
+test("idle gaps keep cadence fresh without revoking previously validated overlap", () => {
+  const b = new SubmissionBudget()
+  b.configure(2 ** 28, 4)
+  b.primePresentation(24, 2 ** 30)
+  b.submitted(10, 15)
+  b.submitted(500, 510)
+  // Received during new work, but neither submission overlaps this gap.
+  b.frame(150, 16.7, 1, 520, 150, 100)
+  b.sample(2 ** 28, 40, 2, 525)
+  assert.equal(b.reads, 2 ** 30)
+  assert.equal(b.relaxationAllowed, true)
+})
+
+test("a visible long stall overlapping a pending GPU fence revokes overlap", () => {
+  const b = new SubmissionBudget()
+  b.configure(2 ** 28, 4)
+  b.primePresentation(24, 2 ** 30)
+  b.waiting(120)
+  b.frame(1200, 16.7, 1, 1310, 1200, 100)
+  b.completed(1320)
+  assert.equal(b.reads, 2 ** 28)
+  assert.equal(b.relaxationAllowed, false)
+})

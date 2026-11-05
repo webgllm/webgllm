@@ -307,7 +307,7 @@ async function load(
           cached
         })
       }
-    })
+    }, signal)
     if (signal.aborted) throw new Superseded()
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
@@ -379,8 +379,6 @@ async function load(
             tuned: { ...engine.tuned }
           }
         : null
-    if (measured && JSON.stringify(measured) !== JSON.stringify(note))
-      await writeGpuNote(noteKey, measured)
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
@@ -406,6 +404,8 @@ async function load(
     // What it took, in place of the estimate.
     await claimMemory(model, engine.gpu.bytes)
     if (signal.aborted) throw new Superseded()
+    if (measured && JSON.stringify(measured) !== JSON.stringify(note))
+      void writeGpuNote(noteKey, measured)
     return {
       model,
       contextLength,
@@ -940,14 +940,14 @@ async function generate(request: GenerateRequest) {
     throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
   }
   // Extend the startup-tested overlap only from completed real inference.
-  // Save after timing, and before admitting another queued generation.
+  // Persist in the background so OPFS never delays completion.
   const pacing = engine.gpu.validatedPresentation
   const recommendation = pacing ?? (engine.gpu.presentationAdvice.relaxation ? model.note?.pacing : undefined)
   const overlapFailed = !engine.gpu.presentationAdvice.relaxation && engine.tuned.submissionOverlap !== 0
   if (overlapFailed) engine.tuned.submissionOverlap = 0
   if (model.note && (overlapFailed || JSON.stringify(model.note.pacing) !== JSON.stringify(recommendation))) {
     model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
-    await writeGpuNote(model.noteKey, model.note)
+    void writeGpuNote(model.noteKey, model.note)
   }
   post({ type: "done", id, stats })
   } finally {

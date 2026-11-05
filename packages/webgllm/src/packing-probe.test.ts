@@ -19,7 +19,13 @@ function fixture(native = false, fail = false) {
       submissionWindow?: number
     },
     batchSize: 512,
-    config: { vocabSize: 128000, hiddenSize: 2048 },
+    contextLength: 8192,
+    embedding: {},
+    finalNorm: {},
+    choosePromptPacking: Reflect.get(Engine.prototype, "choosePromptPacking"),
+    async chooseMatvec() { return undefined },
+    f16Scratch() { return undefined },
+    config: { vocabSize: 128000, hiddenSize: 2048, numLayers: layers.length },
     layers,
     work: [1, 2, 3] as number[] | null,
     buffers: { residual: [{}], rms: {} },
@@ -58,6 +64,7 @@ function fixture(native = false, fail = false) {
       program() {
         return {}
       },
+      async finish() { return undefined },
       async runAsync() {
         return undefined
       },
@@ -65,9 +72,10 @@ function fixture(native = false, fail = false) {
         return new Float32Array(1)
       }
     },
-    async forwardHidden(tokens: number[]) {
+    async forwardHidden(tokens: number[], options?: { fullRows?: boolean }) {
       assert.equal(this.layers.length, native ? 3 : 2)
-      assert.equal(TUNING.lastRowOnly, 0)
+      assert.equal(options?.fullRows, true)
+      assert.ok(tokens.length <= this.contextLength)
       assert.ok(this.work === null || this.work.length === 1)
       this.work = [1]
       if (fail && ++calls === 2) throw Error("probe failed")
@@ -100,8 +108,8 @@ test("native layout comparisons preserve the real model operator mixture", async
   let clock = 0
   t.mock.method(performance, "now", () => clock)
   const forward = state.forwardHidden.bind(state)
-  state.forwardHidden = async (tokens) => {
-    await forward(tokens)
+  state.forwardHidden = async (...args) => {
+    await forward(...args)
     clock +=
       state.tuned.f16Matmul === 1 ? 10 : state.tuned.f16Pack === 3 ? 7 : 8
   }
@@ -125,8 +133,8 @@ test("a layout winning only one reversed timing pair does not become the product
   const seen = new Map<string, number>()
   t.mock.method(performance, "now", () => clock)
   const forward = state.forwardHidden.bind(state)
-  state.forwardHidden = async (tokens) => {
-    await forward(tokens)
+  state.forwardHidden = async (...args) => {
+    await forward(...args)
     const key = `${state.tuned.f16Matmul}/${state.tuned.f16Pack}`
     const n = (seen.get(key) ?? 0) + 1
     seen.set(key, n)
@@ -147,8 +155,8 @@ test("a failed presentation trial is not repeated by later packing candidates", 
   const { state } = fixture(false)
   const forward = state.forwardHidden.bind(state)
   let failed = false
-  state.forwardHidden = async (tokens) => {
-    await forward(tokens)
+  state.forwardHidden = async (...args) => {
+    await forward(...args)
     if (!failed && state.gpu.presentationAdvice.relaxation) {
       state.gpu.readsPerSlice = 2 ** 28
       state.gpu.presentationAdvice.relaxation = false
@@ -169,7 +177,7 @@ test("a fast successful complete pipeline retains its tested presentation window
   let clock = 0
   t.mock.method(performance, "now", () => clock)
   const forward = state.forwardHidden.bind(state)
-  state.forwardHidden = async tokens => { await forward(tokens); clock += 5 }
+  state.forwardHidden = async (...args) => { await forward(...args); clock += 5 }
   await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
   assert.equal(state.tuned.submissionWindow, 24)
 })
@@ -180,7 +188,7 @@ test("a large packing win requires agreement from the reversed short pair", asyn
   let clock=0
   t.mock.method(performance,"now",()=>clock)
   const forward=state.forwardHidden.bind(state)
-  state.forwardHidden=async tokens=>{await forward(tokens);clock+=tokens.length*(state.tuned.f16Pack===3?1:0.6)}
+  state.forwardHidden=async (...args)=>{await forward(...args);clock+=args[0].length*(state.tuned.f16Pack===3?1:0.6)}
   await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
   assert.equal(state.tuned.f16Pack,0)
   assert.equal(calls(),6)
@@ -191,7 +199,7 @@ test("a short-size disagreement rejects a misleading first full-batch win", asyn
   let clock=0,full=0
   t.mock.method(performance,"now",()=>clock)
   const forward=state.forwardHidden.bind(state)
-  state.forwardHidden=async tokens=>{await forward(tokens);if(state.tuned.f16Pack===3)clock+=10;else if(tokens.length===512)clock+=++full===1?6:12;else clock+=12}
+  state.forwardHidden=async (...args)=>{await forward(...args);if(state.tuned.f16Pack===3)clock+=10;else if(args[0].length===512)clock+=++full===1?6:12;else clock+=12}
   await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
   assert.equal(state.tuned.f16Pack,3)
 })
@@ -201,8 +209,45 @@ test("new full-batch compilation retains complete warm-up and full reversed pair
   let clock=0,compiled=false
   t.mock.method(performance,"now",()=>clock)
   const forward=state.forwardHidden.bind(state)
-  state.forwardHidden=async tokens=>{await forward(tokens);clock+=10;if(tokens.length===512&&!compiled){state.gpu.compiled.count++;compiled=true}}
+  state.forwardHidden=async (...args)=>{await forward(...args);clock+=10;if(args[0].length===512&&!compiled){state.gpu.compiled.count++;compiled=true}}
   await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
   assert.equal(calls(),10)
   assert.equal(state.tuned.f16Pack,3)
+})
+
+for (const contextLength of [256, 32])
+  test(`cold weight load calibrates within a ${contextLength}-token context`, async () => {
+    const { state, calls } = fixture()
+    state.contextLength = contextLength
+    const loadedWeights = {
+      [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true as const, value: undefined }) })
+    }
+    await Engine.prototype.load.call(state as unknown as Engine, loadedWeights)
+    if (contextLength === 256) {
+      assert.ok(calls() > 0)
+      assert.ok(state.packingReport.every(sample => Reflect.get(sample, "rows") === 256))
+    } else {
+      assert.equal(calls(), 0)
+    }
+  })
+
+test("a superseded packing probe leaves a concurrent load and global tuning alone", async () => {
+  const { state: first, calls } = fixture()
+  const { state: second } = fixture()
+  const abort = new AbortController()
+  const before = TUNING.lastRowOnly
+  const forward = first.forwardHidden.bind(first)
+  first.forwardHidden = async (...args) => {
+    await forward(...args)
+    abort.abort()
+  }
+  const old = first.choosePromptPacking.call(first, abort.signal)
+  const replacement = second.choosePromptPacking.call(second)
+  assert.equal(TUNING.lastRowOnly, before)
+  await assert.rejects(old, { name: "AbortError" })
+  await replacement
+  assert.equal(calls(), 1)
+  assert.equal(first.packingReport.length, 0)
+  assert.ok(second.packingReport.length > 0)
+  assert.equal(TUNING.lastRowOnly, before)
 })

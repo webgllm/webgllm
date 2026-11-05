@@ -28,6 +28,7 @@ let phase = "idle",
   phaseStart = performance.now(),
   last = performance.now(),
   loadingStartedAt = 0
+let measuring = true
 let gaps: number[] = [],
   taps = 0
 const gpuEvents: unknown[] = []
@@ -44,7 +45,7 @@ tap.onclick = (event) => {
   })
 }
 function frame(t: number) {
-  if (phase !== "complete") {
+  if (measuring) {
     gaps.push(t - last)
     frameTimes.push({ at: t, gap: t - last })
   }
@@ -57,7 +58,8 @@ function frame(t: number) {
   ctx.fill()
   ctx.fillStyle = "#fff"
   ctx.font = "24px sans-serif"
-  ctx.fillText(`${phase} ${((t - phaseStart) / 1000).toFixed(1)}s`, 10, 35)
+  const label = phase === "completion" ? "complete" : phase
+  ctx.fillText(`${label} ${((t - phaseStart) / 1000).toFixed(1)}s`, 10, 35)
   requestAnimationFrame(frame)
 }
 requestAnimationFrame(frame)
@@ -517,8 +519,12 @@ async function run() {
     await end()
   }
   stopFrames()
+  begin("completion")
   if (params.get("hold") !== "1") await shutdown()
-  begin("complete")
+  // Paint the completion state and include the frames spent releasing the worker.
+  await end()
+  measuring = false
+  document.documentElement.dataset.phase = "complete"
   await result({ phase: "complete" })
   log("ALL DONE")
   // Completed telemetry is already persisted by /result. Do not retain

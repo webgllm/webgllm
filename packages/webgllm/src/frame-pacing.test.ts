@@ -23,7 +23,7 @@ test("frame feedback reports 120 Hz and the absolute start of its observation wi
     }
   )
   Reflect.set(globalThis, "cancelAnimationFrame", () => undefined)
-  Reflect.set(globalThis, "document", { visibilityState: "visible" })
+  Reflect.set(globalThis, "document", Object.assign(new EventTarget(), { visibilityState: "visible" }))
   try {
     const stop = monitorFrames((...values) => sent.push(values as number[]))
     for (let i = 0; i <= 24; i++) frames.shift()?.(100 + (i * 1000) / 120)
@@ -56,7 +56,7 @@ test("short catch-up callbacks remain in the mean instead of inventing a slowdow
     }
   )
   Reflect.set(globalThis, "cancelAnimationFrame", () => undefined)
-  Reflect.set(globalThis, "document", { visibilityState: "visible" })
+  Reflect.set(globalThis, "document", Object.assign(new EventTarget(), { visibilityState: "visible" }))
   try {
     const stop = monitorFrames((...values) => sent.push(values as number[]))
     let now = 100
@@ -84,7 +84,7 @@ for (const fps of [60, 120])
     const previous = { raf: globalThis.requestAnimationFrame, cancel: globalThis.cancelAnimationFrame, document: globalThis.document }
     Reflect.set(globalThis, "requestAnimationFrame", (fn: FrameRequestCallback) => { frames.push(fn); return frames.length })
     Reflect.set(globalThis, "cancelAnimationFrame", () => undefined)
-    Reflect.set(globalThis, "document", { visibilityState: "visible" })
+    Reflect.set(globalThis, "document", Object.assign(new EventTarget(), { visibilityState: "visible" }))
     try {
       const stop = monitorFrames((...values) => sent.push(values as number[]))
       for (let i = 0; i <= 120; i++) frames.shift()?.(Math.floor(100 + i * 1000 / fps))
@@ -100,3 +100,40 @@ for (const fps of [60, 120])
       Reflect.set(globalThis, "document", previous.document)
     }
   })
+
+test("visible long gaps are reported, hidden gaps are skipped, and 120 Hz can settle at 60 Hz", (t) => {
+  const queued: FrameRequestCallback[] = [], sent: number[][] = []
+  const doc = Object.assign(new EventTarget(), { visibilityState: "visible" })
+  for (const [key, value] of Object.entries({
+    requestAnimationFrame: (fn: FrameRequestCallback) => queued.push(fn),
+    cancelAnimationFrame: () => undefined,
+    document: doc
+  })) {
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    Object.defineProperty(globalThis, key, { configurable: true, value })
+    t.after(() => {
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    })
+  }
+  const stop = monitorFrames((...values) => sent.push(values as number[]))
+  let now = 100
+  const next = (elapsed: number) => queued.shift()?.(now += elapsed)
+  next(0)
+  for (let i = 0; i < 24; i++) next(1000 / 120)
+  next(1200)
+  assert.equal(sent.at(-1)?.[0], 1200)
+  assert.equal(sent.at(-1)?.[2], 1)
+  for (let i = 0; i < 8; i++) next(1000 / 60)
+  const settled = sent.at(-1)
+  assert.ok(settled && Math.abs(settled[1] - 1000 / 60) < 1e-6)
+  assert.ok(sent.slice(2).every(([interval, expected]) => interval < expected * 1.8))
+  const before = sent.length
+  for (const visibilityState of ["hidden", "visible"]) {
+    doc.visibilityState = visibilityState
+    doc.dispatchEvent(new Event("visibilitychange"))
+  }
+  next(5000)
+  assert.equal(sent.length, before)
+  stop()
+})

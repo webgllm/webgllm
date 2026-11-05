@@ -6,6 +6,9 @@ export class SubmissionBudget {
   private decodeAt = -Infinity
   private decodeSmooth = 0
   private activeWorkAt = -Infinity
+  private submissions = new Float64Array(128)
+  private submissionIndex = 0
+  private pendingSince = Infinity
   private smoothFrames = 0
   private initial = -1
   private target = -1
@@ -42,6 +45,8 @@ export class SubmissionBudget {
     this.ahead = 2
     this.layers = 1
     this.activeWorkAt = this.decodeAt = this.lastFrame = -Infinity
+    this.submissionIndex = 0
+    this.pendingSince = Infinity
     this.smoothFrames = this.decodeSmooth = 0
     this.growAfter = 0
   }
@@ -72,12 +77,36 @@ export class SubmissionBudget {
     this.activeWorkAt = now
   }
 
+  submitted(start: number, end: number) {
+    const index = (this.submissionIndex++ * 2) % this.submissions.length
+    this.submissions[index] = start
+    this.submissions[index + 1] = end
+  }
+
+  waiting(start: number) {
+    this.pendingSince = start
+  }
+
+  completed(end: number) {
+    this.submitted(this.pendingSince, end)
+    this.pendingSince = Infinity
+  }
+
+  private overlaps(start: number, end: number) {
+    if (this.pendingSince < end) return true
+    const limit = Math.min(this.submissionIndex * 2, this.submissions.length)
+    for (let i = 0; i < limit; i += 2)
+      if (this.submissions[i] < end && this.submissions[i + 1] > start) return true
+    return false
+  }
+
   frame(
     intervalMs: number,
     expectedMs: number,
     frames: number,
     now = performance.now(),
-    meanMs?: number
+    meanMs?: number,
+    startedAt?: number
   ) {
     if (
       this.initial <= 0 ||
@@ -85,8 +114,7 @@ export class SubmissionBudget {
       !Number.isFinite(intervalMs) ||
       !Number.isFinite(expectedMs) ||
       expectedMs < 4 ||
-      intervalMs < 4 ||
-      intervalMs >= 1000
+      intervalMs < 4
     )
       return
     this.lastFrame = now
@@ -95,6 +123,9 @@ export class SubmissionBudget {
     this.healthyFrame =
       intervalMs < expectedMs * 1.8 && average <= expectedMs * 1.03
     if (intervalMs > expectedMs * 1.8 || average > expectedMs * 1.03) {
+      const span = average * frames
+      const start = startedAt ?? now - span
+      if (!this.overlaps(start, start + span)) return
       const previousWindow = this.presentationWindow
       const severe = intervalMs > expectedMs * 1.8
       if (severe) {

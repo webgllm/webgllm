@@ -618,7 +618,8 @@ export class Engine {
   /** Uploads the model, piece by piece, as the loader yields it. */
   async load(
     pieces: AsyncIterable<WeightPiece>,
-    onProgress?: (piece: WeightPiece) => void
+    onProgress?: (piece: WeightPiece) => void,
+    signal?: AbortSignal
   ) {
     let mark = performance.now()
     this.loadMs = {
@@ -630,6 +631,7 @@ export class Engine {
       matvec: 0
     }
     for await (const piece of pieces) {
+      signal?.throwIfAborted()
       const got = performance.now()
       this.loadMs.reading += got - mark
       if (piece.kind === "config") this.configure(piece.config)
@@ -684,9 +686,10 @@ export class Engine {
     this.loadMs.scratch = performance.now() - started
     this.expandedUpload = new Uint8Array(0)
     started = performance.now()
-    await this.choosePromptPacking()
+    await this.choosePromptPacking(signal)
     this.loadMs.packing = performance.now() - started
     started = performance.now()
+    signal?.throwIfAborted()
     await this.chooseMatvec()
     this.loadMs.matvec = performance.now() - started
   }
@@ -1279,7 +1282,7 @@ export class Engine {
     // before each): what the f16 matmul's choices change isn't only the
     // matmuls (see the f16 choices below).
     const tokens = Array.from(
-      { length: Math.min(this.batchSize, this.capacity) },
+      { length: Math.min(this.batchSize, this.capacity, this.contextLength) },
       (_, i) => 1000 + (i % 5000)
     )
     let forwards = false
@@ -1389,7 +1392,7 @@ export class Engine {
       // between a prompt's small dependent passes. Forwards need the cache:
       // if the caller keeps something in it (`keepCache`), these choices
       // are left for another time (undefined).
-      const quad = this.quadMatmuls && TUNING.quad > 0
+      const quad = this.quadMatmuls && TUNING.quad > 0 && tokens.length >= TUNING.f16MinRows
       const free = !options.keepCache
       let f16Matmul: number | null | undefined = this.promptMatmulMeasured
         ? before.f16Matmul
@@ -1593,7 +1596,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
 
   /** Storage must be competitive for prefill, not just a one-token matvec. */
   private async layoutPrefill(made: GpuMatrix[]) {
-    const rows = this.batchSize
+    const rows = Math.min(this.batchSize, this.contextLength)
     if (!this.quadMatmuls || rows < TUNING.f16MinRows || !this.quads.has(this.buffers.gateUp.id))
       return { rgba4: 1, bytes: 1 }
     const matrix = made[0]
@@ -1997,7 +2000,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return fitsExpandedHead(head, previous, f.width * f.hd * 8, activation)
   }
 
-  private async choosePromptPacking() {
+  private async choosePromptPacking(signal?: AbortSignal) {
+    signal?.throwIfAborted()
     if (!this.quadMatmuls) return
     const native = this.layerMats().some((m) => m.rgba4)
     if (
@@ -2014,13 +2018,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return
     }
     if (!native && !this.usesF16()) return
-    const probeRows =
+    const probeRows = Math.min(
+      this.contextLength,
+      this.batchSize,
       TUNING.packingProbeRows > 0
-        ? Math.min(
-            this.batchSize,
-            Math.max(TUNING.f16MinRows, TUNING.packingProbeRows)
-          )
-        : this.batchSize
+        ? Math.max(TUNING.f16MinRows, TUNING.packingProbeRows)
+        : Infinity
+    )
+    if (probeRows < Math.max(SPLIT_ROWS + 1, TUNING.f16MinRows)) return
     const options: Array<{ pack: number; matmul?: number }> = native
       ? [
           {
@@ -2041,7 +2046,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       previousMatmul = this.tuned.f16Matmul,
       previousParts = this.tuned.rmsParts,
       phase = this.gpu.activePhase,
-      lastRowOnly = TUNING.lastRowOnly,
       quota = this.tuned.submissionReads ?? TUNING.submissionReads
     let overlap = Math.max(quota, 2 ** 29), allowOverlap = true, trial = false, overlapFailures = 0
     const samples = options.map(() => [] as number[]),
@@ -2061,9 +2065,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           return true
         })
     this.work = null
-    TUNING.lastRowOnly = 0
     this.gpu.configurePacing(quota, TUNING.submissionMs)
     const sample = async (index: number, rows = probeRows) => {
+      signal?.throwIfAborted()
       this.tuned.f16Pack = options[index].pack
       if (native) this.tuned.f16Matmul = options[index].matmul
       this.gpu.resetPacing(true)
@@ -2074,7 +2078,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         { length: rows },
         (_, i) => (i * 7919 + 13) % this.config.vocabSize
       )
-      await this.forwardHidden(tokens)
+      await this.forwardHidden(tokens, { fullRows: true })
+      signal?.throwIfAborted()
       const width = Math.ceil(this.config.hiddenSize / 4 / 64)
       await this.gpu.runAsync({
         program: this.gpu.program(`#version 300 es
@@ -2087,6 +2092,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         work: 64
       })
       await this.gpu.read(this.buffers.rms, { x: 0, y: 0, width, height: rows })
+      signal?.throwIfAborted()
       // The normal frame controller rolls the trial back immediately if
       // this queue prevents presentation. Never retry it in later variants.
       if (trial && (this.gpu.readsPerSlice < overlap || !this.gpu.presentationAdvice.relaxation || this.gpu.presentationAdvice.window < this.gpu.presentationAdvice.cap)) {
@@ -2187,7 +2193,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     } finally {
       this.layers = all
       this.work = null
-      TUNING.lastRowOnly = lastRowOnly
       this.reset()
       this.gpu.configurePacing(
         this.tuned.submissionReads ?? quota,
@@ -5108,6 +5113,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     tokens: ArrayLike<number>,
     options: {
       draft?: boolean
+      /** Retain all final hidden rows for a calibration checksum. */
+      fullRows?: boolean
       /**
        * Saves the anchor snapshot (see snapshot) after this many of the
        * tokens, from inside the batch: no batch of its own (one batch at
@@ -5128,7 +5135,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
     }
-    const { saveAt, prefixAt } = options
+    const { saveAt, prefixAt, fullRows } = options
     if (saveAt !== undefined || prefixAt !== undefined) {
       if (tokens.length > this.capacity ||
         (saveAt !== undefined && (!this.canSaveInside || !(saveAt > 0 && saveAt < tokens.length))) ||
@@ -5143,7 +5150,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.saving = saveAt !== undefined ? [] : null
       this.prefixSaving = learned ? { row: prefixAt!, state: learned } : null
       try {
-        const last = await this.forwardBatch(Array.from(tokens), undefined, false, saveAt)
+        const last = await this.forwardBatch(Array.from(tokens), undefined, false, saveAt, fullRows)
         if (saveAt !== undefined) {
           const saved: Snapshot = { conv: [], windows: [], linear: this.saving! }
           this.keepSnapshot(pos0 + saveAt, saved, true)
@@ -5166,7 +5173,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const from = start
       start += size
       const batch = Array.from({ length: size }, (_, i) => tokens[from + i])
-      last = await this.forwardBatch(batch, undefined)
+      last = await this.forwardBatch(batch, undefined, false, undefined, fullRows)
     }
     return last
   }
@@ -5807,42 +5814,42 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const sliceRows = this.logitRows
     const height = split * rows * sliceRows
     const target = this.headTarget(split, rows)
-    await this.gpu.runAsync(
-      {
-        name: "head",
-        program: this.gpu.program(
-          K.withRms(K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined }), this.parts)
-        ),
-        inputs: {
-          ...(scaledRow0 !== undefined && { uR: b.residual[0] }),
-          uA: scaledRow0 !== undefined ? b.scaled[0] : b.lastNormed,
-          uW: e.quants,
-          uS: e.scales,
-          ...(e.zeros && { uZ: e.zeros })
-        },
-        uniforms: {
-          uKb: { int: e.blocks },
-          uH: { int: e.rowsPerColumn },
-          uRowTexels: { int: e.rowTexels },
-          uG: { int: e.groups },
-          uOutW: { int: OUT_WIDTH },
-          uSliceRows: { int: sliceRows },
-          uKbSlice: { int: Math.ceil(e.blocks / split) },
-          uRows: { int: rows },
-          ...(scaledRow0 !== undefined && {
-            uRowA0: { int: scaledRow0 },
-            uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
-            uROff: { int: this.config.hiddenSize / 4 },
-            uParts: { int: this.parts },
-            uTexels: { int: this.config.hiddenSize / 4 },
-            uEps: this.config.normEps
-          })
-        },
-        output: target,
-        rect: { x: 0, y: 0, width: OUT_WIDTH, height }
+    // Bound the vocabulary projection by the measured GPU quota, like
+    // other matrix work. Fixed row bands force needless fences on fast GPUs.
+    await this.gpu.runAsync({
+      name: "head",
+      work: Math.ceil(e.blocks / split) * 24,
+      program: this.gpu.program(
+        K.withRms(K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined }), this.parts)
+      ),
+      inputs: {
+        ...(scaledRow0 !== undefined && { uR: b.residual[0] }),
+        uA: scaledRow0 !== undefined ? b.scaled[0] : b.lastNormed,
+        uW: e.quants,
+        uS: e.scales,
+        ...(e.zeros && { uZ: e.zeros })
       },
-      Math.max(1, sliceRows / 4)
-    )
+      uniforms: {
+        uKb: { int: e.blocks },
+        uH: { int: e.rowsPerColumn },
+        uRowTexels: { int: e.rowTexels },
+        uG: { int: e.groups },
+        uOutW: { int: OUT_WIDTH },
+        uSliceRows: { int: sliceRows },
+        uKbSlice: { int: Math.ceil(e.blocks / split) },
+        uRows: { int: rows },
+        ...(scaledRow0 !== undefined && {
+          uRowA0: { int: scaledRow0 },
+          uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+          uROff: { int: this.config.hiddenSize / 4 },
+          uParts: { int: this.parts },
+          uTexels: { int: this.config.hiddenSize / 4 },
+          uEps: this.config.normEps
+        })
+      },
+      output: target,
+      rect: { x: 0, y: 0, width: OUT_WIDTH, height }
+    })
     return this.headSlices(target, split, rows, sum)
   }
 
@@ -5865,7 +5872,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     probe: LayerProbe | undefined,
     idsOnGpu = false,
     /** Gated DeltaNet layers copy their state after this many rows into `saving`. */
-    saveAt?: number
+    saveAt?: number,
+    fullRows = false
   ) {
     const c = this.config
     const b = this.buffers
@@ -6038,7 +6046,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
     const paced = rows > SPLIT_ROWS
     // Only the last row's logits are asked for (see lastRowOnly).
-    const lastRowOnly = TUNING.lastRowOnly > 0 && rows > SPLIT_ROWS && !probe
+    const lastRowOnly = TUNING.lastRowOnly > 0 && rows > SPLIT_ROWS && !probe && !fullRows
     this.lastRowOnly = lastRowOnly
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
