@@ -140,6 +140,17 @@ function replySources(message: ThreadMessage) {
   );
 }
 
+/** A reply's prompt, cache and token counts, from webgllm's usage and timings. */
+export type ReplyStats = {
+  promptMs?: number;
+  promptTokensPerSecond?: number;
+  promptTokens?: number;
+  cachedTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+};
+
 const parse = (json: string): ReadonlyJSONObject => {
   try {
     const value: unknown = JSON.parse(json);
@@ -236,10 +247,21 @@ export function chatModel(): ChatModelAdapter {
           totalChunks,
           toolCallCount: calls.length,
         };
+        // What assistant-ui's timing has no fields for, for the stats badge.
+        const stats: ReplyStats = {
+          ...(timings && { promptMs: timings.prompt_ms, promptTokensPerSecond: timings.prompt_tokens_per_second }),
+          ...(usage && {
+            promptTokens: usage.prompt_tokens,
+            cachedTokens: usage.prompt_tokens_details.cached_tokens,
+            outputTokens: usage.completion_tokens,
+            reasoningTokens: usage.completion_tokens_details.reasoning_tokens,
+            totalTokens: usage.total_tokens,
+          }),
+        };
         if (calls.length === 0) {
           // The answer: the pages its web searches found go under it as
           // source parts, which assistant-ui renders as chips.
-          yield { content: [...content(), ...replySources(current)], metadata: { timing } };
+          yield { content: [...content(), ...replySources(current)], metadata: { timing, custom: { stats } } };
           return;
         }
         // assistant-ui's local runtime doesn't run tools itself: run each
@@ -269,7 +291,7 @@ export function chatModel(): ChatModelAdapter {
             return { ...part, ...results[index] };
           }),
           status: { type: 'requires-action', reason: 'tool-calls' },
-          metadata: { steps: [{}], timing },
+          metadata: { steps: [{}], timing, custom: { stats } },
         };
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return;

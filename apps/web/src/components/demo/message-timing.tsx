@@ -1,6 +1,7 @@
 "use client";
 
-import { useMessageTiming } from "@assistant-ui/react";
+import { useAuiState, useMessageTiming } from "@assistant-ui/react";
+import type { ReplyStats } from "./model";
 import {
   Tooltip,
   TooltipContent,
@@ -8,7 +9,7 @@ import {
   TooltipTrigger,
 } from "./ui";
 import { cn } from "@/lib/cn";
-import type { FC } from "react";
+import { useState, type FC } from "react";
 
 const formatTimingMs = (ms: number | undefined): string => {
   if (ms === undefined) return "—";
@@ -41,16 +42,23 @@ export const MessageTiming: FC<{
   side?: "top" | "right" | "bottom" | "left";
 }> = ({ className, side = "right" }) => {
   const timing = useMessageTiming();
+  // Phones have no hover: a tap on the badge opens and closes the stats too.
+  const [open, setOpen] = useState(false);
+  // webgllm's prompt, cache and token counts, which assistant-ui's timing has no fields for.
+  const stats = useAuiState(
+    (s) => (s.message.metadata.custom as { stats?: ReplyStats } | undefined)?.stats,
+  );
   if (timing?.totalStreamTime === undefined) return null;
 
   return (
     <TooltipProvider>
-      <Tooltip>
+      <Tooltip open={open} onOpenChange={setOpen}>
         <TooltipTrigger asChild>
           <button
             type="button"
             data-slot="message-timing-trigger"
             aria-label="Message timing"
+            onClick={() => setOpen((value) => !value)}
             className={cn(
               "text-fd-muted-foreground hover:bg-fd-accent hover:text-fd-accent-foreground flex items-center rounded-md p-1 font-mono text-xs tabular-nums transition-colors",
               className,
@@ -82,11 +90,67 @@ export const MessageTiming: FC<{
             </div>
             {timing.tokensPerSecond !== undefined && (
               <div className="flex items-center justify-between gap-4">
-                <span className="text-fd-muted-foreground">Speed</span>
+                <span className="text-fd-muted-foreground">Output speed</span>
                 <span className="font-mono tabular-nums">
                   {timing.tokensPerSecond.toFixed(1)} tok/s
                 </span>
               </div>
+            )}
+            {stats?.promptTokensPerSecond !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Prompt speed</span>
+              <span className="font-mono tabular-nums">
+                {stats.promptTokensPerSecond.toFixed(1)} tok/s
+              </span>
+            </div>
+            )}
+            {stats?.promptMs !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Prompt time</span>
+              <span className="font-mono tabular-nums">
+                {formatTimingMs(stats.promptMs)}
+              </span>
+            </div>
+            )}
+            {stats?.promptTokens !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Prompt tokens</span>
+              <span className="font-mono tabular-nums">
+                {stats.promptTokens}
+              </span>
+            </div>
+            )}
+            {stats?.cachedTokens !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Cached</span>
+              <span className="font-mono tabular-nums">
+                {stats.cachedTokens}
+              </span>
+            </div>
+            )}
+            {stats?.outputTokens !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Output tokens</span>
+              <span className="font-mono tabular-nums">
+                {stats.outputTokens}
+              </span>
+            </div>
+            )}
+            {!!stats?.reasoningTokens && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Reasoning</span>
+              <span className="font-mono tabular-nums">
+                {stats.reasoningTokens}
+              </span>
+            </div>
+            )}
+            {stats?.totalTokens !== undefined && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-fd-muted-foreground">Total tokens</span>
+              <span className="font-mono tabular-nums">
+                {stats.totalTokens}
+              </span>
+            </div>
             )}
             <div className="flex items-center justify-between gap-4">
               <span className="text-fd-muted-foreground">Chunks</span>
