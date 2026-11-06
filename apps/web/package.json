@@ -10,6 +10,17 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },
+  "nx": {
+    "targets": {
+      "build": {
+        "outputs": [
+          "{projectRoot}/dist",
+          "{projectRoot}/.output",
+          "{projectRoot}/.wrangler/deploy"
+        ]
+      }
+    }
+  },
   "dependencies": {
     "@tanstack/react-router": "^1.170.46",
     "@tanstack/react-router-devtools": "^1.167.2",
