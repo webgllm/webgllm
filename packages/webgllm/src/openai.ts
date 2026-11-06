@@ -128,6 +128,13 @@ export type ChatCompletionCreateParamsBase = {
   thinking_budget_tokens?: number | null
   /** False: don't reuse or keep the prompt's cache across calls. */
   cache_prompt?: boolean | null
+  /**
+   * Automatic tool calls are checked against their tools; a bad one (an
+   * unknown tool, arguments that fail the schema, markup that doesn't
+   * parse) is generated again constrained to the schema. False returns
+   * them as the model wrote them. Default true.
+   */
+  repair_tool_calls?: boolean | null
 }
 
 export type ChatCompletionCreateParamsStreaming = ChatCompletionCreateParamsBase & {

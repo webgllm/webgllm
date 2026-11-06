@@ -72,7 +72,7 @@ for await (const chunk of stream) {
 
 ### Tools
 
-OpenAI's `tools` and `tool_choice` (`"auto"`, `"none"`, `"required"` or a named function). Calls come back as `message.tool_calls` with `arguments` as a JSON string; send results back as `tool` messages. A forced call (`"required"` or a name) is constrained to the tool's JSON Schema; objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode.
+OpenAI's `tools` and `tool_choice` (`"auto"`, `"none"`, `"required"` or a named function). Calls come back as `message.tool_calls` with `arguments` as a JSON string; send results back as `tool` messages. A forced call (`"required"` or a name) is constrained to the tool's JSON Schema; objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. Automatic calls are checked against their tools: a call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, with the model's failed attempt in the chat and the call constrained to the schema (its tokens count in `usage`). `repair_tool_calls: false` returns calls as the model wrote them.
 
 ### Structured output
 

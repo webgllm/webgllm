@@ -153,6 +153,29 @@
         check("answer uses the tool result", /18/.test(followup.choices[0].message.content ?? ""))
       }
 
+      // Tool-call repair: a required enum the model tends to leave out.
+      const strictTools = [{
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get the current weather for a city",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" }, units: { type: "string", enum: ["celsius", "fahrenheit"] } },
+            required: ["city", "units"]
+          }
+        }
+      }]
+      const ask = [{ role: "user", content: "What's the weather in Paris right now?" }]
+      const raw = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0, repair_tool_calls: false })
+      const repaired = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0 })
+      const rawCall = raw.choices[0].message.tool_calls?.[0]
+      const fixedCall = repaired.choices[0].message.tool_calls?.[0]
+      log("repair raw", rawCall?.function ?? raw.choices[0].message.content, raw.usage.completion_tokens)
+      log("repair fixed", fixedCall?.function ?? repaired.choices[0].message.content, repaired.usage)
+      const fixedArgs = fixedCall ? JSON.parse(fixedCall.function.arguments) : null
+      check("repaired call has both required arguments", !!fixedArgs && typeof fixedArgs.city === "string" && ["celsius", "fahrenheit"].includes(fixedArgs.units))
+
       // Abort mid-stream.
       const controller = new AbortController()
       let aborted = false

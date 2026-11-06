@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
-import { fakeStorage, fakeWorkers, settle } from "./fake-worker.test.js"
+import { fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
 import type { FakeOptions } from "./fake-worker.test.js"
 import type { ChatCompletionChunk, LoadProgress } from "./openai.js"
 import { internals, WebGLLM } from "./webgllm.js"
@@ -199,4 +199,67 @@ test("unloadModel fails a running completion with model-not-loaded", async () =>
   await settle()
   await client.unloadModel(LFM2)
   await assert.rejects(pending, { code: "model-not-loaded" })
+})
+
+const weatherTool = {
+  type: "function" as const,
+  function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }
+}
+const qwenCall = (body: string) => `<tool_call>\n<function=get_weather>\n${body}\n</function>\n</tool_call>`
+
+test("tool-call repair: arguments that fail the schema are generated again for that tool", async () => {
+  const { llm: client, workers } = llm({
+    reply: (request) =>
+      request.toolChoice
+        ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Paris" } } } }
+        : { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] }
+  })
+  const completion = await client.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  const [first, repair] = workers.of(QWEN)!.generations()
+  assert.equal(first!.toolChoice, undefined)
+  assert.deepEqual(repair!.toolChoice, { name: "get_weather" })
+  // The prompt so far stays; the failed call and a note follow; thinking closes at once.
+  assert.deepEqual(repair!.chat.slice(0, first!.chat.length), first!.chat)
+  assert.equal(repair!.chat.length, first!.chat.length + 2)
+  assert.equal(repair!.thinkingBudgetTokens, 0)
+  const call = completion.choices[0]?.message.tool_calls?.[0]
+  assert.equal(call?.function.arguments, '{"city":"Paris"}')
+  assert.equal(completion.choices[0]?.finish_reason, "tool_calls")
+  // Both generations count.
+  assert.equal(completion.usage.completion_tokens, 2 * STATS.outputTokens)
+  assert.equal(completion.usage.prompt_tokens, 2 * STATS.inputTokens)
+})
+
+test("tool-call repair: unknown tools and unparsed markup are forced to any tool; off returns them as written", async () => {
+  const forced = (request: { toolChoice?: unknown }) =>
+    request.toolChoice ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Rome" } } } } : undefined
+  const unknown = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"] } })
+  const a = await unknown.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  assert.equal(unknown.workers.of(QWEN)!.generations()[1]!.toolChoice, "required")
+  assert.equal(a.choices[0]?.message.tool_calls?.[0]?.function.name, "get_weather")
+
+  const broken = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\nnot a call\n</tool_call>"] } })
+  const b = await broken.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  assert.equal(b.choices[0]?.message.tool_calls?.length, 1)
+  assert.equal(b.choices[0]?.message.content, null)
+
+  const off = llm({ reply: (r) => forced(r) ?? { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] } })
+  const c = await off.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: false })
+  assert.equal(off.workers.of(QWEN)!.generations().length, 1)
+  assert.equal(c.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"town":"Paris"}')
+})
+
+test("tool-call repair runs before a stream's tool calls, and valid calls aren't repeated", async () => {
+  const { llm: client, workers } = llm({
+    reply: (request) =>
+      request.toolChoice
+        ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Oslo" } } } }
+        : { tokens: ["Checking.", qwenCall("<parameter=city>\nOslo\n</parameter>")] }
+  })
+  const chunks = await collect(
+    await client.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], stream: true, stream_options: { include_usage: true } })
+  )
+  assert.equal(workers.of(QWEN)!.generations().length, 1)
+  const call = chunks.flatMap((c) => c.choices[0]?.delta.tool_calls ?? [])[0]
+  assert.equal(call?.function?.arguments, '{"city":"Oslo"}')
 })

@@ -8,11 +8,15 @@ import {
   createReplyReader,
   isCatalogModel,
   planCompletion,
+  planRepairs,
   randomId,
+  repairRequest,
   timingsOf,
   usageOf
 } from "./chat-completions.js"
 import type { CompletionPlan, ReplyDelta } from "./chat-completions.js"
+import type { ParsedToolCall } from "./tool-calls.js"
+import type { RunTimings } from "./protocol.js"
 import { defaultWorker, hasWebGl2 } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
 import { browserStorage, fileKey, modelFiles } from "./model-files.js"
@@ -218,7 +222,44 @@ class Completions {
     )
     const last = reader.finish(end)
     for (const d of last.deltas) deltas.push(d)
-    return buildCompletion(meta, deltas, last.toolCalls, last.finishReason, end.stats)
+    const settled = await this.settleToolCalls(plan, last, options.signal)
+    for (const d of settled.deltas) deltas.push(d)
+    const toolCalls = reader.toolCalls(settled.calls)
+    return buildCompletion(meta, deltas, toolCalls, toolCalls.length ? "tool_calls" : last.finishReason, end.stats, settled.repairs)
+  }
+
+  /**
+   * Checks an automatic reply's tool calls and generates bad ones again,
+   * each constrained to its tool's schema (see planRepairs). Unrepaired
+   * malformed markup is shown as the text it is.
+   */
+  private async settleToolCalls(
+    plan: CompletionPlan,
+    last: { calls: Array<ParsedToolCall>; malformed?: string },
+    signal: AbortSignal | undefined
+  ): Promise<{ calls: Array<ParsedToolCall>; deltas: Array<ReplyDelta>; repairs: Array<RunTimings> }> {
+    const calls = [...last.calls]
+    const repairs: Array<RunTimings> = []
+    let malformed = last.malformed
+    if (plan.parseTools && plan.repairToolCalls) {
+      for (const repair of await planRepairs(calls, malformed, plan.generate.tools)) {
+        throwIfAborted(signal)
+        const end = await abortable(
+          this.pool.generate(plan.model, repairRequest(plan, repair), {
+            contextLength: this.llm.contextLength,
+            // A forced call comes back in "done"; any thinking before it isn't shown.
+            onToken: () => undefined,
+            ...(signal && { signal })
+          }),
+          signal
+        )
+        if (!end.toolCall) throw new Error("A tool call couldn't be repaired.")
+        repairs.push(end.stats)
+        calls[repair.index] = { name: end.toolCall.name, args: end.toolCall.arguments }
+        malformed = undefined
+      }
+    }
+    return { calls, deltas: malformed !== undefined ? [{ content: malformed }] : [], repairs }
   }
 
   /**
@@ -254,15 +295,20 @@ class Completions {
         ...(options.onProgress && { onProgress: options.onProgress }),
         signal: stop.signal
       })
+      .then(async (end) => {
+        const last = reader.finish(end)
+        for (const d of last.deltas) chunks.push(writer.delta(d))
+        notify()
+        const settled = await this.settleToolCalls(plan, last, stop.signal)
+        for (const d of settled.deltas) chunks.push(writer.delta(d))
+        const toolCalls = reader.toolCalls(settled.calls)
+        chunks.push(...writer.toolCalls(toolCalls))
+        const timings = timingsOf(end.stats)
+        chunks.push(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
+        if (plan.includeUsage) chunks.push(writer.usage(usageOf(end.stats, settled.repairs), timings))
+      })
       .then(
-        (end) => {
-          const last = reader.finish(end)
-          for (const d of last.deltas) chunks.push(writer.delta(d))
-          chunks.push(...writer.toolCalls(last.toolCalls))
-          const timings = timingsOf(end.stats)
-          chunks.push(writer.finish(last.finishReason, plan.includeUsage ? undefined : timings))
-          if (plan.includeUsage) chunks.push(writer.usage(usageOf(end.stats), timings))
-        },
+        () => undefined,
         (error: unknown) => {
           failure = { error }
         }

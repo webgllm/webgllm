@@ -5,7 +5,9 @@ import {
   createChunkWriter,
   createReplyReader,
   planCompletion,
+  planRepairs,
   randomId,
+  repairRequest,
   timingsOf,
   toChatMessages,
   usageOf
@@ -256,13 +258,15 @@ function readAll(pieces: Array<string>, options: Parameters<typeof createReplyRe
   const reader = createReplyReader({ newId: ids(), ...options })
   const deltas: Array<ReplyDelta> = pieces.flatMap((p) => reader.push(p))
   const done = reader.finish(last)
-  const all = [...deltas, ...done.deltas]
+  // Unrepaired markup shows as text (repair is tested apart: planRepairs).
+  const all = [...deltas, ...done.deltas, ...(done.malformed !== undefined ? [{ content: done.malformed }] : [])]
+  const toolCalls = reader.toolCalls(done.calls)
   return {
     streamed: deltas,
     content: all.map((d) => ("content" in d ? d.content : "")).join(""),
     reasoning: all.map((d) => ("reasoning_content" in d ? d.reasoning_content : "")).join(""),
-    toolCalls: done.toolCalls,
-    finishReason: done.finishReason
+    toolCalls,
+    finishReason: toolCalls.length ? "tool_calls" : done.finishReason
   }
 }
 
@@ -378,4 +382,74 @@ test("a whole completion: content null when only tool calls", () => {
 
 test("ids look like OpenAI's", () => {
   assert.match(randomId("call_"), /^call_[A-Za-z0-9]{24}$/)
+})
+
+const weatherTool = {
+  type: "function" as const,
+  function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }
+}
+
+test("planRepairs: valid calls pass; bad arguments, unknown tools and unparsed markup are repaired", async () => {
+  const tools = [weatherTool]
+  const ok = { name: "get_weather", args: { city: "Paris" } }
+  assert.deepEqual(await planRepairs([ok], undefined, tools), [])
+  // Open objects take extra keys in the tool's own schema; a missing required one fails.
+  const town = { name: "get_weather", args: { town: "Paris" } }
+  assert.deepEqual(await planRepairs([town], undefined, tools), [{ index: 0, problem: "invalid-arguments", choice: { name: "get_weather" }, draft: town }])
+  const typed = { name: "get_weather", args: { city: 3 } }
+  assert.equal((await planRepairs([typed], undefined, tools))[0]?.problem, "invalid-arguments")
+  const unknown = { name: "get_time", args: {} }
+  assert.deepEqual(await planRepairs([ok, unknown], undefined, tools), [{ index: 1, problem: "unknown-tool", choice: "required", draft: unknown }])
+  assert.deepEqual(await planRepairs([], "<tool_call>junk</tool_call>", tools), [{ index: 0, problem: "malformed", choice: "required", markup: "<tool_call>junk</tool_call>" }])
+  // No tools offered: markup stays text.
+  assert.deepEqual(await planRepairs([], "<tool_call>junk</tool_call>", []), [])
+  // A schema the validator can't check passes.
+  const odd = { type: "function" as const, function: { name: "odd", parameters: { type: "object", unevaluatedProperties: false } } }
+  assert.deepEqual(await planRepairs([{ name: "odd", args: { a: 1 } }], undefined, [odd]), [])
+})
+
+test("repairRequest appends the failed call and a note, drops stop strings and closes thinking", () => {
+  const qwen = planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, tools: [weatherTool], stop: ["END"], reasoning_effort: "high", thinking_budget_tokens: 300 })
+  const draft = { name: "get_weather", args: { town: "Paris" } }
+  const request = repairRequest(qwen, { index: 0, problem: "invalid-arguments", choice: { name: "get_weather" }, draft })
+  // The prompt so far is kept as it was (the cache covers it).
+  assert.deepEqual(request.chat.slice(0, qwen.generate.chat.length), qwen.generate.chat)
+  const [attempt, note] = request.chat.slice(qwen.generate.chat.length)
+  assert.deepEqual(attempt?.tool_calls?.[0]?.function, { name: "get_weather", arguments: { town: "Paris" } })
+  assert.equal(note?.role, "user")
+  assert.match(note?.content ?? "", /get_weather/)
+  assert.deepEqual(request.tools, qwen.generate.tools)
+  assert.deepEqual(request.toolChoice, { name: "get_weather" })
+  assert.equal(request.stop, undefined)
+  assert.equal(request.thinkingBudgetTokens, 0)
+  assert.equal(request.thinking, true)
+  // Thinking off stays off, with no budget.
+  const off = planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, tools: [weatherTool], reasoning_effort: "none" })
+  const malformed = repairRequest(off, { index: 0, problem: "malformed", choice: "required", markup: "<tool_call>junk" })
+  assert.equal(malformed.thinking, false)
+  assert.equal(malformed.thinkingBudgetTokens, undefined)
+  assert.equal(malformed.chat.at(-2)?.content, "<tool_call>junk")
+  // LFM2 writes calls in its own format, in the content.
+  const lfm2 = planCompletion({ model: "LiquidAI/LFM2.5-350M-GGUF", messages: hi, tools: [weatherTool] })
+  const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "required", draft: { name: "get_time", args: {} } })
+  assert.match(written.chat.at(-2)?.content ?? "", /get_time/)
+  assert.match(written.chat.at(-1)?.content ?? "", /no tool named get_time/)
+})
+
+test("usage sums the reply and its repairs", () => {
+  const stats = { inputTokens: 100, cachedTokens: 0, outputTokens: 20, firstTokenMs: 1, promptMs: 1, decodeMs: 1, thinkingTokens: 5 }
+  const repair = { ...stats, cachedTokens: 99, outputTokens: 8, thinkingTokens: 0 }
+  assert.deepEqual(usageOf(stats, [repair]), {
+    prompt_tokens: 200,
+    completion_tokens: 28,
+    total_tokens: 228,
+    prompt_tokens_details: { cached_tokens: 99 },
+    completion_tokens_details: { reasoning_tokens: 5 }
+  })
+})
+
+test("repair_tool_calls must be a boolean and defaults to on", () => {
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, true)
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: false }).repairToolCalls, false)
+  assert.throws(() => planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: "yes" as never }), TypeError)
 })

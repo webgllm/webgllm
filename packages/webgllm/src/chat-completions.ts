@@ -4,6 +4,7 @@
  * and tool-call markup inline, as the model writes them) turned back into
  * a completion or its chunks. No worker here: webgllm.ts runs it.
  */
+import { validateStructuredValue } from "./constraint/index.js"
 import { WebGLLMError } from "./errors.js"
 import { WEBGL_MODEL_META } from "./model-meta.js"
 import type { WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
@@ -43,6 +44,8 @@ export type CompletionPlan = {
   parseTools: boolean
   /** False keeps only the first tool call. */
   parallelToolCalls: boolean
+  /** Check parsed tool calls against their tools, and regenerate bad ones (see planRepairs). */
+  repairToolCalls: boolean
 }
 
 export const isCatalogModel = (model: unknown): model is WebGlTextModel =>
@@ -319,6 +322,9 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   if (body.cache_prompt !== undefined && body.cache_prompt !== null && typeof body.cache_prompt !== "boolean") {
     throw new TypeError("cache_prompt must be a boolean.")
   }
+  if (body.repair_tool_calls !== undefined && body.repair_tool_calls !== null && typeof body.repair_tool_calls !== "boolean") {
+    throw new TypeError("repair_tool_calls must be a boolean.")
+  }
 
   const generate: GenerateFields = {
     chat,
@@ -341,7 +347,8 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     generate,
     // A JSON answer can't hold markup; a forced call comes back in "done".
     parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto"),
-    parallelToolCalls: body.parallel_tool_calls !== false
+    parallelToolCalls: body.parallel_tool_calls !== false,
+    repairToolCalls: body.repair_tool_calls !== false
   }
 }
 
@@ -396,39 +403,126 @@ export function createReplyReader(options: {
     push(text: string): Array<ReplyDelta> {
       return read(thinking.push(text), [])
     },
+    /**
+     * The rest of the reply and its tool calls as parsed, not yet checked
+     * (see settleToolCalls). `malformed` is tool-call markup no call parsed from.
+     */
     finish(end: GenerationEnd): {
       deltas: Array<ReplyDelta>
-      toolCalls: Array<ChatCompletionMessageToolCall>
-      finishReason: FinishReason
+      calls: Array<ParsedToolCall>
+      malformed?: string
+      finishReason: WorkerFinishReason
     } {
       const deltas = read(thinking.flush(), [])
-      let parsed: Array<ParsedToolCall> = []
+      let calls: Array<ParsedToolCall> = []
+      let malformed: string | undefined
       if (tools) {
         const { text, markup } = tools.flush()
         if (text) deltas.push({ content: text })
-        parsed = markup ? parseToolCalls(markup) : []
-        // Markup that isn't any tool call is shown as the text it is.
-        if (markup && parsed.length === 0) deltas.push({ content: markup })
+        calls = markup ? parseToolCalls(markup) : []
+        if (markup && calls.length === 0) malformed = markup
       }
-      if (end.toolCall) parsed = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...parsed]
-      if (options.parallelToolCalls === false) parsed = parsed.slice(0, 1)
-      const toolCalls = parsed.map((call) => ({
+      if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
+      return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }
+    },
+    /** Checked calls as OpenAI's tool calls (one only when parallel calls are off). */
+    toolCalls(calls: Array<ParsedToolCall>): Array<ChatCompletionMessageToolCall> {
+      return (options.parallelToolCalls === false ? calls.slice(0, 1) : calls).map((call) => ({
         id: newId(),
         type: "function" as const,
         function: { name: call.name, arguments: JSON.stringify(call.args) }
       }))
-      return { deltas, toolCalls, finishReason: toolCalls.length ? "tool_calls" : end.finishReason }
     }
   }
 }
 
-export function usageOf(stats: RunTimings): CompletionUsage {
+/** Token counts, summed over the reply and any tool-call repairs it took. */
+export function usageOf(stats: RunTimings, repairs: ReadonlyArray<RunTimings> = []): CompletionUsage {
+  const all = [stats, ...repairs]
+  const sum = (pick: (s: RunTimings) => number) => all.reduce((total, s) => total + pick(s), 0)
+  const prompt = sum((s) => s.inputTokens)
+  const completion = sum((s) => s.outputTokens)
   return {
-    prompt_tokens: stats.inputTokens,
-    completion_tokens: stats.outputTokens,
-    total_tokens: stats.inputTokens + stats.outputTokens,
-    prompt_tokens_details: { cached_tokens: stats.cachedTokens },
-    completion_tokens_details: { reasoning_tokens: stats.thinkingTokens ?? 0 }
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: sum((s) => s.cachedTokens) },
+    completion_tokens_details: { reasoning_tokens: sum((s) => s.thinkingTokens ?? 0) }
+  }
+}
+
+/**
+ * A tool call to generate again, constrained to its tool: `index` replaces
+ * that call. `draft` is the call as the model wrote it, or `markup` the
+ * call text that didn't parse.
+ */
+export type ToolRepair =
+  | { index: number; problem: "invalid-arguments" | "unknown-tool"; choice: ToolChoice; draft: ParsedToolCall }
+  | { index: number; problem: "malformed"; choice: ToolChoice; markup: string }
+
+const EMPTY_ARGUMENTS = { type: "object", properties: {}, additionalProperties: false }
+
+/**
+ * Which of an automatic reply's tool calls need generating again: a call
+ * to a tool that wasn't offered (any offered tool will do), arguments that
+ * fail their tool's schema (that tool), or call markup that didn't parse
+ * as any call (any tool). A schema the validator can't check passes.
+ */
+export async function planRepairs(
+  calls: ReadonlyArray<ParsedToolCall>,
+  malformed: string | undefined,
+  tools: ReadonlyArray<ChatTool>
+): Promise<Array<ToolRepair>> {
+  const repairs: Array<ToolRepair> = []
+  for (const [index, call] of calls.entries()) {
+    const tool = tools.find((t) => t.function.name === call.name)
+    if (!tool) {
+      repairs.push({ index, problem: "unknown-tool", choice: "required", draft: call })
+      continue
+    }
+    let valid = true
+    try {
+      valid = await validateStructuredValue(tool.function.parameters ?? EMPTY_ARGUMENTS, call.args)
+    } catch {
+      // Unsupported by the validator: nothing to check against.
+    }
+    if (!valid) repairs.push({ index, problem: "invalid-arguments", choice: { name: call.name }, draft: call })
+  }
+  if (malformed !== undefined && calls.length === 0 && tools.length > 0) {
+    repairs.push({ index: 0, problem: "malformed", choice: "required", markup: malformed })
+  }
+  return repairs
+}
+
+/**
+ * The request again with the model's own failed call appended as its turn,
+ * a note on what was wrong, and the call forced to the tool's schema. The
+ * draft keeps what the model got right (forcing from the bare prompt
+ * loses it), and appending keeps the prompt's cache. Stop strings don't
+ * apply to a call, and thinking closes at once where the model takes a
+ * budget: it already thought in the reply being repaired.
+ */
+export function repairRequest(plan: CompletionPlan, repair: ToolRepair): GenerateFields {
+  const { stop: _stop, thinkingBudgetTokens: _budget, ...rest } = plan.generate
+  const meta = WEBGL_MODEL_META[plan.model]
+  const format = meta.toolFormat ?? "lfm3"
+  const names = plan.generate.tools.map((t) => t.function.name).join(", ")
+  const attempt: ChatMessage =
+    repair.problem === "malformed"
+      ? { role: "assistant", content: repair.markup }
+      : assistantToolTurn("", [{ ...repair.draft, id: "call_0" }], format)
+  const note =
+    repair.problem === "invalid-arguments"
+      ? `The arguments of that ${repair.draft.name} call don't match its parameters. Call ${repair.draft.name} again with arguments that do.`
+      : repair.problem === "unknown-tool"
+        ? `There's no tool named ${repair.draft.name}. Call one of these instead: ${names}.`
+        : `That tool call couldn't be read. Call one of these tools again: ${names}.`
+  const budget = plan.generate.thinking !== false && meta.reasoning?.budget
+  return {
+    ...rest,
+    chat: [...plan.generate.chat, attempt, { role: "user", content: note }],
+    toolChoice: repair.choice,
+    ...(budget && { thinkingBudgetTokens: 0 })
   }
 }
 
@@ -484,7 +578,8 @@ export function buildCompletion(
   deltas: Array<ReplyDelta>,
   toolCalls: Array<ChatCompletionMessageToolCall>,
   finishReason: FinishReason,
-  stats: RunTimings
+  stats: RunTimings,
+  repairs: ReadonlyArray<RunTimings> = []
 ): ChatCompletion {
   let content = ""
   let reasoning = ""
@@ -511,7 +606,7 @@ export function buildCompletion(
         logprobs: null
       }
     ],
-    usage: usageOf(stats),
+    usage: usageOf(stats, repairs),
     timings: timingsOf(stats)
   }
 }
