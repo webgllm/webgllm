@@ -15,10 +15,11 @@ import {
 import { createLocalStorageAdapter, type AsyncStorageLike } from '@assistant-ui/core/react';
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { useSidebar } from 'fumadocs-ui/layouts/docs/slots/sidebar';
-import { useMemo, useSyncExternalStore, type FC } from 'react';
+import { useMemo, type FC } from 'react';
 import { baseOptions } from '@/lib/layout.shared';
 import { useExaToolkit } from './exa';
-import { chatModel, MODELS, modelStatus } from './model';
+import { chatModel, MODELS } from './model';
+import { ModelProgress } from './model-progress';
 import { ModelSelector } from './model-selector';
 import { Thread } from './thread';
 import { ThreadList } from './thread-list';
@@ -88,7 +89,7 @@ const ComposerModelSelector: FC = () => (
   <ModelSelector models={MODELS} defaultEffort="high" variant="ghost" size="sm" />
 );
 
-const threadComponents = { ComposerExtra: ComposerModelSelector };
+const threadComponents = { ComposerExtra: ComposerModelSelector, Indicator: ModelProgress };
 
 /**
  * assistant-ui's starter layout (templates/default/app/assistant.tsx): the
@@ -127,11 +128,7 @@ export function DemoApp({
               <span className="hidden md:block">/</span>
               <span className="font-medium text-fd-foreground">Demo</span>
             </nav>
-            <ModelStatusLine />
           </header>
-          <div className="flex border-b px-4 py-2 empty:hidden md:hidden">
-            <ModelStatusLine />
-          </div>
           <div className="flex-1 overflow-hidden">
             <DemoThread chatId={chatId} />
           </div>
@@ -152,24 +149,4 @@ const CloseSidebarOnSwitch: FC = () => {
   const { setOpen } = useSidebar();
   useAuiEvent('threads.selectionChanged', () => setOpen(false));
   return null;
-};
-
-/** The selected model's download and load, which the first message waits for. */
-const ModelStatusLine: FC = () => {
-  const status = useSyncExternalStore(modelStatus.subscribe, modelStatus.get, modelStatus.get);
-  if (status.state === 'idle' || status.state === 'ready') return null;
-  if (status.state === 'error') {
-    return <span className="ms-auto truncate text-xs text-red-500">{status.message}</span>;
-  }
-  const percent = Math.round(status.progress * 100);
-  return (
-    <span className="ms-auto flex min-w-0 items-center gap-2 text-xs text-fd-muted-foreground">
-      <span className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-fd-muted">
-        <span className="block h-full rounded-full bg-fd-primary transition-[width]" style={{ width: `${percent}%` }} />
-      </span>
-      <span className="truncate">
-        {status.state === 'downloading' ? 'Downloading' : 'Loading'} {percent}%
-      </span>
-    </span>
-  );
 };

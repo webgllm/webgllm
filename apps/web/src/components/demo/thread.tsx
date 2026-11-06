@@ -120,6 +120,8 @@ export type ThreadComponents = {
     | undefined;
   TaskGroup?: ComponentType<{ group: ThreadGroupPart }> | undefined;
   ComposerExtra?: ComponentType | undefined;
+  /** Shown while the assistant has nothing to show yet; gets the default dot as children. */
+  Indicator?: ComponentType<PropsWithChildren> | undefined;
 };
 
 const messageGroupBy = groupPartByType({
@@ -671,6 +673,7 @@ const AssistantMessage: FC = () => {
     ToolGroup,
     ReasoningGroup,
     TaskGroup: TaskGroupComponent,
+    Indicator,
   } = useContext(ThreadComponentsContext);
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
 
@@ -739,8 +742,8 @@ const AssistantMessage: FC = () => {
                 return <Sources {...part} />;
               case "data":
                 return part.dataRendererUI;
-              case "indicator":
-                return (
+              case "indicator": {
+                const dot = (
                   <span
                     data-slot="aui_assistant-message-indicator"
                     className="animate-pulse font-sans"
@@ -749,6 +752,8 @@ const AssistantMessage: FC = () => {
                     {"●"}
                   </span>
                 );
+                return Indicator ? <Indicator>{dot}</Indicator> : dot;
+              }
               default:
                 return null;
             }

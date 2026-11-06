@@ -34,7 +34,14 @@ export type ModelId = (typeof MODEL_NAMES)[number][0];
 /** Where the selected model is: loading it shows here, as the chat waits for it. */
 export type ModelStatus =
   | { state: 'idle' }
-  | { state: 'downloading' | 'loading'; progress: number }
+  | {
+      state: 'downloading' | 'loading';
+      model: string;
+      /** webgllm's progress across both phases: downloading takes 0–0.9, loading the rest. */
+      progress: number;
+      /** The files were already stored, so loading runs across 0–1. */
+      cached: boolean;
+    }
   | { state: 'ready' }
   | { state: 'error'; message: string };
 
@@ -59,21 +66,10 @@ let client: WebGLLM | undefined;
 export function webgllm(): WebGLLM {
   client ??= new WebGLLM({
     contextLength: 8192,
-    onProgress: ({ phase, progress }) =>
-      setStatus({ state: phase === 'download' ? 'downloading' : 'loading', progress }),
+    onProgress: ({ model, phase, progress, cached }) =>
+      setStatus({ state: phase === 'download' ? 'downloading' : 'loading', model, progress, cached }),
   });
   return client;
-}
-
-/** Loads `model` ahead of the first message, so its download shows at once. */
-export function preload(model: ModelId) {
-  setStatus({ state: 'loading', progress: 0 });
-  webgllm()
-    .loadModel(model)
-    .then(
-      () => setStatus({ state: 'ready' }),
-      (error: unknown) => setStatus({ state: 'error', message: error instanceof Error ? error.message : String(error) }),
-    );
 }
 
 type ReadonlyJSONObject = ToolCallMessagePart['args'];
