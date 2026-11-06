@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "webgllm-web",
+  "name": "webgllm",
   "compatibility_date": "2026-11-05",
   // Static assets only: no Worker code runs.
   "assets": {
