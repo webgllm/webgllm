@@ -1,18 +1,39 @@
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { appName, gitConfig } from './shared';
 
+function WebGLLMIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      focusable="false"
+      width={24}
+      height={24}
+      viewBox="0 0 32 32"
+      className="shrink-0"
+    >
+      <rect
+        x="1"
+        y="1"
+        width="30"
+        height="30"
+        rx="7"
+        fill="#4b2b83"
+        className="dark:fill-[#c7b5ff]"
+      />
+      <g fill="#fff" className="dark:fill-[#2c174e]">
+        <path d="M5.5 9H10l2.6 8.5 1.9-6h3l1.9 6L21 13h4.3l-3.5 10h-4.1L16 18.5 14.3 23h-4.1Z" />
+        <rect x="22.5" y="7" width="4.5" height="4.5" rx=".6" />
+      </g>
+    </svg>
+  );
+}
+
 export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
       title: (
         <span className="inline-flex items-center gap-2">
-          <img
-            src="/favicon.svg"
-            alt=""
-            width={24}
-            height={24}
-            className="shrink-0 scheme-light dark:scheme-dark"
-          />
+          <WebGLLMIcon />
           {appName}
         </span>
       ),
