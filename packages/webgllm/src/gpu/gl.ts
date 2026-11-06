@@ -1150,6 +1150,9 @@ export class Gpu {
     if (!sync || this.fenceReady(sync)) return
     budget.waiting(at)
     const began = performance.now()
+    // Measured slow fences get one high-refresh interval to signal before
+    // we add the latency of a timer wake-up.
+    const pollGraceMs = this.promptFrameBudgetMs > 0 ? 8 : 2
     try {
       for (let spins = 0; ; spins++) {
         // Spin on messages at first; back off to timers on long waits. With
@@ -1158,7 +1161,7 @@ export class Gpu {
         const sleep =
           this.phase !== "load" &&
           this.pollsBeforeSleep > 0 &&
-          performance.now() - began >= 2 &&
+          performance.now() - began >= pollGraceMs &&
           ++this.polls % this.pollsBeforeSleep === 0
         if (spins < 2000 && !sleep) await this.yieldOnce()
         else if (performance.now() < this.throttledUntil) {

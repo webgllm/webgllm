@@ -263,6 +263,10 @@ The hardware-neutral `webgl-perf.html` harness measures cached-file loading,
 prompt and generation throughput, painted frame cadence, and GPU texture memory.
 `baseline=1` uses an untouched worker; `production=1` uses the optimized worker.
 Reuse one tab for every run. Wait for `ALL DONE` or an error before navigation.
+Use **Animation renderer** and **Run benchmark** to compare CSS motion with
+Canvas 2D redraws in that tab. The control preserves the engine and workload
+settings and gives each run a new result ID. Automation can pass `render=css`
+or `render=canvas` (the default). Every result records the renderer.
 
 ```sh
 node packages/webgl/bench/build-workers.mjs /path/to/original/checkout baseline-worker.js

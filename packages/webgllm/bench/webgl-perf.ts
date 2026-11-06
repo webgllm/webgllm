@@ -4,6 +4,11 @@ import type { WorkerResponse, RunTimings } from "../src/protocol.js"
 const params = new URLSearchParams(location.search)
 const id = params.get("id") ?? String(Date.now())
 const baseline = params.get("baseline") === "1"
+const render = params.get("render") === "css" ? "css" : "canvas"
+const renderer = document.querySelector<HTMLFormElement>("#renderer")!
+const controls = renderer.querySelector("fieldset")!
+const selection = renderer.querySelector("select")!
+selection.value = render
 const heading = document.querySelector("h1")
 if (!heading) throw new Error("Benchmark heading missing")
 heading.textContent = baseline
@@ -20,10 +25,14 @@ const log = (s: string) => {
 const result = (value: object) =>
   fetch("/result", {
     method: "POST",
-    body: JSON.stringify({ id, at: new Date().toISOString(), ...value })
+    body: JSON.stringify({ id, at: new Date().toISOString(), render, ...value })
   })
 const canvas = document.querySelector("canvas")!
-const ctx = canvas.getContext("2d")!
+const motion = document.querySelector<HTMLElement>("#css-motion")!
+const cssPhase = document.querySelector<HTMLElement>("#css-phase")!
+canvas.hidden = render !== "canvas"
+motion.hidden = render !== "css"
+const ctx = render === "canvas" ? canvas.getContext("2d") : null
 let phase = "idle",
   phaseStart = performance.now(),
   last = performance.now(),
@@ -34,7 +43,7 @@ let gaps: number[] = [],
 const gpuEvents: unknown[] = []
 let stageEvents: Array<{ name: string; at: number }> = []
 const frameTimes: Array<{ at: number; gap: number }> = []
-const tap = document.querySelector("button")!
+const tap = document.querySelector<HTMLButtonElement>("#tap")!
 tap.onclick = (event) => {
   tap.textContent = `Test touch response: ${++taps}`
   void result({
@@ -45,27 +54,29 @@ tap.onclick = (event) => {
   })
 }
 function frame(t: number) {
-  if (measuring) {
-    gaps.push(t - last)
-    frameTimes.push({ at: t, gap: t - last })
-  }
+  if (!measuring) return
+  gaps.push(t - last)
+  frameTimes.push({ at: t, gap: t - last })
   last = t
-  ctx.fillStyle = "#13171c"
-  ctx.fillRect(0, 0, 700, 180)
-  ctx.fillStyle = "#71e4ba"
-  ctx.beginPath()
-  ctx.arc(350 + 290 * Math.sin(t / 600), 90, 28, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.fillStyle = "#fff"
-  ctx.font = "24px sans-serif"
-  const label = phase === "completion" ? "complete" : phase
-  ctx.fillText(`${label} ${((t - phaseStart) / 1000).toFixed(1)}s`, 10, 35)
+  if (ctx) {
+    ctx.fillStyle = "#13171c"
+    ctx.fillRect(0, 0, 700, 180)
+    ctx.fillStyle = "#71e4ba"
+    ctx.beginPath()
+    ctx.arc(350 + 290 * Math.sin(t / 600), 90, 28, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.fillStyle = "#fff"
+    ctx.font = "24px sans-serif"
+    const label = phase === "completion" ? "complete" : phase
+    ctx.fillText(`${label} ${((t - phaseStart) / 1000).toFixed(1)}s`, 10, 35)
+  }
   requestAnimationFrame(frame)
 }
 requestAnimationFrame(frame)
 function begin(name: string) {
   document.documentElement.dataset.phase = name
   phase = name
+  if (render === "css") cssPhase.textContent = name
   phaseStart = performance.now()
   if (name === "load") loadingStartedAt = phaseStart
   last = phaseStart
@@ -104,6 +115,7 @@ async function end(extra: object = {}) {
     document.visibilityState
   const data = {
     phase,
+    render,
     foregroundValid:
       atStart === "visible" &&
       document.visibilityState === "visible" &&
@@ -236,6 +248,7 @@ async function userAgentMemory(when: string) {
   await result({ phase: "ua-memory", when, ...measured })
 }
 async function run() {
+  if (render === "canvas" && !ctx) throw Error("Canvas 2D is unavailable")
   await result({
     phase: "environment",
     query: Object.fromEntries(params),
@@ -531,6 +544,19 @@ async function run() {
   // every frame through Safari's back/forward cache between test pages.
   frameTimes.length = gaps.length = gpuEvents.length = stageEvents.length = 0
 }
+renderer.addEventListener("submit", (event) => {
+  event.preventDefault()
+  controls.disabled = true
+  const url = new URL(location.href)
+  url.searchParams.set("render", selection.value)
+  url.searchParams.delete("id")
+  void Promise.resolve(
+    (globalThis as { __benchShutdown?: () => Promise<boolean> })
+      .__benchShutdown?.()
+  ).catch(() => {
+    // Shutdown terminates the worker even when disposal fails.
+  }).then(() => location.replace(url.href))
+})
 void run().catch(async (e) => {
   document.documentElement.dataset.phase = "error"
   log(`ERROR ${e.stack}`)
@@ -542,4 +568,10 @@ void run().catch(async (e) => {
     /* A failed worker may already be gone. */
   }
   await result({ phase: "error", error: String(e) })
+}).finally(() => {
+  measuring = false
+  for (const animation of document.querySelectorAll<HTMLElement>(
+    "#spinner, #css-motion .track"
+  )) animation.style.animationPlayState = "paused"
+  controls.disabled = false
 })

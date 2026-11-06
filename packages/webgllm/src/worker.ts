@@ -20,7 +20,7 @@ import type { ModelFile, WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, verify } from "./sampler.js"
-import { download, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
+import { download, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -199,7 +199,8 @@ async function load(
   /** Most tokens a chat may hold: the model's own context length when undefined. */
   contextLength: number | undefined,
   /** Without multiple render targets or the chunked recurrence: after a failed self-check. */
-  plain = false
+  plain = false,
+  reuseTuning = true
 ): Promise<Loaded> {
   const meta = modelMeta(model)
   // The GPU first: a browser or GPU that can't run the model says so before
@@ -225,6 +226,7 @@ async function load(
   })
   pacingEngine = engine
   lap("context")
+  let reusedTuning = false
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -255,23 +257,29 @@ async function load(
       >,
       ...(templateFile && { chatTemplate: await templateFile.text() })
     })
-    // What an earlier load measured on this GPU with this model and code.
-    const noteKey = [
+    const scope = [
       engine.gpu.limits.renderer,
       navigator.userAgent,
       model,
-      plain ? "plain" : "mrt",
-      // The engine's code and its settings (a remembered check or pick
-      // doesn't carry over to other defaults).
-      `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}`
-    ].join("|")
-    const note = (await readGpuNotes())[noteKey]
-    timings.calibrationCached = note ? 1 : 0
+      plain ? "plain" : "mrt"
+    ].join("|") + "|"
+    const settings = hash(JSON.stringify(TUNING))
+    const noteKey = `${scope}${Engine.fingerprint}.${settings}`
+    const notes = await readGpuNotes()
+    const checkedNote = notes[noteKey]
+    // A code update may only change scheduling. Keep compatible tuning
+    // choices and check the new engine before saving them under its key.
+    const note = checkedNote ?? (reuseTuning
+      ? previousGpuTuning(notes, scope, settings, SELF_CHECK_MAX)
+      : undefined)
+    reusedTuning = !checkedNote && !!note
+    timings.calibrationCached = checkedNote ? 1 : 0
+    timings.calibrationReused = reusedTuning ? 1 : 0
     timings.engineCode = parseInt(Engine.fingerprint, 16)
     if (note) {
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
-      if (note.tuned) engine.tuned = note.tuned
+      if (note.tuned) engine.tuned = { ...note.tuned }
     }
     const pieces =
       meta.files.kind === "gguf"
@@ -364,8 +372,8 @@ async function load(
     // tries again with the simplest passes, then says so (not gibberish).
     // A pass is remembered (same GPU, browser, model and code).
     const error =
-      note && note.selfCheck <= SELF_CHECK_MAX
-        ? note.selfCheck
+      checkedNote && checkedNote.selfCheck <= SELF_CHECK_MAX
+        ? checkedNote.selfCheck
         : await engine.selfCheck()
     lap("selfCheck")
     const measured =
@@ -382,6 +390,7 @@ async function load(
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
+      if (reusedTuning) throw new GpuError("Previous GPU tuning failed validation.")
       if (plain) {
         throw new GpuError(
           `This GPU computes attention wrong (relative error ${error.toExponential(1)}).`
@@ -405,7 +414,7 @@ async function load(
     // What it took, in place of the estimate.
     await claimMemory(model, engine.gpu.bytes)
     if (signal.aborted) throw new Superseded()
-    if (measured && JSON.stringify(measured) !== JSON.stringify(note))
+    if (measured && JSON.stringify(measured) !== JSON.stringify(checkedNote))
       void writeGpuNote(noteKey, measured)
     return {
       model,
@@ -421,6 +430,8 @@ async function load(
   } catch (error) {
     // A failed or superseded load frees its textures now.
     release(engine)
+    if (reusedTuning && !signal.aborted && error instanceof GpuError)
+      return load(model, signal, contextLength, plain, false)
     throw error
   }
 }

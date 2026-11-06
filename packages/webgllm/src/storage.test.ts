@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { isOldVersion, writeGpuNote, type GpuNote } from "./storage.js"
+import { isOldVersion, previousGpuTuning, writeGpuNote, type GpuNote } from "./storage.js"
 
 const repo = "onnx-community/LFM3-1.7B-ONNX"
 const commit = "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7"
@@ -41,6 +41,25 @@ describe("isOldVersion", () => {
     assert.ok(isOldVersion(old, data))
     assert.ok(!isOldVersion(old, graph))
   })
+})
+
+test("a new engine can reuse checked tuning from the same GPU, model and settings", () => {
+  const scope = "gpu|browser|model|mrt|"
+  const note: GpuNote = {
+    layout: "bytes",
+    calibrated: true,
+    selfCheck: 0.001,
+    tuned: { shortSplit: null, f16Pack: 0 }
+  }
+  const notes = {
+    "gpu|browser|other|mrt|older.settings": note,
+    [`${scope}older.other-settings`]: note,
+    [`${scope}older.settings`]: { ...note, selfCheck: 0.05 },
+    [`${scope}previous.settings`]: note
+  }
+  assert.equal(previousGpuTuning(notes, scope, "settings", 0.01), note)
+  assert.equal(previousGpuTuning(notes, scope, "missing", 0.01), undefined)
+  assert.equal(previousGpuTuning(notes, scope, "settings", 0.0001), undefined)
 })
 
 test("locked calibration writes stop after one retry and release the next queued write", async (t) => {

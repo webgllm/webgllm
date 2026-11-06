@@ -72,6 +72,20 @@ export async function readGpuNotes(): Promise<Record<string, GpuNote>> {
   return (await readNotes()) ?? {}
 }
 
+/** Tuning choices from the same GPU, browser, model and settings. */
+export function previousGpuTuning(
+  notes: Record<string, GpuNote>,
+  scope: string,
+  settings: string,
+  maxError: number
+): GpuNote | undefined {
+  return Object.entries(notes).find(([key, note]) =>
+    key.startsWith(scope) && key.endsWith(`.${settings}`) &&
+    note?.calibrated === true && note.tuned &&
+    note.selfCheck >= 0 && note.selfCheck <= maxError
+  )?.[1]
+}
+
 /** The notes; {} if there are none yet, null if they couldn't be read. */
 async function readNotes(): Promise<Record<string, GpuNote> | null> {
   let file: File

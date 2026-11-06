@@ -11,9 +11,40 @@
       font: 15px system-ui;
       margin: 20px;
     }
-    canvas {
+    canvas,
+    #css-motion {
       width: 100%;
       height: 140px;
+    }
+    #css-motion {
+      position: relative;
+      overflow: hidden;
+    }
+    #css-motion p {
+      position: absolute;
+      top: 0;
+      left: 1.4%;
+      margin: 5px 0;
+      color: white;
+    }
+    #css-motion .track {
+      position: absolute;
+      inset: 0;
+      animation: sweep 1.885s cubic-bezier(.37, 0, .63, 1) infinite alternate;
+    }
+    #css-motion .dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 8%;
+      height: 31.1%;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      background: #71e4ba;
+    }
+    @keyframes sweep {
+      from { transform: translateX(-41.4%); }
+      to { transform: translateX(41.4%); }
     }
     pre {
       white-space: pre-wrap;
@@ -39,8 +70,22 @@
     }
   </style>
   <h1>WebGL performance pacing</h1>
+  <form id="renderer">
+    <fieldset disabled>
+      <label for="render">Animation renderer</label>
+      <select id="render" name="render">
+        <option value="canvas">Canvas 2D</option>
+        <option value="css">CSS</option>
+      </select>
+      <button type="submit">Run benchmark</button>
+    </fieldset>
+  </form>
   <div id="spinner"></div>
-  <canvas width="700" height="180"></canvas
+  <div id="css-motion" hidden>
+    <div class="track" aria-hidden="true"><div class="dot"></div></div>
+    <p id="css-phase"></p>
+  </div>
+  <canvas width="700" height="180" hidden></canvas
   ><button id="tap">Test touch response: 0</button>
   <button id="release" disabled>Release model</button>
   <pre id="out"></pre>
