@@ -1,3 +1,25 @@
+## 0.1.1 (2026-11-06)
+
+### 🚀 Features
+
+- **webgllm:** model lifecycle events and exact catalog types ([f338c9b](https://github.com/webgllm/webgllm/commit/f338c9b))
+
+### 🩹 Fixes
+
+- **webgllm:** serialize loads, fit startup probes, free failed readbacks ([b5f8530](https://github.com/webgllm/webgllm/commit/b5f8530))
+- **bench:** start decode timing at the first token, survive bad requests ([b3bced0](https://github.com/webgllm/webgllm/commit/b3bced0))
+- **webgllm:** serialize stream reads, scope tool schemas, refuse a zero penalty ([c724bfa](https://github.com/webgllm/webgllm/commit/c724bfa))
+- **webgllm:** share file downloads and drop canceled evictions ([695dc9d](https://github.com/webgllm/webgllm/commit/695dc9d))
+- **webgllm:** only resume downloads that match the stored version ([ccff39a](https://github.com/webgllm/webgllm/commit/ccff39a))
+
+### 🔥 Performance
+
+- **webgllm:** sample large top_k and nucleus without full scans ([c74f7e8](https://github.com/webgllm/webgllm/commit/c74f7e8))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.0 (2026-11-06)
 
 ### 🚀 Features
