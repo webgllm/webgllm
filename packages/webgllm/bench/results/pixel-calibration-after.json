@@ -1,0 +1,21 @@
+{
+  "ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)|Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36|LiquidAI/LFM3-1.7B-GGUF|mrt|c5fea23d.f489b622": {
+    "layout": "bytes",
+    "selfCheck": 0.00024371075391278995,
+    "calibrated": true,
+    "head": {
+      "expanded": true,
+      "split": 2
+    },
+    "tuned": {
+      "shortSplit": null,
+      "f16Matmul": null,
+      "f16Pack": 0,
+      "flashDecode": null,
+      "submissionReads": 268435456,
+      "submissionOverlap": 0,
+      "submissionWindow": 4,
+      "rmsParts": 64
+    }
+  }
+}

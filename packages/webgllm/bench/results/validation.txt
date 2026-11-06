@@ -1,0 +1,475 @@
+Command: NX_DAEMON=false NX_ISOLATE_PLUGINS=false pnpm --config.verify-deps-before-run=false exec nx run-many -t test typecheck build lint -p webgl --output-style=static
+
+
+ NX   Running targets test, typecheck, build, lint for project webgl:
+
+- webgl
+
+
+
+> nx run webgl:test
+
+(node:70406) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+$ node scripts/test.mjs
+(node:70421) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:70424) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ leaving the stream early stops the generation in the worker (12.608042ms)
+(node:70425) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ cache growth bounds overlap and drains before returning without changing capacity (0.584584ms)
+✔ known 512-token prompt reserves only its final required capacity (0.343416ms)
+✔ known 548-token prompt reserves only its final required capacity (0.094417ms)
+✔ known 2085-token prompt reserves only its final required capacity (0.050417ms)
+✔ invalid prompt reservations fail before allocating memory (0.2675ms)
+✔ fast calibrated allocation overlap retains the original cache capacity (0.1295ms)
+(node:70426) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ queries in the cache
+  ✔ runs cover the slots in order, never crossing a block or a ring's end (0.4375ms)
+  ✔ a ring never gives up a key the tokens being written still read (12.852042ms)
+  ✔ a full cache must hold the queries' slots (0.114375ms)
+✔ queries in the cache (13.927791ms)
+(node:70427) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ chunked gated delta rule
+  ✔ matches token by token: 64 tokens, chunks of 16 (23.12425ms)
+  ✔ matches token by token: 64 tokens, chunks of 32 (4.8235ms)
+  ✔ matches token by token: 50 tokens, chunks of 16 (1.537792ms)
+  ✔ matches token by token: 37 tokens, chunks of 32 (1.473791ms)
+  ✔ matches token by token: 5 tokens, chunks of 16 (0.151667ms)
+  ✔ matches token by token: 1 tokens, chunks of 16 (0.082292ms)
+  ✔ matches token by token: 96 tokens, chunks of 64 (1.376584ms)
+  ✔ nearly collinear keys and slow decay stay exact (1.223167ms)
+  ✔ fast decay (exp of big negative sums) doesn't overflow (0.544125ms)
+  ✔ chunks ending at token 7 of 50 (the first 7, then 16): the same outputs, and the state there (1.607042ms)
+  ✔ chunks ending at token 39 of 50 (the first 7, then 16): the same outputs, and the state there (1.782792ms)
+  ✔ chunks ending at token 1 of 64 (the first 1, then 16): the same outputs, and the state there (0.683541ms)
+  ✔ chunks ending at token 31 of 37 (the first 15, then 16): the same outputs, and the state there (0.410208ms)
+  ✔ chunks ending at token 3 of 5 (the first 3, then 16): the same outputs, and the state there (0.094333ms)
+  ✔ a chunked batch then token steps continue the same state (1.76575ms)
+✔ chunked gated delta rule (41.578666ms)
+(node:70428) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ lookupDraft
+  ✔ drafts what followed the latest earlier occurrence of the last 4 tokens (1.376375ms)
+  ✔ an n-token match drafts at most 2^(n-1) tokens, and at most max (0.093709ms)
+  ✔ the latest occurrence wins (0.066583ms)
+  ✔ nothing below minMatch, nothing with max 0 (0.063041ms)
+  ✔ drafts stop at the end of the text (0.054083ms)
+✔ lookupDraft (2.245708ms)
+▶ DraftPolicy
+  ✔ times a token alone before drafting (0.256125ms)
+  ✔ drafts the most when drafts are usually right and batches cost about a token (2.607709ms)
+  ✔ stops drafting when drafts are rarely right (1.353167ms)
+  ✔ stops drafting when a batch costs more than it earns (1.274417ms)
+  ✔ never writes slower than plain decoding by much (5.345125ms)
+  ✔ drafts again once unchecked drafts start being right (0.101875ms)
+  ✔ peek answers like choose without changing what it remembers (0.062625ms)
+  ✔ a batch cut short scores only the drafts it judged (0.051042ms)
+  ✔ one stalled batch doesn't stop drafting for the rest of the reply (0.243541ms)
+  ✔ drafts past those checked are scored once a batch keeps every one (0.095375ms)
+  ✔ rates stay between 0 and 1 (0.0735ms)
+✔ DraftPolicy (11.954708ms)
+✔ native embedding reads amortize I/O within the existing raw-plus-packed tensor budget (0.490042ms)
+(node:70429) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ the f16 matmul's chunks (Engine.f16Plan)
+  ✔ whole matrices where they fit, whole K-slices where one does (0.633834ms)
+  ✔ rows in columns when one slice doesn't fit (0.073625ms)
+  ✔ every chunk fits the scratch and covers the matrix (0.397917ms)
+✔ the f16 matmul's chunks (Engine.f16Plan) (1.58575ms)
+(node:70430) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ short completed fences avoid timer sleeps even at the periodic polling threshold (1.548292ms)
+(node:70431) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:70432) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ frame monitoring is optional outside a window (0.434833ms)
+✔ frame feedback reports 120 Hz and the absolute start of its observation window (1.649459ms)
+✔ short catch-up callbacks remain in the mean instead of inventing a slowdown (0.410167ms)
+✔ whole-millisecond timestamps retain healthy 60 Hz cadence (4.22225ms)
+✔ whole-millisecond timestamps retain healthy 120 Hz cadence (0.755375ms)
+(node:70433) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ fused float inputs require every consumer to accept the selected FP16 layout (0.449125ms)
+✔ paced bands cover exactly the original rectangle, using absolute coordinates (1.571959ms)
+(node:70434) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ disabled pacing preserves a single submission without a fence (0.096917ms)
+✔ a row larger than the budget still progresses, and MRT uses the full target (0.143417ms)
+✔ short output heads are sliced even below the read budget (0.082792ms)
+✔ paced matrix bands align to raster tiles without consuming the leftover sliver (0.092792ms)
+✔ a delayed load-frame window cannot reduce the new prompt's budget (0.533416ms)
+✔ a small projection starts a new chunk instead of splitting across its boundary (0.098125ms)
+✔ cached bindings are reused and a texture upload invalidates its active sampler binding (2.294042ms)
+(node:70435) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:70436) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ half floats
+  ✔ values a half holds exactly round-trip (4.790625ms)
+  ✔ rounds to the nearest half (0.074833ms)
+  ✔ overflow is infinity, NaN stays NaN, signed zero kept (0.083916ms)
+  ✔ the table and halvesToFloats agree with fromHalf (0.4235ms)
+✔ half floats (5.920459ms)
+(node:70437) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ an unsplit expanded Q6 head uses its format-aware kernel rather than the old byte shader (0.44325ms)
+✔ head work stays constant when the automatic submission quota grows (0.55ms)
+(node:70438) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ the f16 prompt matmul's h2 reads (TUNING.f16Pack)
+  ✔ f16Pack 0 builds the RGBA16F kernels as they were (2.311ms)
+  ✔ each bit reads its input as h2 texels, two K texels a step (0.244875ms)
+  ✔ h2 dequantization calls the texel's math twice into one h2 texel (0.349417ms)
+✔ the f16 prompt matmul's h2 reads (TUNING.f16Pack) (3.415166ms)
+(node:70439) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ dependent storage timing: decode win false, prefill win true (1.85525ms)
+✔ dependent storage timing: decode win true, prefill win false (0.382791ms)
+✔ dependent storage timing: decode win true, prefill win true (0.385167ms)
+(node:70440) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ warm-up drops cached full-layer costs before selecting a subset (0.462584ms)
+✔ warm-up drops cached full-layer costs before selecting a subset and restores layers on failure (0.221875ms)
+(node:70441) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ packing calibration restores all operator kinds and pacing (10.031542ms)
+✔ packing calibration restores all operator kinds and pacing after failure (0.340292ms)
+✔ native layout comparisons preserve the real model operator mixture (0.904541ms)
+✔ a layout winning only one reversed timing pair does not become the production choice (0.349834ms)
+✔ a failed presentation trial is not repeated by later packing candidates (0.339959ms)
+✔ a fast successful complete pipeline retains its tested presentation window (0.295292ms)
+(node:70442) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ panel layout
+  ✔ kt 151, segments of 2048, 1 rows, 16384 wide (2.011958ms)
+  ✔ kt 513, segments of 2048, 1 rows, 16384 wide (3.268792ms)
+  ✔ kt 1976, segments of 2048, 3 rows, 16384 wide (24.387459ms)
+  ✔ kt 1977, segments of 2048, 8 rows, 16384 wide (20.491792ms)
+  ✔ kt 8000, segments of 2048, 1 rows, 16384 wide (4.058542ms)
+  ✔ kt 1980, segments of 128, 1 rows, 16384 wide (1.402375ms)
+  ✔ kt 1980, segments of 2048, 2 rows, 4096 wide (4.281166ms)
+✔ panel layout (60.620042ms)
+▶ chunked softmax
+  ✔ a cache of 1,000 keys (3.203833ms)
+  ✔ a sliding window: the first 300 keys masked, whole chunks of them empty (1.289833ms)
+  ✔ masked keys inside chunks, before and after live ones (0.593125ms)
+  ✔ segments, the last one short (empty chunks at its end) (1.8295ms)
+✔ chunked softmax (7.082709ms)
+✔ presentation drains periodically empty the compute queue while ordinary bands overlap (1.487792ms)
+(node:70443) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:70444) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ sharedPrefix
+  ✔ counts the leading items both have (0.308667ms)
+✔ sharedPrefix (0.742417ms)
+▶ unsharedTail and anchorFor
+  ✔ a template that rewrites past replies: the generation prompt's tail, anchored at its <|im_start|> (0.272792ms)
+  ✔ a template that writes replies back as asked: the anchor at the prompt's end (0.088583ms)
+  ✔ no anchor after a tool's result: the last question's stays (0.060166ms)
+✔ unsharedTail and anchorFor (0.527125ms)
+▶ promptPlan
+  ✔ a batch ends at the anchor, the rest read after it (0.881375ms)
+  ✔ with few snapshots kept, only the anchor's (0.106ms)
+  ✔ an anchor saved from inside its batch splits nothing (0.115791ms)
+  ✔ an anchor at the end, before the start or missing splits nothing (0.072834ms)
+✔ promptPlan (1.318833ms)
+(node:70445) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ byte expansion preserves every Q6_K weight exactly across row groups and chunks (19.0445ms)
+✔ head expansion is rejected unless scratch savings cover both head and activation memory (0.115625ms)
+✔ extra head partial-sum storage cannot consume an unfunded memory budget (0.069292ms)
+✔ head scratch accounting includes the whole new target when switching from an unsplit head (0.07425ms)
+✔ automatic scratch reuses the former tuner's two-buffer budget without increasing its retained ceiling (0.117291ms)
+(node:70446) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ expanded head uploads stay within 128 KiB and preserve all row data across chunks (10.713166ms)
+✔ GPU upload borrows existing storage and routes chunk data across panels and columns (0.505083ms)
+(node:70447) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ six-way read-ahead keeps the byte cap plus only the current consumed slice (4.887875ms)
+(node:70448) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ contiguous reads share one bounded backing store and preserve every slice's byte offset (1.117542ms)
+✔ coalescing cannot retain a backing store beyond the read-ahead byte cap (0.934417ms)
+(node:70449) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Q4_0 word copies preserve bytes for unaligned views, row offsets and permutations (1.187958ms)
+✔ Q8_0 word copies preserve bytes for unaligned views, row offsets and permutations (0.169375ms)
+(node:70450) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ rawRgba4
+  ✔ texel t of row r, block b, holds weights 4t..4t+3, the first in the low nibble (2.691083ms)
+✔ rawRgba4 (3.156833ms)
+▶ MatMulNBits repacking
+  ✔ quantsFromRaw matches packMatMulNBits' quants (1.351459ms)
+  ✔ packMatMulNBitsScales matches packMatMulNBits' scales and zero points (0.169958ms)
+  ✔ rows land at row0 (matrices filled part by part) (0.123666ms)
+  ✔ zero points unpack low nibble first, two blocks a byte (0.07125ms)
+✔ MatMulNBits repacking (1.859958ms)
+▶ ggml dequantization
+  ✔ Q4_1: d · q + m, weight j in the low nibble, j + 16 in the high one (3.101167ms)
+  ✔ Q5_K: 6-bit scales and mins (both packings), the fifth bit from qh (0.415667ms)
+✔ ggml dequantization (3.752125ms)
+(node:70451) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ decode-only MRT storage is bounded and its complete replacement cost is accounted (0.648917ms)
+✔ attention slicing funds scratch only with bytes actually removed from score buffers (0.116083ms)
+(node:70453) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ whole-word RGBA4 packing matches independent nibble extraction for all byte values (2.304083ms)
+(node:70455) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ normalization compiles the selected 16-part reduction as a fixed loop (0.500083ms)
+✔ normalization compiles the selected 64-part reduction as a fixed loop (0.077417ms)
+(node:70457) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ createSampler
+  ✔ temperature 0 is the argmax at probability 1 (1.305583ms)
+  ✔ the repetition penalty divides positive logits and multiplies negative ones (0.136459ms)
+  ✔ top_k keeps the k likeliest, normalized (0.12275ms)
+  ✔ top_p drops the tail once the kept share reaches it (0.091958ms)
+✔ createSampler (2.17625ms)
+▶ verify (speculative sampling)
+  ✔ tokens come out distributed as the distribution, draft 10 (13.183292ms)
+  ✔ tokens come out distributed as the distribution, draft 11 (14.947458ms)
+  ✔ tokens come out distributed as the distribution, draft 13 (12.892ms)
+  ✔ tokens come out distributed as the distribution, draft 99 (8.293125ms)
+  ✔ a draft at probability 1 is always kept (0.15675ms)
+  ✔ greedy: a one-token distribution keeps its token, replaces any other (0.127209ms)
+✔ verify (speculative sampling) (49.846917ms)
+▶ draw
+  ✔ draws in proportion to p (1.991875ms)
+  ✔ never returns a token at probability 0 (0.077125ms)
+✔ draw (2.133708ms)
+(node:70458) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ startup checks reuse real reference inputs and leave no model cache (0.618ms)
+✔ recurrent models retain their existing numerical rejection result (0.104792ms)
+✔ a failed reference forward always clears its cache even when reuse was requested (0.227959ms)
+✔ the fused startup check conservatively converts GPU-relative error to a CPU-relative bound (0.103292ms)
+✔ dense startup checks retain every attention layout and restore layer indexing on failure (0.415625ms)
+(node:70459) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+▶ isOldVersion
+  ✔ a file and its markers saved at a pinned commit (0.474666ms)
+  ✔ not the file at main (0.06125ms)
+  ✔ not another file whose name ends the same (0.064417ms)
+  ✔ not another repo's file (0.135208ms)
+  ✔ a file in a folder (0.07625ms)
+✔ isOldVersion (1.819ms)
+(node:70460) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ fence fallback adjusts unobserved work within its calibrated quota (1.478292ms)
+✔ fixed/disabled pacing ignores feedback and invalid fence samples (0.121792ms)
+✔ isolated presentation misses change queue drains before shrinking efficient matrix bands (0.177125ms)
+✔ healthy frames keep the calibrated matrix quota until sustained presentation fairness is proven (0.078875ms)
+✔ decode quanta grow with smooth frames and back off on stutter (0.100917ms)
+✔ recent cadence suppresses slow fence fallback after idle (0.071667ms)
+✔ fast complete-layer fences scale decode without device limits (0.07375ms)
+✔ whole-workload calibration bounds invalid estimates and scales fast workloads (0.070875ms)
+✔ 240 Hz cadence lowers the four-millisecond completion target (0.072125ms)
+✔ presentation policy learns only from active work and startup reset discards compiler stalls (0.133042ms)
+✔ mean cadence detects an isolated stall hidden below p95 (0.066625ms)
+✔ larger queues require proven presentation fairness and roll back without shrinking efficient bands (0.118083ms)
+✔ only completed smooth real-compute history can become a persisted pacing recommendation (0.088709ms)
+✔ saved overlap restores the calibrated quota immediately after a critical stall (0.120542ms)
+✔ smooth presentation alone does not increase matrix bands without a fast matrix fence (0.577292ms)
+✔ isolated missed frames preserve efficient bands and recover the drain window (0.163792ms)
+✔ repeated stalls in one burst still reduce the matrix quota (0.060375ms)
+✔ efficient matrix samples recover even after backoff below half the initial quota (0.059042ms)
+✔ moderate callback jitter with healthy mean cadence does not revoke proven overlap (0.051209ms)
+✔ an isolated missed frame rolls back immediately without permanently disabling recovery (0.048916ms)
+✔ healthy 60 FPS rendering uses the same maximum drain interval (0.0645ms)
+✔ healthy 120 FPS rendering uses the same maximum drain interval (0.03325ms)
+(node:70462) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ vocabulary size includes sparse added-token IDs without copying the vocabulary Map (2.103667ms)
+(node:70463) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ tuning awaits an asynchronous attention sample before fencing or starting another sample (13.34525ms)
+(node:70464) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ owned GGUF matrices remain intact until consumed, then release their backing stores (0.48825ms)
+✔ raw/aliased sources are retained and closing an interrupted upload releases owned matrices (0.146959ms)
+(node:70465) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ embedding panel selection preserves logical row boundaries (0.446417ms)
+✔ single-panel embedding shaders remain identical (0.056958ms)
+✔ head rectangles cover every logit once and address the right column and panel (14.711042ms)
+ℹ tests 175
+ℹ suites 19
+ℹ pass 175
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 167.337667
+
+> nx run webgl:build
+
+> tsc --build tsconfig.lib.json
+
+
+> nx run webgl:typecheck
+
+> tsc --build --emitDeclarationOnly
+
+
+> nx run webgl:lint
+
+> eslint .
+
+(node:70405) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/mem-worker.ts
+  81:27  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/mm2.ts
+   572:16  warning  'transformFeedback' is defined but never used  @typescript-eslint/no-unused-vars
+   585:16  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   590:16  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   596:21  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   609:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   669:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   677:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   696:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   922:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   931:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   939:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   945:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+  1015:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/webgl-perf.ts
+  17:3   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  25:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  26:13  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  36:13  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/scripts/check-loaders.ts
+   579:33  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   583:25  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   604:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   605:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   709:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   710:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   711:40  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   712:43  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   713:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   715:46  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   716:46  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   729:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   730:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   733:41  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   733:61  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   738:8   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   789:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   949:20  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   949:40  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1127:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1159:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1160:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1161:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1162:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1165:35  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1166:36  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1167:32  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1184:25  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+
+✖ 46 problems (0 errors, 46 warnings)
+
+
+
+
+ NX   Successfully ran targets test, typecheck, build, lint for project webgl
+
+
+  Run duration:      1.6s
+  Cache:             0/4 hit (0%)
+  Critical path:     1.6s (1 task)
+  Recoverable time:  <1ms
+
+Final benchmark-helper lint after adding motion analysis:
+
+> nx run webgl:lint
+
+> eslint .
+
+(node:71797) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/mem-worker.ts
+  81:27  warning  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/mm2.ts
+   572:16  warning  'transformFeedback' is defined but never used  @typescript-eslint/no-unused-vars
+   585:16  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   590:16  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   596:21  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   609:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   669:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   677:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   696:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   922:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   931:18  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   939:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+   945:20  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+  1015:17  warning  Forbidden non-null assertion                   @typescript-eslint/no-non-null-assertion
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/bench/webgl-perf.ts
+  17:3   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  25:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  26:13  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  36:13  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+
+/Users/david/Developer/tanstack-ai-browser/.worktrees/webgl-performance/packages/webgl/scripts/check-loaders.ts
+   579:33  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   583:25  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   604:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   605:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   709:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   710:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   711:40  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   712:43  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   713:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   715:46  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   716:46  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   729:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   730:7   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   733:41  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   733:61  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   738:8   warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   789:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   949:20  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+   949:40  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1127:16  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1159:18  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1160:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1161:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1162:14  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1165:35  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1166:36  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1167:32  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+  1184:25  warning  Forbidden non-null assertion  @typescript-eslint/no-non-null-assertion
+
+✖ 46 problems (0 errors, 46 warnings)
+
+
+
+
+ NX   Successfully ran target lint for project webgl
+
+
+  Run duration:      1.4s
+  Cache:             0/1 hit (0%)
+  Critical path:     1.4s (1 task)
+  Recoverable time:  <1ms
+
+Benchmark helper syntax checks passed; all three summaries reproduced exactly from selected raw evidence. HTML report visually checked in the one existing task tab.

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Transformers.js quality</title>
+    <style>
+      body {
+        font:
+          12px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      const out = document.getElementById("out")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+      }
+      log(navigator.userAgent)
+      const worker = new Worker("/bundle/bench/tjs-quality-worker.js", {
+        type: "module"
+      })
+      worker.onmessage = ({ data }) => {
+        if (data.type === "log") log(data.text)
+        else if (data.type === "error") log(`ERROR: ${data.message}\nALL DONE`)
+        else if (data.type === "done") log("ALL DONE")
+      }
+      worker.onerror = (e) => log(`worker error: ${e.message}\nALL DONE`)
+    </script>
+  </body>
+</html>

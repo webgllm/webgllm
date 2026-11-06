@@ -1,0 +1,67 @@
+{
+  "kind": "ua-page",
+  "id": "mac-optimized-memory-long",
+  "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000",
+  "complete": true,
+  "retainedPageBytes": 55176354,
+  "breakdown": [
+    {
+      "attribution": [],
+      "bytes": 968553,
+      "types": [
+        "Shared"
+      ]
+    },
+    {
+      "attribution": [],
+      "bytes": 0,
+      "types": []
+    },
+    {
+      "attribution": [
+        {
+          "scope": "Window",
+          "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+        }
+      ],
+      "bytes": 1046425,
+      "types": [
+        "JavaScript"
+      ]
+    },
+    {
+      "attribution": [
+        {
+          "scope": "DedicatedWorkerGlobalScope",
+          "url": "http://localhost:8788/dist/current-worker.js"
+        }
+      ],
+      "bytes": 52625176,
+      "types": [
+        "JavaScript"
+      ]
+    },
+    {
+      "attribution": [],
+      "bytes": 32200,
+      "types": [
+        "DOM"
+      ]
+    },
+    {
+      "attribution": [
+        {
+          "scope": "Window",
+          "url": "http://localhost:8788/webgl-perf.html?id=mac-optimized-memory-long&production=1&restoreCalibration=mac-after&hold=1&rounds=1&len=2048&uaMemory=1&idleMs=1000"
+        }
+      ],
+      "bytes": 504000,
+      "types": [
+        "Canvas"
+      ]
+    }
+  ],
+  "gpuBytes": 1417196928,
+  "peakGpuBytes": 1417196928,
+  "scope": "measureUserAgentSpecificMemory after GC: this page plus its dedicated worker; GPU texture bytes separate. Not natural CPU peak or process/phone RSS."
+}

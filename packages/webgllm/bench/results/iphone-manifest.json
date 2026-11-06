@@ -1,0 +1,71 @@
+{
+  "metadata": {
+    "device": "iPhone 16 Pro Max",
+    "os": "iOS 27.2 (24B119), as reported by CoreDevice",
+    "browser": "Safari 27.2",
+    "renderer": "Apple GPU",
+    "baselineCommit": "2c10f9e",
+    "branch": "perf/webgl-performance",
+    "model": "LiquidAI/LFM3-1.7B-GGUF",
+    "file": "LFM3-1.7B-QAD-Q4_0.gguf",
+    "fileBytes": 1049615680,
+    "promptBatch": 512,
+    "maxOutputTokens": 64,
+    "thinking": false,
+    "speculative": true,
+    "benchmarkTabs": 1,
+    "pageRenderingPreference": "Prefer Page Rendering Updates near 60fps disabled by user; Safari reopened; idle 120 Hz verified",
+    "idleMs": 60000,
+    "restBetweenRoundsMs": 60000,
+    "memoryKind": "webkit",
+    "optimizedEngineCode": 446196241,
+    "optimizedCommit": "70d3ea0",
+    "versionLimitation": "Physical iPhone results use checkpoint 70d3ea0 (engine 446196241). Subsequent startup storage selection and fast-workload pacing refinements were tested on Pixel and Mac after the iPhone was returned; final branch needs an iPhone recheck."
+  },
+  "runs": {
+    "beforeShort": "iphone-rested-before-short",
+    "afterShort": "iphone-refresh-short",
+    "beforeLong": "iphone-rested-before-long",
+    "afterLong": "iphone-refresh-long",
+    "sampled": "iphone-refresh-sampled"
+  },
+  "files": {
+    "loadBefore": "iphone-load-release-before.json",
+    "loadAfter": "iphone-load-release-after.json",
+    "memoryBeforeShort": "iphone-memory-release-before-short.json",
+    "memoryAfterShort": "iphone-memory-release-after-short.json",
+    "memoryBeforeLong": "iphone-memory-release-before-long.json",
+    "memoryAfterLong": "iphone-memory-release-after-long.json"
+  },
+  "qualityRun": "iphone-refresh-quality",
+  "interrupted": [],
+  "controls": [
+    {
+      "name": "Original, paired control",
+      "ids": [
+        "iphone-paired-before-long-1",
+        "iphone-paired-before-long-2"
+      ],
+      "interpretation": "Same-session reference on an earlier build; shows run-to-run variation."
+    },
+    {
+      "name": "Optimized, normal polling",
+      "ids": [
+        "iphone-paired-normal-long-1",
+        "iphone-paired-normal-long-2"
+      ],
+      "interpretation": "Earlier 24-frame drain ceiling; superseded by the cadence-independent ceiling."
+    },
+    {
+      "name": "Optimized, timer-free polling",
+      "ids": [
+        "iphone-paired-poll-free-long-1",
+        "iphone-paired-poll-free-long-2"
+      ],
+      "interpretation": "No consistent paired gain; periodic backoff retained."
+    }
+  ],
+  "evidenceRunIds": [
+    "iphone-mixture-probe-mw1qa7uf-cold-1"
+  ]
+}

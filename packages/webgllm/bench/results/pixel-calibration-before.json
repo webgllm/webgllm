@@ -1,0 +1,15 @@
+{
+  "calibrationLog": "tuned in the background: {\"shortSplit\":null,\"f16Matmul\":null,\"f16Pack\":0,\"flashDecode\":null,\"shortSplitGain\":1.5,\"shortSplitNoise\":12.6,\"f16PackGain\":21.6,\"f16PackNoise\":2.1,\"flashDecodeGain\":21.5,\"flashDecodeNoise\":23.7}",
+  "notes": {
+    "ANGLE (Imagination Technologies, PowerVR D-Series DXT-48-1536, OpenGL ES 3.2)|Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36|LiquidAI/LFM3-1.7B-GGUF|mrt|9a245e24.91bee98a": {
+      "layout": "bytes",
+      "selfCheck": 0.00023392737952937078,
+      "tuned": {
+        "shortSplit": null,
+        "f16Matmul": null,
+        "f16Pack": 0,
+        "flashDecode": null
+      }
+    }
+  }
+}

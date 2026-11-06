@@ -1,0 +1,264 @@
+{
+  "mode": "baseline",
+  "complete": true,
+  "results": [
+    {
+      "id": "pixel-before-control-mw1nj3ry-cold-1",
+      "at": "2026-11-04T05:04:07.594Z",
+      "cold": true,
+      "loadMs": 9943.879999995232,
+      "engineLoadMs": 9890,
+      "fps": 55.61209507760202,
+      "maxFrameMs": 558.3649999999998,
+      "timings": {
+        "context": 25,
+        "files": 11,
+        "weights": 5846,
+        "weightsReading": 3978,
+        "weightsUploading": 1356,
+        "toRgba4": 13,
+        "repackOnnx": 0,
+        "layoutProbe": 227,
+        "warmUp": 719,
+        "programs": 56,
+        "compileMs": 203,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 3289,
+        "total": 9890
+      },
+      "gpuBytes": 1395974528,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "pixel-before-control-mw1nj3ry-cold-2",
+      "at": "2026-11-04T05:04:23.586Z",
+      "cold": true,
+      "loadMs": 9880.439999997616,
+      "engineLoadMs": 9811,
+      "fps": 55.15948682448671,
+      "maxFrameMs": 533.3400000000001,
+      "timings": {
+        "context": 21,
+        "files": 10,
+        "weights": 5847,
+        "weightsReading": 3996,
+        "weightsUploading": 1293,
+        "toRgba4": 12,
+        "repackOnnx": 0,
+        "layoutProbe": 212,
+        "warmUp": 688,
+        "programs": 56,
+        "compileMs": 197,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 3245,
+        "total": 9811
+      },
+      "gpuBytes": 1395974528,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "pixel-before-control-mw1nj3ry-cold-3",
+      "at": "2026-11-04T05:04:39.706Z",
+      "cold": true,
+      "loadMs": 10037.280000001192,
+      "engineLoadMs": 9968,
+      "fps": 55.29386447323718,
+      "maxFrameMs": 558.3499999999985,
+      "timings": {
+        "context": 20,
+        "files": 9,
+        "weights": 5864,
+        "weightsReading": 3952,
+        "weightsUploading": 1390,
+        "toRgba4": 29,
+        "repackOnnx": 0,
+        "layoutProbe": 252,
+        "warmUp": 751,
+        "programs": 56,
+        "compileMs": 220,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 3323,
+        "total": 9968
+      },
+      "gpuBytes": 1395974528,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "pixel-tuned-load-before-cached-1",
+      "cold": false,
+      "loadMs": 6388.020000010729,
+      "engineLoadMs": 6316,
+      "fps": 58.54709283931044,
+      "maxFrameMs": 133.32999999999993,
+      "timings": {
+        "context": 24,
+        "files": 11,
+        "weights": 5598,
+        "weightsReading": 3919,
+        "weightsUploading": 1126,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 683,
+        "programs": 56,
+        "compileMs": 211,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 6316
+      },
+      "gpuBytes": 1413546368,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "pixel-tuned-load-before-cached-2",
+      "cold": false,
+      "loadMs": 6220.655000001192,
+      "engineLoadMs": 6147,
+      "fps": 58.35398362389981,
+      "maxFrameMs": 141.66499999999996,
+      "timings": {
+        "context": 22,
+        "files": 10,
+        "weights": 5418,
+        "weightsReading": 3794,
+        "weightsUploading": 1090,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 698,
+        "programs": 56,
+        "compileMs": 223,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 6147
+      },
+      "gpuBytes": 1413546368,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "pixel-tuned-load-before-cached-3",
+      "cold": false,
+      "loadMs": 6090.430000007153,
+      "engineLoadMs": 6029,
+      "fps": 58.6165508838589,
+      "maxFrameMs": 141.66499999999996,
+      "timings": {
+        "context": 15,
+        "files": 12,
+        "weights": 5337,
+        "weightsReading": 3703,
+        "weightsUploading": 1101,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 665,
+        "programs": 56,
+        "compileMs": 201,
+        "warm_batch9": 23,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 5,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": 0,
+        "tunedFlashDecode": -1,
+        "selfCheck": 0,
+        "total": 6029
+      },
+      "gpuBytes": 1413546368,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    }
+  ]
+}

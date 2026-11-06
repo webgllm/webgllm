@@ -1,0 +1,588 @@
+/**
+ * The other runtimes on the same prompt as check.html's smoke test, for
+ * comparison: Transformers.js on WebGPU (the transformers-js package's own
+ * worker, driven through its messages) and wllama with every layer on
+ * WebGPU, or each on the CPU in WebAssembly. `?run=tjs`, `tjs-cpu`, `wllama`
+ * or `wllama-cpu`; results go to the server's log.
+ */
+import { loadTokenizer } from "../src/tokenizer.js"
+
+const params = new URLSearchParams(location.search)
+const out = document.getElementById("out") as HTMLPreElement
+const log = (text: string) => {
+  out.textContent += `${text}\n`
+  void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+}
+
+/**
+ * ?q=quote asks for a reply that copies the prompt (where drafts help);
+ * ?q=capital asks the check page's question (a fact the filler doesn't
+ * hold, to see whether a long prompt drowns it out).
+ */
+const QUESTION =
+  params.get("q") === "quote"
+    ? "Copy the first three sentences above word for word, then describe the scene in a short paragraph."
+    : params.get("q") === "capital"
+      ? "What is the capital of France? Answer in one sentence."
+      : "Describe the river scene above in a short paragraph."
+const FILLER =
+  "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+/** ?followup=1's second message: about 80 tokens. */
+const FOLLOW_UP =
+  "Thank you. Now tell the same scene again, but from the point of view of the miller's daughter herself: what she sees from the window of the mill at dawn, what she hears from the river, how she feels about counting the sacks again, and what she hopes to buy at the market in the square once the morning's work is done. Keep it to one paragraph."
+
+/** The smoke test's prompt: the question after filler, about `length` tokens in all. */
+async function promptText(length: number) {
+  const [tokenizerJson, tokenizerConfig, chatTemplate] = await Promise.all([
+    fetch("/hf/tokenizer.json").then((r) => r.json() as Promise<object>),
+    fetch("/hf/tokenizer_config.json").then(
+      (r) => r.json() as Promise<Record<string, unknown>>
+    ),
+    fetch("/hf/chat_template.jinja").then((r) => r.text())
+  ])
+  const tokenizer = loadTokenizer({
+    tokenizerJson,
+    tokenizerConfig,
+    chatTemplate
+  })
+  // Repeats of the filler from its token count (re-encoding the whole
+  // prompt per repeat is quadratic), then a few more to reach the length.
+  const count = (pad: string) =>
+    tokenizer.encodeChat([{ role: "user", content: pad + QUESTION }], {
+      addGenerationPrompt: true
+    }).length
+  const base = count("")
+  const per = count(FILLER) - base
+  let pad = FILLER.repeat(Math.max(0, Math.floor((length - base) / per)))
+  while (count(pad) < length) pad += FILLER
+  return `${pad}\n\n${QUESTION}`
+}
+
+const median = (values: Array<number>) =>
+  [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
+
+function summarize(
+  name: string,
+  runs: Array<{ promptTps: number; decodeTps: number; ttftMs: number }>
+) {
+  log(
+    `RESULT ${name}: prompt ${median(runs.map((r) => r.promptTps)).toFixed(1)} tokens/s, ` +
+      `writing ${median(runs.map((r) => r.decodeTps)).toFixed(1)} tokens/s, ` +
+      `first token ${(median(runs.map((r) => r.ttftMs)) / 1000).toFixed(2)} s (median of ${runs.length})`
+  )
+}
+
+/**
+ * wllama through the wllama package's own client, as the app runs it: its
+ * llama.cpp builds (the compat build where the browser needs it, as Safari
+ * does), its model files from Hugging Face, WebGPU or (`gpu` false) the CPU.
+ */
+async function runWllamaPackage(text: string, gpu = true) {
+  const url = "/bundle-wllama/src/client.js"
+  const client = (await import(/* @vite-ignore */ url)) as {
+    configureRuntime: (options: Record<string, unknown>) => void
+    setContextLength: (model: string, contextLength: number | undefined) => void
+    loadModel: (model: string) => Promise<{
+      getLoadedContextInfo: () => { n_ctx: number; n_ctx_train: number }
+      createChatCompletion: (
+        options: Record<string, unknown>
+      ) => Promise<{
+        timings?: Record<string, number>
+        choices: Array<{ message: { content?: string } }>
+      }>
+      exit: () => Promise<void>
+    }>
+  }
+  const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+  // llama.cpp's own load log says where the model runs (layers offloaded,
+  // the WebGPU device): its lines about that go to this page's log.
+  const relevant = /offload|webgpu|WebGPU|ggml_wgpu|backend|CPU_REPACK|compat|n_ctx|KV buffer|kv_cache|llama_kv|compute buffer/i
+  let forwarded = 0
+  for (const level of ["log", "info", "warn", "debug"] as const) {
+    const original = console[level].bind(console)
+    console[level] = (...args: Array<unknown>) => {
+      const line = args.map(String).join(" ")
+      if (relevant.test(line) && forwarded++ < 40) log(`[llama.cpp] ${line.slice(0, 200)}`)
+      original(...args)
+    }
+  }
+  client.configureRuntime({ gpu, debug: true })
+  // ?ctx= sets the context; left out, the model's whole window.
+  const ctx = params.get("ctx")
+  client.setContextLength(model, ctx ? Number(ctx) : undefined)
+  const t0 = performance.now()
+  const wllama = await client.loadModel(model)
+  const info = wllama.getLoadedContextInfo()
+  log(`wllama context: n_ctx ${info.n_ctx}, n_ctx_train ${info.n_ctx_train}`)
+  log(`wllama (package) loaded ${model} ${gpu ? "on WebGPU where it can" : "on the CPU"} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
+  const generate = (content: string, maxTokens: number) =>
+    wllama.createChatCompletion({
+      messages: [{ role: "user", content }],
+      max_tokens: maxTokens,
+      temperature: 0,
+      cache_prompt: false,
+      chat_template_kwargs: { enable_thinking: false }
+    })
+  await generate("Hi", 4)
+  // ?followup=tool: a reply that calls a tool, then the tool's result sent
+  // back, logging how much of the second prompt was reused from the cache.
+  if (params.get("followup") === "tool") {
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "The current weather in a city.",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" } },
+            required: ["city"]
+          }
+        }
+      }
+    ]
+    const first: Array<Record<string, unknown>> = [
+      { role: "user", content: `${text}\n\nNow, what's the weather in Paris? Use the tool.` }
+    ]
+    const ask = (messages: Array<Record<string, unknown>>) =>
+      wllama.createChatCompletion({
+        messages,
+        tools,
+        max_tokens: 64,
+        temperature: 0,
+        cache_prompt: true,
+        chat_template_kwargs: { enable_thinking: false }
+      }) as Promise<{
+        timings?: Record<string, number>
+        choices: Array<{ message: { content?: string; tool_calls?: Array<{ id?: string }> } }>
+      }>
+    const one = await ask(first)
+    const call = one.choices[0]?.message
+    const t1 = one.timings ?? {}
+    log(`FOLLOWUP turn 1: processed ${t1.prompt_n}, reused ${t1.cache_n}, ${t1.prompt_ms?.toFixed(0)} ms; tool calls: ${JSON.stringify(call?.tool_calls ?? call?.content)}`)
+    if (!call?.tool_calls?.length) return log("FOLLOWUP: no tool call")
+    const two = await ask([
+      ...first,
+      { role: "assistant", content: call.content ?? "", tool_calls: call.tool_calls },
+      { role: "tool", tool_call_id: call.tool_calls[0].id ?? "0", content: '{"temp_c": 18, "sky": "cloudy"}' }
+    ])
+    const t2 = two.timings ?? {}
+    log(`FOLLOWUP turn 2: processed ${t2.prompt_n}, reused ${t2.cache_n}, ${t2.prompt_ms?.toFixed(0)} ms; reply ${JSON.stringify((two.choices[0]?.message.content ?? "").slice(0, 120))}`)
+    await wllama.exit()
+    return
+  }
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    const res = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const t = res.timings ?? {}
+    const promptTps = (t.prompt_n / t.prompt_ms) * 1000
+    const decodeTps = (t.predicted_n / t.predicted_ms) * 1000
+    log(
+      `wllama ${gpu ? "WebGPU" : "WASM"} run ${i + 1}: ${t.prompt_n} prompt tokens in ${t.prompt_ms?.toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${t.predicted_n} tokens at ${decodeTps.toFixed(1)} tokens/s`
+    )
+    if (i === 0)
+      log(`reply: ${JSON.stringify((res.choices[0]?.message.content ?? "").slice(0, 160))}`)
+    runs.push({ promptTps, decodeTps, ttftMs: t.prompt_ms })
+  }
+  summarize(`wllama ${gpu ? "WebGPU" : "WASM (CPU)"}, ${model}`, runs)
+  await wllama.exit()
+}
+
+/** Transformers.js on WebGPU, through the transformers-js package's worker. */
+async function runTjs(text: string, cpu = false) {
+  const worker = new Worker(
+    cpu ? "/bundle/bench/tjs-cpu-worker.js" : "/bundle-tjs/src/worker.js",
+    // "…:debug" turns on the worker's memory logs (?debug=1).
+    { type: "module", name: params.get("debug") ? "transformers-js:debug" : "transformers-js" }
+  )
+  let lastPct = -10
+  const pending = new Map<
+    string,
+    {
+      tokens: number
+      text: string
+      resolve: (stats: Record<string, number | null>) => void
+      reject: (e: Error) => void
+    }
+  >()
+  /** Each finished request's reply text. */
+  const replies = new Map<string, string>()
+  let ready: () => void = () => undefined
+  let failed: (e: Error) => void = () => undefined
+  worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
+    if (data.type === "progress") {
+      const pct = Math.floor(data.progress * 100)
+      if (pct >= lastPct + 10) {
+        lastPct = pct
+        log(`loading ${pct}% (${data.cached ? "from storage" : "downloading"})`)
+      }
+    } else if (data.type === "ready") ready()
+    else if (data.type === "load-error") failed(new Error(data.message))
+    else if (data.type === "log") log(`[worker] ${data.text}`)
+    else if (data.type === "token") {
+      const p = pending.get(data.id)
+      if (p) {
+        p.tokens++
+        p.text += data.text
+      }
+    } else if (data.type === "done") {
+      const p = pending.get(data.id)
+      if (p) replies.set(data.id, p.text)
+      p?.resolve(data.stats)
+    }
+    else if (data.type === "error")
+      pending.get(data.id)?.reject(new Error(data.message))
+  }
+  const model = params.get("model") ?? "onnx-community/LFM3-1.7B-ONNX"
+  const t0 = performance.now()
+  await new Promise<void>((resolve, reject) => {
+    ready = resolve
+    failed = reject
+    // The context the chats use (?ctx=, 8,192 by default, as on an iPhone).
+    worker.postMessage({
+      type: "load",
+      modelId: model,
+      dtype: cpu ? "q4" : "q4f16",
+      contextLength: Number(params.get("ctx") ?? 8192)
+    })
+  })
+  log(
+    `Transformers.js loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`
+  )
+  let n = 0
+  const generate = (content: string, maxTokens: number) =>
+    new Promise<Record<string, number | null>>((resolve, reject) => {
+      const id = `run${n++}`
+      pending.set(id, { tokens: 0, text: "", resolve, reject })
+      worker.postMessage({
+        type: "generate",
+        id,
+        chat: [{ role: "user", content }],
+        tools: [],
+        thinking: false,
+        sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
+        maxTokens,
+        // (?ctx= for longer prompts.)
+        contextLength: Number(params.get("ctx") ?? 8192),
+        thinkingOpen: "<think>"
+      })
+    })
+  await generate("Hi", 4)
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    // A different first line each time, so no run reuses another's cache.
+    const wall0 = performance.now()
+    const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const lastText = replies.get(`run${n - 1}`) ?? ""
+    const wall = performance.now() - wall0
+    const input = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
+    const promptTps = (input / (s.promptMs ?? 1)) * 1000
+    const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
+    log(
+      `  stopwatch: whole reply ${wall.toFixed(0)} ms for ${s.outputTokens} tokens; minus the prompt, ${(((s.outputTokens ?? 1) - 1) / ((wall - (s.promptMs ?? 0)) / 1000)).toFixed(1)} tokens/s`
+    )
+    if (i === 0) log(`reply: ${JSON.stringify(lastText.slice(0, 200))}`)
+    log(
+      `Transformers.js ${cpu ? "WASM" : "WebGPU"} run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s`
+    )
+    runs.push({ promptTps, decodeTps, ttftMs: s.promptMs ?? 0 })
+  }
+  summarize(
+    cpu ? "Transformers.js WASM (CPU), onnx-community ONNX q4" : "Transformers.js WebGPU, onnx-community ONNX q4f16",
+    runs
+  )
+}
+
+/**
+ * This package's WebGL 2 engine, through its worker as the app runs it
+ * (with speculative decoding unless ?speculative=0), on the same prompt.
+ */
+async function runWebgl(text: string) {
+  const worker = new Worker("/bundle/src/worker.js", { type: "module" })
+  const model = params.get("model") ?? "onnx-community/LFM3-1.7B-ONNX"
+  const speculative = params.get("speculative") !== "0"
+  // ?tune=knob:value,… sets engine TUNING knobs in the worker.
+  const tune = Object.fromEntries(
+    (params.get("tune") ?? "")
+      .split(",")
+      .filter(Boolean)
+      .map((pair) => {
+        const [knob, value] = pair.split(":")
+        return [knob, Number(value)]
+      })
+  )
+  if (Object.keys(tune).length) {
+    worker.postMessage({ type: "tune", values: tune })
+    log(`tuning: ${JSON.stringify(tune)}`)
+  }
+  let lastPct = -10
+  let ready: () => void = () => undefined
+  let failed: (e: Error) => void = () => undefined
+  const pending = new Map<
+    string,
+    { resolve: (s: Record<string, number | null>) => void; reject: (e: Error) => void }
+  >()
+  let reply = ""
+  worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
+    if (data.type === "progress") {
+      const pct = Math.floor(data.progress * 100)
+      if (pct >= lastPct + 10) {
+        lastPct = pct
+        log(`loading ${pct}% (${data.cached ? "from storage" : "downloading"})`)
+      }
+    } else if (data.type === "ready") {
+      if (data.timings) log(`LOAD PHASES (ms): ${JSON.stringify(data.timings)}`)
+      ready()
+    } else if (data.type === "load-error") failed(new Error(data.message))
+    else if (data.type === "log") log(`[worker] ${data.text}`)
+    else if (data.type === "token") reply += data.text
+    else if (data.type === "done") pending.get(data.id)?.resolve(data.stats)
+    else if (data.type === "error") pending.get(data.id)?.reject(new Error(data.message))
+  }
+  const t0 = performance.now()
+  await new Promise<void>((resolve, reject) => {
+    ready = resolve
+    failed = reject
+    worker.postMessage({ type: "load", model })
+  })
+  log(`WebGL loaded ${model} in ${((performance.now() - t0) / 1000).toFixed(1)} s`)
+  // ?idle=ms: wait that long before the first request (the worker tunes
+  // when idle; see tuneWhenIdle).
+  const idle = Number(params.get("idle") ?? 0)
+  if (idle > 0) await new Promise((r) => setTimeout(r, idle))
+  let n = 0
+  const generate = (
+    content: string | Array<{ role: string; content: string }>,
+    maxTokens: number
+  ) =>
+    new Promise<Record<string, number | null>>((resolve, reject) => {
+      const id = `run${n++}`
+      pending.set(id, { resolve, reject })
+      reply = ""
+      worker.postMessage({
+        type: "generate",
+        id,
+        model,
+        chat: typeof content === "string" ? [{ role: "user", content }] : content,
+        tools: [],
+        thinking: false,
+        sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
+        maxTokens,
+        speculative
+      })
+    })
+  await generate("Hi", 4)
+  // ?followup=1: each run a first message, its reply, then a follow-up
+  // question (the reply back in the chat, as the app sends it): how much
+  // of the follow-up's prompt is read again, and how long it takes.
+  if (params.get("followup") === "1") {
+    const runs = []
+    for (let i = 0; i < 3; i++) {
+      const first = [{ role: "user", content: `Run ${i + 1} of the benchmark.\n\n${text}` }]
+      await generate(first, 64)
+      const chat = [
+        ...first,
+        { role: "assistant", content: reply },
+        { role: "user", content: FOLLOW_UP }
+      ]
+      const s = await generate(chat, 64)
+      const read = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
+      log(
+        `FOLLOWUP run ${i + 1}: ${s.inputTokens} prompt tokens, ${read} read in ${(s.promptMs ?? 0).toFixed(0)} ms (${((read / (s.promptMs ?? 1)) * 1000).toFixed(1)} tokens/s), first token ${(s.firstTokenMs ?? 0).toFixed(0)} ms, ${s.outputTokens} tokens at ${((((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000).toFixed(1)} tokens/s`
+      )
+      runs.push({ read, promptMs: s.promptMs ?? 0, ttftMs: s.firstTokenMs ?? 0 })
+    }
+    log(
+      `RESULT FOLLOWUP ${model}: ${median(runs.map((r) => r.read))} prompt tokens read in ${median(runs.map((r) => r.promptMs)).toFixed(0)} ms, first token ${(median(runs.map((r) => r.ttftMs)) / 1000).toFixed(3)} s (median of 3)`
+    )
+    worker.terminate()
+    return
+  }
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    const s = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const input = (s.inputTokens ?? 0) - (s.cachedTokens ?? 0)
+    const promptTps = (input / (s.promptMs ?? 1)) * 1000
+    const decodeTps = (((s.outputTokens ?? 1) - 1) / (s.decodeMs ?? 1)) * 1000
+    log(
+      `WebGL run ${i + 1}: ${input} prompt tokens in ${(s.promptMs ?? 0).toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${s.outputTokens} tokens at ${decodeTps.toFixed(1)} tokens/s${s.draftBatches ? `, ${s.draftBatches} draft batches, ${s.draftsKept} of ${s.draftsChecked} drafts kept` : ""}`
+    )
+    if (i === 0) log(`reply: ${JSON.stringify(reply.slice(0, 200))}`)
+    runs.push({ promptTps, decodeTps, ttftMs: s.firstTokenMs ?? 0 })
+  }
+  summarize(`WebGL${speculative ? " (speculative)" : ""}, ${model}`, runs)
+  {
+    // The last prompt again (a retry): resumed from its saved end, it
+    // should read no prompt tokens and give the same reply.
+    const last = `Run 3 of the benchmark.\n\n${text}`
+    await generate(last, 64)
+    const first = reply
+    const s = await generate(last, 64)
+    log(
+      `RETRY: ${s.cachedTokens} of ${s.inputTokens} prompt tokens cached, prompt ${(s.promptMs ?? 0).toFixed(0)} ms, first token ${(s.firstTokenMs ?? 0).toFixed(0)} ms, ${reply === first ? "same reply" : `DIFFERENT reply: ${JSON.stringify(reply.slice(0, 120))} vs ${JSON.stringify(first.slice(0, 120))}`}`
+    )
+  }
+  worker.terminate()
+}
+
+/**
+ * ?run=switch: one worker switching between the 350M and LFM3 a few times,
+ * a short reply after each load, as the app does when you pick another
+ * model (each switch must free the last model's GPU memory first).
+ */
+async function runSwitch() {
+  const worker = new Worker("/bundle/src/worker.js", { type: "module" })
+  const models = (params.get("models") ?? "LiquidAI/LFM2.5-350M-ONNX,onnx-community/LFM3-1.7B-ONNX").split(",")
+  const rounds = Number(params.get("rounds") ?? 5)
+  let settle: { resolve: () => void; reject: (e: Error) => void } | null = null
+  // What the current step waits for: a model's "ready" or a reply's "done".
+  let awaiting = ""
+  let reply = ""
+  worker.onmessage = ({ data }) => {
+    // The page holds no other runtime's model: room is always there.
+    if (data.type === "claim") return worker.postMessage({ type: "claimed" })
+    if (data.type === "token") reply += data.text
+    else if (data.type === "ready" && data.model === awaiting) settle?.resolve()
+    else if (data.type === "done" && data.id === awaiting) settle?.resolve()
+    else if (data.type === "load-error" || data.type === "error")
+      settle?.reject(new Error(data.message))
+  }
+  worker.onerror = (e) => settle?.reject(new Error(e.message || "worker error"))
+  const wait = () =>
+    new Promise<void>((resolve, reject) => {
+      settle = { resolve, reject }
+    })
+  for (let i = 0; i < rounds; i++) {
+    const model = models[i % models.length]
+    const t0 = performance.now()
+    awaiting = model
+    const loaded = wait()
+    worker.postMessage({ type: "load", model })
+    await loaded
+    const loadS = (performance.now() - t0) / 1000
+    reply = ""
+    awaiting = `switch${i}`
+    const done = wait()
+    worker.postMessage({
+      type: "generate",
+      id: `switch${i}`,
+      model,
+      chat: [{ role: "user", content: "What is the capital of France? One sentence." }],
+      tools: [],
+      thinking: false,
+      sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 },
+      maxTokens: 24
+    })
+    await done
+    log(
+      `SWITCH ${i + 1}/${rounds}: ${model} loaded in ${loadS.toFixed(1)} s, replied in ${((performance.now() - t0) / 1000 - loadS).toFixed(1)} s: ${JSON.stringify(reply.slice(0, 80))}`
+    )
+  }
+  worker.terminate()
+}
+
+/** wllama (llama.cpp in WebAssembly) with every layer offloaded to WebGPU. */
+async function runWllama(text: string, gpu = true) {
+  const url = "/wllama/index.js"
+  const { Wllama, LoggerWithoutDebug } = (await import(
+    /* @vite-ignore */ url
+  )) as {
+    Wllama: new (
+      paths: Record<string, string>,
+      config: Record<string, unknown>
+    ) => {
+      loadModelFromUrl: (
+        url: string,
+        options: Record<string, unknown>
+      ) => Promise<void>
+      createChatCompletion: (
+        options: Record<string, unknown>
+      ) => Promise<{
+        timings?: Record<string, number>
+        choices: Array<{ message: { content?: string } }>
+      }>
+      exit: () => Promise<void>
+    }
+    LoggerWithoutDebug: unknown
+  }
+  const model = params.get("model") ?? "LFM3-1.7B-QAD-Q4_0.gguf"
+  const wasm = params.get("wasm") ?? "wllama-relaxed.wasm"
+  const debug = params.get("debug") === "1"
+  const wllama = new Wllama(
+    { default: `/wasm/${wasm}` },
+    debug
+      ? { logger: console }
+      : { logger: LoggerWithoutDebug, suppressNativeLog: true }
+  )
+  const t0 = performance.now()
+  await wllama.loadModelFromUrl(`/models/${model}`, {
+    n_ctx: 2048,
+    n_gpu_layers: gpu ? 999 : 0,
+    swa_full: true
+  })
+  log(
+    `wllama loaded ${model} with n_gpu_layers ${gpu ? 999 : 0} in ${((performance.now() - t0) / 1000).toFixed(1)} s (${wasm})`
+  )
+  const generate = (content: string, maxTokens: number) =>
+    wllama.createChatCompletion({
+      messages: [{ role: "user", content }],
+      max_tokens: maxTokens,
+      temperature: 0,
+      cache_prompt: false,
+      chat_template_kwargs: { enable_thinking: false }
+    })
+  await generate("Hi", 4)
+  const runs = []
+  for (let i = 0; i < 3; i++) {
+    const res = await generate(`Run ${i + 1} of the benchmark.\n\n${text}`, 64)
+    const t = res.timings ?? {}
+    const promptTps = (t.prompt_n / t.prompt_ms) * 1000
+    const decodeTps = (t.predicted_n / t.predicted_ms) * 1000
+    log(
+      `wllama ${gpu ? "WebGPU" : "WASM"} run ${i + 1}: ${t.prompt_n} prompt tokens in ${t.prompt_ms?.toFixed(0)} ms (${promptTps.toFixed(1)} tokens/s), ${t.predicted_n} tokens at ${decodeTps.toFixed(1)} tokens/s`
+    )
+    if (i === 0)
+      log(
+        `reply: ${JSON.stringify((res.choices[0]?.message.content ?? "").slice(0, 160))}`
+      )
+    runs.push({ promptTps, decodeTps, ttftMs: t.prompt_ms })
+  }
+  summarize(`wllama ${gpu ? "WebGPU" : "WASM (CPU)"}, ${model}`, runs)
+  await wllama.exit()
+}
+
+async function main() {
+  log(navigator.userAgent)
+  // Multithreaded WebAssembly (wllama, onnxruntime on the CPU) needs the
+  // page cross-origin isolated (COOP same-origin + COEP require-corp).
+  log(
+    `cross-origin isolated: ${String(globalThis.crossOriginIsolated)}, ${navigator.hardwareConcurrency} logical cores`
+  )
+  // How full the site's storage is: Safari closes a file mid-download when
+  // the site runs out of room.
+  const { usage = 0, quota = 0 } = await navigator.storage.estimate()
+  log(`storage: ${Math.round(usage / 1e6)} of ${Math.round(quota / 1e6)} MB used`)
+  const text = await promptText(Number(params.get("len") ?? 512))
+  const run = params.get("run")
+  if (run === "tjs") await runTjs(text)
+  else if (run === "tjs-cpu") await runTjs(text, true)
+  else if (run === "wllama") await runWllama(text)
+  else if (run === "wllama-cpu") await runWllama(text, false)
+  else if (run === "wllama-pkg") await runWllamaPackage(text)
+  else if (run === "wllama-pkg-cpu") await runWllamaPackage(text, false)
+  else if (run === "webgl") await runWebgl(text)
+  else if (run === "switch") await runSwitch()
+  else log("Pass ?run=tjs, tjs-cpu, wllama or wllama-cpu.")
+}
+
+main().then(
+  () => log("ALL DONE"),
+  (error: unknown) =>
+    log(
+      `ERROR: ${error instanceof Error ? `${error.message}\n${error.stack}` : String(error)}\nALL DONE`
+    )
+)

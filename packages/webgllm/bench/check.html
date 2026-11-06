@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL 2 LFM3 check</title>
+    <style>
+      body {
+        font:
+          12px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      // ?model=…gguf&batch=128&precision=highp&layers=1
+      const params = new URLSearchParams(location.search)
+      const out = document.getElementById("out")
+      // ?jank=1: each line stamped with seconds since load, and at the end
+      // every frame gap over 50 ms with when it was.
+      const stamp = params.get("jank") === "1"
+      const log = (text) => {
+        if (stamp) text = `[${(performance.now() / 1000).toFixed(2)}] ${text}`
+        out.textContent += `${text}\n`
+        void fetch("/log", { method: "POST", body: text }).catch(
+          () => undefined
+        )
+      }
+      log(navigator.userAgent)
+      const worker = new Worker("/bundle/bench/check-worker.js", {
+        type: "module"
+      })
+      // Frame gaps on this page over the window the worker reports (prompt
+      // runs, in absolute time): a stand-in for how much the GPU work
+      // starves the compositor.
+      const frames = []
+      const frame = (t) => {
+        frames.push(performance.timeOrigin + t)
+        if (frames.length > 20000) frames.splice(0, 10000)
+        requestAnimationFrame(frame)
+      }
+      requestAnimationFrame(frame)
+      worker.onmessage = ({ data }) => {
+        if (data.type === "jank") {
+          const report = () => {
+            // Every frame in the window, and one either side of it.
+            const i0 = Math.max(0, frames.findIndex((f) => f >= data.from) - 1)
+            let i1 = frames.findIndex((f) => f > data.to)
+            if (i1 < 0) i1 = frames.length - 1
+            const inside = frames.slice(i0, i1 + 1)
+            const gaps = []
+            for (let i = 1; i < inside.length; i++) gaps.push(inside[i] - inside[i - 1])
+            const sorted = [...gaps].sort((a, b) => a - b)
+            const over = (ms) => gaps.filter((g) => g > ms).length
+            log(
+              `JANK over ${(data.to - data.from).toFixed(0)} ms: ${gaps.length} frames, median ${sorted[Math.floor(sorted.length / 2)]?.toFixed(1)} ms, worst ${sorted[sorted.length - 1]?.toFixed(1)} ms, over 34 ms: ${over(34)}, over 100 ms: ${over(100)}`
+            )
+          }
+          // (Frames up to a second after the window, once they've come.)
+          setTimeout(report, 1200)
+          return
+        }
+        if (data.type === "log") log(data.text)
+        else if (data.type === "error") log(`ERROR: ${data.message}\nALL DONE`)
+        else if (data.type === "done") {
+          if (stamp) {
+            const t0 = performance.timeOrigin
+            const freezes = []
+            for (let i = 1; i < frames.length; i++) {
+              const gap = frames[i] - frames[i - 1]
+              if (gap > 50)
+                freezes.push(`${((frames[i - 1] - t0) / 1000).toFixed(2)}s +${gap.toFixed(0)}ms`)
+            }
+            log(`FREEZES: ${freezes.join(", ") || "none"}`)
+          }
+          log("ALL DONE")
+        }
+      }
+      worker.onerror = (e) => log(`worker error: ${e.message}\nALL DONE`)
+      worker.postMessage({
+        model: params.get("model") ?? "LFM3-1.7B-QAD-Q4_0.gguf",
+        format: params.get("format") ?? "gguf",
+        onnx: params.get("onnx") ?? undefined,
+        graph: params.get("graph") ?? undefined,
+        ring: params.get("ring") !== "0",
+        kvRows: params.get("kvrows") ? Number(params.get("kvrows")) : undefined,
+        noMrt: params.get("nomrt") ? params.get("nomrt").split(",") : undefined,
+        batch: Number(params.get("batch") ?? 128),
+        precision: params.get("precision") ?? "highp",
+        layers: params.get("layers") !== "0",
+        smoke: params.get("smoke") === "1",
+        checks: params.get("checks") !== "0",
+        compare: params.get("compare") ?? undefined,
+        ab: params.get("ab") ?? undefined,
+        abDecode: params.get("abDecode") ?? undefined,
+        attnab: params.get("attnab") ?? undefined,
+        attnAt: params.get("attnAt") ?? undefined,
+        rounds: params.get("rounds") ?? undefined,
+        sweep: params.get("sweep") ?? undefined,
+        tuneab: params.get("tuneab") ?? undefined,
+        rounds: params.get("rounds") ? Number(params.get("rounds")) : undefined,
+        programs: params.get("programs") === "1",
+        chain: params.get("chain") === "1",
+        tune: params.get("tune") ?? undefined,
+        texels: params.get("texels") ?? undefined,
+        question: params.get("q") ?? undefined,
+        length: params.get("len") ? Number(params.get("len")) : undefined,
+        skip: params.get("skip") ? params.get("skip").split(",") : undefined,
+        decodeAt: params.get("decodeAt") ? Number(params.get("decodeAt")) : undefined,
+        alternate: params.get("alternate") === "1",
+        attn: params.get("attn") === "1",
+        linstate: params.get("linstate") ?? undefined,
+        small: params.get("small") === "1",
+        abwrite: params.get("abwrite") === "1",
+        anchor: params.get("anchor") === "1",
+        formats: params.get("formats") ?? undefined
+      })
+    </script>
+  </body>
+</html>

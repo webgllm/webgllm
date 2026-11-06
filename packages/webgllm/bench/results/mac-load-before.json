@@ -1,0 +1,273 @@
+{
+  "mode": "baseline",
+  "complete": true,
+  "results": [
+    {
+      "id": "mac-baseline-calibrate",
+      "cold": true,
+      "at": "2026-11-04T09:11:12.192Z",
+      "loadMs": 1845.2099999189377,
+      "engineLoadMs": 1820,
+      "fullyCalibratedMs": 2653.6200000047684,
+      "fps": 60.15575463219707,
+      "maxFrameMs": 17.644999999999982,
+      "timings": {
+        "context": 7,
+        "files": 2,
+        "weights": 1342,
+        "weightsReading": 970,
+        "weightsUploading": 170,
+        "toRgba4": 7,
+        "repackOnnx": 0,
+        "layoutProbe": 73,
+        "warmUp": 116,
+        "programs": 56,
+        "compileMs": 80,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 353,
+        "total": 1820
+      },
+      "gpuBytes": 1395974528,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "mac-before-cold2",
+      "cold": true,
+      "at": "2026-11-04T11:42:19.496Z",
+      "loadMs": 2159.25,
+      "engineLoadMs": 2127,
+      "fullyCalibratedMs": 2980.2549999952316,
+      "fps": 60.20609007757323,
+      "maxFrameMs": 18.604999999999563,
+      "timings": {
+        "context": 6,
+        "files": 1,
+        "weights": 1640,
+        "weightsReading": 983,
+        "weightsUploading": 463,
+        "toRgba4": 300,
+        "repackOnnx": 0,
+        "layoutProbe": 76,
+        "warmUp": 116,
+        "programs": 55,
+        "compileMs": 81,
+        "warm_batch9": 20,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 364,
+        "total": 2127
+      },
+      "gpuBytes": 1333059968,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "mac-before-cold3",
+      "cold": true,
+      "at": "2026-11-04T11:43:14.847Z",
+      "loadMs": 1858.0749999284744,
+      "engineLoadMs": 1824,
+      "fullyCalibratedMs": 2676.4499999284744,
+      "fps": 60.27743767302793,
+      "maxFrameMs": 18.625,
+      "timings": {
+        "context": 7,
+        "files": 1,
+        "weights": 1340,
+        "weightsReading": 959,
+        "weightsUploading": 186,
+        "toRgba4": 7,
+        "repackOnnx": 0,
+        "layoutProbe": 76,
+        "warmUp": 118,
+        "programs": 56,
+        "compileMs": 78,
+        "warm_batch9": 21,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 4,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": -1,
+        "selfCheck": 357,
+        "total": 1824
+      },
+      "gpuBytes": 1395974528,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "mac-final-before-short",
+      "cold": false,
+      "at": "2026-11-04T11:12:20.044Z",
+      "loadMs": 1423.9650000333786,
+      "engineLoadMs": 1401,
+      "fullyCalibratedMs": 1423.9650000333786,
+      "fps": 60.3947428468987,
+      "maxFrameMs": 18.590000000000146,
+      "timings": {
+        "context": 7,
+        "files": 6,
+        "weights": 1265,
+        "weightsReading": 956,
+        "weightsUploading": 105,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 123,
+        "programs": 56,
+        "compileMs": 78,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1401
+      },
+      "gpuBytes": 1395863936,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "mac-final-before-long",
+      "cold": false,
+      "at": "2026-11-04T11:13:32.111Z",
+      "loadMs": 1489.5,
+      "engineLoadMs": 1462,
+      "fullyCalibratedMs": 1489.5,
+      "fps": 60.42296072507553,
+      "maxFrameMs": 18.6299999999992,
+      "timings": {
+        "context": 6,
+        "files": 4,
+        "weights": 1307,
+        "weightsReading": 996,
+        "weightsUploading": 115,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 146,
+        "programs": 56,
+        "compileMs": 99,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1462
+      },
+      "gpuBytes": 1395863936,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    },
+    {
+      "id": "mac-memory-before-short",
+      "cold": false,
+      "at": "2026-11-04T09:28:22.424Z",
+      "loadMs": 1428.0800000429153,
+      "engineLoadMs": 1392,
+      "fullyCalibratedMs": 1428.0800000429153,
+      "fps": 60.22071592446894,
+      "maxFrameMs": 17.605000000000018,
+      "timings": {
+        "context": 6,
+        "files": 1,
+        "weights": 1269,
+        "weightsReading": 971,
+        "weightsUploading": 100,
+        "toRgba4": 0,
+        "repackOnnx": 0,
+        "warmUp": 116,
+        "programs": 56,
+        "compileMs": 78,
+        "warm_batch9": 22,
+        "warm_pick": 16,
+        "warm_logits": 2,
+        "warm_argmax": 1,
+        "warm_batchF16": 0,
+        "warm_draft": 1,
+        "warm_token": 0,
+        "warm_chunked": 6,
+        "tunedShortSplit": 0,
+        "tunedF16Matmul": -1,
+        "tunedF16Pack": -1,
+        "tunedFlashDecode": 1,
+        "selfCheck": 0,
+        "total": 1392
+      },
+      "gpuBytes": 1395863936,
+      "foregroundValid": true,
+      "visibilityHistory": [
+        {
+          "name": "visible",
+          "startTime": 0
+        }
+      ]
+    }
+  ]
+}

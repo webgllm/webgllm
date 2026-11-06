@@ -1,0 +1,3873 @@
+/**
+ * The model's operations as fragment shaders. Each fragment writes one
+ * texel of the output tensor.
+ *
+ * Tensor layouts (rows are tokens, or cache positions):
+ * - f32: RGBA32F, 4 features per texel: element (row, c) at texel
+ *   (c / 4, row), component c % 4.
+ * - h2: RGBA32UI, 8 halves per texel: element (row, c) at texel
+ *   (c / 8, row), word (c % 8) / 2, low half for even c. Matmul inputs
+ *   and the KV cache use it: half the fetches of f32.
+ * - Quantized weights: see weights.ts. Their textures may be split into
+ *   columns when a matrix has more row groups than a texture is tall:
+ *   row group g is in column g / H at row g % H.
+ */
+
+/*
+ * RGBA4 weight texels hold 4 consecutive weights with the first in the low
+ * nibble (A) and the last in the high one (R): as MatMulNBits stores them,
+ * so its bytes upload as they are. Kernels read them as .wzyx.
+ */
+const HEADER = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
+precision highp isampler2D;
+/* Halves of an h2 texel: elements 0..3 and 4..7. */
+vec4 h2lo(uvec4 u) { return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y)); }
+vec4 h2hi(uvec4 u) { return vec4(unpackHalf2x16(u.z), unpackHalf2x16(u.w)); }
+/* Clamped to half's range: overflow saturates alike on every GPU (the spec
+   leaves packHalf2x16 of a too-large value to the implementation). */
+uvec4 packH2(vec4 a, vec4 b) {
+  a = clamp(a, -65504.0, 65504.0);
+  b = clamp(b, -65504.0, 65504.0);
+  return uvec4(packHalf2x16(a.xy), packHalf2x16(a.zw), packHalf2x16(b.xy), packHalf2x16(b.zw));
+}
+/* Component i of v, as a select: some compilers get v[i] wrong when i
+   varies by fragment. */
+float comp(vec4 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+uint comp(uvec4 v, int i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+/* Texel x (features 4x..4x+3) of token m in a pair tensor. */
+uniform int uPairSplit;
+uniform int uSliceStride;
+vec4 pf(highp usampler2D s, int x, int m) {
+  // A K-split prompt matmul stacks its uPairSplit slices, uSliceStride
+  // rows apart.
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < max(uPairSplit, 1); k++) {
+    uvec4 u = texelFetch(s, ivec2(x, (m >> 1) + k * uSliceStride), 0);
+    acc += (m & 1) == 0 ? h2lo(u) : h2hi(u);
+  }
+  return acc;
+}
+/*
+ * The same from a 4-token matmul's two outputs (see matmulQuad): tokens
+ * 4q, 4q + 1 in a, 4q + 2, 4q + 3 in b, row q (plus its K-slices).
+ */
+vec4 pfq(highp usampler2D a, highp usampler2D b, int x, int m) {
+  vec4 acc = vec4(0.0);
+  int row = m >> 2;
+  bool second = ((m >> 1) & 1) == 1;
+  for (int k = 0; k < max(uPairSplit, 1); k++) {
+    ivec2 p = ivec2(x, row + k * uSliceStride);
+    uvec4 u = second ? texelFetch(b, p, 0) : texelFetch(a, p, 0);
+    acc += (m & 1) == 0 ? h2lo(u) : h2hi(u);
+  }
+  return acc;
+}
+/* The same from a split matmul's uSplitIn partial sums (row m · uSplitIn + s). */
+uniform int uSplitIn;
+vec4 pf(highp sampler2D s, int x, int m) {
+  // A constant bound, so the loop unrolls and the reads go out together.
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < 16; k++) {
+    if (k >= uSplitIn) break;
+    acc += texelFetch(s, ivec2(x, m * uSplitIn + k), 0);
+  }
+  return acc;
+}
+
+`
+
+
+/**
+ * The add's h2(x · next norm weights) is stored divided by this (and the
+ * matmul that reads it multiplies back), so large residuals don't overflow
+ * halves.
+ */
+const PRESCALE = 32
+
+/**
+ * A kernel builder that returns the same string for the same options: a
+ * pass looks its program up by source, and a string built once has its
+ * hash cached, so issuing a pass doesn't rebuild and rehash kilobytes.
+ */
+function memo<A extends Array<unknown>>(
+  build: (...args: A) => string
+): ((...args: A) => string) & { source: string } {
+  const cache = new Map<string, string>()
+  const made = (...args: A) => {
+    const key = JSON.stringify(args)
+    let source = cache.get(key)
+    if (source === undefined) {
+      source = build(...args)
+      cache.set(key, source)
+    }
+    return source
+  }
+  // (The generator's own text, for the engine's code fingerprint.)
+  return Object.assign(made, { source: build.toString() })
+}
+
+export type MatmulOptions = {
+  bits: 4 | 8
+  zeros: boolean
+  /** 4-bit bytes in RGBA8 (normalized: the texture unit converts them) rather than RGBA8UI. */
+  unorm?: boolean
+  /** Scales and zero points packed in one h2 texel (uS: RGBA32UI, scales then zeros); no uZ. */
+  packed?: boolean
+  /**
+   * One input row, its output spread over a 2D texture (the output head:
+   * 32,000 texels is wider than some GPUs allow). Otherwise output texel
+   * (g, m) is row group g of input row m.
+   */
+  wrap: boolean
+  /** Precision of the per-block sums (accumulators stay highp). */
+  precision: "highp" | "mediump"
+  /**
+   * Weights in byte textures (RGBA8UI, or RGBA8I for 8-bit): the texture
+   * unit splits the bytes and nibbles split with float math. Otherwise
+   * RGBA32UI texels, split with integer shifts.
+   */
+  bytes: boolean
+  /**
+   * Split K across fragments (for a few rows, where N / 4 fragments would
+   * leave the GPU idle): output row m * uSplit + s holds slice s's partial
+   * sums, over blocks [s * uKbSlice, (s + 1) * uKbSlice); consumers add
+   * them up (pf's sampler2D overload).
+   */
+  split?: boolean
+  /**
+   * Write a pair tensor: fragment (g, y) computes tokens 2y and 2y + 1
+   * (for layer weights not in RGBA4: 8-bit).
+   */
+  pair?: boolean
+  /**
+   * With `split`: read h2(x · norm weights) the add drew at column uAOff of
+   * uA, and apply the row's 1 / RMS (from uR's sums of squares) last, as
+   * matmulSplitRgba4's "prescaled" does.
+   */
+  normed?: false | "prescaled"
+  /** With `split`: output texel x holds row group x - uGx0 (a region of a shared target). */
+  offset?: boolean
+}
+
+/**
+ * out = A · Wᵀ for h2 activations A (rows × K) and quantized W (N × K).
+ * Uniforms: uKb (blocks per row), uH (row groups per weight column),
+ * uRowTexels (quant texels per row group per column), uG (row groups);
+ * with `wrap`, uOutW (output texels per row) and uLogitRows (output rows
+ * per input row: rows of the input are stacked that many output rows apart).
+ */
+function matmulSource(o: MatmulOptions) {
+  const P = o.precision === "mediump" ? "mediump " : ""
+  const rows = [0, 1, 2, 3]
+  const body: Array<string> = []
+  const line = (s: string) => body.push(`    ${s}`)
+  if (o.packed) {
+    line(`uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(`vec4 d = h2lo(sz);`)
+    line(`vec4 z = h2hi(sz);`)
+  } else {
+    line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    if (o.zeros) line(`vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`)
+  }
+  const aOff = o.normed === "prescaled" ? "uAOff + " : ""
+  for (const j of [0, 1, 2, 3]) {
+    line(`uvec4 a${j} = texelFetch(uA, ivec2(${aOff}kb * 4 + ${j}, m), 0);`)
+    line(`${P}vec4 A${2 * j} = h2lo(a${j});`)
+    line(`${P}vec4 A${2 * j + 1} = h2hi(a${j});`)
+  }
+  if (o.bits === 4) {
+    line(
+      `${P}float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`
+    )
+    for (const r of rows) {
+      line(`{`)
+      if (!o.bytes)
+        line(`  uvec4 w = texelFetch(uW, ivec2(wx + kb * 4 + ${r}, gr), 0);`)
+      line(`  ${P}float b = 0.0;`)
+      for (const w of [0, 1, 2, 3]) {
+        const c = "xyzw"[w]
+        if (o.bytes) {
+          // Bytes 4w..4w+3 of the block row: low nibbles are weights
+          // 4w..4w+3, high nibbles 16+4w.., split exactly in floats.
+          line(
+            o.unorm
+              ? `  { ${P}vec4 B = floor(texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0) * 255.0 + 0.5);`
+              : `  { ${P}vec4 B = vec4(texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0));`
+          )
+          line(`    ${P}vec4 hi = floor(B * 0.0625);`)
+          line(`    ${P}vec4 lo = B - 16.0 * hi;`)
+        } else {
+          line(
+            `  { ${P}vec4 lo = vec4((uvec4(w.${c}) >> uvec4(0u, 8u, 16u, 24u)) & 15u);`
+          )
+          line(
+            `    ${P}vec4 hi = vec4((uvec4(w.${c}) >> uvec4(4u, 12u, 20u, 28u)) & 15u);`
+          )
+        }
+        line(`    b += dot(lo, A${w}) + dot(hi, A${w + 4}); }`)
+      }
+      const zero = o.zeros || o.packed ? `z.${"xyzw"[r]}` : "8.0"
+      line(
+        `  acc.${"xyzw"[r]} += d.${"xyzw"[r]} * (float(b) - ${zero} * float(sa));`
+      )
+      line(`}`)
+    }
+  } else {
+    // 8-bit: word w of a block row holds weights 4w..4w+3 as signed bytes.
+    for (const r of rows) {
+      line(`{`)
+      if (!o.bytes) {
+        line(
+          `  uvec4 w0 = texelFetch(uW, ivec2(wx + kb * 8 + ${r * 2}, gr), 0);`
+        )
+        line(
+          `  uvec4 w1 = texelFetch(uW, ivec2(wx + kb * 8 + ${r * 2 + 1}, gr), 0);`
+        )
+      }
+      line(`  ${P}float b = 0.0;`)
+      for (const w of [0, 1, 2, 3, 4, 5, 6, 7]) {
+        if (o.bytes) {
+          line(
+            `  { ${P}vec4 q = vec4(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + w}, gr), 0)); b += dot(q, A${w}); }`
+          )
+        } else {
+          const word = `w${w >> 2}.${"xyzw"[w & 3]}`
+          line(
+            `  { ${P}vec4 q = vec4(ivec4(uvec4(${word}) << uvec4(24u, 16u, 8u, 0u)) >> 24); b += dot(q, A${w}); }`
+          )
+        }
+      }
+      line(`  acc.${"xyzw"[r]} += d.${"xyzw"[r]} * float(b);`)
+      line(`}`)
+    }
+  }
+  const index = o.wrap
+    ? `int m = y / uLogitRows;
+  y -= m * uLogitRows;
+  int g = y * uOutW + x;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int kb0 = 0;
+  int kb1 = uKb;`
+    : o.split
+      ? `int g = x${o.offset ? " - uGx0" : ""};
+  int m = y / uSplit;
+  int slice = y - m * uSplit;
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);`
+      : `int g = x;
+  int m = y;
+  int kb0 = 0;
+  int kb1 = uKb;`
+  const weights =
+    o.bytes && o.bits === 8 ? "isampler2D" : o.unorm ? "sampler2D" : "usampler2D"
+  return `${HEADER}${o.normed === "prescaled" ? `${RMS_SCALE}\nuniform int uAOff;` : ""}
+${o.offset ? "uniform int uGx0;" : ""}
+uniform usampler2D uA;
+uniform ${weights} uW;
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uLogitRows;
+uniform int uSplit;
+uniform int uKbSlice;
+out ${o.pair ? "uvec4" : "vec4"} o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  ${o.pair ? "vec4 r0 = vec4(0.0);\n  for (int tt = 0; tt < 2; tt++) {\n  int g = x;\n  int m = 2 * y + tt;\n  int kb0 = 0;\n  int kb1 = uKb;" : index}
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc = vec4(0.0);
+  for (int kb = kb0; kb < kb1; kb++) {
+${body.join("\n")}
+  }
+  ${o.pair ? "if (tt == 0) r0 = acc;\n  else o = packH2(r0, acc);\n  }" : o.normed === "prescaled" ? `o = acc * (rmsScale(m) * ${PRESCALE}.0);` : "o = acc;"}
+}`
+}
+
+/**
+ * The prompt matmul for 4-bit weights in RGBA4 textures (texel
+ * (column · uRowTexels + kb · 32 + r · 8 + j, row group) holds row r's
+ * weights 32kb + 4j .. + 3 as q / 15: the texture unit splits the nibbles
+ * and converts them, exactly). Each fragment computes one row group (4 rows)
+ * for two tokens, 2y and 2y + 1, into one pair texel: half the weight
+ * fetches of one token per fragment, in the 16 bytes a fragment can write
+ * without slowing down. Sums are f32: per block d · (Σ q·a − zero · Σ a).
+ */
+function matmulPairSource(o: { zeros: boolean }) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+  line(
+    o.zeros
+      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+      : `const vec4 z = vec4(8.0);`
+  )
+  line(`vec4 b0 = vec4(0.0); vec4 b1 = vec4(0.0); float s0 = 0.0; float s1 = 0.0;`)
+  for (let j = 0; j < 8; j++) {
+    line(`{`)
+    for (const r of [0, 1, 2, 3])
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx;`)
+    const half = j & 1 ? "h2hi" : "h2lo"
+    for (const t of [0, 1]) {
+      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`    s${t} += dot(a, vec4(1.0));`)
+      line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+    }
+    line(`}`)
+  }
+  line(`acc0 += d * (15.0 * b0 - z * s0);`)
+  line(`acc1 += d * (15.0 * b1 - z * s1);`)
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uSliceRows;
+uniform int uKbSlice;
+out uvec4 o;
+void main() {
+  // K split into slices stacked in the output: slice s's partial sums for
+  // pair row py are at row s · uSliceRows + py (pf adds them up).
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 2 * (y - slice * uSliceRows);
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+  }
+  o = packH2(acc0, acc1);
+}`
+}
+
+/**
+ * The prompt matmul for RGBA4 weights with four tokens per fragment (see
+ * matmulPair): twice the multiplies per weight read. Tokens 4q, 4q + 1 go
+ * to output 0 and 4q + 2, 4q + 3 to output 1, as pair texels, at row
+ * s · uSliceRows + q for K-slice s (pfq reads them).
+ */
+function matmulQuadSource(o: { zeros: boolean }) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+  line(
+    o.zeros
+      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+      : `const vec4 z = vec4(8.0);`
+  )
+  line(
+    `vec4 b0 = vec4(0.0); vec4 b1 = vec4(0.0); vec4 b2 = vec4(0.0); vec4 b3 = vec4(0.0);`
+  )
+  line(`float s0 = 0.0; float s1 = 0.0; float s2 = 0.0; float s3 = 0.0;`)
+  for (let j = 0; j < 8; j++) {
+    line(`{`)
+    for (const r of [0, 1, 2, 3])
+      line(`  vec4 w${r} = texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx;`)
+    const half = j & 1 ? "h2hi" : "h2lo"
+    for (const t of [0, 1, 2, 3]) {
+      line(`  { vec4 a = ${half}(texelFetch(uA, ivec2(kb * 4 + ${j >> 1}, m0 + ${t}), 0));`)
+      line(`    s${t} += dot(a, vec4(1.0));`)
+      line(`    b${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+    }
+    line(`}`)
+  }
+  for (const t of [0, 1, 2, 3]) line(`acc${t} += d * (15.0 * b${t} - z * s${t});`)
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uSliceRows;
+uniform int uKbSlice;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out uvec4 o1;
+void main() {
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 4 * (y - slice * uSliceRows);
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  vec4 acc2 = vec4(0.0);
+  vec4 acc3 = vec4(0.0);
+  for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+  }
+  o0 = packH2(acc0, acc1);
+  o1 = packH2(acc2, acc3);
+}`
+}
+
+/**
+ * RGBA4 weights (see matmulQuad's layout) dequantized to f16 for the f16
+ * prompt matmul: texel (c · uKq + kq, y) holds row c · uHd + y's weights
+ * 4kq .. 4kq + 3, (q − zero) · scale. Rows past the matrix are zero.
+ */
+function dequantRgba4Source(o: { zeros: boolean; h2?: boolean }) {
+  return dequantOut(o.h2, `${HEADER}
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq + uKq0;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  vec4 w = texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0).wzyx;
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  float z = ${o.zeros ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))" : "8.0"};
+  o = (15.0 * w - z) * d;
+}`)
+}
+
+/**
+ * DEQUANT_RGBA4 for 4-bit weights in byte texels (RGBA8UI: texel
+ * (kb · 16 + r · 4 + w) of a row group holds row r's bytes 4w .. 4w + 3,
+ * low nibbles weights 4w + i, high nibbles 16 + 4w + i) or, with `words`,
+ * RGBA32UI (texel kb · 4 + r, word w those 4 bytes).
+ */
+function dequantBytesSource(o: {
+  zeros: boolean
+  words: boolean
+  unorm?: boolean
+  packed?: boolean
+  /** h2 output texels (see dequantOut). */
+  h2?: boolean
+}) {
+  return dequantOut(o.h2, `${HEADER}
+uniform ${o.unorm ? "sampler2D" : "usampler2D"} uW;
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq + uKq0;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  int w = j & 3;
+  ${
+    o.words
+      ? `uint word = comp(texelFetch(uW, ivec2(col * uRowTexels + kb * 4 + r, gr), 0), w);
+  uvec4 b = (uvec4(word) >> uvec4(0u, 8u, 16u, 24u)) & 255u;`
+      : o.unorm
+        ? `uvec4 b = uvec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + w, gr), 0) * 255.0 + 0.5);`
+        : `uvec4 b = texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + w, gr), 0);`
+  }
+  vec4 q = vec4(j < 4 ? b & 15u : b >> 4u);
+  ${
+    o.packed
+      ? `uvec4 sz = texelFetch(uS, ivec2(col * uKb + kb, gr), 0);
+  float d = comp(h2lo(sz), r);
+  float z = comp(h2hi(sz), r);`
+      : `float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  float z = ${o.zeros ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))" : "8.0"};`
+  }
+  o = (q - z) * d;
+}`)
+}
+
+/**
+ * A dequantization kernel (texel x of the f16 layout, RGBA16F) as is, or
+ * with `h2` writing texels 2x' and 2x' + 1 of each column as one h2 texel x'
+ * (RGBA32UI, 8 halves: columns uKq / 2 texels wide). The kernel's main
+ * becomes a function of the texel, called twice.
+ */
+function dequantOut(h2: boolean | undefined, source: string) {
+  if (!h2) return source
+  const head = `out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);`
+  const skip = "if (row >= uN) { o = vec4(0.0); return; }"
+  const last = /\n {2}o = ([^;]*);\n}$/
+  if (!source.includes(head) || !source.includes(skip) || !last.test(source))
+    throw new Error("dequantOut: unexpected kernel")
+  return (
+    source
+      .replace(head, "vec4 deq(int x, int y) {")
+      .replace(skip, "if (row >= uN) return vec4(0.0);")
+      .replace(last, "\n  return $1;\n}") +
+    `
+out uvec4 o;
+void main() {
+  int hk = uKq >> 1;
+  int x2 = int(gl_FragCoord.x);
+  int c = x2 / hk;
+  int x = c * uKq + 2 * (x2 - c * hk);
+  int y = int(gl_FragCoord.y);
+  o = packH2(deq(x, y), deq(x + 1, y));
+}`
+  )
+}
+
+/** h2 activations (8 halves a texel) as RGBA16F (4 a texel), for the f16 matmul. */
+export const H2_TO_F16 = `${HEADER}
+uniform usampler2D uA;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  uvec4 u = texelFetch(uA, ivec2(x / 2, int(gl_FragCoord.y)), 0);
+  o = (x & 1) == 1 ? h2hi(u) : h2lo(u);
+}`
+
+/**
+ * The prompt matmul on f16 weights (DEQUANT_RGBA4's layout) and RGBA16F
+ * activations: 4 rows × 4 tokens per fragment, nothing but dots in the
+ * loop; with `half`, each dot in mediump (full rate where the GPU has
+ * half-precision ALUs), added up in highp. Output as matmulQuad's: tokens 4q, 4q + 1 to o0
+ * and 4q + 2, 4q + 3 to o1, at row s · uSliceRows + q for K-slice s.
+ *
+ * `packed` (TUNING.f16Pack) reads h2 texels, 8 halves a fetch rather than
+ * 4, split by unpackHalf2x16: bit 1 the activations straight from the h2
+ * tensor (no RGBA16F copy), bit 2 the weights in dequantOut's h2 layout.
+ */
+function matmulF16Source(o: { half: boolean; packed?: number }) {
+  const P = o.half ? "mediump " : ""
+  if (o.packed) return matmulF16PackedSource(o.half, o.packed)
+  return `${HEADER}
+uniform ${P}sampler2D uW;
+uniform ${P}sampler2D uA;
+uniform int uKq;
+uniform int uHd;
+uniform int uSliceRows;
+uniform int uKqSlice;
+uniform int uRow0;
+uniform int uKq0;
+uniform int uKqW;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out uvec4 o1;
+void main() {
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 4 * (y - slice * uSliceRows);
+  int row = 4 * g - uRow0;
+  int c = row / uHd;
+  int wx = c * uKqW - uKq0;
+  int wy = row - c * uHd;
+  int kq0 = slice * uKqSlice;
+  int kq1 = min(uKq, kq0 + uKqSlice);
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  vec4 acc2 = vec4(0.0);
+  vec4 acc3 = vec4(0.0);
+  for (int kq = kq0; kq < kq1; kq++) {
+    ${P}vec4 w0 = texelFetch(uW, ivec2(wx + kq, wy), 0);
+    ${P}vec4 w1 = texelFetch(uW, ivec2(wx + kq, wy + 1), 0);
+    ${P}vec4 w2 = texelFetch(uW, ivec2(wx + kq, wy + 2), 0);
+    ${P}vec4 w3 = texelFetch(uW, ivec2(wx + kq, wy + 3), 0);
+    ${P}vec4 a;
+    a = texelFetch(uA, ivec2(kq, m0), 0);
+    acc0 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 1), 0);
+    acc1 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 2), 0);
+    acc2 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+    a = texelFetch(uA, ivec2(kq, m0 + 3), 0);
+    acc3 += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+  }
+  o0 = packH2(acc0, acc1);
+  o1 = packH2(acc2, acc3);
+}`
+}
+
+/** matmulF16 reading h2 texels (see its `packed`): two K texels a step. */
+function matmulF16PackedSource(half: boolean, packed: number) {
+  const P = half ? "mediump " : ""
+  const hA = (packed & 1) !== 0
+  const hW = (packed & 2) !== 0
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  for (const r of [0, 1, 2, 3])
+    if (hW) line(`uvec4 W${r} = texelFetch(uW, ivec2((wx + kq) >> 1, wy + ${r}), 0);`)
+  for (const t of [0, 1, 2, 3])
+    if (hA) line(`uvec4 A${t} = texelFetch(uA, ivec2(kq >> 1, m0 + ${t}), 0);`)
+  for (const u of [0, 1]) {
+    const h = u ? "h2hi" : "h2lo"
+    line(`{`)
+    for (const r of [0, 1, 2, 3])
+      line(
+        hW
+          ? `  ${P}vec4 w${r} = ${h}(W${r});`
+          : `  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + kq + ${u}, wy + ${r}), 0);`
+      )
+    for (const t of [0, 1, 2, 3]) {
+      line(
+        hA
+          ? `  { ${P}vec4 a = ${h}(A${t});`
+          : `  { ${P}vec4 a = texelFetch(uA, ivec2(kq + ${u}, m0 + ${t}), 0);`
+      )
+      line(`    acc${t} += vec4(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }`)
+    }
+    line(`}`)
+  }
+  return `${HEADER}
+uniform ${hW ? "usampler2D" : `${P}sampler2D`} uW;
+uniform ${hA ? "usampler2D" : `${P}sampler2D`} uA;
+uniform int uKq;
+uniform int uHd;
+uniform int uSliceRows;
+uniform int uKqSlice;
+uniform int uRow0;
+uniform int uKq0;
+uniform int uKqW;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out uvec4 o1;
+void main() {
+  int g = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int slice = y / uSliceRows;
+  int m0 = 4 * (y - slice * uSliceRows);
+  int row = 4 * g - uRow0;
+  int c = row / uHd;
+  int wx = c * uKqW - uKq0;
+  int wy = row - c * uHd;
+  // (Slices are whole blocks, 8 K texels each, and wx a multiple of uKq:
+  // every step starts on an even texel.)
+  int kq0 = slice * uKqSlice;
+  int kq1 = min(uKq, kq0 + uKqSlice);
+  vec4 acc0 = vec4(0.0);
+  vec4 acc1 = vec4(0.0);
+  vec4 acc2 = vec4(0.0);
+  vec4 acc3 = vec4(0.0);
+  for (int kq = kq0; kq < kq1; kq += 2) {
+${L.join("\n")}
+  }
+  o0 = packH2(acc0, acc1);
+  o1 = packH2(acc2, acc3);
+}`
+}
+
+/**
+ * The few-token matmul for RGBA4 weights (see `matmulPair`), split along K:
+ * output row m · uSplit + s holds row group x's partial sums for token m
+ * over blocks [s · uKbSlice, (s + 1) · uKbSlice); pf adds them up. One
+ * token per fragment: a fragment writing several tokens' sums (several
+ * outputs) runs slower than their own fragments reading the same weights.
+ */
+function matmulSplitRgba4Source(o: {
+  zeros: boolean
+  /**
+   * 4-bit weights in byte texels (RGBA8UI, as dequantBytes reads them)
+   * rather than RGBA4: half the fetches, nibbles split in floats.
+   */
+  bytes?: boolean
+  /** With bytes: in RGBA8 (normalized) rather than RGBA8UI. */
+  unorm?: boolean
+  /** Scales and zero points in one h2 texel (see MatmulOptions.packed). */
+  packed?: boolean
+  /**
+   * Apply the RMS norm to the residual: "weights" reads the f32 residual
+   * and multiplies by the norm weights (uNorm) here, "prescaled" reads
+   * h2(x · weights) the add drew at column uAOff of uA. Either way the
+   * row's 1 / RMS (from the residual uR's sums of squares) is applied last.
+   */
+  normed?: false | "weights" | "prescaled"
+  /** Output texel x holds row group x - uGx0 (a region of a shared target). */
+  offset?: boolean
+  /** Stream a weight column at a time, keeping two activation vectors live. */
+  stream?: boolean
+}) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  if (o.packed) {
+    line(`uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(`vec4 d = h2lo(sz);`)
+    line(`vec4 z = h2hi(sz);`)
+  } else {
+    line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+    line(
+      o.zeros
+        ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+        : `const vec4 z = vec4(8.0);`
+    )
+  }
+  if (!o.stream || !o.bytes) {
+    if (o.normed === "weights") {
+      // x · norm weights from the f32 residual; the row's 1 / RMS is applied
+      // to the sums at the end (it's the same for the whole row).
+      for (let j = 0; j < 8; j++)
+        line(
+          `vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
+        )
+    } else if (o.normed === "prescaled") {
+      for (const j of [0, 1, 2, 3]) {
+        line(
+          `uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, m), 0);`
+        )
+        line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+      }
+    } else
+      for (const j of [0, 1, 2, 3]) {
+        line(`uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, m), 0);`)
+        line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+      }
+    line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
+  } else line(`float sa = 0.0;`)
+  line(`vec4 b = vec4(0.0);`)
+  if (o.bytes) {
+    // Byte texel kb · 16 + r · 4 + w: row r's weights 4w + i (low
+    // nibbles) and 16 + 4w + i (high). With byte B = lo + 16 hi,
+    // lo · A_w + hi · A_w+4 = B · A_w + hi · (A_w+4 − 16 A_w): the
+    // difference once per block, then a floor and two dots per texel.
+    // Texel column w at a time: its helper lives only while its four
+    // rows' bytes are read (fewer registers live through the block).
+    // Normalized bytes come as B / 255: B · A sums go in bb, times 255
+    // once a block; hi = floor(B / 16) as floor(B' · 255 / 16 + 1 / 32).
+    line(`vec4 bb = vec4(0.0);`)
+    for (const w of [0, 1, 2, 3]) {
+      line(`{`)
+      if (o.stream) {
+        for (const j of [w, w + 4]) {
+          if (o.normed === "weights")
+            line(
+              `  vec4 A${j} = texelFetch(uA, ivec2(kb * 8 + ${j}, m), 0) * texelFetch(uNorm, ivec2(kb * 8 + ${j}, 0), 0);`
+            )
+          else
+            line(
+              `  vec4 A${j} = ${j & 1 ? "h2hi" : "h2lo"}(texelFetch(uA, ivec2(${o.normed === "prescaled" ? "uAOff + " : ""}kb * 4 + ${j >> 1}, m), 0));`
+            )
+        }
+        line(`  sa += dot(A${w} + A${w + 4}, vec4(1.0));`)
+      }
+      line(`  vec4 C = A${w + 4} - 16.0 * A${w};`)
+      for (const r of [0, 1, 2, 3]) {
+        const fetch = `texelFetch(uW, ivec2(wx + kb * 16 + ${r * 4 + w}, gr), 0)`
+        line(
+          o.unorm ? `  { vec4 B = ${fetch};` : `  { vec4 B = vec4(${fetch});`
+        )
+        line(`    bb.${"xyzw"[r]} += dot(B, A${w});`)
+        line(
+          `    b.${"xyzw"[r]} += dot(floor(${o.unorm ? "B * 15.9375 + 0.03125" : "B * 0.0625"}), C); }`
+        )
+      }
+      line(`}`)
+    }
+    line(o.unorm ? `b += 255.0 * bb;` : `b += bb;`)
+    line(`acc += d * (b - z * sa);`)
+  } else {
+    for (const r of [0, 1, 2, 3]) {
+      const terms = Array.from(
+        { length: 8 },
+        (_, j) =>
+          `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
+      )
+      line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
+    }
+    line(`acc += d * (15.0 * b - z * sa);`)
+  }
+  const inputs =
+    o.normed === "weights"
+      ? `${RMS_SCALE}\nuniform sampler2D uA;\nuniform sampler2D uNorm;`
+      : o.normed === "prescaled"
+        ? `${RMS_SCALE}\nuniform usampler2D uA;\nuniform int uAOff;`
+        : "uniform usampler2D uA;"
+  return `${HEADER}${inputs}
+uniform ${o.bytes && !o.unorm ? "usampler2D" : "sampler2D"} uW;
+uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
+${o.zeros && !o.packed ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uSplit;
+uniform int uKbSlice;
+${o.offset ? "uniform int uGx0;" : ""}
+out vec4 o;
+void main() {
+  int g = int(gl_FragCoord.x)${o.offset ? " - uGx0" : ""};
+  int y = int(gl_FragCoord.y);
+  int m = y / uSplit;
+  int slice = y - m * uSplit;
+  int kb0 = slice * uKbSlice;
+  int kb1 = min(uKb, kb0 + uKbSlice);
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc = vec4(0.0);
+  for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+  }
+  o = ${
+    o.normed === "prescaled"
+      ? `acc * (rmsScale(m) * ${PRESCALE}.0)`
+      : o.normed
+        ? "acc * rmsScale(m)"
+        : "acc"
+  };
+}`
+}
+
+/**
+ * The output head for RGBA4 weights (see `matmulPair`): one token (row 0
+ * of uA), output spread over uOutW-wide rows (the vocabulary is wider than
+ * a texture). Texel (x, s · uSliceRows + y) holds row group y · uOutW + x's
+ * sums over blocks [s · uKbSlice, (s + 1) · uKbSlice); HEAD_SUM adds the
+ * slices when there's more than one.
+ */
+function headRgba4Source(o: {
+  zeros: boolean
+  /**
+   * Read the last add's h2(x · final norm weights / PRESCALE) from row
+   * uRowA0 + r, column uAOff, and apply the row's 1 / RMS (from uR) last,
+   * instead of normalized h2 activations from row r.
+   */
+  prescaled?: boolean
+}) {
+  const L: Array<string> = []
+  const line = (s: string) => L.push(`    ${s}`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);`)
+  line(
+    o.zeros
+      ? `vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));`
+      : `const vec4 z = vec4(8.0);`
+  )
+  for (const j of [0, 1, 2, 3]) {
+    line(
+      o.prescaled
+        ? `uvec4 a${j} = texelFetch(uA, ivec2(uAOff + kb * 4 + ${j}, uRowA0 + r), 0);`
+        : `uvec4 a${j} = texelFetch(uA, ivec2(kb * 4 + ${j}, r), 0);`
+    )
+    line(`vec4 A${2 * j} = h2lo(a${j}); vec4 A${2 * j + 1} = h2hi(a${j});`)
+  }
+  line(`float sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4(1.0));`)
+  line(`vec4 b = vec4(0.0);`)
+  for (const r of [0, 1, 2, 3]) {
+    const terms = Array.from(
+      { length: 8 },
+      (_, j) => `dot(texelFetch(uW, ivec2(wx + kb * 32 + ${r * 8 + j}, gr), 0).wzyx, A${j})`
+    )
+    line(`b.${"xyzw"[r]} = ${terms.join(" + ")};`)
+  }
+  line(`acc += d * (15.0 * b - z * sa);`)
+  return `${HEADER}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uSliceRows;
+uniform int uKbSlice;
+uniform int uRows;
+${o.prescaled ? `${RMS_SCALE}\nuniform int uAOff;\nuniform int uRowA0;` : ""}
+out vec4 o;
+void main() {
+  // Row (slice · uRows + r) · uSliceRows + yl: token r's slice.
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int block = y / uSliceRows;
+  int slice = block / uRows;
+  int r = block - slice * uRows;
+  int g = (y - block * uSliceRows) * uOutW + x;
+  vec4 acc = vec4(0.0);
+  if (g < uG) {
+    int kb0 = slice * uKbSlice;
+    int kb1 = min(uKb, kb0 + uKbSlice);
+    int col = g / uH;
+    int gr = g - col * uH;
+    int wx = col * uRowTexels;
+    int sx = col * uKb;
+    for (int kb = kb0; kb < kb1; kb++) {
+${L.join("\n")}
+    }
+  }
+  o = ${o.prescaled ? `acc * (rmsScale(uRowA0 + r) * ${PRESCALE}.0)` : "acc"};
+}`
+}
+
+/**
+ * The embedding for a few tokens with the extras an add draws (see
+ * addScaled): `part` "values" is the embedding rows, "rms" their partial
+ * sums of squares (from column uBase), "scaled" h2(x · layer 0's norm
+ * weights / PRESCALE) into output 1 (from column uBase), so layer 0's split
+ * matmuls fold its norm too. RGBA4 embeddings; outputs as the add's.
+ */
+function embedFoldSource(o: { zeros: boolean; part: "values" | "rms" | "scaled" }) {
+  const zero = o.zeros
+    ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))"
+    : "8.0"
+  const main =
+    o.part === "values"
+      ? `o = embedTexel(x, y);
+  o2 = uvec4(0u);`
+      : o.part === "rms"
+        ? `int p = x - uBase;
+  int i0 = p * uChunk;
+  int i1 = min(uTexels, i0 + uChunk);
+  vec4 s = vec4(0.0);
+  for (int i = i0; i < i1; i++) {
+    vec4 v = embedTexel(i, y);
+    s += v * v;
+  }
+  o = s;
+  o2 = uvec4(0u);`
+        : `int j = x - uBase;
+  vec4 a = embedTexel(2 * j, y) * texelFetch(uNext, ivec2(2 * j, 0), 0);
+  vec4 b = embedTexel(2 * j + 1, y) * texelFetch(uNext, ivec2(2 * j + 1, 0), 0);
+  o = vec4(0.0);
+  o2 = packH2(a * (1.0 / ${PRESCALE}.0), b * (1.0 / ${PRESCALE}.0));`
+  return `${HEADER}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform sampler2D uNext;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uBase;
+uniform int uChunk;
+uniform int uTexels;
+layout(location = 0) out vec4 o;
+layout(location = 1) out uvec4 o2;
+vec4 embedTexel(int x, int y) {
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = x * 4;
+  int kb = c >> 5;
+  int j = c & 31;
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0).wzyx + 0.5);
+  return d * (q - ${zero});
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  ${main}
+}`
+}
+
+/**
+ * The output head's slices (see `headRgba4`) added up: texel (x, y) of
+ * token y / uSliceRows.
+ */
+export const HEAD_SUM = `${HEADER}
+uniform sampler2D uP;
+uniform int uSplit;
+uniform int uSliceRows;
+uniform int uRows;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 acc = vec4(0.0);
+  for (int s = 0; s < uSplit; s++)
+    acc += texelFetch(uP, ivec2(p.x, p.y + s * uRows * uSliceRows), 0);
+  o = acc;
+}`
+
+/**
+ * A split gate|up matmul's slices summed and through SwiGLU, straight into
+ * the h2 activations: texel (x, m) holds silu(gate) · up for features
+ * 8x..8x+7 of token m (gate texel t, up texel uHalf + t).
+ */
+export const REDUCE_SWIGLU = `${HEADER}
+uniform sampler2D uP;
+uniform int uHalf;
+out uvec4 o;
+vec4 silu(vec4 g) { return g / (1.0 + exp(-g)); }
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 a = silu(pf(uP, 2 * x, m)) * pf(uP, uHalf + 2 * x, m);
+  vec4 b = silu(pf(uP, 2 * x + 1, m)) * pf(uP, uHalf + 2 * x + 1, m);
+  o = packH2(a, b);
+}`
+
+/** A pair tensor as f32 (for probes): texel (x, m). */
+export const PAIR_TO_F32 = `${HEADER}
+uniform usampler2D uX;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  o = pf(uX, p.x, p.y);
+}`
+
+/**
+ * Embedding rows for token ids (uIds: R32UI, one id per row) from the
+ * quantized embedding: f32 output, 4 features per texel.
+ */
+function embedSource(o: {
+  bits: 4 | 8
+  zeros: boolean
+  bytes: boolean
+  rgba4?: boolean
+}) {
+  const zero = o.zeros
+    ? "float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))"
+    : "8.0"
+  let fetch: string
+  if (o.rgba4) {
+    // Texel kb · 32 + r · 8 + j / 4: row r's weights 32kb + j .. + 3, as q / 15.
+    fetch = `vec4 q = floor(15.0 * texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0).wzyx + 0.5);
+  o = d * (q - ${zero});`
+  } else if (o.bits === 4 && o.bytes) {
+    fetch = `int word = j < 16 ? j >> 2 : (j - 16) >> 2;
+  vec4 B = vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 16 + r * 4 + word, gr), 0));
+  vec4 hi = floor(B * 0.0625);
+  vec4 q = j < 16 ? B - 16.0 * hi : hi;
+  o = d * (q - ${zero});`
+  } else if (o.bits === 4) {
+    fetch = `uvec4 t = texelFetch(uW, ivec2(col * uRowTexels + kb * 4 + r, gr), 0);
+  uint word = comp(t, j < 16 ? j >> 2 : (j - 16) >> 2);
+  uvec4 shifts = j < 16 ? uvec4(0u, 8u, 16u, 24u) : uvec4(4u, 12u, 20u, 28u);
+  vec4 q = vec4((uvec4(word) >> shifts) & 15u);
+  o = d * (q - ${zero});`
+  } else if (o.bytes) {
+    fetch = `o = d * vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + (j >> 2), gr), 0));`
+  } else {
+    fetch = `uvec4 t = texelFetch(uW, ivec2(col * uRowTexels + kb * 8 + r * 2 + (j >> 4), gr), 0);
+  uint word = comp(t, (j & 15) >> 2);
+  vec4 q = vec4(ivec4(uvec4(word) << uvec4(24u, 16u, 8u, 0u)) >> 24);
+  o = d * q;`
+  }
+  return `${HEADER}
+uniform usampler2D uIds;
+uniform ${o.rgba4 ? "sampler2D" : o.bytes && o.bits === 8 ? "isampler2D" : "usampler2D"} uW;
+uniform sampler2D uS;
+${o.zeros ? "uniform usampler2D uZ;" : ""}
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = x * 4;
+  int kb = c >> 5;
+  int j = c & 31;
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  ${fetch}
+}`
+}
+
+/**
+ * The RoPE table's two parts (see Engine.ropeTable): positions below this,
+ * and multiples of it; headPrep adds a position's two angles.
+ */
+export const ROPE_LOW = 1024
+
+/** Pixels per row that each sum a slice of the row's squares (RMS_PARTIAL). */
+export const RMS_PARTS = 64
+
+/**
+ * Partial sums of squares: pixel (p, m) sums texels [p·uChunk, (p+1)·uChunk)
+ * of row m. The norms add up the RMS_PARTS partials, so no pixel walks a
+ * whole row.
+ */
+/**
+ * `kind`: x is f32, a pair tensor, or a split matmul's partial sums
+ * (read through pf).
+ */
+function rmsPartialSource(kind: "f32" | "pair" | "split") {
+  const pair = kind !== "f32"
+  return `${HEADER}
+uniform ${kind === "pair" ? "usampler2D" : "sampler2D"} uX;
+uniform int uTexels;
+uniform int uChunk;
+out vec4 o;
+void main() {
+  int p = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int i0 = p * uChunk;
+  int i1 = min(uTexels, i0 + uChunk);
+  vec4 s = vec4(0.0);
+  // Unrolled 4 at a time, so the reads go out together.
+  for (int i = i0; i < i1; i += 4) {
+    for (int k = 0; k < 4; k++) {
+      if (i + k >= i1) break;
+      vec4 v = ${pair ? "pf(uX, i + k, m)" : "texelFetch(uX, ivec2(i + k, m), 0)"};
+      s += v * v;
+    }
+  }
+  o = s;
+}`
+}
+
+/** 1 / RMS of row m from its RMS_PARTIAL sums (uTexels: the row's texels). */
+const RMS_SCALE = `
+uniform sampler2D uR;
+uniform int uROff;
+uniform int uTexels;
+uniform int uParts;
+uniform float uEps;
+float rmsScale(int m) {
+  // A constant bound (RMS_PARTS), so the loop unrolls and the reads go out
+  // together.
+  vec4 s = vec4(0.0);
+  for (int p = 0; p < 64/* RMS_REDUCTION */; p++)
+    s += texelFetch(uR, ivec2(uROff + p, m), 0);
+  return inversesqrt(dot(s, vec4(1.0)) / float(uTexels * 4) + uEps);
+}
+`
+
+const rmsVariants = new Map<string, Map<number, string>>()
+
+/** Fixed loop bounds retain compiler unrolling for each measured RMS shape. */
+export function withRms(source: string, parts: number) {
+  let variants = rmsVariants.get(source)
+  if (!variants) {
+    variants = new Map()
+    rmsVariants.set(source, variants)
+  }
+  let variant = variants.get(parts)
+  if (variant === undefined) {
+    variant = source.replace("64/* RMS_REDUCTION */", String(parts))
+    variants.set(parts, variant)
+  }
+  return variant
+}
+
+/** h2 out = x · rms(x) · w, from f32 x, its RMS_PARTIAL sums and f32 weights. */
+export const NORM_TO_H2 = `${HEADER}${RMS_SCALE}
+uniform sampler2D uX;
+uniform sampler2D uNorm;
+uniform int uRowIn;
+out uvec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int m = y + max(uRowIn, 0);
+  float r = rmsScale(m);
+  vec4 a = texelFetch(uX, ivec2(2 * x, m), 0) * r * texelFetch(uNorm, ivec2(2 * x, 0), 0);
+  vec4 b = texelFetch(uX, ivec2(2 * x + 1, m), 0) * r * texelFetch(uNorm, ivec2(2 * x + 1, 0), 0);
+  o = packH2(a, b);
+}`
+
+/** Norm directly into FP16 input storage, avoiding the packed intermediate. */
+export const NORM_TO_F16 = `${HEADER}${RMS_SCALE}
+uniform sampler2D uX;
+uniform sampler2D uNorm;
+uniform int uRowIn;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y) + max(uRowIn, 0);
+  o = clamp(texelFetch(uX, ivec2(x, m), 0) * rmsScale(m) * texelFetch(uNorm, ivec2(x, 0), 0), -65504.0, 65504.0);
+}`
+
+export const SWIGLU_F16 = `${HEADER}
+uniform usampler2D uGU;
+uniform int uHalf;
+out vec4 o;
+vec4 silu(vec4 x) { return x / (1.0 + exp(-x)); }
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  o = clamp(silu(pf(uGU, p.x, p.y)) * pf(uGU, uHalf + p.x, p.y), -65504.0, 65504.0);
+}`
+
+/**
+ * y as added to the residual: through a sandwich norm (LFM3: y · rms(y) · w,
+ * with y's RMS_PARTIAL sums in uR) or as it is (LFM2).
+ */
+function addedY(normed: boolean) {
+  return normed
+    ? `${RMS_SCALE}
+uniform sampler2D uNorm;
+float rowScale(int m) { return rmsScale(m); }
+vec4 added(int x, int m, float rs) {
+  return pf(uY, x, m) * rs * texelFetch(uNorm, ivec2(x, 0), 0);
+}`
+    : `
+uniform int uTexels;
+float rowScale(int m) { return 1.0; }
+vec4 added(int x, int m, float rs) { return pf(uY, x, m); }`
+}
+
+/**
+ * The add's outputs: the residual texture, and with `mrt` the h2 texture
+ * the next split matmuls read (see addScaled; other draws leave zeros).
+ */
+function addOutputs(mrt: boolean) {
+  return mrt
+    ? "layout(location = 0) out vec4 o;\nlayout(location = 1) out uvec4 o2;"
+    : "out vec4 o;"
+}
+
+/** f32 out = h + y, y through the sandwich norm when `normed`. */
+function addNormedSource(normed: boolean, mrt = false) {
+  return `${HEADER}
+uniform sampler2D uH;
+uniform usampler2D uY;
+${addedY(normed)}
+${addOutputs(mrt)}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  o = texelFetch(uH, p, 0) + added(p.x, p.y, rowScale(p.y));
+  ${mrt ? "o2 = uvec4(0u);" : ""}
+}`
+}
+
+/**
+ * ADD_NORMED's output times the next norm's weights (uNext), as h2 into
+ * the add's second output from column uBase (texel j: features 8j..8j+7):
+ * what the next split matmuls read (they apply the 1 / RMS).
+ */
+function addScaledSource(normed: boolean) {
+  return `${HEADER}
+uniform sampler2D uH;
+uniform usampler2D uY;
+uniform sampler2D uNext;
+uniform int uBase;
+${addedY(normed)}
+${addOutputs(true)}
+void main() {
+  int j = int(gl_FragCoord.x) - uBase;
+  int m = int(gl_FragCoord.y);
+  float rs = rowScale(m);
+  vec4 a = (texelFetch(uH, ivec2(2 * j, m), 0) + added(2 * j, m, rs)) * texelFetch(uNext, ivec2(2 * j, 0), 0);
+  vec4 b = (texelFetch(uH, ivec2(2 * j + 1, m), 0) + added(2 * j + 1, m, rs)) * texelFetch(uNext, ivec2(2 * j + 1, 0), 0);
+  o = vec4(0.0);
+  // Scaled down by PRESCALE (the matmul scales back up), so a large
+  // residual stays inside half precision's range.
+  o2 = packH2(a * (1.0 / ${PRESCALE}.0), b * (1.0 / ${PRESCALE}.0));
+}`
+}
+
+/**
+ * The partial sums of squares of ADD_NORMED's output x = h + y · rms(y) · w,
+ * computed from its inputs, so they can be drawn in the same pass as the
+ * add itself (into the residual's last RMS_PARTS columns, from uBase).
+ */
+function rmsOfAddSource(normed: boolean, mrt = false) {
+  return `${HEADER}
+uniform sampler2D uH;
+uniform usampler2D uY;
+${addedY(normed)}
+uniform int uChunk;
+uniform int uBase;
+${addOutputs(mrt)}
+void main() {
+  int p = int(gl_FragCoord.x) - uBase;
+  int m = int(gl_FragCoord.y);
+  int i0 = p * uChunk;
+  int i1 = min(uTexels, i0 + uChunk);
+  float rs = rowScale(m);
+  vec4 s = vec4(0.0);
+  for (int i = i0; i < i1; i++) {
+    vec4 v = texelFetch(uH, ivec2(i, m), 0) + added(i, m, rs);
+    s += v * v;
+  }
+  o = s;
+  ${mrt ? "o2 = uvec4(0u);" : ""}
+}`
+}
+
+/**
+ * A kernel that reads matmul outputs (`names`) as pair tensors, made to
+ * read a split matmul's partial sums instead (pf's other overload).
+ */
+function fromPartialsSource(source: string, names: Array<string>) {
+  let out = source
+  for (const name of names)
+    out = out.replace(`uniform usampler2D ${name};`, `uniform sampler2D ${name};`)
+  return out
+}
+
+/**
+ * The short convolution: from in_proj's output (f32 B | C | x, uD/4 texels
+ * each), z = C · Σ_k w[k] · (B·x)[t - (width-1) + k], with earlier tokens'
+ * B·x from the state (uState: width-1 rows, oldest first). h2 output.
+ * Weights uConv: texel (c / 4, k) holds tap k of channels c..c+3.
+ */
+function shortConvSource(width: number) {
+  const taps = Array.from({ length: width }, (_, k) => k)
+    .map(
+      (k) => `  {
+    int t = m - ${width - 1 - k};
+    vec4 y0;
+    vec4 y1;
+    if (t >= 0) {
+      y0 = pf(uBCx, c0, t) * pf(uBCx, 2 * dt + c0, t);
+      y1 = pf(uBCx, c0 + 1, t) * pf(uBCx, 2 * dt + c0 + 1, t);
+    } else {
+      y0 = texelFetch(uState, ivec2(c0, ${width - 1} + t), 0);
+      y1 = texelFetch(uState, ivec2(c0 + 1, ${width - 1} + t), 0);
+    }
+    a0 += texelFetch(uConv, ivec2(c0, ${k}), 0) * y0;
+    a1 += texelFetch(uConv, ivec2(c0 + 1, ${k}), 0) * y1;
+  }`
+    )
+    .join("\n")
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+uniform int uDt;
+out uvec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int dt = uDt;
+  int c0 = 2 * x;
+  vec4 a0 = vec4(0.0);
+  vec4 a1 = vec4(0.0);
+${taps}
+  vec4 C0 = pf(uBCx, dt + c0, m);
+  vec4 C1 = pf(uBCx, dt + c0 + 1, m);
+  o = packH2(C0 * a0, C1 * a1);
+}`
+}
+
+/**
+ * The convolution's state after a batch of uM tokens: the last width-1
+ * values of B·x, oldest first, from this batch or the previous state.
+ */
+function convStateSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform int uDt;
+uniform int uM;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int i = int(gl_FragCoord.y);
+  int t = uM - ${width - 1} + i;
+  if (t >= 0) {
+    o = pf(uBCx, x, t) * pf(uBCx, 2 * uDt + x, t);
+  } else {
+    o = texelFetch(uState, ivec2(x, uM + i), 0);
+  }
+}`
+}
+
+/**
+ * shortConv and convState in one draw, for a few rows: output 0 is the
+ * convolution's h2 output (texels x < uDt / 2, rows < uM), output 1 the
+ * state after the batch (rows < width - 1); the two outputs are one size.
+ */
+function convFusedSource(width: number) {
+  const w = width - 1
+  const taps = Array.from({ length: width }, (_, k) => k)
+    .map(
+      (k) => `    {
+      int t = m - ${w - k};
+      vec4 y0;
+      vec4 y1;
+      if (t >= 0) {
+        y0 = pf(uBCx, c0, t) * pf(uBCx, 2 * dt + c0, t);
+        y1 = pf(uBCx, c0 + 1, t) * pf(uBCx, 2 * dt + c0 + 1, t);
+      } else {
+        y0 = texelFetch(uState, ivec2(c0, ${w} + t), 0);
+        y1 = texelFetch(uState, ivec2(c0 + 1, ${w} + t), 0);
+      }
+      a0 += texelFetch(uConv, ivec2(c0, ${k}), 0) * y0;
+      a1 += texelFetch(uConv, ivec2(c0 + 1, ${k}), 0) * y1;
+    }`
+    )
+    .join("\n")
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+uniform int uDt;
+uniform int uM;
+layout(location = 0) out uvec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int dt = uDt;
+  o0 = uvec4(0u);
+  o1 = vec4(0.0);
+  if (m < ${w}) {
+    int t = uM - ${w} + m;
+    o1 = t >= 0
+      ? pf(uBCx, x, t) * pf(uBCx, 2 * dt + x, t)
+      : texelFetch(uState, ivec2(x, uM + m), 0);
+  }
+  if (2 * x < dt && m < uM) {
+    int c0 = 2 * x;
+    vec4 a0 = vec4(0.0);
+    vec4 a1 = vec4(0.0);
+${taps}
+    vec4 C0 = pf(uBCx, dt + c0, m);
+    vec4 C1 = pf(uBCx, dt + c0 + 1, m);
+    o0 = packH2(C0 * a0, C1 * a1);
+  }
+}`
+}
+
+/**
+ * The convolution's state after each prefix of a few-token batch (for
+ * speculative decoding, which may keep only some of a batch's tokens):
+ * block p - 1 (width - 1 rows) holds convState's output for uM = p.
+ */
+function convPrefixesSource(width: number) {
+  const w = width - 1
+  return `${HEADER}
+uniform usampler2D uBCx;
+uniform sampler2D uState;
+uniform int uDt;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int p = y / ${w} + 1;
+  int i = y - (p - 1) * ${w};
+  int t = p - ${w} + i;
+  if (t >= 0) {
+    o = pf(uBCx, x, t) * pf(uBCx, 2 * uDt + x, t);
+  } else {
+    o = texelFetch(uState, ivec2(x, p + i), 0);
+  }
+}`
+}
+
+
+/*
+ * Qwen3.5's Gated DeltaNet (see LinearAttentionWeights in weights.ts), in
+ * passes over these tensors (f32 unless said):
+ * - in: the in_proj output (pair or split partials): q | k | v | z, C4 =
+ *   2·K4 + V4 texels of q|k|v (K4, V4: key and value dims over 4), then z.
+ * - gates: per row, beta of heads 4i..4i+3 at texel i, decay at H4 + i.
+ * - qkv: silu(conv(q|k|v)), C4 texels; conv state: the last width - 1
+ *   rows of raw q|k|v.
+ * - qk: per row, q̂ (L2-normalized, over √dk) in texels 0..K4, k̂ after.
+ * - state: per value head h, S[k][v] at texel (h·dv/4 + v/4, k).
+ * - delta, o: per row, V4 texels.
+ */
+
+/**
+ * beta = sigmoid(b), decay = exp(A · softplus(a + dtBias)) from the b|a
+ * projection; with `log`, the decay's log (A · softplus, for the chunked
+ * recurrence).
+ */
+function linGatesSource(heads4: number, log = false) {
+  return `${HEADER}
+uniform usampler2D uBA;
+uniform sampler2D uA;
+uniform sampler2D uDt;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  if (x < ${heads4}) {
+    o = 1.0 / (1.0 + exp(-pf(uBA, x, m)));
+  } else {
+    int i = x - ${heads4};
+    vec4 t = pf(uBA, x, m) + texelFetch(uDt, ivec2(i, 0), 0);
+    vec4 softplus = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+    o = ${log ? "" : "exp"}(texelFetch(uA, ivec2(i, 0), 0) * softplus);
+  }
+}`
+}
+
+/**
+ * silu of the depthwise causal convolution over q|k|v (uConv: texel (x, k)
+ * holds tap k of channels 4x..4x+3, oldest first), earlier tokens' inputs
+ * from the state (width - 1 rows, oldest first).
+ */
+function linConvTaps(width: number) {
+  const w = width - 1
+  return Array.from({ length: width }, (_, k) => k)
+    .map(
+      (k) => `  {
+    int t = m - ${w - k};
+    vec4 y;
+    if (t >= 0) y = pf(uIn, x, t);
+    else y = texelFetch(uState, ivec2(x, ${w} + t), 0);
+    acc += texelFetch(uConv, ivec2(x, ${k}), 0) * y;
+  }`
+    )
+    .join("\n")
+}
+
+function linConvSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 acc = vec4(0.0);
+${linConvTaps(width)}
+  o = acc / (1.0 + exp(-acc));
+}`
+}
+
+/**
+ * LIN_CONV and LIN_CONV_STATE in one pass, for at most width - 1 rows
+ * (writing): row y's output into the first target, state row y after uM
+ * tokens into the second (both width - 1 rows tall; rows past uM of the
+ * first are left over).
+ */
+function linConvFusedSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform sampler2D uConv;
+uniform int uM;
+layout(location = 0) out vec4 o;
+layout(location = 1) out vec4 oState;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 acc = vec4(0.0);
+${linConvTaps(width)}
+  o = acc / (1.0 + exp(-acc));
+  int ts = uM - ${width - 1} + m;
+  if (ts >= 0) oState = pf(uIn, x, ts);
+  else oState = texelFetch(uState, ivec2(x, uM + m), 0);
+}`
+}
+
+/** The convolution's state after uM tokens: their last width - 1 raw inputs. */
+function linConvStateSource(width: number) {
+  return `${HEADER}
+uniform usampler2D uIn;
+uniform sampler2D uState;
+uniform int uM;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int i = int(gl_FragCoord.y);
+  int t = uM - ${width - 1} + i;
+  if (t >= 0) o = pf(uIn, x, t);
+  else o = texelFetch(uState, ivec2(x, uM + i), 0);
+}`
+}
+
+/** q̂ and k̂: each head's q and k over its L2 norm (q also over √dk). */
+function linPrepSource(keyHeadDim: number) {
+  const T = keyHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uQKV;
+uniform int uK4;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int base = (x / ${T}) * ${T};
+  vec4 s = vec4(0.0);
+  for (int i = 0; i < ${T}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(base + i, m), 0);
+    s += v * v;
+  }
+  float inv = inversesqrt(dot(s, vec4(1.0)) + 1e-6);
+  o = texelFetch(uQKV, ivec2(x, m), 0) * inv * (x < uK4 ? ${(1 / Math.sqrt(keyHeadDim)).toFixed(9)} : 1.0);
+}`
+}
+
+/**
+ * The recurrence's first pass, for token row uRow: per value texel,
+ * kv = (decay S)ᵀk̂ and qs = Sᵀq̂ over the head's keys, then delta =
+ * beta (v - kv) and the output o = decay·qs + (q̂·k̂) delta (o read from
+ * the state after the update, without it). `out`: which of the two this
+ * draw writes (both: two render targets).
+ */
+function linDeltaSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  out: "both" | "delta" | "o"
+}) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oDelta;\nlayout(location = 1) out vec4 oOut;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oDelta = d;\n  oOut = decay * qs + qk * d;"
+      : o.out === "delta"
+        ? "oResult = d;"
+        : "oResult = decay * qs + qk * d;"
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uQKV;
+uniform sampler2D uG;
+uniform int uK4;
+uniform int uH4;
+${outs}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kb = h * ${DK4};
+  vec4 kv = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  float qk = 0.0;
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 q = texelFetch(uQK, ivec2(kb + i, m), 0);
+    vec4 k = texelFetch(uQK, ivec2(uK4 + kb + i, m), 0);
+    qk += dot(q, k);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    kv += s0 * k.x + s1 * k.y + s2 * k.z + s3 * k.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  float beta = comp(texelFetch(uG, ivec2(h >> 2, m), 0), h & 3);
+  float decay = comp(texelFetch(uG, ivec2(uH4 + (h >> 2), m), 0), h & 3);
+  vec4 v = texelFetch(uQKV, ivec2(2 * uK4 + x, m), 0);
+  vec4 d = beta * (v - decay * kv);
+  ${write}
+}`
+}
+
+/**
+ * LIN_GATES, LIN_PREP and LIN_DELTA in one pass, for writing (heads with
+ * as many key as value dims, as many key heads as value heads): each
+ * fragment takes its head's q and k from the conv output (uQKV) over
+ * their L2 norms, and its beta and decay from the b|a projection's split
+ * partial sums (uBA from texel uBAx), the same math as those passes.
+ * Writes delta, the output, k̂ (texel x: the head's key texels line up
+ * with its value texels) and the decay (in x), for LIN_STATE's texelDecay.
+ */
+function linDeltaFusedSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  if (DK4 !== DV4) throw new Error("The fused recurrence needs as many key dims as value dims.")
+  const scale = (1 / Math.sqrt(o.keyHeadDim)).toFixed(9)
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQKV;
+uniform sampler2D uBA;
+uniform sampler2D uA;
+uniform sampler2D uDt;
+uniform int uK4;
+uniform int uH4;
+uniform int uBAx;
+layout(location = 0) out vec4 oDelta;
+layout(location = 1) out vec4 oOut;
+layout(location = 2) out vec4 oK;
+layout(location = 3) out vec4 oDecay;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kb = h * ${DK4};
+  vec4 sq = vec4(0.0);
+  vec4 sk = vec4(0.0);
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(kb + i, m), 0);
+    sq += v * v;
+  }
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 v = texelFetch(uQKV, ivec2(uK4 + kb + i, m), 0);
+    sk += v * v;
+  }
+  float invq = inversesqrt(dot(sq, vec4(1.0)) + 1e-6);
+  float invk = inversesqrt(dot(sk, vec4(1.0)) + 1e-6);
+  vec4 kv = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  float qk = 0.0;
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 q = texelFetch(uQKV, ivec2(kb + i, m), 0) * invq * ${scale};
+    vec4 k = texelFetch(uQKV, ivec2(uK4 + kb + i, m), 0) * invk * 1.0;
+    qk += dot(q, k);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    kv += s0 * k.x + s1 * k.y + s2 * k.z + s3 * k.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  int g = h >> 2;
+  float beta = comp(1.0 / (1.0 + exp(-pf(uBA, uBAx + g, m))), h & 3);
+  vec4 t = pf(uBA, uBAx + uH4 + g, m) + texelFetch(uDt, ivec2(g, 0), 0);
+  vec4 softplus = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+  float decay = comp(exp(texelFetch(uA, ivec2(g, 0), 0) * softplus), h & 3);
+  vec4 v = texelFetch(uQKV, ivec2(2 * uK4 + x, m), 0);
+  vec4 d = beta * (v - decay * kv);
+  oDelta = d;
+  oOut = decay * qs + qk * d;
+  oK = texelFetch(uQKV, ivec2(uK4 + x, m), 0) * invk * 1.0;
+  oDecay = vec4(decay, 0.0, 0.0, 0.0);
+}`
+}
+
+/** The recurrence's second pass: S = decay·S + k̂ deltaᵀ, for token row uRow. */
+function linStateSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  /** Decay at uG's texel (x, uRow).x (LIN_DELTA_FUSED's), not the gates'. */
+  texelDecay?: boolean
+}) {
+  const DV4 = o.valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uDelta;
+uniform sampler2D uG;
+uniform int uRow;
+uniform int uK4;
+uniform int uH4;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int k = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  float decay = ${o.texelDecay ? "texelFetch(uG, ivec2(x, uRow), 0).x" : "comp(texelFetch(uG, ivec2(uH4 + (h >> 2), uRow), 0), h & 3)"};
+  int kc = h * ${o.keyHeadDim} + k;
+  float kk = comp(texelFetch(uQK, ivec2(uK4 + (kc >> 2), uRow), 0), kc & 3);
+  o = decay * texelFetch(uS, ivec2(x, k), 0) + kk * texelFetch(uDelta, ivec2(x, uRow), 0);
+}`
+}
+
+/**
+ * The gated RMSNorm, into h2 for out_proj: each head's o over its RMS,
+ * times the weights (shared by the heads) and silu(z) (z from the in_proj
+ * output at texel uZ on).
+ */
+function linNormSource(valueHeadDim: number) {
+  const T = valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uO;
+uniform usampler2D uIn;
+uniform sampler2D uNorm;
+uniform int uZ;
+uniform float uEps;
+out uvec4 o;
+vec4 gated(int t, int m, int base, float inv) {
+  vec4 z = pf(uIn, uZ + t, m);
+  return texelFetch(uO, ivec2(t, m), 0) * inv * texelFetch(uNorm, ivec2(t - base, 0), 0) * (z / (1.0 + exp(-z)));
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int base = ((2 * x) / ${T}) * ${T};
+  vec4 s = vec4(0.0);
+  for (int i = 0; i < ${T}; i++) {
+    vec4 v = texelFetch(uO, ivec2(base + i, m), 0);
+    s += v * v;
+  }
+  float inv = inversesqrt(dot(s, vec4(1.0)) / ${valueHeadDim}.0 + uEps);
+  o = packH2(gated(2 * x, m, base, inv), gated(2 * x + 1, m, base, inv));
+}`
+}
+
+/*
+ * The chunked recurrence for prompt batches (see delta-rule.ts for the
+ * math, which these passes follow step for step): tokens in chunks of C
+ * from the batch's row 0 (the last chunk may be shorter). Besides the
+ * tensors above (gates holding log-decays, from linGates' `log`):
+ * - cum: per row, G (the chunk's running sum of log-decays) of heads
+ *   4i..4i+3 at texel i.
+ * - A, T, P: per row t, head h's C columns s (the chunk's tokens) at
+ *   texels h·C/4 + s/4.
+ * - U and Oi (V4 texels a row), W and Q' (K4).
+ * Everything is f32 and highp: the solve and the state chain are what a
+ * mediump GPU would get wrong first.
+ */
+
+/**
+ * The first row of row t's chunk: chunks of `chunk` rows after a first one
+ * of uFirst rows (at most `chunk`: shorter, so that a chunk ends where a
+ * snapshot is taken; see Engine.recurrenceChunks).
+ */
+const chunkStart = (chunk: number) => `uniform int uFirst;
+int chunkStart(int t) { return t < uFirst ? 0 : uFirst + ((t - uFirst) / ${chunk}) * ${chunk}; }`
+
+/** G of row m's heads, cum texel i: the log-decays summed from the chunk's start. */
+function linCumSource(chunk: number) {
+  return `${HEADER}
+uniform sampler2D uG;
+uniform int uH4;
+${chunkStart(chunk)}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 s = vec4(0.0);
+  for (int r = chunkStart(m); r <= m; r++) s += texelFetch(uG, ivec2(uH4 + x, r), 0);
+  o = s;
+}`
+}
+
+/** The decay G of head h at row r (the cum tensor). */
+const LIN_G = `float linG(highp sampler2D cum, int h, int r) {
+  return comp(texelFetch(cum, ivec2(h >> 2, r), 0), h & 3);
+}`
+
+/**
+ * A[t][s] = beta_t exp(G_t - G_s) k̂_t·k̂_s for s < t, and P[t][s] =
+ * exp(G_t - G_s) q̂_t·k̂_s for s ≤ t (0 elsewhere): four columns a
+ * fragment. `out`: which this draw writes (both: two render targets).
+ */
+function linGramSource(o: { keyHeadDim: number; chunk: number; out: "both" | "a" | "p" }) {
+  const DK4 = o.keyHeadDim / 4
+  const C4 = o.chunk / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oA;\nlayout(location = 1) out vec4 oP;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oA = a;\n  oP = p;"
+      : o.out === "a"
+        ? "oResult = a;"
+        : "oResult = p;"
+  return `${HEADER}
+uniform sampler2D uQK;
+uniform sampler2D uG;
+uniform sampler2D uCum;
+uniform int uK4;
+${chunkStart(o.chunk)}
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${C4};
+  int s0 = chunkStart(t) + 4 * (x - h * ${C4});
+  int kb = h * ${DK4};
+  ivec4 s = ivec4(s0, s0 + 1, s0 + 2, s0 + 3);
+  // (Columns past t are masked out below; their rows are read as t's.)
+  ivec4 r = min(s, ivec4(t));
+  vec4 kk = vec4(0.0);
+  vec4 qk = vec4(0.0);
+  if (s0 <= t) {
+    for (int i = 0; i < ${DK4}; i++) {
+      vec4 q = texelFetch(uQK, ivec2(kb + i, t), 0);
+      vec4 k = texelFetch(uQK, ivec2(uK4 + kb + i, t), 0);
+      vec4 k0 = texelFetch(uQK, ivec2(uK4 + kb + i, r.x), 0);
+      vec4 k1 = texelFetch(uQK, ivec2(uK4 + kb + i, r.y), 0);
+      vec4 k2 = texelFetch(uQK, ivec2(uK4 + kb + i, r.z), 0);
+      vec4 k3 = texelFetch(uQK, ivec2(uK4 + kb + i, r.w), 0);
+      kk += vec4(dot(k, k0), dot(k, k1), dot(k, k2), dot(k, k3));
+      qk += vec4(dot(q, k0), dot(q, k1), dot(q, k2), dot(q, k3));
+    }
+  }
+  float gt = linG(uCum, h, t);
+  vec4 gs = vec4(linG(uCum, h, r.x), linG(uCum, h, r.y), linG(uCum, h, r.z), linG(uCum, h, r.w));
+  vec4 decay = exp(min(gt - gs, 0.0));
+  float beta = comp(texelFetch(uG, ivec2(h >> 2, t), 0), h & 3);
+  vec4 a = beta * decay * kk * vec4(lessThan(s, ivec4(t)));
+  vec4 p = decay * qk * vec4(lessThanEqual(s, ivec4(t)));
+  ${write}
+}`
+}
+
+/**
+ * T = (I + A)⁻¹, lower triangular, by forward substitution: a fragment
+ * holds four of T's columns (as a vec4) down the chunk's rows to its own.
+ */
+function linSolveSource(chunk: number) {
+  const C4 = chunk / 4
+  return `${HEADER}
+uniform sampler2D uA;
+${chunkStart(chunk)}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${C4};
+  int j4 = x - h * ${C4};
+  int c0 = chunkStart(t);
+  int rt = t - c0;
+  int j0 = 4 * j4;
+  o = vec4(0.0);
+  if (j0 > rt) return;
+  vec4 X[${chunk}];
+  for (int i = 0; i < ${chunk}; i++) X[i] = vec4(0.0);
+  ivec4 cols = ivec4(j0, j0 + 1, j0 + 2, j0 + 3);
+  for (int r = j0; r <= rt; r++) {
+    vec4 acc = vec4(equal(cols, ivec4(r)));
+    // (A is 0 from column r on, and X is still 0 there.)
+    for (int s4 = j4; 4 * s4 < r; s4++) {
+      vec4 a = texelFetch(uA, ivec2(h * ${C4} + s4, c0 + r), 0);
+      int s = 4 * s4;
+      acc -= a.x * X[s] + a.y * X[s + 1] + a.z * X[s + 2] + a.w * X[s + 3];
+    }
+    X[r] = acc;
+  }
+  o = X[rt];
+}`
+}
+
+/**
+ * U = T diag(beta) V and W = T diag(beta exp(G)) K over the chunk's rows
+ * up to t. `out` both needs dk = dv (one texel index for both).
+ */
+function linUWSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  chunk: number
+  out: "both" | "u" | "w"
+}) {
+  const C4 = o.chunk / 4
+  const D4 = (o.out === "w" ? o.keyHeadDim : o.valueHeadDim) / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oU;\nlayout(location = 1) out vec4 oW;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both" ? "oU = u;\n  oW = w;" : o.out === "u" ? "oResult = u;" : "oResult = w;"
+  const wantU = o.out !== "w"
+  const wantW = o.out !== "u"
+  return `${HEADER}
+uniform sampler2D uT;
+uniform sampler2D uQK;
+uniform sampler2D uQKV;
+uniform sampler2D uG;
+uniform sampler2D uCum;
+uniform int uK4;
+${chunkStart(o.chunk)}
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${D4};
+  int c0 = chunkStart(t);
+  vec4 u = vec4(0.0);
+  vec4 w = vec4(0.0);
+  for (int s = c0; s <= t; s++) {
+    int j = s - c0;
+    float tau = comp(texelFetch(uT, ivec2(h * ${C4} + (j >> 2), t), 0), j & 3)
+      * comp(texelFetch(uG, ivec2(h >> 2, s), 0), h & 3);
+    ${wantU ? "u += tau * texelFetch(uQKV, ivec2(2 * uK4 + x, s), 0);" : ""}
+    ${wantW ? "w += tau * exp(linG(uCum, h, s)) * texelFetch(uQK, ivec2(uK4 + x, s), 0);" : ""}
+  }
+  ${write}
+}`
+}
+
+/**
+ * Oi = P U and Q' = diag(exp(G)) Q - P W over the chunk's rows up to t
+ * (the chunk's output, less what its starting state adds: Q' S0).
+ */
+function linQOSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  chunk: number
+  out: "both" | "oi" | "q"
+}) {
+  const C4 = o.chunk / 4
+  const D4 = (o.out === "q" ? o.keyHeadDim : o.valueHeadDim) / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oI;\nlayout(location = 1) out vec4 oQ;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oI = oi;\n  oQ = q;"
+      : o.out === "oi"
+        ? "oResult = oi;"
+        : "oResult = q;"
+  return `${HEADER}
+uniform sampler2D uP;
+uniform sampler2D uU;
+uniform sampler2D uW;
+uniform sampler2D uQK;
+uniform sampler2D uCum;
+${chunkStart(o.chunk)}
+${outs}
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int h = x / ${D4};
+  int c0 = chunkStart(t);
+  vec4 oi = vec4(0.0);
+  vec4 pw = vec4(0.0);
+  for (int s = c0; s <= t; s++) {
+    int j = s - c0;
+    float p = comp(texelFetch(uP, ivec2(h * ${C4} + (j >> 2), t), 0), j & 3);
+    ${o.out !== "q" ? "oi += p * texelFetch(uU, ivec2(x, s), 0);" : ""}
+    ${o.out !== "oi" ? "pw += p * texelFetch(uW, ivec2(x, s), 0);" : ""}
+  }
+  vec4 q = ${o.out !== "oi" ? "exp(linG(uCum, h, t)) * texelFetch(uQK, ivec2(x, t), 0) - pw" : "vec4(0.0)"};
+  ${write}
+}`
+}
+
+/**
+ * A chunk's first state-reading pass, rows uC0.. of it: delta D = U - W S0
+ * and the output O = Oi + Q' S0, per value texel over the head's keys.
+ * `out`: which this draw writes (both: two render targets).
+ */
+function linChunkOutSource(o: {
+  keyHeadDim: number
+  valueHeadDim: number
+  out: "both" | "delta" | "o"
+}) {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  const outs =
+    o.out === "both"
+      ? "layout(location = 0) out vec4 oDelta;\nlayout(location = 1) out vec4 oOut;"
+      : "out vec4 oResult;"
+  const write =
+    o.out === "both"
+      ? "oDelta = texelFetch(uU, ivec2(x, t), 0) - ws;\n  oOut = texelFetch(uOi, ivec2(x, t), 0) + qs;"
+      : o.out === "delta"
+        ? "oResult = texelFetch(uU, ivec2(x, t), 0) - ws;"
+        : "oResult = texelFetch(uOi, ivec2(x, t), 0) + qs;"
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uU;
+uniform sampler2D uW;
+uniform sampler2D uOi;
+uniform sampler2D uQp;
+${outs}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int t = int(gl_FragCoord.y);
+  int kb = (x / ${DV4}) * ${DK4};
+  vec4 ws = vec4(0.0);
+  vec4 qs = vec4(0.0);
+  for (int i = 0; i < ${DK4}; i++) {
+    vec4 w = texelFetch(uW, ivec2(kb + i, t), 0);
+    vec4 q = texelFetch(uQp, ivec2(kb + i, t), 0);
+    int r = 4 * i;
+    vec4 s0 = texelFetch(uS, ivec2(x, r), 0);
+    vec4 s1 = texelFetch(uS, ivec2(x, r + 1), 0);
+    vec4 s2 = texelFetch(uS, ivec2(x, r + 2), 0);
+    vec4 s3 = texelFetch(uS, ivec2(x, r + 3), 0);
+    ws += s0 * w.x + s1 * w.y + s2 * w.z + s3 * w.w;
+    qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+  }
+  ${write}
+}`
+}
+
+/**
+ * A chunk's state update, its rows [uC0, uC1): S = exp(G_last) S0 +
+ * Σ_s exp(G_last - G_s) k̂_s D_sᵀ.
+ */
+function linChunkStateSource(o: { keyHeadDim: number; valueHeadDim: number }) {
+  const DV4 = o.valueHeadDim / 4
+  return `${HEADER}
+uniform sampler2D uS;
+uniform sampler2D uQK;
+uniform sampler2D uDelta;
+uniform sampler2D uCum;
+uniform int uK4;
+uniform int uC0;
+uniform int uC1;
+out vec4 o;
+${LIN_G}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int k = int(gl_FragCoord.y);
+  int h = x / ${DV4};
+  int kc = h * ${o.keyHeadDim} + k;
+  float last = linG(uCum, h, uC1 - 1);
+  vec4 acc = exp(last) * texelFetch(uS, ivec2(x, k), 0);
+  for (int s = uC0; s < uC1; s++) {
+    float kk = comp(texelFetch(uQK, ivec2(uK4 + (kc >> 2), s), 0), kc & 3);
+    acc += exp(last - linG(uCum, h, s)) * kk * texelFetch(uDelta, ivec2(x, s), 0);
+  }
+  o = acc;
+}`
+}
+
+/** Copies rows [uOff, uOff + height) of an f32 tensor to rows [0, height). */
+export const COPY_ROWS = `${HEADER}
+uniform sampler2D uX;
+uniform int uOff;
+out vec4 o;
+void main() {
+  o = texelFetch(uX, ivec2(int(gl_FragCoord.x), int(gl_FragCoord.y) + uOff), 0);
+}`
+
+/**
+ * RMS-normalized and rotated head vectors. Reads one head (32 f32 texels
+ * from texel uBase + head * 32) of the q|k|v|gate projection, normalizes it
+ * with uNorm (32 texels), and applies RoPE from the table uRope (texels
+ * 0..15 cos, 16..31 sin of frequencies 0..63, for positions below
+ * ROPE_LOW and for multiples of it). The
+ * rotated dims come first (the loaders order them so): dim j pairs with
+ * j + P for j < P, P = rotated dims / 2 = 4 · uPairTexels, with frequency
+ * j; the dims after 2P aren't rotated. Writes f32 (`out: "f32"`, 4 dims per texel, for
+ * queries) or h2 (8 dims per texel, for the key cache).
+ */
+function headPrepSource(o: {
+  /**
+   * "cache": the f32 queries' bits, into free slots of the KV cache
+   * texture (see queryInCache): the fragment at slot uQSlot0 + (y −
+   * uRowOffset), texel x − uXOff holds query texel (slot % qSlots) ·
+   * kvWidth + x of token slot / qSlots.
+   */
+  out: "f32" | "h2" | "cache"
+  rope: boolean
+  norm: boolean
+  /** Dims per head (LFM3: 128, LFM2: 64). */
+  headDim: number
+  /** With "cache": texels per cache row, slots per token, query texels per token. */
+  cache?: { kvWidth: number; slots: number; texels: number }
+}) {
+  const texelsPerOut = o.out === "h2" ? 2 : 1
+  // f32 texels per head; the RoPE table's sines start half a head in.
+  const T = o.headDim / 4
+  const prep = `
+vec4 rotated(int base, int t, int pos, float inv) {
+  vec4 v = pf(uQKVG, base + t, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(t, 0), 0)" : ""};
+  ${
+    o.rope
+      ? `if (t >= 2 * uPairTexels) return v;
+  bool first = t < uPairTexels;
+  int tp = first ? t + uPairTexels : t - uPairTexels;
+  int f = first ? t : tp;
+  vec4 p = pf(uQKVG, base + tp, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(tp, 0), 0)" : ""};
+  // pos = lo + ${ROPE_LOW} · hi: cos and sin of each part's angle, added.
+  int lo = pos & ${ROPE_LOW - 1};
+  int hi = ${ROPE_LOW} + (pos >> ${Math.log2(ROPE_LOW)});
+  vec4 c1 = texelFetch(uRope, ivec2(f, lo), 0);
+  vec4 s1 = texelFetch(uRope, ivec2(${T / 2} + f, lo), 0);
+  vec4 c2 = texelFetch(uRope, ivec2(f, hi), 0);
+  vec4 s2 = texelFetch(uRope, ivec2(${T / 2} + f, hi), 0);
+  vec4 cs = c1 * c2 - s1 * s2;
+  vec4 sn = s1 * c2 + c1 * s2;
+  return first ? v * cs - p * sn : v * cs + p * sn;`
+      : "return v;"
+  }
+}`
+  const c = o.cache
+  if (o.out === "cache" && !c) throw new Error("Queries in the cache need its shape.")
+  const where =
+    o.out === "cache" && c
+      ? `int slot = int(gl_FragCoord.y) - uRowOffset;
+  m = slot / ${c.slots};
+  int x = (slot - m * ${c.slots}) * ${c.kvWidth} + int(gl_FragCoord.x) - uXOff;
+  if (x >= ${c.texels}) { o = uvec4(0u); return; }`
+      : `int x = int(gl_FragCoord.x) - uXOff;
+  m = int(gl_FragCoord.y) - uRowOffset;`
+  return `${HEADER}
+uniform usampler2D uQKVG;
+uniform sampler2D uNorm;
+uniform sampler2D uRope;
+uniform int uBase;
+uniform int uPairTexels;
+uniform int uPos0;
+uniform int uRowOffset;
+uniform int uXOff;
+uniform float uEps;
+uniform float uScale;
+int m;
+${prep}
+out ${o.out === "f32" ? "vec4" : "uvec4"} o;
+void main() {
+  ${where}
+  int head = x / ${T / texelsPerOut};
+  int t0 = (x % ${T / texelsPerOut}) * ${texelsPerOut};
+  int base = uBase + head * ${T};
+  float inv = 1.0;
+  ${
+    o.norm
+      ? `vec4 s = vec4(0.0);
+  for (int i = 0; i < ${T}; i++) {
+    vec4 v = pf(uQKVG, base + i, m);
+    s += v * v;
+  }
+  inv = inversesqrt(dot(s, vec4(1.0)) / ${o.headDim}.0 + uEps);`
+      : ""
+  }
+  int pos = uPos0 + m;
+  ${
+    o.out === "f32"
+      ? "o = rotated(base, t0, pos, inv) * uScale;"
+      : o.out === "cache"
+        ? "o = floatBitsToUint(rotated(base, t0, pos, inv) * uScale);"
+        : "o = packH2(rotated(base, t0, pos, inv), rotated(base, t0 + 1, pos, inv));"
+  }
+}`
+}
+
+/**
+ * Attention's output gate: none, one sigmoid per head (LFM3: the head's
+ * value at uGateTexel + h / 4), or one per dim (Qwen3.5: output texel x's
+ * 8 dims at texels uGateTexel + 2x, + 1).
+ */
+export type Gate = boolean | "dim"
+
+/** The end of attend and attendCombine: lo, hi over l, times the gate, as h2. */
+function gateOut(gate: Gate) {
+  if (gate === "dim")
+    return `vec4 g0 = pf(uQKVG, uGateTexel + 2 * x, m);
+  vec4 g1 = pf(uQKVG, uGateTexel + 2 * x + 1, m);
+  o = packH2(lo / (l * (1.0 + exp(-g0))), hi / (l * (1.0 + exp(-g1))));`
+  return `${
+    gate
+      ? `float gate = comp(pf(uQKVG, uGateTexel + h / 4, m), h & 3);
+  float scale = 1.0 / (l * (1.0 + exp(-gate)));`
+      : "float scale = 1.0 / l;"
+  }
+  o = packH2(lo * scale, hi * scale);`
+}
+
+/**
+ * Where cache slot `slot` (a position, or its ring row) of texel x lives:
+ * caches taller than 2^uKvShift rows wrap into blocks uKvWidth texels wide,
+ * side by side.
+ */
+const KV_AT = `
+uniform int uKvShift;
+uniform int uKvWidth;
+ivec2 kvAt(int x, int slot) {
+  return ivec2(x + (slot >> uKvShift) * uKvWidth, slot & ((1 << uKvShift) - 1));
+}`
+
+/**
+ * The heads one attention fragment handles: G query heads sharing a KV
+ * head, so each key and value is read once for all of them. Scores of
+ * member i go to texture i (uS, uS1, ...), one row group per G heads.
+ */
+const sNames = (G: number) =>
+  Array.from({ length: G }, (_, i) => (i === 0 ? "uS" : `uS${i}`))
+
+/** A score texel of head h's texture (its member h % G). */
+const scoreAt = (G: number) => {
+  if (G === 1) return "vec4 S(int h, ivec2 p) { return texelFetch(uS, p, 0); }"
+  const names = sNames(G)
+  let body = `texelFetch(${names[G - 1]}, p, 0)`
+  for (let i = G - 2; i >= 0; i--)
+    body = `hm == ${i} ? texelFetch(${names[i]}, p, 0) : ${body}`
+  return `vec4 S(int h, ivec2 p) { int hm = h % ${G}; return ${body}; }`
+}
+
+/**
+ * Attention scores, 4 keys per texel, for the uRows queries from uM0: row
+ * g * uRows + (m - uM0) of texture i holds query m of head g·G + i
+ * against keys uJ0 + 4x .. + 3 (G heads per fragment, sharing their KV
+ * head's keys). With uRing > 0 the cache is a ring of that many rows
+ * (position j at row j % uRing). Queries are pre-scaled f32 (uQ), keys h2
+ * in the cache (uK: row = position, 16 texels per KV head). Masked keys
+ * (later than the query, outside the sliding window, past uKeys) get a
+ * sentinel representable in the score texture.
+ */
+function scoresSource(
+  headDim: number,
+  G: number,
+  /** Queries as headPrep's "cache" left them (uK's slots from uQSlot0), not uQ. */
+  cache?: { kvWidth: number; slots: number },
+  halfScores = false
+) {
+  const mask = halfScores ? "-65504.0" : "-1e30"
+  const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
+  // A head's query texels never straddle a cache row (kvWidth is a whole
+  // number of heads' texels): one address a member.
+  const query = (i: number) =>
+    cache
+      ? `ivec2 pq${i};
+  {
+    int t = (h0 + ${i}) * ${2 * U};
+    int slot = uQSlot0 + m * ${cache.slots} + t / ${cache.kvWidth};
+    if (uRing > 0) slot -= (slot / uRing) * uRing;
+    pq${i} = kvAt(t - (t / ${cache.kvWidth}) * ${cache.kvWidth}, slot);
+  }`
+      : ""
+  const qa = (i: number, k: number) =>
+    cache
+      ? `uintBitsToFloat(texelFetch(uK, ivec2(pq${i}.x + 2 * u + ${k}, pq${i}.y), 0))`
+      : `texelFetch(uQ, ivec2((h0 + ${i}) * ${2 * U} + 2 * u + ${k}, m), 0)`
+  return `${HEADER}
+${cache ? "uniform int uQSlot0;" : "uniform sampler2D uQ;"}
+uniform usampler2D uK;
+uniform int uRows;
+uniform int uM0;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uPos0;
+uniform int uWindow;
+uniform int uGroup;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uTotalRows;
+uniform int uSegRows;
+uniform int uSegKeys;
+${KV_AT}
+${members.map((i) => `layout(location = ${i}) out vec4 o${i};`).join("\n")}
+void main() {
+  // Panels of uKt texels side by side, each holding uPanelRows rows: row r
+  // (query m of row group g, r = g · uRows + m − uM0) at (panel · uKt + x, y).
+  int panel = int(gl_FragCoord.x) / uKt;
+  int x = int(gl_FragCoord.x) - panel * uKt;
+  int y = panel * uPanelRows + int(gl_FragCoord.y);
+  if (y >= uTotalRows) {
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
+    return;
+  }
+  // Key segment s of a long range: its rows follow segment s - 1's.
+  int s = y / uSegRows;
+  y -= s * uSegRows;
+  int g = y / uRows;
+  int m = uM0 + (y - g * uRows);
+  int h0 = g * ${G};
+  int kh = h0 / uGroup;
+  int qpos = uPos0 + m;
+  // The 4 keys' rows (masked ones read row 0 and are dropped below), and
+  // each query texel read once for all 4.
+  // (Whole-vector ops: some compilers get component writes in loops wrong.)
+  ivec4 j = uJ0 + s * uSegKeys + 4 * x + ivec4(0, 1, 2, 3);
+  ivec4 inRange = ivec4(lessThan(j - uJ0, ivec4(uKeys)));
+  ivec4 past = ivec4(lessThanEqual(j, ivec4(qpos)));
+  ivec4 inWindow = uWindow > 0 ? ivec4(lessThan(qpos - j, ivec4(uWindow))) : ivec4(1);
+  ivec4 liveInt = inRange * past * inWindow;
+  bvec4 live = bvec4(liveInt);
+  ivec4 row = (uRing > 0 ? j - (j / uRing) * uRing : j) * liveInt;
+  if (!any(live)) {
+    ${members.map((i) => `o${i} = vec4(${mask});`).join(" ")}
+    return;
+  }
+${members.map(query).join("\n")}
+  ivec2 p0 = kvAt(kh * ${U}, row.x);
+  ivec2 p1 = kvAt(kh * ${U}, row.y);
+  ivec2 p2 = kvAt(kh * ${U}, row.z);
+  ivec2 p3 = kvAt(kh * ${U}, row.w);
+  ${members.map((i) => `vec4 acc${i} = vec4(0.0);`).join(" ")}
+  for (int u = 0; u < ${U}; u++) {
+    uvec4 k0 = texelFetch(uK, ivec2(p0.x + u, p0.y), 0);
+    uvec4 k1 = texelFetch(uK, ivec2(p1.x + u, p1.y), 0);
+    uvec4 k2 = texelFetch(uK, ivec2(p2.x + u, p2.y), 0);
+    uvec4 k3 = texelFetch(uK, ivec2(p3.x + u, p3.y), 0);
+    vec4 l0 = h2lo(k0), u0 = h2hi(k0), l1 = h2lo(k1), u1 = h2hi(k1);
+    vec4 l2 = h2lo(k2), u2 = h2hi(k2), l3 = h2lo(k3), u3 = h2hi(k3);
+${members
+  .map(
+    (i) => `    {
+      vec4 qa = ${qa(i, 0)};
+      vec4 qb = ${qa(i, 1)};
+      acc${i} += vec4(dot(qa, l0) + dot(qb, u0), dot(qa, l1) + dot(qb, u1),
+        dot(qa, l2) + dot(qb, u2), dot(qa, l3) + dot(qb, u3));
+    }`
+  )
+  .join("\n")}
+  }
+  ${members.map((i) => `o${i} = mix(vec4(${mask}), ${halfScores ? `clamp(acc${i}, -65000.0, 65000.0)` : `acc${i}`}, live);`).join("\n  ")}
+}`
+}
+
+/**
+ * Softmax over a query's scores, the weighted sum of values (uV: h2 cache),
+ * times the head's sigmoid gate (from the q|k|v|gate projection at texel
+ * uGateTexel). h2 output: 8 dims of one head per texel. Scores as
+ * scoresSource(G) leaves them.
+ */
+function attendSource(headDim: number, gate: Gate, G: number) {
+  const U = headDim / 8
+  return `${HEADER}
+${sNames(G)
+  .map((n) => `uniform sampler2D ${n};`)
+  .join("\n")}
+uniform usampler2D uV;
+uniform usampler2D uQKVG;
+uniform int uRows;
+uniform int uM0;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uGroup;
+uniform int uGateTexel;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uVOff;
+${KV_AT}
+${scoreAt(G)}
+out uvec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${U};
+  int u = x - h * ${U};
+  int kh = h / uGroup;
+  int r = (h / ${G}) * uRows + (m - uM0);
+  int panel = r / uPanelRows;
+  int row = r - panel * uPanelRows;
+  int sx = panel * uKt;
+  // Whole score texels, two at a time with their own sums, so the reads
+  // go out together (masked keys score -1e30: weight 0).
+  int texels = (uKeys + 3) / 4;
+  vec4 m0 = vec4(-1e30);
+  vec4 m1 = vec4(-1e30);
+  int i = 0;
+  for (; i + 1 < texels; i += 2) {
+    m0 = max(m0, S(h, ivec2(sx + i, row)));
+    m1 = max(m1, S(h, ivec2(sx + i + 1, row)));
+  }
+  if (i < texels) m0 = max(m0, S(h, ivec2(sx + i, row)));
+  m0 = max(m0, m1);
+  float mx = max(max(m0.x, m0.y), max(m0.z, m0.w));
+  int vx = uVOff + kh * ${U} + u;
+  vec4 l4 = vec4(0.0);
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  vec4 lo1 = vec4(0.0);
+  vec4 hi1 = vec4(0.0);
+  for (i = 0; i < texels; i += 2) {
+    bool two = i + 1 < texels;
+    vec4 e0 = exp(S(h, ivec2(sx + i, row)) - mx);
+    vec4 e1 = two ? exp(S(h, ivec2(sx + i + 1, row)) - mx) : vec4(0.0);
+    l4 += e0 + e1;
+    ivec4 j0 = uJ0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j1 = j0 + 4;
+    // Zero-weighted lanes past the last key read the last key's row, not
+    // rows that may be unwritten or outside the cache (0 · NaN is NaN).
+    j0 = min(j0, ivec4(uJ0 + uKeys - 1));
+    j1 = min(j1, ivec4(uJ0 + uKeys - 1));
+    if (uRing > 0) {
+      j0 = j0 - (j0 / uRing) * uRing;
+      j1 = j1 - (j1 / uRing) * uRing;
+    }
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, kvAt(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, kvAt(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, kvAt(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, kvAt(vx, j1.w), 0);
+    lo += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
+    hi += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
+    lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
+    hi1 += e1.x * h2hi(b0) + e1.y * h2hi(b1) + e1.z * h2hi(b2) + e1.w * h2hi(b3);
+  }
+  lo += lo1;
+  hi += hi1;
+  float l = dot(l4, vec4(1.0));
+  ${gateOut(gate)}
+}`
+}
+
+/**
+ * Attention for long key ranges, part 1: like attend, but over one chunk
+ * of uChunkTexels score texels, so many fragments share a query's keys,
+ * and for the G heads of a row group at once (each value read once for
+ * them all). Fragment x: row group x / U, dims 8(x % U)..; row (uChunk0
+ * + c) · uSliceQ + (m - uM0): chunk c of query m (several passes, one per
+ * segment of a long key range, fill rows side by side). Outputs, for
+ * member i, the chunk's softmax-weighted sum of values (dims 0..3 and
+ * 4..7, relative to the chunk's own max) and (max, sum of weights) at
+ * locations 3i..3i+2; attendCombine adds chunks.
+ */
+function attendChunkSource(headDim: number, G: number, halfScores = false) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
+  const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
+  const names = sNames(G)
+  return `${HEADER}
+${names.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uV;
+uniform int uRows;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uGroup;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uVOff;
+uniform int uSliceQ;
+uniform int uChunkTexels;
+uniform int uChunk0;
+uniform int uSegRows;
+uniform int uSegKeys;
+uniform int uSegChunks;
+${KV_AT}
+${members
+  .map(
+    (i) => `layout(location = ${3 * i}) out vec4 o${3 * i};
+layout(location = ${3 * i + 1}) out vec4 o${3 * i + 1};
+layout(location = ${3 * i + 2}) out vec4 o${3 * i + 2};`
+  )
+  .join("\n")}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int qi = y % uSliceQ;
+  // Chunk c of key segment s of this pass's keys (uSegChunks each): rows
+  // from chunk uChunk0 on. The segment's scores are its own rows.
+  int cg = y / uSliceQ - uChunk0;
+  int s = cg / uSegChunks;
+  int c = cg - s * uSegChunks;
+  int g = x / ${U};
+  int u = x - g * ${U};
+  int kh = (g * ${G}) / uGroup;
+  int r = s * uSegRows + g * uRows + qi;
+  int panel = r / uPanelRows;
+  int row = r - panel * uPanelRows;
+  int sx = panel * uKt;
+  int sj0 = uJ0 + s * uSegKeys;
+  int texels = (max(0, min(uKeys - s * uSegKeys, uSegKeys)) + 3) / 4;
+  int t0 = c * uChunkTexels;
+  int t1 = min(texels, t0 + uChunkTexels);
+  int vx = uVOff + kh * ${U} + u;
+${members
+  .map(
+    (i) => `  float mx${i};
+  {
+    vec4 m0 = vec4(-1e30);
+    vec4 m1 = vec4(-1e30);
+    int i = t0;
+    for (; i + 1 < t1; i += 2) {
+      m0 = max(m0, texelFetch(${names[i]}, ivec2(sx + i, row), 0));
+      m1 = max(m1, texelFetch(${names[i]}, ivec2(sx + i + 1, row), 0));
+    }
+    if (i < t1) m0 = max(m0, texelFetch(${names[i]}, ivec2(sx + i, row), 0));
+    m0 = max(m0, m1);
+    mx${i} = max(max(m0.x, m0.y), max(m0.z, m0.w));
+  }
+  vec4 l${i} = vec4(0.0);
+  vec4 lo${i} = vec4(0.0);
+  vec4 hi${i} = vec4(0.0);`
+  )
+  .join("\n")}
+${
+  G === 1
+    ? `  if (mx0 ${empty}) {
+    // Every key in the chunk masked: it adds nothing.
+    o0 = vec4(0.0);
+    o1 = vec4(0.0);
+    o2 = vec4(-1e30, 0.0, 0.0, 0.0);
+    return;
+  }
+  vec4 lo1 = vec4(0.0);
+  vec4 hi1 = vec4(0.0);
+  for (int i = t0; i < t1; i += 2) {
+    bool two = i + 1 < t1;
+    vec4 e0 = exp(texelFetch(uS, ivec2(sx + i, row), 0) - mx0);
+    vec4 e1 = two ? exp(texelFetch(uS, ivec2(sx + i + 1, row), 0) - mx0) : vec4(0.0);
+    l0 += e0 + e1;
+    ivec4 j0 = sj0 + 4 * i + ivec4(0, 1, 2, 3);
+    ivec4 j1 = j0 + 4;
+    // Zero-weighted lanes past the last key read the last key's row, not
+    // rows that may be unwritten or outside the cache (0 · NaN is NaN).
+    j0 = min(j0, ivec4(uJ0 + uKeys - 1));
+    j1 = min(j1, ivec4(uJ0 + uKeys - 1));
+    if (uRing > 0) {
+      j0 = j0 - (j0 / uRing) * uRing;
+      j1 = j1 - (j1 / uRing) * uRing;
+    }
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    uvec4 b0 = texelFetch(uV, kvAt(vx, j1.x), 0);
+    uvec4 b1 = texelFetch(uV, kvAt(vx, j1.y), 0);
+    uvec4 b2 = texelFetch(uV, kvAt(vx, j1.z), 0);
+    uvec4 b3 = texelFetch(uV, kvAt(vx, j1.w), 0);
+    lo0 += e0.x * h2lo(a0) + e0.y * h2lo(a1) + e0.z * h2lo(a2) + e0.w * h2lo(a3);
+    hi0 += e0.x * h2hi(a0) + e0.y * h2hi(a1) + e0.z * h2hi(a2) + e0.w * h2hi(a3);
+    lo1 += e1.x * h2lo(b0) + e1.y * h2lo(b1) + e1.z * h2lo(b2) + e1.w * h2lo(b3);
+    hi1 += e1.x * h2hi(b0) + e1.y * h2hi(b1) + e1.z * h2hi(b2) + e1.w * h2hi(b3);
+  }
+  lo0 += lo1;
+  hi0 += hi1;`
+    : `  // (A member whose keys are all masked here sums nothing: its max is
+  // -1e30, so exp(score - max) is exp(0) = 1 for masked keys; its weights
+  // are zeroed below.)
+  for (int i = t0; i < t1; i++) {
+    ivec4 j0 = min(sj0 + 4 * i + ivec4(0, 1, 2, 3), ivec4(uJ0 + uKeys - 1));
+    if (uRing > 0) j0 = j0 - (j0 / uRing) * uRing;
+    uvec4 a0 = texelFetch(uV, kvAt(vx, j0.x), 0);
+    uvec4 a1 = texelFetch(uV, kvAt(vx, j0.y), 0);
+    uvec4 a2 = texelFetch(uV, kvAt(vx, j0.z), 0);
+    uvec4 a3 = texelFetch(uV, kvAt(vx, j0.w), 0);
+    vec4 al0 = h2lo(a0), ah0 = h2hi(a0), al1 = h2lo(a1), ah1 = h2hi(a1);
+    vec4 al2 = h2lo(a2), ah2 = h2hi(a2), al3 = h2lo(a3), ah3 = h2hi(a3);
+${members
+  .map(
+    (i) => `    {
+      vec4 e = exp(texelFetch(${names[i]}, ivec2(sx + i, row), 0) - mx${i});
+      l${i} += e;
+      lo${i} += e.x * al0 + e.y * al1 + e.z * al2 + e.w * al3;
+      hi${i} += e.x * ah0 + e.y * ah1 + e.z * ah2 + e.w * ah3;
+    }`
+  )
+  .join("\n")}
+  }`
+}
+${members
+  .map(
+    (i) => `  bool dead${i} = mx${i} ${empty};
+  o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
+  o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
+  o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
+  )
+  .join("\n")}
+}`
+}
+
+/**
+ * Attention for long key ranges, part 2: query m's chunks (attendChunk)
+ * rescaled to the largest max and added up, times the head's gate, as h2
+ * (one head's 8 dims per texel). Head h's chunks are member h % G's
+ * textures (uP{3i}..uP{3i+2}), at row group h / G's texels.
+ */
+function attendCombineSource(headDim: number, gate: Gate, G: number) {
+  const U = headDim / 8
+  const P = Array.from({ length: 3 * G }, (_, k) => `uP${k}`)
+  // Texture k (of 3) of head h's member hm.
+  const fetch = (k: number) => {
+    let body = `texelFetch(uP${3 * (G - 1) + k}, p, 0)`
+    for (let i = G - 2; i >= 0; i--)
+      body = `hm == ${i} ? texelFetch(uP${3 * i + k}, p, 0) : ${body}`
+    return body
+  }
+  return `${HEADER}
+${P.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uQKVG;
+uniform int uM0;
+uniform int uSliceQ;
+uniform int uChunks;
+uniform int uGateTexel;
+out uvec4 o;
+int hm;
+vec4 P0(ivec2 p) { return ${fetch(0)}; }
+vec4 P1(ivec2 p) { return ${fetch(1)}; }
+vec4 P2(ivec2 p) { return ${fetch(2)}; }
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${U};
+  hm = h % ${G};
+  int px = (h / ${G}) * ${U} + (x - h * ${U});
+  int qi = m - uM0;
+  float mx = -1e30;
+  for (int c = 0; c < uChunks; c++)
+    mx = max(mx, P2(ivec2(px, c * uSliceQ + qi)).x);
+  float l = 0.0;
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  for (int c = 0; c < uChunks; c++) {
+    ivec2 p = ivec2(px, c * uSliceQ + qi);
+    vec2 ml = P2(p).xy;
+    float w = exp(ml.x - mx);
+    l += ml.y * w;
+    lo += w * P0(p);
+    hi += w * P1(p);
+  }
+  ${gateOut(gate)}
+}`
+}
+
+/**
+ * Writing's chunks of keys (attendChunk's job, for few queries): chunk k
+ * of query qi at texels ((k % uOutPanels) · uOutPanelW + x, (k /
+ * uOutPanels) · uSliceQ + qi), panels side by side (a few: a long
+ * one-row target is several times slower on an iPhone). Chunk k is chunk k % uSegChunks of key segment k /
+ * uSegChunks; chunks past the keys are empty. `online`: one loop, each
+ * member's softmax kept online (a running max, the sums rescaled when it
+ * rises), so each score is read once; else the max first, then the sums
+ * (a shorter chain of dependent steps a key). `unroll` score texels a
+ * step. Outputs as attendChunk's.
+ */
+function attendPanelSource(
+  headDim: number, G: number, unroll = 1, online = true, halfScores = false
+) {
+  const empty = halfScores ? "<= -65504.0" : "< -1e29"
+  const U = headDim / 8
+  const members = Array.from({ length: G }, (_, i) => i)
+  const names = sNames(G)
+  const steps = (n: number) => Array.from({ length: n }, (_, t) => t)
+  // n score texels from i: every read first (they go out together), then
+  // each member's running max, rescale and sums.
+  const step = (n: number) => `${steps(n)
+    .map(
+      (t) => `    ivec4 j${t} = min(sj0 + 4 * (i + ${t}) + ivec4(0, 1, 2, 3), ivec4(uJ0 + uKeys - 1));
+    if (uRing > 0) j${t} = j${t} - (j${t} / uRing) * uRing;
+    uvec4 a${t}0 = texelFetch(uV, kvAt(vx, j${t}.x), 0);
+    uvec4 a${t}1 = texelFetch(uV, kvAt(vx, j${t}.y), 0);
+    uvec4 a${t}2 = texelFetch(uV, kvAt(vx, j${t}.z), 0);
+    uvec4 a${t}3 = texelFetch(uV, kvAt(vx, j${t}.w), 0);
+${members.map((i) => `    vec4 s${i}_${t} = texelFetch(${names[i]}, ivec2(sx + i + ${t}, row), 0);`).join("\n")}`
+    )
+    .join("\n")}
+${members
+  .map(
+    (i) => `    {
+${
+  online
+    ? `      float m = mx${i};
+${steps(n)
+  .map((t) => `      m = max(m, max(max(s${i}_${t}.x, s${i}_${t}.y), max(s${i}_${t}.z, s${i}_${t}.w)));`)
+  .join("\n")}
+      float scale = exp(mx${i} - m);
+      mx${i} = m;
+      l${i} *= scale;
+      lo${i} *= scale;
+      hi${i} *= scale;`
+    : `      float m = mx${i};`
+}
+${steps(n)
+  .map(
+    (t) => `      {
+        vec4 e = exp(s${i}_${t} - m);
+        l${i} += e;
+        lo${i} += e.x * h2lo(a${t}0) + e.y * h2lo(a${t}1) + e.z * h2lo(a${t}2) + e.w * h2lo(a${t}3);
+        hi${i} += e.x * h2hi(a${t}0) + e.y * h2hi(a${t}1) + e.z * h2hi(a${t}2) + e.w * h2hi(a${t}3);
+      }`
+  )
+  .join("\n")}
+    }`
+  )
+  .join("\n")}`
+  return `${HEADER}
+${names.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uV;
+uniform int uRows;
+uniform int uRing;
+uniform int uJ0;
+uniform int uKeys;
+uniform int uGroup;
+uniform int uKt;
+uniform int uPanelRows;
+uniform int uVOff;
+uniform int uSliceQ;
+uniform int uChunkTexels;
+uniform int uSegRows;
+uniform int uSegKeys;
+uniform int uSegChunks;
+uniform int uOutPanels;
+uniform int uOutPanelW;
+${KV_AT}
+${members
+  .map(
+    (i) => `layout(location = ${3 * i}) out vec4 o${3 * i};
+layout(location = ${3 * i + 1}) out vec4 o${3 * i + 1};
+layout(location = ${3 * i + 2}) out vec4 o${3 * i + 2};`
+  )
+  .join("\n")}
+void main() {
+  int px = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int op = px / uOutPanelW;
+  int x = px - op * uOutPanelW;
+  int qi = y % uSliceQ;
+  int k = (y / uSliceQ) * uOutPanels + op;
+  int s = k / uSegChunks;
+  int c = k - s * uSegChunks;
+  int g = x / ${U};
+  int u = x - g * ${U};
+  int kh = (g * ${G}) / uGroup;
+  int r = s * uSegRows + g * uRows + qi;
+  int panel = r / uPanelRows;
+  int row = r - panel * uPanelRows;
+  int sx = panel * uKt;
+  int sj0 = uJ0 + s * uSegKeys;
+  int texels = (max(0, min(uKeys - s * uSegKeys, uSegKeys)) + 3) / 4;
+  int t0 = c * uChunkTexels;
+  int t1 = min(texels, t0 + uChunkTexels);
+  int vx = uVOff + kh * ${U} + u;
+${members
+  .map(
+    (i) => `  float mx${i} = -1e30;
+  vec4 l${i} = vec4(0.0);
+  vec4 lo${i} = vec4(0.0);
+  vec4 hi${i} = vec4(0.0);`
+  )
+  .join("\n")}
+  // (Masked keys score -1e30. Until a member's first live key its max is
+  // -1e30 too, so what it sums meanwhile is scaled by exp(-1e30 - max) = 0
+  // at that key; a member with none is written empty below.)
+${
+  online
+    ? ""
+    : `  // Each member's max over the chunk first (the scores are read again
+  // below, from the cache), so the sums need no rescaling.
+  for (int i = t0; i < t1; i++) {
+${members
+  .map(
+    (i) => `    vec4 s${i} = texelFetch(${names[i]}, ivec2(sx + i, row), 0);
+    mx${i} = max(mx${i}, max(max(s${i}.x, s${i}.y), max(s${i}.z, s${i}.w)));`
+  )
+  .join("\n")}
+  }
+`
+}  int i = t0;
+${
+  unroll > 1
+    ? `  for (; i + ${unroll - 1} < t1; i += ${unroll}) {
+${step(unroll)}
+  }
+`
+    : ""
+}  for (; i < t1; i++) {
+${step(1)}
+  }
+${members
+  .map(
+    (i) => `  bool dead${i} = mx${i} ${empty};
+  o${3 * i} = dead${i} ? vec4(0.0) : lo${i};
+  o${3 * i + 1} = dead${i} ? vec4(0.0) : hi${i};
+  o${3 * i + 2} = dead${i} ? vec4(-1e30, 0.0, 0.0, 0.0) : vec4(mx${i}, dot(l${i}, vec4(1.0)), 0.0, 0.0);`
+  )
+  .join("\n")}
+}`
+}
+
+/** Chunks attendPanelCombine reads per step of its loop. */
+const COMBINE_UNROLL = 8
+
+/**
+ * attendCombine for attendPanel's layout: query m's uChunks chunks from
+ * panels uOutPanels across, uOutPanelW texels each.
+ */
+function attendPanelCombineSource(headDim: number, gate: Gate, G: number) {
+  const U = headDim / 8
+  const P = Array.from({ length: 3 * G }, (_, k) => `uP${k}`)
+  const fetch = (k: number) => {
+    let body = `texelFetch(uP${3 * (G - 1) + k}, p, 0)`
+    for (let i = G - 2; i >= 0; i--)
+      body = `hm == ${i} ? texelFetch(uP${3 * i + k}, p, 0) : ${body}`
+    return body
+  }
+  return `${HEADER}
+${P.map((n) => `uniform sampler2D ${n};`).join("\n")}
+uniform usampler2D uQKVG;
+uniform int uM0;
+uniform int uSliceQ;
+uniform int uChunks;
+uniform int uGateTexel;
+uniform int uOutPanels;
+uniform int uOutPanelW;
+out uvec4 o;
+int hm;
+vec4 P0(ivec2 p) { return ${fetch(0)}; }
+vec4 P1(ivec2 p) { return ${fetch(1)}; }
+vec4 P2(ivec2 p) { return ${fetch(2)}; }
+ivec2 at(int px, int c, int qi) {
+  int row = c / uOutPanels;
+  return ivec2(px + (c - row * uOutPanels) * uOutPanelW, row * uSliceQ + qi);
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  int h = x / ${U};
+  hm = h % ${G};
+  int px = (h / ${G}) * ${U} + (x - h * ${U});
+  int qi = m - uM0;
+  // One pass over the chunks, ${COMBINE_UNROLL} at a time (their reads go out
+  // together: a writing step's combine is a few hundred fragments, so each
+  // waits out its reads' latency), the running max rescaling the sums.
+  // (An empty chunk, max -1e30 and sums 0, adds nothing; every query has
+  // a live key, itself.)
+  float mx = -1e30;
+  float l = 0.0;
+  vec4 lo = vec4(0.0);
+  vec4 hi = vec4(0.0);
+  int c = 0;
+  for (; c + ${COMBINE_UNROLL - 1} < uChunks; c += ${COMBINE_UNROLL}) {
+${Array.from(
+  { length: COMBINE_UNROLL },
+  (_, n) => `    ivec2 p${n} = at(px, c + ${n}, qi);
+    vec2 m${n} = P2(p${n}).xy;
+    vec4 a${n} = P0(p${n});
+    vec4 b${n} = P1(p${n});`
+).join("\n")}
+    float mn = max(mx, ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `m${n}.x`).reduce((a, b) => `max(${a}, ${b})`)});
+    float scale = exp(mx - mn);
+${Array.from({ length: COMBINE_UNROLL }, (_, n) => `    float w${n} = exp(m${n}.x - mn);`).join("\n")}
+    l = l * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `m${n}.y * w${n}`).join(" + ")};
+    lo = lo * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `w${n} * a${n}`).join(" + ")};
+    hi = hi * scale + ${Array.from({ length: COMBINE_UNROLL }, (_, n) => `w${n} * b${n}`).join(" + ")};
+    mx = mn;
+  }
+  for (; c < uChunks; c++) {
+    ivec2 p = at(px, c, qi);
+    vec2 ml = P2(p).xy;
+    float mn = max(mx, ml.x);
+    float scale = exp(mx - mn);
+    float w = exp(ml.x - mn);
+    l = l * scale + ml.y * w;
+    lo = lo * scale + w * P0(p);
+    hi = hi * scale + w * P1(p);
+    mx = mn;
+  }
+  ${gateOut(gate)}
+}`
+}
+
+/** Values into the h2 cache: 8 dims per texel, rows offset to the cache position. */
+function valuesSource(headDim: number) {
+  const U = headDim / 8
+  return `${HEADER}
+uniform usampler2D uQKVG;
+uniform int uBase;
+uniform int uRowOffset;
+uniform int uXOff;
+out uvec4 o;
+void main() {
+  int x = int(gl_FragCoord.x) - uXOff;
+  int m = int(gl_FragCoord.y) - uRowOffset;
+  int head = x / ${U};
+  int t = uBase + head * ${2 * U} + (x % ${U}) * 2;
+  o = packH2(pf(uQKVG, t, m), pf(uQKVG, t + 1, m));
+}`
+}
+
+/** SwiGLU: silu(gate) · up, from w1|w3's f32 output (uHalf texels each). h2 output. */
+export const SWIGLU = `${HEADER}
+uniform usampler2D uGU;
+uniform int uHalf;
+out uvec4 o;
+vec4 silu(vec4 g) { return g / (1.0 + exp(-g)); }
+void main() {
+  int x = int(gl_FragCoord.x);
+  int m = int(gl_FragCoord.y);
+  vec4 a = silu(pf(uGU, 2 * x, m)) * pf(uGU, uHalf + 2 * x, m);
+  vec4 b = silu(pf(uGU, 2 * x + 1, m)) * pf(uGU, uHalf + 2 * x + 1, m);
+  o = packH2(a, b);
+}`
+
+/** Copies an f32 tensor (for debugging reads of h2 tensors: h2 → f32). */
+export const H2_TO_F32 = `${HEADER}
+uniform usampler2D uX;
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  uvec4 u = texelFetch(uX, ivec2(p.x >> 1, p.y), 0);
+  o = (p.x & 1) == 0 ? h2lo(u) : h2hi(u);
+}`
+
+/** Copies an f32 tensor. */
+export const COPY = `${HEADER}
+uniform sampler2D uX;
+out vec4 o;
+void main() {
+  o = texelFetch(uX, ivec2(gl_FragCoord.xy), 0);
+}`
+
+/*
+ * Picking candidates on the GPU, so writing a token reads back ~50 KB
+ * instead of every logit. Logits are the output head's wrapped layout
+ * (uOutW RGBA texels, 4·uOutW logits, per row); the mask (R8UI, 4·uOutW
+ * wide) marks prompt tokens (1), never to draw (2), or generated tokens (3).
+ */
+const PENALIZED = `
+uniform int uLogitRows;
+/* The head's K-slices to add up (1: summed already), uHeadStride rows apart. */
+uniform int uHeadSplit;
+uniform int uHeadStride;
+uniform ivec4 uExtra;
+uniform ivec4 uExtra2;
+/* The batch row that logits row 0 is (when rows are picked one at a time). */
+uniform int uPenaltyRow0;
+uniform usampler2D uAllowed;
+uniform int uAllowedEnabled;
+uniform int uAllowedWidth;
+uniform int uAllowedRows;
+uniform int uAllowedStride;
+uniform float uPresencePenalty;
+/*
+ * Token id's logit with the repetition penalty for row r of a batch: the
+ * mask's seen tokens, and the batch's drafts before row r (uExtra, then
+ * uExtra2: draft i is row i + 1's input, so rows after it have seen it).
+ */
+float penalized(float v, uint m, int id, int r) {
+  if (uAllowedEnabled != 0) {
+    int word = id >> 5;
+    int maskRow = uAllowedRows == 1 ? 0 : r;
+    if (maskRow >= uAllowedRows) return -1e30;
+    uint bits = texelFetch(uAllowed, ivec2(word % uAllowedWidth, word / uAllowedWidth + maskRow * uAllowedStride), 0).x;
+    if ((bits & (1u << uint(id & 31))) == 0u) return -1e30;
+  }
+  if (m == 2u) return -1e30;
+  bool generated = m == 3u;
+  for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) generated = true;
+  for (int k = 0; k < 4; k++) if (k + 4 < r && uExtra2[k] == id) generated = true;
+  bool seen = m == 1u || generated;
+  if (seen) v = v < 0.0 ? v * uPenalty : v / uPenalty;
+  return generated ? v - uPresencePenalty : v;
+}
+vec4 chunkTexel(int c, int t, int r) {
+  int texel = c * 64 + t;
+  ivec2 p = ivec2(texel % uOutW, texel / uOutW);
+  vec4 v = vec4(0.0);
+  for (int s = 0; s < 4; s++) {
+    if (s >= uHeadSplit) break;
+    v += texelFetch(uLogits, ivec2(p.x, p.y + r * uLogitRows + s * uHeadStride), 0);
+  }
+  int base = 4 * p.x;
+  int id = 4 * texel;
+  return vec4(
+    penalized(v.x, texelFetch(uMask, ivec2(base, p.y), 0).x, id, r + uPenaltyRow0),
+    penalized(v.y, texelFetch(uMask, ivec2(base + 1, p.y), 0).x, id + 1, r + uPenaltyRow0),
+    penalized(v.z, texelFetch(uMask, ivec2(base + 2, p.y), 0).x, id + 2, r + uPenaltyRow0),
+    penalized(v.w, texelFetch(uMask, ivec2(base + 3, p.y), 0).x, id + 3, r + uPenaltyRow0));
+}`
+
+/** Each 256-logit chunk's largest (penalized) logit: x = chunk index, y = row. */
+export const CHUNK_MAX = `${HEADER}
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform int uOutW;
+uniform float uPenalty;
+${PENALIZED}
+out vec4 o;
+void main() {
+  int c = int(gl_FragCoord.x);
+  int r = int(gl_FragCoord.y);
+  float mx = -1e30;
+  for (int t = 0; t < 64; t++) {
+    vec4 v = chunkTexel(c, t, r);
+    mx = max(mx, max(max(v.x, v.y), max(v.z, v.w)));
+  }
+  o = vec4(mx, 0.0, 0.0, 0.0);
+}`
+
+/**
+ * CHUNK_MAX, also noting where in the chunk its first largest logit is
+ * (.y), so the argmax needn't walk the chunk again.
+ */
+export const CHUNK_MAX_AT = `${HEADER}
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform int uOutW;
+uniform float uPenalty;
+${PENALIZED}
+out vec4 o;
+void main() {
+  int c = int(gl_FragCoord.x);
+  int r = int(gl_FragCoord.y);
+  float mx = -3e38;
+  int at = 0;
+  for (int t = 0; t < 64; t++) {
+    vec4 v = chunkTexel(c, t, r);
+    if (v.x > mx) { mx = v.x; at = 4 * t; }
+    if (v.y > mx) { mx = v.y; at = 4 * t + 1; }
+    if (v.z > mx) { mx = v.z; at = 4 * t + 2; }
+    if (v.w > mx) { mx = v.w; at = 4 * t + 3; }
+  }
+  o = vec4(mx, float(at), 0.0, 0.0);
+}`
+
+/**
+ * CHUNK_ARGMAX from CHUNK_MAX_AT's maxima and positions: the first chunk
+ * with the largest maximum, scanned 8 chunks at a time (independent reads),
+ * then that chunk's position. uChunks is fixed by withChunks.
+ */
+export const CHUNK_ARGMAX_AT = `${HEADER}
+uniform sampler2D uMax;
+uniform int uChunks;
+uniform int uRow;
+out uvec4 o;
+void main() {
+  float t0 = -3e38, t1 = -3e38, t2 = -3e38, t3 = -3e38, t4 = -3e38, t5 = -3e38, t6 = -3e38, t7 = -3e38;
+  int b0 = 0, b1 = 1, b2 = 2, b3 = 3, b4 = 4, b5 = 5, b6 = 6, b7 = 7;
+  for (int i = 0; i < uChunks; i += 8) {
+    float v0 = texelFetch(uMax, ivec2(i, uRow), 0).x;
+    float v1 = i + 1 < uChunks ? texelFetch(uMax, ivec2(i + 1, uRow), 0).x : -3e38;
+    float v2 = i + 2 < uChunks ? texelFetch(uMax, ivec2(i + 2, uRow), 0).x : -3e38;
+    float v3 = i + 3 < uChunks ? texelFetch(uMax, ivec2(i + 3, uRow), 0).x : -3e38;
+    float v4 = i + 4 < uChunks ? texelFetch(uMax, ivec2(i + 4, uRow), 0).x : -3e38;
+    float v5 = i + 5 < uChunks ? texelFetch(uMax, ivec2(i + 5, uRow), 0).x : -3e38;
+    float v6 = i + 6 < uChunks ? texelFetch(uMax, ivec2(i + 6, uRow), 0).x : -3e38;
+    float v7 = i + 7 < uChunks ? texelFetch(uMax, ivec2(i + 7, uRow), 0).x : -3e38;
+    if (v0 > t0) { t0 = v0; b0 = i; }
+    if (v1 > t1) { t1 = v1; b1 = i + 1; }
+    if (v2 > t2) { t2 = v2; b2 = i + 2; }
+    if (v3 > t3) { t3 = v3; b3 = i + 3; }
+    if (v4 > t4) { t4 = v4; b4 = i + 4; }
+    if (v5 > t5) { t5 = v5; b5 = i + 5; }
+    if (v6 > t6) { t6 = v6; b6 = i + 6; }
+    if (v7 > t7) { t7 = v7; b7 = i + 7; }
+  }
+  // Merged with ties to the lower index, as CHUNK_RANK ranks them.
+  float top = t0;
+  int best = b0;
+  if (t1 > top || (t1 == top && b1 < best)) { top = t1; best = b1; }
+  if (t2 > top || (t2 == top && b2 < best)) { top = t2; best = b2; }
+  if (t3 > top || (t3 == top && b3 < best)) { top = t3; best = b3; }
+  if (t4 > top || (t4 == top && b4 < best)) { top = t4; best = b4; }
+  if (t5 > top || (t5 == top && b5 < best)) { top = t5; best = b5; }
+  if (t6 > top || (t6 == top && b6 < best)) { top = t6; best = b6; }
+  if (t7 > top || (t7 == top && b7 < best)) { top = t7; best = b7; }
+  int at = int(texelFetch(uMax, ivec2(best, uRow), 0).y);
+  o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
+}`
+
+/**
+ * CHUNK_ARGMAX_AT for every row at once (fragment y: row y), as floats:
+ * x the token id, y its penalized logit. For greedy decoding, which needs
+ * nothing else read back.
+ */
+export const CHUNK_ARGMAX_ROWS = CHUNK_ARGMAX_AT.replace("uniform int uRow;", "")
+  .replace("out uvec4 o;\nvoid main() {", "out vec4 o;\nvoid main() {\n  int uRow = int(gl_FragCoord.y);")
+  .replace(
+    "o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);",
+    "o = vec4(float(best * 256 + at), top, 0.0, 0.0);"
+  )
+
+const chunksCache = new Map<string, Map<number, string>>()
+/** `source` with its chunk count fixed at `n`, so its loops have a constant bound. */
+export function withChunks(source: string, n: number) {
+  let bySource = chunksCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    chunksCache.set(source, bySource)
+  }
+  let out = bySource.get(n)
+  if (out === undefined) {
+    out = source.replace("uniform int uChunks;", `const int uChunks = ${n};`)
+    bySource.set(n, out)
+  }
+  return out
+}
+
+/** Each chunk's rank by its largest logit (0 = largest; ties by index). */
+export const CHUNK_RANK = `${HEADER}
+uniform sampler2D uMax;
+uniform int uChunks;
+out vec4 o;
+void main() {
+  int c = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
+  float mine = texelFetch(uMax, ivec2(c, row), 0).x;
+  int rank = 0;
+  for (int i = 0; i < uChunks; i++) {
+    float v = texelFetch(uMax, ivec2(i, row), 0).x;
+    if (v > mine || (v == mine && i < c)) rank++;
+  }
+  o = vec4(float(rank), 0.0, 0.0, 0.0);
+}`
+
+/** Pixel r: the index of the chunk ranked r (CHUNK_RANK inverted). */
+export const CHUNK_BY_RANK = `${HEADER}
+uniform sampler2D uRank;
+uniform int uChunks;
+out vec4 o;
+void main() {
+  int r = int(gl_FragCoord.x);
+  int row = int(gl_FragCoord.y);
+  int c = 0;
+  for (int i = 0; i < uChunks; i++) {
+    if (int(texelFetch(uRank, ivec2(i, row), 0).x) == r) c = i;
+  }
+  o = vec4(float(c), 0.0, 0.0, 0.0);
+}`
+
+/**
+ * Row r: the logits of the chunk ranked r (from CHUNK_BY_RANK), 64
+ * texels, then its index in texel 64.
+ */
+export const CHUNK_GATHER = `${HEADER}
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform sampler2D uByRank;
+uniform usampler2D uIds;
+uniform int uOutW;
+uniform float uPenalty;
+uniform int uCount;
+${PENALIZED}
+out vec4 o;
+void main() {
+  // Row row · uCount + k: row's chunk ranked k; then its index (texel 64)
+  // and the ids texture's first id (texel 65: CHUNK_ARGMAX's guess).
+  int t = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int row = y / uCount;
+  int k = y - row * uCount;
+  int c = int(texelFetch(uByRank, ivec2(k, row), 0).x);
+  o = t < 64
+    ? chunkTexel(c, t, row)
+    : t == 64
+      ? vec4(float(c), 0.0, 0.0, 0.0)
+      : vec4(float(texelFetch(uIds, ivec2(0, 0), 0).x), 0.0, 0.0, 0.0);
+}`
+
+/**
+ * The likeliest token (penalized) of row uRow, as a token id into the ids
+ * texture, straight from the chunk maxima: the first chunk with the largest
+ * (as CHUNK_RANK ranks them), then its first largest logit. Needs only
+ * CHUNK_MAX, so the next forward needn't wait for the rest of the pick.
+ */
+export const CHUNK_ARGMAX = `${HEADER}
+uniform sampler2D uMax;
+uniform sampler2D uLogits;
+uniform usampler2D uMask;
+uniform int uOutW;
+uniform int uChunks;
+uniform int uRow;
+uniform float uPenalty;
+${PENALIZED}
+out uvec4 o;
+void main() {
+  int best = 0;
+  float top = texelFetch(uMax, ivec2(0, uRow), 0).x;
+  for (int i = 1; i < uChunks; i++) {
+    float v = texelFetch(uMax, ivec2(i, uRow), 0).x;
+    if (v > top) { top = v; best = i; }
+  }
+  float b = -3e38;
+  int at = 0;
+  for (int t = 0; t < 64; t++) {
+    vec4 v = chunkTexel(best, t, uRow);
+    for (int c = 0; c < 4; c++) {
+      float vc = comp(v, c);
+      if (vc > b) { b = vc; at = 4 * t + c; }
+    }
+  }
+  o = uvec4(uint(best * 256 + at), 0u, 0u, 0u);
+}`
+
+/**
+ * Copies cache rows (h2) between caches of different lengths: target row y
+ * holds position uPos0 + (y - uRow0), read from row position % uMod of uX.
+ */
+export const COPY_POSITIONS = `${HEADER}
+uniform usampler2D uX;
+uniform int uPos0;
+uniform int uRow0;
+uniform int uMod;
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int pos = uPos0 + (p.y - uRow0);
+  o = texelFetch(uX, ivec2(p.x, pos % uMod), 0);
+}`
+
+/*
+ * ggml Q6_K, read natively (see weights.ts for the layout), from a byte
+ * texture: a row's super-block of 256 weights is 52 RGBA8UI texels, ql
+ * (texels 0..31), qh (32..47) and the int8 scales (48..51), with its fp16 d
+ * in the scales texture. In half n of a super-block, for l = 0..31, as
+ * dequantize_row_q6_K:
+ *   y[128n + l]      = d · sc[8n + l/16 + 0] · ((ql[64n + l] & 15      | (qh[32n + l] >> 0 & 3) << 4) - 32)
+ *   y[128n + l + 32] = d · sc[8n + l/16 + 2] · ((ql[64n + l + 32] & 15 | (qh[32n + l] >> 2 & 3) << 4) - 32)
+ *   y[128n + l + 64] = d · sc[8n + l/16 + 4] · ((ql[64n + l] >> 4      | (qh[32n + l] >> 4 & 3) << 4) - 32)
+ *   y[128n + l + 96] = d · sc[8n + l/16 + 6] · ((ql[64n + l + 32] >> 4 | (qh[32n + l] >> 6 & 3) << 4) - 32)
+ * Texel w of a half covers l = 4w..4w+3: ql texels 16n + w and 16n + 8 + w,
+ * qh texel 32 + 8n + w. The bits come apart with float math (exact on
+ * integers up to 255), which mobile GPUs run faster than integer shifts.
+ */
+/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
+export const EXPAND_Q6_BYTES = `${HEADER}
+uniform usampler2D uNative;
+uniform int uX0;
+uniform int uY0;
+out vec4 o;
+uint nativeWord(int base, int y, int word) {
+  return comp(texelFetch(uNative, ivec2(base + (word >> 2), y), 0), word & 3);
+}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int block = p.x >> 8;
+  int row = (p.x >> 6) & 3;
+  int j = (p.x & 63) * 4;
+  int base = (block * 4 + row) * 13;
+  int n = j >> 7;
+  int part = (j >> 5) & 3;
+  int lane = j & 31;
+  uint ql = nativeWord(base, p.y, (n * 64 + lane + (part & 1) * 32) >> 2);
+  uint qh = nativeWord(base, p.y, (128 + n * 32 + lane) >> 2);
+  uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
+  uvec4 lo = (uvec4(ql) >> shifts) & 255u;
+  uvec4 hi = (uvec4(qh) >> shifts) & 255u;
+  uvec4 q = ((lo >> uint((part >> 1) * 4)) & 15u) | (((hi >> uint(part * 2)) & 3u) << 4u);
+  if ((j & 15) == 0) {
+    int at = 192 + (j >> 4);
+    uint scale = (nativeWord(base, p.y, at >> 2) >> uint((at & 3) * 8)) & 255u;
+    q |= ((uvec4(scale) >> uvec4(0u, 2u, 4u, 6u)) & 3u) << 6u;
+  }
+  o = vec4(q) / 255.0;
+}
+`
+
+const Q6_K_UNPACK = `
+// Low nibbles (lo) and high nibbles (hi) of 4 bytes.
+void nibbles(vec4 B, out vec4 lo, out vec4 hi) { hi = floor(B * 0.0625); lo = B - 16.0 * hi; }
+// The four 2-bit fields of 4 bytes, lowest first.
+void pairs(vec4 B, out vec4 h0, out vec4 h1, out vec4 h2, out vec4 h3) {
+  vec4 t1 = floor(B * 0.25);
+  h0 = B - 4.0 * t1;
+  vec4 t2 = floor(t1 * 0.25);
+  h1 = t1 - 4.0 * t2;
+  h3 = floor(t2 * 0.25);
+  h2 = t2 - 4.0 * h3;
+}
+// An int8 scale from its byte.
+float sc8(float b) { return b < 128.0 ? b : b - 256.0; }`
+
+/**
+ * The output head from a Q6_K embedding: `matmul` with `wrap`, for 6-bit
+ * weights. For each word position the four groups' activations are decoded
+ * once and shared by the fragment's 4 rows; each row reads its 3 weight
+ * texels and the 2 scale texels for that half.
+ */
+function matmulQ6KHeadSource(o: { split: boolean }) {
+  const C = "xyzw"
+  const body: Array<string> = []
+  const line = (s: string) => body.push(`    ${s}`)
+  line(`vec4 s = vec4(0.0);`)
+  for (const n of [0, 1]) {
+    for (let w = 0; w < 8; w++) {
+      const half = w & 1 ? "h2hi" : "h2lo"
+      line(`{`)
+      for (let g = 0; g < 4; g++) {
+        line(
+          `  vec4 A${g} = ${half}(texelFetch(uA, ivec2(sb * 32 + ${16 * n + 4 * g + (w >> 1)}, m), 0));`
+        )
+      }
+      for (const r of [0, 1, 2, 3]) {
+        line(`  {`)
+        line(`    int t0 = wx + (sb * 4 + ${r}) * 52;`)
+        line(`    vec4 a0, a1, b0, b1, h0, h1, h2, h3;`)
+        line(
+          `    nibbles(vec4(texelFetch(uW, ivec2(t0 + ${16 * n + w}, gr), 0)), a0, a1);`
+        )
+        line(
+          `    nibbles(vec4(texelFetch(uW, ivec2(t0 + ${16 * n + 8 + w}, gr), 0)), b0, b1);`
+        )
+        line(
+          `    pairs(vec4(texelFetch(uW, ivec2(t0 + ${32 + 8 * n + w}, gr), 0)), h0, h1, h2, h3);`
+        )
+        // Scales 8n + (w >> 2) + 2g: groups 0 and 1 in texel 48 + 2n,
+        // groups 2 and 3 in the next.
+        line(
+          `    vec4 SA = vec4(texelFetch(uW, ivec2(t0 + ${48 + 2 * n}, gr), 0));`
+        )
+        line(
+          `    vec4 SB = vec4(texelFetch(uW, ivec2(t0 + ${49 + 2 * n}, gr), 0));`
+        )
+        const c0 = C[w >> 2]
+        const c2 = C[(w >> 2) + 2]
+        line(`    s.${C[r]} += sc8(SA.${c0}) * dot(a0 + 16.0 * h0 - 32.0, A0)`)
+        line(`      + sc8(SA.${c2}) * dot(b0 + 16.0 * h1 - 32.0, A1)`)
+        line(`      + sc8(SB.${c0}) * dot(a1 + 16.0 * h2 - 32.0, A2)`)
+        line(`      + sc8(SB.${c2}) * dot(b1 + 16.0 * h3 - 32.0, A3);`)
+        line(`  }`)
+      }
+      line(`}`)
+    }
+  }
+  line(`acc += d * s;`)
+  return `${HEADER}${Q6_K_UNPACK}
+uniform usampler2D uA;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uLogitRows;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int m = y / uLogitRows;
+  y -= m * uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+  int g = y * uOutW + x;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc = vec4(0.0);
+  for (int sb = sb0; sb < sb1; sb++) {
+    vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);
+${body.join("\n")}
+  }
+  o = acc;
+}`
+}
+
+/*
+ * A K-slice of a Q6_K head (see Engine.headQ6K): output row (slice · uRows
+ * + m) · uLogitRows + y holds token m's sums over super-blocks [slice ·
+ * uKbSlice, (slice + 1) · uKbSlice), as headRgba4's slices.
+ */
+const Q6_K_SLICE_UNIFORMS = "uniform int uKbSlice;\nuniform int uRows;"
+const Q6_K_SLICE = `  int slice = m / uRows;
+  m -= slice * uRows;
+  int sb0 = slice * uKbSlice;
+  int sb1 = min(uKb, sb0 + uKbSlice);`
+const Q6_K_WHOLE = `  int sb0 = 0;
+  int sb1 = uKb;`
+
+export const MATMUL_Q6_K_HEAD = matmulQ6KHeadSource({ split: false })
+/** MATMUL_Q6_K_HEAD over a K-slice of super-blocks. */
+export const MATMUL_Q6_K_HEAD_SPLIT = matmulQ6KHeadSource({ split: true })
+
+/*
+ * Q6_K in word texels (RGBA32UI): a row's super-block is 13 texels, ql
+ * (texels 0..7), qh (8..11) and the 16 int8 scales (12), the same bytes as
+ * the byte layout in a quarter of the fetches. Uint i of ql holds bytes
+ * 4i..4i+3 (byte j at bits 8j): uints 16n + w and 16n + 8 + w are the
+ * byte layout's ql texels 16n + w and 16n + 8 + w, uint 8n + w of qh its
+ * texel 32 + 8n + w. The bits come apart four weights at a time in
+ * integer registers (q6g*), then into floats as half mantissas (q6v).
+ */
+const Q6_K_WORDS = `
+const uvec4 BYTE_SHIFT = uvec4(0u, 8u, 16u, 24u);
+// 4 6-bit values in the bytes of q, minus 32: each byte as the mantissa
+// of a half whose exponent makes it 1024 + byte, two to an unpackHalf2x16.
+vec4 q6v(uint q) {
+  vec2 e = unpackHalf2x16((q & 0x00FF00FFu) | 0x64006400u);
+  vec2 f = unpackHalf2x16(((q >> 8u) & 0x00FF00FFu) | 0x64006400u);
+  return vec4(e.x, f.x, e.y, f.y) - 1056.0;
+}
+// The 6-bit values of groups 0..3 (see Q6_K_UNPACK) for 4 word positions,
+// one a byte, from ql word a, ql word b (32 bytes on) and qh word h.
+uint q6g0(uint a, uint h) { return (a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4u); }
+uint q6g1(uint b, uint h) { return (b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2u); }
+uint q6g2(uint a, uint h) { return ((a >> 4u) & 0x0F0F0F0Fu) | (h & 0x30303030u); }
+uint q6g3(uint b, uint h) { return ((b >> 4u) & 0x0F0F0F0Fu) | ((h >> 2u) & 0x30303030u); }
+// An int8 scale: byte b of u.
+float sc8w(uint u, uint b) { return float(int(u << (24u - 8u * b)) >> 24); }`
+
+/**
+ * The output head from a Q6_K embedding in word texels (see Q6_K_WORDS):
+ * one quarter of a super-block (half n, word positions 4hw..4hw+3) per
+ * loop iteration, its activations decoded once for the fragment's 4 rows,
+ * then each row's ql, ql + 32 and qh words and its scales word. A loop,
+ * not unrolled: the same work unrolled a super-block at a time (as
+ * MATMUL_Q6_K_HEAD) took 1.3 ms a head on an M3 Ultra against 0.6, its
+ * registers the limit. With `split`, a
+ * K-slice of super-blocks; with `prescaled`, reads the last add's
+ * h2(x · final norm weights / PRESCALE) from row uRowA0 + m, column uAOff
+ * (see headRgba4).
+ */
+function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
+  const C = "xyzw"
+  const body: Array<string> = []
+  const line = (s: string) => body.push(`    ${s}`)
+  line(`int sb = q >> 2;`)
+  line(`int n = (q >> 1) & 1;`)
+  line(`int hw = q & 1;`)
+  line(`vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);`)
+  // Activations k = 256 sb + 128 n + 32 g + 4 w + i: h2 texel k / 8, the
+  // pair of word positions 2wp, 2wp + 1 in its two halves.
+  line(
+    `int a0 = ${o.prescaled ? "uAOff + " : ""}sb * 32 + 16 * n + 2 * hw;`
+  )
+  const row = o.prescaled ? "uRowA0 + m" : "m"
+  for (let wp = 0; wp < 2; wp++)
+    for (let g = 0; g < 4; g++) {
+      line(`uvec4 u${wp}${g} = texelFetch(uA, ivec2(a0 + ${4 * g + wp}, ${row}), 0);`)
+      line(`vec4 A${2 * wp}${g} = h2lo(u${wp}${g}); vec4 A${2 * wp + 1}${g} = h2hi(u${wp}${g});`)
+    }
+  line(`int qa = 4 * n + hw;`)
+  line(`int qh = 8 + 2 * n + hw;`)
+  // Scales 8n + hw + 2g (g = 0..3): bytes hw, hw + 2 of uints 2n, 2n + 1.
+  line(`uint b0 = uint(hw), b2 = uint(hw + 2);`)
+  for (const r of [0, 1, 2, 3]) {
+    line(`{`)
+    line(`  int t = wx + (sb * 4 + ${r}) * 13;`)
+    line(`  uvec4 QA = texelFetch(uW, ivec2(t + qa, gr), 0);`)
+    line(`  uvec4 QB = texelFetch(uW, ivec2(t + qa + 2, gr), 0);`)
+    line(`  uvec4 QH = texelFetch(uW, ivec2(t + qh, gr), 0);`)
+    line(`  uvec4 S = texelFetch(uW, ivec2(t + 12, gr), 0);`)
+    line(`  uvec2 SS = n == 0 ? S.xy : S.zw;`)
+    line(`  vec4 p = vec4(0.0);`)
+    for (let wi = 0; wi < 4; wi++) {
+      const c = C[wi]
+      line(
+        `  p += vec4(dot(q6v(q6g0(QA.${c}, QH.${c})), A${wi}0), dot(q6v(q6g1(QB.${c}, QH.${c})), A${wi}1), dot(q6v(q6g2(QA.${c}, QH.${c})), A${wi}2), dot(q6v(q6g3(QB.${c}, QH.${c})), A${wi}3));`
+      )
+    }
+    line(
+      `  acc.${C[r]} += d.${C[r]} * dot(p, vec4(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));`
+    )
+    line(`}`)
+  }
+  return `${HEADER}${Q6_K_WORDS}
+uniform usampler2D uA;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uG;
+uniform int uOutW;
+uniform int uLogitRows;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+${o.prescaled ? `${RMS_SCALE}\nuniform int uAOff;\nuniform int uRowA0;` : ""}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int m = y / uLogitRows;
+  y -= m * uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+  int g = y * uOutW + x;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int col = g / uH;
+  int gr = g - col * uH;
+  int wx = col * uRowTexels;
+  int sx = col * uKb;
+  vec4 acc = vec4(0.0);
+  for (int q = sb0 * 4; q < sb1 * 4; q++) {
+${body.join("\n")}
+  }
+  o = ${o.prescaled ? `acc * (rmsScale(uRowA0 + m) * ${PRESCALE}.0)` : "acc"};
+}`
+}
+
+const q6Words = new Map<string, string>()
+/** The Q6_K head for word texels (see matmulQ6KHeadWordsSource). */
+export function matmulQ6KHeadWords(o: { split: boolean; prescaled: boolean }) {
+  const key = `${o.split} ${o.prescaled}`
+  let source = q6Words.get(key)
+  if (!source) q6Words.set(key, (source = matmulQ6KHeadWordsSource(o)))
+  return source
+}
+
+/** EMBED_Q6_K for word texels (see Q6_K_WORDS). */
+export const EMBED_Q6_K_WORDS = `${HEADER}${Q6_K_WORDS}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int sb = c >> 8;
+  int n = (c >> 7) & 1;
+  int grp = (c >> 5) & 3;
+  int w = (c & 31) >> 2;
+  int t0 = col * uRowTexels + (sb * 4 + r) * 13;
+  // ql uint 16n + w (groups 0, 2) or 16n + 8 + w (1, 3); qh uint 32 + 8n + w.
+  int qi = 16 * n + 8 * (grp & 1) + w;
+  uint q = comp(texelFetch(uW, ivec2(t0 + (qi >> 2), gr), 0), qi & 3);
+  int hi = 32 + 8 * n + w;
+  uint h = comp(texelFetch(uW, ivec2(t0 + (hi >> 2), gr), 0), hi & 3);
+  uvec4 lo = ((uvec4(q) >> BYTE_SHIFT) >> uint(4 * (grp >> 1))) & 15u;
+  uvec4 hb = ((uvec4(h) >> BYTE_SHIFT) >> uint(2 * grp)) & 3u;
+  int k = 8 * n + (w >> 2) + 2 * grp;
+  float sc = sc8w(comp(texelFetch(uW, ivec2(t0 + 12, gr), 0), k >> 2), uint(k & 3));
+  float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
+  o = (d * sc) * (vec4(lo | (hb << 4u)) - 32.0);
+}`
+
+/** Embedding rows for token ids from a Q6_K embedding: `embed`, for 6-bit weights. */
+export const EMBED_Q6_K = `${HEADER}${Q6_K_UNPACK}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int sb = c >> 8;
+  int n = (c >> 7) & 1;
+  int grp = (c >> 5) & 3;
+  int w = (c & 31) >> 2;
+  int t0 = col * uRowTexels + (sb * 4 + r) * 52;
+  vec4 lo, hi, h0, h1, h2, h3;
+  nibbles(vec4(texelFetch(uW, ivec2(t0 + 16 * n + w + (grp & 1) * 8, gr), 0)), lo, hi);
+  pairs(vec4(texelFetch(uW, ivec2(t0 + 32 + 8 * n + w, gr), 0)), h0, h1, h2, h3);
+  vec4 low = grp < 2 ? lo : hi;
+  vec4 high = grp == 0 ? h0 : grp == 1 ? h1 : grp == 2 ? h2 : h3;
+  int k = 8 * n + (w >> 2) + 2 * grp;
+  float sc = sc8(float(comp(texelFetch(uW, ivec2(t0 + 48 + (k >> 2), gr), 0), k & 3)));
+  float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
+  o = (d * sc) * (low + 16.0 * high - 32.0);
+}`
+
+export const matmul = memo(matmulSource)
+export const matmulPair = memo(matmulPairSource)
+export const matmulSplitRgba4 = memo(matmulSplitRgba4Source)
+export const headRgba4 = memo(headRgba4Source)
+export const embed = memo(embedSource)
+export const rmsPartial = memo(rmsPartialSource)
+export const addNormed = memo(addNormedSource)
+export const addScaled = memo(addScaledSource)
+export const rmsOfAdd = memo(rmsOfAddSource)
+export const shortConv = memo(shortConvSource)
+export const convState = memo(convStateSource)
+export const convFused = memo(convFusedSource)
+export const convPrefixes = memo(convPrefixesSource)
+export const headPrep = memo(headPrepSource)
+export const scores = memo(scoresSource)
+export const attend = memo(attendSource)
+export const values = memo(valuesSource)
+export const linGates = memo(linGatesSource)
+export const linConv = memo(linConvSource)
+export const linConvState = memo(linConvStateSource)
+export const linPrep = memo(linPrepSource)
+export const linDelta = memo(linDeltaSource)
+export const linDeltaFused = memo(linDeltaFusedSource)
+export const linConvFused = memo(linConvFusedSource)
+export const linState = memo(linStateSource)
+export const linNorm = memo(linNormSource)
+export const linCum = memo(linCumSource)
+export const linGram = memo(linGramSource)
+export const linSolve = memo(linSolveSource)
+export const linUW = memo(linUWSource)
+export const linQO = memo(linQOSource)
+export const linChunkOut = memo(linChunkOutSource)
+export const linChunkState = memo(linChunkStateSource)
+const partialsCache = new Map<string, Map<string, string>>()
+/** fromPartialsSource, memoized (sources are memoized, so lookups are cheap). */
+export function fromPartials(source: string, names: Array<string>) {
+  let bySource = partialsCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    partialsCache.set(source, bySource)
+  }
+  const key = names.join(",")
+  let out = bySource.get(key)
+  if (out === undefined) {
+    out = fromPartialsSource(source, names)
+    bySource.set(key, out)
+  }
+  return out
+}
+
+const splitCache = new Map<string, Map<number, string>>()
+/**
+ * `source` with pf's slice count fixed at `split` (a constant, not a
+ * uniform), so its loop unrolls to exactly that many reads, no branches.
+ */
+export function withSplit(source: string, split: number) {
+  let bySource = splitCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    splitCache.set(source, bySource)
+  }
+  let out = bySource.get(split)
+  if (out === undefined) {
+    out = source.replace(
+      "uniform int uSplitIn;",
+      `const int uSplitIn = ${split};`
+    )
+    bySource.set(split, out)
+  }
+  return out
+}
+
+export const matmulQuad = memo(matmulQuadSource)
+export const dequantRgba4 = memo(dequantRgba4Source)
+const packedScalesCache = new Map<string, string>()
+/**
+ * `source` (a kernel reading a 4-bit matrix's scales uS and zero points uZ
+ * texel by texel) reading them packed instead: uS an RGBA32UI texel of
+ * the block's 4 scales then 4 zero points as halves (one fetch, not two).
+ */
+export function withPackedScales(source: string) {
+  let out = packedScalesCache.get(source)
+  if (out === undefined) {
+    out = source
+      .replace("uniform sampler2D uS;", "uniform usampler2D uS;")
+      .replace("uniform usampler2D uZ;", "")
+      .split("vec4 d = texelFetch(uS, ivec2(sx + kb, gr), 0);")
+      .join("uvec4 sz = texelFetch(uS, ivec2(sx + kb, gr), 0); vec4 d = h2lo(sz);")
+      .split("vec4 z = vec4(texelFetch(uZ, ivec2(sx + kb, gr), 0));")
+      .join("vec4 z = h2hi(sz);")
+      .split("float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);")
+      .join("uvec4 sz = texelFetch(uS, ivec2(col * uKb + kb, gr), 0); float d = comp(h2lo(sz), r);")
+      .split("float(comp(texelFetch(uZ, ivec2(col * uKb + kb, gr), 0), r))")
+      .join("comp(h2hi(sz), r)")
+    if (out.includes("uZ"))
+      throw new Error("A kernel reads zero points in a way withPackedScales doesn't know.")
+    packedScalesCache.set(source, out)
+  }
+  return out
+}
+export const dequantBytes = memo(dequantBytesSource)
+export const matmulF16 = memo(matmulF16Source)
+
+const quadCache = new Map<string, Map<string, string>>()
+/**
+ * A kernel that reads pair tensors `names` with pf, made to read a 4-token
+ * matmul's two outputs instead: each name gets a second sampler, name_B.
+ */
+export function fromQuad(source: string, names: Array<string>) {
+  let bySource = quadCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    quadCache.set(source, bySource)
+  }
+  const key = names.join(",")
+  let out = bySource.get(key)
+  if (out === undefined) {
+    out = source
+    for (const name of names) {
+      out = out
+        .replace(
+          `uniform usampler2D ${name};`,
+          `uniform usampler2D ${name};\nuniform usampler2D ${name}_B;`
+        )
+        .split(`pf(${name},`)
+        .join(`pfq(${name}, ${name}_B,`)
+    }
+    bySource.set(key, out)
+  }
+  return out
+}
+
+const pairSplitCache = new Map<string, Map<number, string>>()
+/**
+ * `source` with the pair tensor's K-slice count fixed at `split` (a
+ * constant, not a uniform), so pf / pfq's loop unrolls.
+ */
+export function withPairSplit(source: string, split: number) {
+  let bySource = pairSplitCache.get(source)
+  if (!bySource) {
+    bySource = new Map()
+    pairSplitCache.set(source, bySource)
+  }
+  let out = bySource.get(split)
+  if (out === undefined) {
+    out = source.replace(
+      "uniform int uPairSplit;",
+      `const int uPairSplit = ${split};`
+    )
+    bySource.set(split, out)
+  }
+  return out
+}
+
+export const attendChunk = memo(attendChunkSource)
+export const attendCombine = memo(attendCombineSource)
+export const attendPanel = memo(attendPanelSource)
+export const attendPanelCombine = memo(attendPanelCombineSource)
+
+export const embedFold = memo(embedFoldSource)
+
+/** Six-bit values and signed subscales share normalized bytes without loss. */
+const Q6_EXPANDED = `
+vec4 q6bytes(sampler2D s,ivec2 p){return floor(255.0*texelFetch(s,p,0)+0.5);}
+float q6scale(vec4 b){float s=dot(floor(b/64.0),vec4(1.0,4.0,16.0,64.0));return s>=128.0?s-256.0:s;}
+vec4 q6values(vec4 b){return b-64.0*floor(b/64.0)-32.0;}`
+
+export function q6ExpandedHead(o: { split: boolean; prescaled: boolean }) {
+  const body: string[] = []
+  for (let j = 0; j < 4; j++)
+    body.push(
+      `uvec4 a${j}=texelFetch(uA,ivec2(${o.prescaled ? "uAOff + " : ""}q*4+${j},${o.prescaled ? "uRowA0 + m" : "m"}),0);vec4 A${2 * j}=h2lo(a${j}),A${2 * j + 1}=h2hi(a${j});`
+    )
+  body.push(`vec4 d=texelFetch(uS,ivec2(col*uKb+(q>>3),gr),0);`)
+  for (let r = 0; r < 4; r++) {
+    body.push(`{ int t=wx+((q>>3)*4+${r})*64+(q&7)*8;`)
+    for (let half = 0; half < 2; half++) {
+      body.push(
+        `{ vec4 B=q6bytes(uW,ivec2(t+${half * 4},gr));float sc=q6scale(B);`
+      )
+      const terms = Array.from(
+        { length: 4 },
+        (_, j) =>
+          `dot(${j === 0 ? "q6values(B)" : `q6bytes(uW,ivec2(t+${half * 4 + j},gr))-32.0`},A${half * 4 + j})`
+      )
+      body.push(
+        `acc.${"xyzw"[r]} += d.${"xyzw"[r]} * sc * (${terms.join("+")}); }`
+      )
+    }
+    body.push("}")
+  }
+  return `${HEADER}${Q6_EXPANDED}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels,uG,uOutW,uLogitRows;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+${o.prescaled ? `${RMS_SCALE}\nuniform int uAOff,uRowA0;` : ""}
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),m=y/uLogitRows;y-=m*uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+int g=y*uOutW+x;if(g>=uG){o=vec4(0);return;}int col=g/uH,gr=g-col*uH,wx=col*uRowTexels;
+vec4 acc=vec4(0);for(int q=sb0*8;q<sb1*8;q++){
+${body.join("\n")}
+}o=${o.prescaled ? `acc*(rmsScale(uRowA0+m)*${PRESCALE}.0)` : "acc"};}`
+}
+
+export const EMBED_Q6_EXPANDED = `${HEADER}${Q6_EXPANDED}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels;
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),id=int(texelFetch(uIds,ivec2(0,y),0).x);
+int g=id>>2,r=id&3,col=g/uH,gr=g-col*uH,sb=x>>6,q=x&63,base=col*uRowTexels+(sb*4+r)*64;
+vec4 quant=q6values(q6bytes(uW,ivec2(base+q,gr)));
+float scale=q6scale(q6bytes(uW,ivec2(base+(q&~3),gr)));
+float d=comp(texelFetch(uS,ivec2(col*uKb+sb,gr),0),r);o=(d*scale)*quant;}`

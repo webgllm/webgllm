@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bench driver</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #fff;
+        font: 12px/1.4 ui-monospace, monospace;
+      }
+      #status {
+        padding: 4px 8px;
+        border-bottom: 1px solid #ddd;
+      }
+      iframe {
+        border: 0;
+        width: 100%;
+        height: calc(100% - 26px);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">waiting for a job</div>
+    <iframe id="frame" title="bench page"></iframe>
+    <script type="module">
+      // One tab for many bench runs, driven from the computer: polls
+      // /models/job.json ({id, url}; ?job=name for /models/name.json, so
+      // two devices can take different jobs) and loads each new job in the
+      // frame, which unloads the last one (its GPU memory goes with it).
+      const frame = document.getElementById("frame")
+      const status = document.getElementById("status")
+      const file = new URLSearchParams(location.search).get("job") ?? "job"
+      let current = null
+      const poll = async () => {
+        try {
+          const job = await fetch(`/models/${file}.json?t=${Date.now()}`, {
+            cache: "no-store"
+          }).then((r) => (r.ok ? r.json() : null))
+          if (job && job.id !== current) {
+            current = job.id
+            status.textContent = `job ${job.id}: ${job.url}`
+            frame.src = job.url
+          }
+        } catch {
+          // No job file yet, or the server is restarting.
+        }
+        setTimeout(poll, 1000)
+      }
+      poll()
+    </script>
+  </body>
+</html>
