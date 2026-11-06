@@ -104,14 +104,6 @@ export const MessageTiming: FC<{
               </span>
             </div>
             )}
-            {stats?.promptMs !== undefined && (
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-fd-muted-foreground">Prompt time</span>
-              <span className="font-mono tabular-nums">
-                {formatTimingMs(stats.promptMs)}
-              </span>
-            </div>
-            )}
             {stats?.promptTokens !== undefined && (
             <div className="flex items-center justify-between gap-4">
               <span className="text-fd-muted-foreground">Prompt tokens</span>

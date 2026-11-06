@@ -142,7 +142,6 @@ function replySources(message: ThreadMessage) {
 
 /** A reply's prompt, cache and token counts, from webgllm's usage and timings. */
 export type ReplyStats = {
-  promptMs?: number;
   promptTokensPerSecond?: number;
   promptTokens?: number;
   cachedTokens?: number;
@@ -249,7 +248,7 @@ export function chatModel(): ChatModelAdapter {
         };
         // What assistant-ui's timing has no fields for, for the stats badge.
         const stats: ReplyStats = {
-          ...(timings && { promptMs: timings.prompt_ms, promptTokensPerSecond: timings.prompt_tokens_per_second }),
+          ...(timings && { promptTokensPerSecond: timings.prompt_tokens_per_second }),
           ...(usage && {
             promptTokens: usage.prompt_tokens,
             cachedTokens: usage.prompt_tokens_details.cached_tokens,
