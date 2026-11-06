@@ -124,3 +124,87 @@ describe("draw", () => {
     for (const x of [0, 0.5, 0.999999]) assert.equal(draw(d, () => x), 2)
   })
 })
+
+/**
+ * The selection the sampler used before its heap and radix sort: the k
+ * largest by rescanning for the smallest kept, and top-p by a comparator
+ * sort. The new one must give the same distribution, bit for bit.
+ */
+function reference(s: { temperature: number; top_k: number; top_p: number; min_p: number }, logits: Float32Array) {
+  const k = Math.max(1, Math.min(s.top_k > 0 ? s.top_k : logits.length, logits.length))
+  let ids: Int32Array
+  let kept: Float32Array
+  if (k >= logits.length) {
+    ids = Int32Array.from({ length: logits.length }, (_, i) => i)
+    kept = logits.slice()
+  } else {
+    ids = new Int32Array(k)
+    kept = new Float32Array(k).fill(-Infinity)
+    let smallest = 0
+    for (let i = 0; i < logits.length; i++) {
+      const x = logits[i]
+      if (!(x > kept[smallest])) continue
+      kept[smallest] = x
+      ids[smallest] = i
+      smallest = 0
+      for (let j = 1; j < k; j++) if (kept[j] < kept[smallest]) smallest = j
+    }
+  }
+  let best = 0
+  for (let j = 1; j < k; j++) if (kept[j] > kept[best]) best = j
+  const max = kept[best]
+  let total = 0
+  for (let j = 0; j < k; j++) {
+    kept[j] = Math.exp((kept[j] - max) / s.temperature)
+    total += kept[j]
+  }
+  for (let j = 0; j < k; j++) {
+    if (kept[j] < s.min_p) {
+      total -= kept[j]
+      kept[j] = 0
+    }
+  }
+  if (s.top_p < 1) {
+    const order = Array.from({ length: k }, (_, j) => j).sort((a, b) => kept[b] - kept[a])
+    let share = 0
+    let cut = false
+    for (const j of order) {
+      if (cut) {
+        total -= kept[j]
+        kept[j] = 0
+      } else {
+        share += kept[j] / total
+        cut = share >= s.top_p
+      }
+    }
+  }
+  for (let j = 0; j < k; j++) kept[j] /= total
+  return { ids, p: kept }
+}
+
+describe("selection matches the rescanning reference", () => {
+  test("same ids, order and probabilities on random logits, with ties and masked tokens", () => {
+    const random = rng(7)
+    const bytes = (a: ArrayBufferView) => Buffer.from(a.buffer, a.byteOffset, a.byteLength)
+    for (let round = 0; round < 60; round++) {
+      const n = 50 + Math.floor(random() * 5000)
+      const logits = new Float32Array(n)
+      // Every third round quantized, for many ties; some tokens masked.
+      const step = round % 3 === 0 ? 0.5 : 0
+      for (let i = 0; i < n; i++) {
+        const x = (random() - 0.5) * 12
+        logits[i] = random() < 0.05 ? -Infinity : step ? Math.round(x / step) * step : x
+      }
+      const s = {
+        temperature: 0.3 + random() * 1.5,
+        top_k: [0, 1, 7, 40, 512, n, n + 3][round % 7],
+        top_p: [1, 0.9, 0.5, 0, 0.99][round % 5],
+        min_p: [0, 0, 0.05][round % 3]
+      }
+      const got = createSampler({ ...s, repetition_penalty: 1 }).distribution(logits.slice())
+      const want = reference(s, logits.slice())
+      assert.ok(bytes(got.ids).equals(bytes(want.ids)), `ids, round ${round}`)
+      assert.ok(bytes(got.p).equals(bytes(want.p)), `p, round ${round}`)
+    }
+  })
+})

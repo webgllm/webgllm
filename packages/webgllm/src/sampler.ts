@@ -61,20 +61,34 @@ export function createSampler({
       let kept: Float32Array
       if (k >= logits.length) {
         // Every token kept (no top-k): no selection to make.
-        keptIds = Int32Array.from({ length: logits.length }, (_, i) => i)
+        keptIds = new Int32Array(k)
+        for (let i = 0; i < k; i++) keptIds[i] = i
         kept = logits.slice()
       } else {
         // The k largest, in no order: replace the smallest kept when beaten.
+        // A min-heap of slots finds it, ties to the lowest slot.
         keptIds = new Int32Array(k)
         kept = new Float32Array(k).fill(-Infinity)
-        let smallest = 0
+        const heap = new Int32Array(k)
+        for (let j = 0; j < k; j++) heap[j] = j
         for (let i = 0; i < logits.length; i++) {
           const x = logits[i]
-          if (!(x > kept[smallest])) continue
-          kept[smallest] = x
-          keptIds[smallest] = i
-          smallest = 0
-          for (let j = 1; j < k; j++) if (kept[j] < kept[smallest]) smallest = j
+          const slot = heap[0]
+          if (!(x > kept[slot])) continue
+          kept[slot] = x
+          keptIds[slot] = i
+          // Sift the slot down to its place.
+          let at = 0
+          for (;;) {
+            let child = 2 * at + 1
+            if (child >= k) break
+            const right = child + 1
+            if (right < k && below(kept, heap[right], heap[child])) child = right
+            if (!below(kept, heap[child], slot)) break
+            heap[at] = heap[child]
+            at = child
+          }
+          heap[at] = slot
         }
       }
       let best = 0
@@ -98,12 +112,12 @@ export function createSampler({
         }
       }
       if (top_p < 1) {
-        const order = Array.from({ length: k }, (_, j) => j).sort(
-          (a, b) => kept[b] - kept[a]
-        )
+        // Zero weights change neither the share nor the total: skipped.
+        const order = descending(kept)
         let share = 0
         let cut = false
-        for (const j of order) {
+        for (let o = 0; o < order.length; o++) {
+          const j = order[o]
           if (cut) {
             total -= kept[j]
             kept[j] = 0
@@ -121,6 +135,49 @@ export function createSampler({
       return draw(this.distribution(logits), random)
     }
   }
+}
+
+/** Whether slot `a` holds less than slot `b`, ties to the lower slot. */
+const below = (kept: Float32Array, a: number, b: number) =>
+  kept[a] < kept[b] || (kept[a] === kept[b] && a < b)
+
+/**
+ * Indices of `weights`' nonzero entries (the weights are nonnegative), from
+ * largest to smallest, ties in index order, as a stable sort gives. A
+ * radix sort on the weights' bits: nonnegative floats order as their bits
+ * do, and it's much faster than a comparator over a whole vocabulary.
+ */
+function descending(weights: Float32Array): Int32Array {
+  const n = weights.length
+  const bits = new Uint32Array(weights.buffer, weights.byteOffset, n)
+  let order = new Int32Array(n)
+  let keys = new Uint32Array(n)
+  let m = 0
+  for (let j = 0; j < n; j++) {
+    if (!(weights[j] > 0)) continue
+    order[m] = j
+    keys[m++] = 0x7fffffff - bits[j]
+  }
+  let nextOrder = new Int32Array(m)
+  let nextKeys = new Uint32Array(m)
+  const count = new Int32Array(2048)
+  for (let shift = 0; shift < 32; shift += 11) {
+    count.fill(0)
+    for (let i = 0; i < m; i++) count[(keys[i] >>> shift) & 2047]++
+    for (let d = 0, sum = 0; d < 2048; d++) {
+      const c = count[d]
+      count[d] = sum
+      sum += c
+    }
+    for (let i = 0; i < m; i++) {
+      const at = count[(keys[i] >>> shift) & 2047]++
+      nextOrder[at] = order[i]
+      nextKeys[at] = keys[i]
+    }
+    ;[order, nextOrder] = [nextOrder, order]
+    ;[keys, nextKeys] = [nextKeys, keys]
+  }
+  return order.subarray(0, m)
 }
 
 /** A token drawn from a distribution (see `distribution`). */
