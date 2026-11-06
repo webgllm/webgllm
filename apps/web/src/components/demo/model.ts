@@ -6,7 +6,8 @@ import { WebGLLM } from 'webgllm';
 export const MODELS = [
   { id: 'LiquidAI/LFM3-1.7B-GGUF', label: 'LFM3 1.7B' },
   { id: 'unsloth/Qwen3.5-2B-GGUF', label: 'Qwen3.5 2B' },
-  { id: 'LiquidAI/LFM2.5-1.2B-Instruct-GGUF', label: 'LFM2.5 1.2B' },
+  { id: 'LiquidAI/LFM2.5-1.2B-Instruct-GGUF', label: 'LFM2.5 1.2B Instruct' },
+  { id: 'LiquidAI/LFM2.5-1.2B-Thinking-GGUF', label: 'LFM2.5 1.2B Thinking' },
   { id: 'LiquidAI/LFM2.5-350M-GGUF', label: 'LFM2.5 350M' },
 ] as const;
 
