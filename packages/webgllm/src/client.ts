@@ -44,6 +44,13 @@ function pending<T>(): Pending<T> {
 
 type Generation = Pending<WorkerGenerationEnd> & { onToken: (text: string) => void }
 
+type Load = Pending<void> & {
+  contextLength: number | undefined
+  id: number
+  /** Not sent yet (it waits for the reply running): the load to go back to if it's called off. */
+  previous?: Load
+}
+
 /** Engine knobs every new worker starts with (see setPromptBatch). */
 const tuning: Record<string, number> = {}
 const live = new Set<ModelWorker>()
@@ -54,10 +61,13 @@ export const defaultWorker = () =>
 
 export class ModelWorker {
   private readonly worker: Worker
-  private load: (Pending<void> & { contextLength: number | undefined; id: number }) | null = null
+  private load: Load | null = null
   /** The last load's id: the worker's "ready" or "load-error" names the load it answers. */
   private loads = 0
+  /** Loads sent and not answered yet. */
+  private readonly open = new Set<number>()
   private downloading: Pending<void> | null = null
+  private readonly stored = pending<void>()
   private readonly generations = new Map<string, Generation>()
   /** Loaded and ready, for the context it was asked for (see contextLength). */
   ready = false
@@ -96,6 +106,11 @@ export class ModelWorker {
     return this.load?.promise ?? null
   }
 
+  /** Resolves once a load has the model's files in storage (a worker that says so). */
+  get storedPromise(): Promise<void> {
+    return this.stored.promise
+  }
+
   private idlers: Array<() => void> = []
 
   /** Resolves once no generation is running (at once if none is). */
@@ -120,12 +135,49 @@ export class ModelWorker {
   loadModel(contextLength: number | undefined): Promise<void> {
     if (this.gone) return Promise.reject(this.gone)
     if (this.load && this.contextLength === contextLength) return this.load.promise
-    this.load?.reject(new Error("The model was loaded again for another context length."))
+    const replaced = new Error("The model was loaded again for another context length.")
+    // Back to what it's loaded for, before the resize was sent: call that off.
+    const previous = this.load?.previous ?? (this.ready ? this.load ?? undefined : undefined)
+    if (this.load?.previous && this.load.previous.contextLength === contextLength) {
+      this.cancelLoad(replaced)
+      return this.load.promise
+    }
+    this.load?.reject(replaced)
     this.ready = false
     this.contextLength = contextLength
-    this.load = { ...pending<void>(), contextLength, id: ++this.loads }
-    this.post({ type: "load", model: this.model, loadId: this.load.id, ...(contextLength !== undefined && { contextLength }) })
-    return this.load.promise
+    const load: Load = { ...pending<void>(), contextLength, id: ++this.loads }
+    this.load = load
+    if (previous && this.busy) {
+      // The worker resizes after the reply running anyway: send it then, and
+      // until then it can be called off with the model staying as it is.
+      load.previous = previous
+      void this.idle().then(() => {
+        if (this.load !== load) return
+        delete load.previous
+        this.sendLoad(load)
+      })
+    } else this.sendLoad(load)
+    return load.promise
+  }
+
+  private sendLoad(load: Load) {
+    if (this.gone) return
+    this.open.add(load.id)
+    this.post({ type: "load", model: this.model, loadId: load.id, ...(load.contextLength !== undefined && { contextLength: load.contextLength }) })
+  }
+
+  /**
+   * Calls off a load not sent yet (a resize waiting for a reply to end): the
+   * model stays loaded for the context it was. False if it was sent.
+   */
+  cancelLoad(reason: Error): boolean {
+    const load = this.load
+    if (!load?.previous || this.gone) return false
+    this.load = load.previous
+    this.contextLength = load.previous.contextLength
+    this.ready = true
+    load.reject(reason)
+    return true
   }
 
   /** Downloads the model's files to storage, without loading it. */
@@ -183,6 +235,36 @@ export class ModelWorker {
     return this.gone !== null
   }
 
+  private failLoad(load: Load, error: Error) {
+    load.reject(error)
+    this.load = null
+    this.ready = false
+  }
+
+  /**
+   * The current load, if a "ready" or "load-error" answers it. A worker that
+   * names no load (one from before loadId) answers the current load only
+   * when it's the one load open: with others open it may be a late answer
+   * to one this replaced, so the load fails rather than guess.
+   */
+  private answered(loadId: number | undefined): Load | null {
+    const load = this.load
+    if (loadId !== undefined) {
+      // The worker answers loads in order: the ones before are done too.
+      for (const id of this.open) if (id <= loadId) this.open.delete(id)
+      return load?.id === loadId ? load : null
+    }
+    if (!load || !this.open.has(load.id)) {
+      if (this.open.size === 1) this.open.clear()
+      return null
+    }
+    const only = this.open.size === 1
+    this.open.clear()
+    if (only) return load
+    this.failLoad(load, new Error("The model's worker answered a load without naming it (loadId) while another was open."))
+    return null
+  }
+
   private handle(data: WorkerResponse) {
     switch (data.type) {
       case "progress":
@@ -194,21 +276,24 @@ export class ModelWorker {
           .catch(() => undefined)
           .then(() => this.post({ type: "claimed" }))
         break
-      case "ready":
+      case "stored":
+        this.stored.resolve()
+        break
+      case "ready": {
         // (A late answer to a load this one replaced is ignored.)
-        if (this.load && data.loadId === this.load.id) {
+        const load = this.answered(data.loadId)
+        if (load) {
           this.ready = true
           this.loadedContextLength = data.contextLength
-          this.load.resolve()
+          load.resolve()
         }
         break
-      case "load-error":
-        if (this.load && data.loadId === this.load.id) {
-          this.load.reject(workerError(data.message, data.code))
-          this.load = null
-          this.ready = false
-        }
+      }
+      case "load-error": {
+        const load = this.answered(data.loadId)
+        if (load) this.failLoad(load, workerError(data.message, data.code))
         break
+      }
       case "downloaded":
         this.downloading?.resolve()
         this.downloading = null

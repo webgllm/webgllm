@@ -30,6 +30,10 @@ export type FakeOptions = {
   loadError?: (model: string) => { message: string; code?: Extract<WorkerResponse, { type: "load-error" }>["code"] } | undefined
   /** What a generation writes; held open (finish it with `finish`) when undefined. */
   reply?: (request: Generate) => { tokens: Array<string>; done?: Partial<Extract<WorkerResponse, { type: "done" }>> } | undefined
+  /** A load has its files in storage (then the fake says "stored"). */
+  stored?: (model: string) => void
+  /** Holds a load after its files are stored until this resolves. */
+  hold?: (model: string) => Promise<void>
 }
 
 export class FakeWorker {
@@ -40,6 +44,7 @@ export class FakeWorker {
   model: string | undefined
   private claimed: Array<() => void> = []
   readonly open = new Map<string, Generate>()
+  private idlers: Array<() => void> = []
 
   constructor(private readonly options: FakeOptions) {}
 
@@ -62,6 +67,7 @@ export class FakeWorker {
     this.open.delete(id)
     for (const text of tokens) this.emit({ type: "token", id, text })
     this.emit({ type: "done", id, stats: STATS, finishReason: "stop", ...done })
+    if (this.open.size === 0) for (const resolve of this.idlers.splice(0)) resolve()
   }
 
   generations(): Array<Generate> {
@@ -72,8 +78,15 @@ export class FakeWorker {
     await Promise.resolve()
     if (message.type === "claimed") this.claimed.shift()?.()
     else if (message.type === "load") {
+      // Like worker.ts: after the generations running.
+      if (this.open.size) await new Promise<void>((resolve) => this.idlers.push(resolve))
       this.model = message.model
       this.emit({ type: "progress", model: message.model, progress: 0.5, cached: true })
+      if (this.options.stored) {
+        this.options.stored(message.model)
+        this.emit({ type: "stored", model: message.model })
+      }
+      await this.options.hold?.(message.model)
       const error = this.options.loadError?.(message.model)
       if (error) return this.emit({ type: "load-error", model: message.model, loadId: message.loadId, ...error })
       await new Promise<void>((resolve) => {

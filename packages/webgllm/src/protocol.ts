@@ -72,7 +72,9 @@ export type WorkerRequest =
        * loads the model again.
        */
       contextLength?: number
-      /** Echoed in the "ready" or "load-error" that answers this load. */
+      /**
+       * Echoed in the "ready" or "load-error" that answers this load. A worker that leaves it out may answer only one load at a time.
+       */
       loadId?: number
     }
   | {
@@ -144,6 +146,8 @@ export type WorkerResponse =
       timings?: Record<string, number>
     }
   | { type: "load-error"; model: string; loadId?: number; message: string; code?: WorkerErrorCode }
+  /** A load has the model's files in storage, before the GPU reads them (downloads waiting on it settle). */
+  | { type: "stored"; model: string }
   | { type: "downloaded"; model: string }
   | { type: "download-error"; model: string; message: string; code?: WorkerErrorCode }
   /**

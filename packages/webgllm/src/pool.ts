@@ -222,9 +222,11 @@ export class ModelPool {
       this.budget.touch(entry.model)
     } catch (error) {
       if (signal?.aborted) {
-        // Nobody wants it any more: stop the load.
+        // Nobody wants it any more: call off a resize not sent yet (the model
+        // stays loaded as it was), else stop the load.
         if (entry.waiters === 1 && !entry.worker.ready && entry.worker.loadPromise === load) {
-          this.drop(entry, abortError(signal) as Error, "aborted")
+          if (entry.worker.cancelLoad(abortError(signal) as Error)) this.restored(entry)
+          else this.drop(entry, abortError(signal) as Error, "aborted")
         }
       } else if (!entry.worker.ready && entry.worker.loadPromise === null) {
         // A failed load frees its worker (and what it claimed); the next try starts afresh.
@@ -236,6 +238,13 @@ export class ModelPool {
       entry.waiters--
       if (onProgress) entry.listeners.delete(onProgress)
     }
+  }
+
+  /** A resize called off: the "load" its "loadstart" waits for, at the context it holds. */
+  private restored(entry: Entry) {
+    entry.watched = entry.worker.loadPromise
+    const contextLength = entry.worker.loadedContextLength ?? entry.worker.contextLength ?? 0
+    this.options.onModelEvent?.({ type: "load", model: entry.model, contextLength })
   }
 
   /** Unloads `model`, or every model; their running generations fail with "model-not-loaded". */
@@ -290,15 +299,17 @@ export class ModelPool {
   }
 
   /**
-   * Gets `model`'s files into storage: a load in progress fetches them (its
-   * GPU failing after doesn't matter), else storage has them, else a worker
-   * of the download's own fetches them.
+   * Gets `model`'s files into storage: a load in progress fetches them (done
+   * once its worker says they're stored or the load ends; its GPU doesn't
+   * matter), else storage has them, else a worker of the download's own
+   * fetches them.
    */
   private async fetchFiles(model: WebGlTextModel, download: Download): Promise<void> {
     const { signal } = download.abort
     const entry = this.entries.get(model)
     const loading = entry?.worker.loadPromise
     if (entry && loading) {
+      const stored = entry.worker.storedPromise
       // Its downloading, as a download's 0–1.
       const forward = (progress: LoadProgress) => {
         if (progress.phase !== "download") return
@@ -307,12 +318,14 @@ export class ModelPool {
       }
       entry.listeners.add(forward)
       try {
-        await abortable(loading.catch(() => undefined), signal)
+        await abortable(Promise.race([loading, stored]).catch(() => undefined), signal)
       } finally {
         entry.listeners.delete(forward)
       }
     }
     if (await abortable(this.options.storage.downloaded(model), signal)) return
+    // Canceled as the check came back: there was no worker to stop yet.
+    throwIfAborted(signal)
     const worker = new ModelWorker(model, this.options.createWorker, {
       onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
       onClaim: () => Promise.resolve(),

@@ -260,6 +260,8 @@ async function load(
       weightFiles
     } = await fetchFiles(model, signal)
     lap("files")
+    // Downloads waiting on this load needn't wait for the GPU.
+    post({ type: "stored", model })
     post({ type: "progress", model, progress: cached ? 0 : 0.9, cached })
     // Room for it first: the page unloads other runtimes' models past the
     // memory budget. An estimate until it's loaded (then the textures it

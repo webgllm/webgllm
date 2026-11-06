@@ -47,3 +47,24 @@ test("a late load-error for a replaced load doesn't fail the new one", async () 
   await resized
   assert.equal(worker.ready, true)
 })
+
+test("a worker that doesn't name its loads answers the only one asked", async () => {
+  const { worker, emit } = manual()
+  const load = worker.loadModel(undefined)
+  emit({ type: "ready", model: worker.model, contextLength: 4096 })
+  await load
+  assert.equal(worker.ready, true)
+  // A resize after it was answered: still unambiguous.
+  const resize = worker.loadModel(64)
+  emit({ type: "load-error", model: worker.model, message: "boom" })
+  await assert.rejects(resize, { message: "boom" })
+})
+
+test("an unnamed answer while two loads are open fails the load rather than guess", async () => {
+  const { worker, emit } = manual()
+  void worker.loadModel(undefined)
+  const resized = worker.loadModel(64)
+  emit({ type: "ready", model: worker.model, contextLength: 4096 })
+  await assert.rejects(resized, /loadId/)
+  assert.equal(worker.ready, false)
+})

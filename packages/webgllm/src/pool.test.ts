@@ -309,3 +309,76 @@ test("a load canceled while it waits for room doesn't unload the model it was wa
   await p.load(C)
   assert.equal(p.isLoaded(C), true)
 })
+
+test("a download canceled after its storage check starts no worker", async () => {
+  // Cancel at each step of the way: none may start writing after it.
+  for (let hops = 0; hops < 12; hops++) {
+    const { pool: p, workers } = pool()
+    const download = p.download(A).catch(() => undefined)
+    for (let i = 0; i < hops; i++) await Promise.resolve()
+    const before = workers.workers.length
+    p.cancelDownload(A)
+    await download
+    await settle()
+    assert.equal(workers.workers.length, before, `canceled after ${hops} microtasks`)
+  }
+})
+
+test("canceling a resize queued behind a reply keeps the model loaded and the reply going", async () => {
+  const { pool: p, workers } = pool()
+  await p.load(A, { contextLength: 8192 })
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const abort = new AbortController()
+  const resize = p.load(A, { contextLength: 4096, signal: abort.signal })
+  await settle()
+  abort.abort()
+  await assert.rejects(resize, { name: "AbortError" })
+  const a = workers.of(A)!
+  assert.equal(a.terminated, false)
+  assert.equal(p.isLoaded(A), true)
+  assert.equal(p.requestedContext(A), 8192)
+  a.finish(a.generations()[0]!.id, ["ok"])
+  const end = await running
+  assert.equal(end.finishReason, "stop")
+  await settle()
+  // The resize never reached the worker; the next generation runs as loaded.
+  assert.equal(a.sent.filter((m) => m.type === "load").length, 1)
+  const next = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  assert.equal(a.generations()[1]?.contextLength, 8192)
+  a.finish(a.generations()[1]!.id)
+  await next
+})
+
+test("a download settles once a concurrent load has stored the files, before the GPU is done", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const downloaded = new Set<string>()
+  const { pool: p, workers } = pool({ downloaded, stored: (model) => downloaded.add(model), hold: () => held })
+  const load = p.load(A)
+  const download = p.download(A)
+  let done = false
+  void download.then(() => (done = true))
+  await settle()
+  assert.equal(done, true)
+  assert.equal(workers.workers.length, 1, "no download worker of its own")
+  release()
+  await load
+})
+
+test("a resize queued behind a reply is sent when the reply ends", async () => {
+  const { pool: p, workers } = pool()
+  await p.load(A, { contextLength: 8192 })
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const resize = p.load(A, { contextLength: 4096 })
+  await settle()
+  const a = workers.of(A)!
+  assert.equal(a.sent.filter((m) => m.type === "load").length, 1)
+  a.finish(a.generations()[0]!.id)
+  await running
+  await resize
+  assert.deepEqual(a.sent.filter((m) => m.type === "load").map((m) => m.type === "load" && m.contextLength), [8192, 4096])
+  assert.equal(p.requestedContext(A), 4096)
+})
