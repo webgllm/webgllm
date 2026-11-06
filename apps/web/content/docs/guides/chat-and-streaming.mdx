@@ -1,0 +1,55 @@
+---
+title: Chat and streaming
+description: Completions, streaming, cancelling and request fields.
+---
+
+`webgllm.chat.completions.create()` takes OpenAI's Chat Completions request and returns its response. Code written for OpenAI's SDK mostly works as it is.
+
+## Streaming
+
+```ts
+const stream = await webgllm.chat.completions.create({
+  model,
+  messages,
+  stream: true,
+  stream_options: { include_usage: true }
+})
+
+for await (const chunk of stream) {
+  output.textContent += chunk.choices[0]?.delta.content ?? ""
+}
+```
+
+## Cancelling
+
+```ts
+const controller = new AbortController()
+const stream = await webgllm.chat.completions.create(
+  { model, messages, stream: true },
+  { signal: controller.signal }
+)
+
+stopButton.onclick = () => controller.abort()
+```
+
+Aborting stops the generation and rejects with a `DOMException` named `AbortError`.
+
+## Follow-ups
+
+Send the whole chat each time, as with OpenAI. webgllm keeps the model's cache between calls and reads only what's new, so a follow-up starts quickly. `cache_prompt: false` turns that off for a request.
+
+## Request fields
+
+| Field | Notes |
+| --- | --- |
+| `max_completion_tokens` (or `max_tokens`) | Thinking included |
+| `temperature`, `top_p`, `presence_penalty` | |
+| `top_k`, `min_p`, `repetition_penalty` | webgllm's own |
+| `stop`, `seed` | |
+| `cache_prompt` | webgllm's own |
+
+Unset sampling fields take the model card's values. Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, image or audio content) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
+
+## Usage and timings
+
+Every response has OpenAI's `usage`, with cached prompt tokens and reasoning tokens, and a `timings` object: time to first token, prompt speed and writing speed.

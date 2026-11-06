@@ -1,0 +1,34 @@
+---
+title: How it works
+description: Workers, weights, kernels and caching.
+---
+
+## Workers
+
+Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `chat.completions.create` call is one generation there. The page's main thread stays free.
+
+The worker downloads the files to the Origin Private File System, resuming a dropped download. It then streams the weights from there into textures one layer at a time, so a model is never all in JavaScript memory.
+
+## Weights
+
+`loadGguf` and `loadOnnx` read either format into the same weights: 4-bit blocks of 32, in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is read natively in the shader, so its weights are exactly llama.cpp's. Only tensors are read from the ONNX graph; its ops aren't run.
+
+## Kernels
+
+Every op is a fragment-shader pass, one output texel per fragment: RMSNorm, the short convolutions, attention over a half-precision cache, SwiGLU, and Qwen3.5's Gated DeltaNet recurrence. Matmuls read weights from byte textures and activations as packed halves.
+
+Prompts are read 512 tokens at a time, and big passes are split into bands of rows to stay under mobile GPUs' watchdogs.
+
+## Sampling
+
+With top-k, the GPU applies the repetition penalty and narrows the logits down to the chunks that hold the top tokens. Writing a token reads back about 50 KB rather than every logit.
+
+## Cache reuse
+
+A follow-up reads only what's new. The attention cache rewinds to any position, and the models' recurrent and convolution states are saved at points a follow-up can resume from.
+
+The cache starts small and grows as a chat does, up to the loaded context length. Long contexts are read in segments.
+
+## Performance
+
+Memory and speed measurements are in the repository's [bench folder](https://github.com/webgllm/webgllm/tree/main/packages/webgllm/bench).

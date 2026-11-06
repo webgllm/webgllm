@@ -1,0 +1,23 @@
+---
+title: Sharing memory with other runtimes
+description: Count webgllm's GPU memory in your app's own budget.
+---
+
+An app that also runs models in other runtimes (Transformers.js, wllama) can count webgllm's memory in its own budget with `onMemoryClaim`.
+
+```ts
+const webgllm = new WebGLLM({
+  memoryBudget: registry.limit, // webgllm still orders and evicts its own models
+  onMemoryClaim: ({ model, bytes, signal }) => registry.claim(`webgllm:${model}`, bytes, { signal })
+})
+
+webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${model}`))
+```
+
+Each time a model's worker claims memory, the hook gets the bytes the model will hold in all, replacing its previous claim. It claims:
+
+- an estimate before loading,
+- the measured textures after loading,
+- each time its attention cache grows.
+
+The worker allocates only after the hook's promise resolves, so the app can make room first, for example by unloading another runtime's model, or another webgllm model with `unloadModel`. Rejecting fails the load, or the reply whose cache grew, with an `out-of-memory` error. `signal` aborts if the model is unloaded meanwhile. The memory is free again at the model's `unload` event.

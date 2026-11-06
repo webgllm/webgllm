@@ -1,0 +1,54 @@
+---
+title: Tool calling
+description: Let the model call your functions.
+---
+
+webgllm takes OpenAI's `tools` and `tool_choice`.
+
+```ts
+const tools = [{
+  type: "function",
+  function: {
+    name: "get_weather",
+    description: "The current weather in a city.",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"]
+    }
+  }
+}]
+
+const messages = [{ role: "user", content: "What's the weather in Paris?" }]
+const reply = await webgllm.chat.completions.create({ model, messages, tools })
+const message = reply.choices[0].message
+
+for (const call of message.tool_calls ?? []) {
+  const args = JSON.parse(call.function.arguments)
+  messages.push(message, {
+    role: "tool",
+    tool_call_id: call.id,
+    content: JSON.stringify(await getWeather(args.city))
+  })
+}
+
+const answer = await webgllm.chat.completions.create({ model, messages, tools })
+```
+
+`models.list()` says which models take tools (`supports.tools`).
+
+## `tool_choice`
+
+- `"auto"` (default): the model decides.
+- `"none"`: no tool calls.
+- `"required"` or `{ type: "function", function: { name } }`: a forced call.
+
+A forced call is constrained to the tool's JSON Schema while it's written, so its arguments are always valid. `parallel_tool_calls: false` keeps only the first call.
+
+## Repair
+
+Automatic calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.
+
+## Schemas
+
+Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. Set `additionalProperties: true` for an open object. See [Structured output](/docs/guides/structured-output#schemas) for the exceptions.

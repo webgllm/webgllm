@@ -1,0 +1,42 @@
+---
+title: Requirements
+description: What the browser and device need.
+---
+
+## Browser
+
+webgllm needs:
+
+- WebGL 2 with float render targets (`EXT_color_buffer_float`)
+- OffscreenCanvas in workers
+
+Current Chrome, Firefox and Safari have both, on desktop and mobile. WebGPU isn't needed.
+
+```ts
+if (!WebGLLM.isSupported()) {
+  // Show a fallback.
+}
+```
+
+Pages don't need cross-origin isolation (COOP/COEP headers).
+
+## Storage
+
+Models are downloaded once to the Origin Private File System and reused on later visits. A dropped download resumes. Browsers may clear a site's storage, after which the model downloads again. When storage is full, loading fails with `storage-full`.
+
+## Memory
+
+Each loaded model holds its weights and its attention cache on the GPU. The cache grows with the chat, up to the context length the model was loaded for, so a smaller `contextLength` takes less memory:
+
+```ts
+await webgllm.loadModel("LiquidAI/LFM3-1.7B-GGUF", { contextLength: 8192 })
+```
+
+Phones have the least room. iOS Safari ends a tab that uses about 2 GB, so load with an 8,192-token context there.
+
+## Limitations
+
+- Text only: image and audio content throw `unsupported-parameter`.
+- One completion per request (`n` is 1); no `logprobs`, `logit_bias` or `frequency_penalty`.
+- Generations run one at a time, across all models.
+- Only the [listed models](/docs/models) run.

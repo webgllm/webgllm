@@ -1,0 +1,29 @@
+---
+title: Models
+description: The models webgllm runs.
+---
+
+Pass a model's id as `model`. `webgllm.models.list()` returns the same list, with each model's size, context length, and whether it's downloaded or loaded.
+
+| Model | Weights | Thinks |
+| --- | --- | --- |
+| `LiquidAI/LFM3-1.7B-GGUF` | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained) | By default |
+| `onnx-community/LFM3-1.7B-ONNX` | onnx-community's q4f16 export | By default |
+| `unsloth/Qwen3.5-2B-GGUF` | unsloth's Q4_0 GGUF | When asked |
+| `onnx-community/Qwen3.5-2B-ONNX` | onnx-community's q4f16 decoder | When asked |
+| `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` | Official QAD Q4_0 | No |
+| `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` | Official Q4_0 | Always |
+| `LiquidAI/LFM2.5-350M-GGUF` | Official QAD Q4_0 | No |
+| `LiquidAI/LFM2.5-1.2B-Instruct-ONNX` | Liquid AI's 4-bit ONNX export | No |
+| `LiquidAI/LFM2.5-1.2B-Thinking-ONNX` | Liquid AI's 4-bit ONNX export | Always |
+| `LiquidAI/LFM2.5-350M-ONNX` | Liquid AI's 4-bit ONNX export | No |
+
+Other ids throw `model-not-supported`. Sampling defaults come from each model card. See [Thinking](/docs/guides/thinking) for switching reasoning on and off.
+
+## Choosing one
+
+- **LFM3 1.7B** is the default choice: it thinks, and has a 262,144-token context.
+- **Qwen3.5 2B** answers directly unless asked to think.
+- **LFM2.5 350M** is the smallest, for weak devices.
+
+Every model takes [tools](/docs/guides/tool-calling).
