@@ -131,37 +131,34 @@ const ReasoningRoot = forwardRef<
   );
 });
 
+/** An edge fade over scrollable text; `visible` says there's hidden text past that edge. */
 function ReasoningFade({
   side = "bottom",
+  visible = true,
   className,
   ...props
-}: React.ComponentProps<"div"> & { side?: "top" | "bottom" }) {
-  if (side === "top") {
-    return (
-      <div
-        data-slot="reasoning-fade"
-        className={cn(
-          "aui-reasoning-fade pointer-events-none absolute inset-x-0 top-0 z-10 h-8",
-          "bg-[linear-gradient(to_bottom,var(--color-fd-background),transparent)]",
-          "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--color-fd-muted)_50%,var(--color-fd-background)),transparent)]",
-          "fade-in-0 animate-in",
-          "animation-duration-(--animation-duration)",
-          className,
-        )}
-        {...props}
-      />
-    );
-  }
-
+}: React.ComponentProps<"div"> & { side?: "top" | "bottom"; visible?: boolean }) {
   return (
     <div
       data-slot="reasoning-fade"
+      data-side={side}
+      data-visible={visible}
+      aria-hidden
       className={cn(
-        "aui-reasoning-fade pointer-events-none absolute inset-x-0 bottom-0 z-10 h-8",
-        "bg-[linear-gradient(to_top,var(--color-fd-background),transparent)]",
-        "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_top,color-mix(in_oklab,var(--color-fd-muted)_50%,var(--color-fd-background)),transparent)]",
-        "fade-in-0 animate-in",
-        "animation-duration-(--animation-duration)",
+        "aui-reasoning-fade pointer-events-none absolute inset-x-0 z-10 h-8",
+        "transition-opacity duration-(--animation-duration) motion-reduce:transition-none",
+        visible ? "opacity-100" : "opacity-0",
+        side === "top"
+          ? [
+              "top-0",
+              "bg-[linear-gradient(to_bottom,var(--color-fd-background),transparent)]",
+              "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--color-fd-muted)_50%,var(--color-fd-background)),transparent)]",
+            ]
+          : [
+              "bottom-0",
+              "bg-[linear-gradient(to_top,var(--color-fd-background),transparent)]",
+              "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_top,color-mix(in_oklab,var(--color-fd-muted)_50%,var(--color-fd-background)),transparent)]",
+            ],
         className,
       )}
       {...props}
@@ -221,8 +218,6 @@ function ReasoningContent({
   children,
   ...props
 }: React.ComponentProps<typeof CollapsibleContent>) {
-  const isPreview = useContext(ReasoningPreviewContext);
-
   return (
     <CollapsibleContent
       data-slot="reasoning-content"
@@ -238,9 +233,7 @@ function ReasoningContent({
       )}
       {...props}
     >
-      <ReasoningFade side="top" />
       {children}
-      {isPreview ? <ReasoningFade /> : null}
     </CollapsibleContent>
   );
 }
@@ -253,6 +246,33 @@ function ReasoningText({
   const isPreview = useContext(ReasoningPreviewContext);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  // Which edges have text scrolled out of view: each gets a fade.
+  const [edges, setEdges] = useState({ top: false, bottom: false });
+
+  useEffect(() => {
+    const scrollEl = scrollRef.current;
+    const contentEl = contentRef.current;
+    if (!scrollEl || !contentEl) return;
+
+    const update = () => {
+      const top = scrollEl.scrollTop > 1;
+      const bottom =
+        scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight > 1;
+      setEdges((prev) =>
+        prev.top === top && prev.bottom === bottom ? prev : { top, bottom },
+      );
+    };
+
+    update();
+    scrollEl.addEventListener("scroll", update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(scrollEl);
+    observer.observe(contentEl);
+    return () => {
+      scrollEl.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isPreview) return;
@@ -300,10 +320,8 @@ function ReasoningText({
 
   return (
     <div
-      ref={scrollRef}
-      data-slot="reasoning-text"
       className={cn(
-        "aui-reasoning-text relative z-0 max-h-64 overflow-y-auto ps-6 pt-2 pb-2 leading-relaxed text-pretty",
+        "aui-reasoning-text-frame relative",
         "transform-gpu transition-[transform,opacity] ease-[cubic-bezier(0.32,0.72,0,1)]",
         "motion-reduce:animate-none",
         "group-data-open/collapsible-content:animate-in",
@@ -316,13 +334,23 @@ function ReasoningText({
         "group-data-closed/collapsible-content:blur-out-[2px]",
         "group-data-open/collapsible-content:animation-duration-(--animation-duration)",
         "group-data-closed/collapsible-content:animation-duration-(--animation-duration)",
-        className,
       )}
-      {...props}
     >
-      <div ref={contentRef} className="aui-reasoning-text-content space-y-4">
-        {children}
+      <ReasoningFade side="top" visible={edges.top} />
+      <div
+        ref={scrollRef}
+        data-slot="reasoning-text"
+        className={cn(
+          "aui-reasoning-text relative z-0 max-h-64 overflow-y-auto ps-6 pt-2 pb-2 leading-relaxed text-pretty",
+          className,
+        )}
+        {...props}
+      >
+        <div ref={contentRef} className="aui-reasoning-text-content space-y-4">
+          {children}
+        </div>
       </div>
+      <ReasoningFade side="bottom" visible={edges.bottom} />
     </div>
   );
 }
