@@ -1,10 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "webgllm",
+  "main": "@tanstack/react-start/server-entry",
   "compatibility_date": "2026-11-05",
-  // Static assets only: no Worker code runs.
+  "compatibility_flags": ["nodejs_compat"],
   "assets": {
-    "directory": "./.output/public",
     "html_handling": "drop-trailing-slash",
     "not_found_handling": "404-page"
   }
