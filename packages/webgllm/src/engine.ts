@@ -4206,7 +4206,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     input: MatIn,
     paced = false,
     /** Whether the queries may go in the cache (see queryInCache; not while probing). */
-    queriesInCache = false
+    queriesInCache = false,
+    /** Sees the q|k|v|gate projection before the out projection reuses the partials. */
+    projected?: (split: number) => Promise<void>
   ) {
     const c = this.config
     const b = this.buffers
@@ -4222,6 +4224,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       rows,
       input.norm
     )
+    await projected?.(split)
     const qkvgIn = split ? this.partials() : b.qkvg
     const read = (source: string) =>
       this.gpu.program(
@@ -6084,22 +6087,27 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       name: string,
       tex: Texture,
       dims: number,
-      h2: boolean | "pair" = false
+      h2: boolean | "pair" = false,
+      /** A pair tensor left as this many slices of the last split matmul. */
+      split = 0
     ) => {
       if (!probe) return
+      if (split) tex = this.partials()
       await probe(layer, name, async () => {
         let src = tex
         if (h2) {
           this.gpu.run({
             program: this.gpu.program(
-              h2 === "pair"
-                ? this.readPair(K.PAIR_TO_F32, "uX", tex)
-                : K.H2_TO_F32
+              split
+                ? this.fromSplit(K.PAIR_TO_F32, ["uX"], split)
+                : h2 === "pair"
+                  ? this.readPair(K.PAIR_TO_F32, "uX", tex)
+                  : K.H2_TO_F32
             ),
-            uniforms: this.pairIn(tex),
+            uniforms: split ? {} : this.pairIn(tex),
             inputs: {
               uX: tex,
-              ...(h2 === "pair" && this.quadInputs("uX", tex))
+              ...(h2 === "pair" && !split && this.quadInputs("uX", tex))
             },
             output: this.debugTexture(),
             rect: { x: 0, y: 0, width: dims / 4, height: rows }
@@ -6186,7 +6194,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           pos0,
           opIn,
           paced,
-          !probe
+          !probe,
+          (split) => look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair", split)
         )
         if (this.prefixSaving && layer.attention.ring) {
           const at = pos0 + this.prefixSaving.row
@@ -6194,7 +6203,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           this.prefixSaving.state.windows.push(window)
           this.copyPositions(layer.attention.kv, layer.attention.ring, window, c.slidingWindow, Math.max(0, at - c.slidingWindow), at)
         }
-        await look(i, "qkvg", b.qkvg, this.qkvgDims(), "pair")
         await look(i, "q", b.q, c.numHeads * c.headDim)
         await look(i, "attn_out", b.attnOut, c.numHeads * c.headDim, true)
         // The cache's keys then values for positions 0.. (one block, no
@@ -6225,7 +6233,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           })
         }
       }
-      await look(i, "op_out", b.opOut, c.hiddenSize, "pair")
+      await look(i, "op_out", b.opOut, c.hiddenSize, "pair", opSplit)
       this.addNormed(
         h,
         opSplit ? this.partials() : b.opOut,
@@ -6294,7 +6302,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         })
       }
       const downSplit = await this.project(downInput, layer.down, b.ffnOut, fr)
-      await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair")
+      await look(i, "ffn_out", b.ffnOut, c.hiddenSize, "pair", downSplit)
       this.addNormed(
         base,
         downSplit ? this.partials() : b.ffnOut,

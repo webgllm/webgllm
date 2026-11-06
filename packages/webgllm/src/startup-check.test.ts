@@ -199,3 +199,98 @@ test("a context too small for the startup checks fails before the GPU is touched
   for (const contextLength of [0, 2, 64.5])
     assert.throws(() => new Engine({} as OffscreenCanvas, { contextLength }), /at least 3/)
 })
+
+/**
+ * forwardBatch on one attention layer with a GPU that only tracks what each
+ * texture holds: `project` writes a split matmul's partials for a few rows,
+ * else the pair tensor. Returns what the qkvg probe read.
+ */
+async function probedQkvg(rows: number) {
+  type Tex = { id: number; width: number; height: number; holds?: string }
+  let ids = 0
+  const tex = (): Tex => ({ id: ++ids, width: 64, height: 64 })
+  const buffers = new Proxy({} as Record<string, unknown>, {
+    get(t, k: string) {
+      if (k === "residual" || k === "residualSmall" || k === "residualLarge")
+        return (t[k] ??= [tex(), tex()])
+      if (k === "lin") return undefined
+      return (t[k] ??= tex())
+    },
+    set(t, k: string, v) { t[k] = v; return true }
+  })
+  const matrix = (name: string) => ({ name, N: 4, K: 4, bits: 8 })
+  const layer = {
+    type: "full_attention",
+    attention: { qkvg: matrix("qkvg"), o: matrix("o"), kv: tex(), qNorm: tex(), kNorm: tex() },
+    gateUp: matrix("gateUp"),
+    down: matrix("down"),
+    operatorNorm: tex(), postOperatorNorm: tex(), ffnNorm: tex(), postFfnNorm: tex()
+  }
+  const gpu = new Proxy({
+    run(o: { inputs?: Record<string, Tex>; output: Tex | Tex[] }) {
+      // A copy (the probe's read) carries its input's contents.
+      const out = Array.isArray(o.output) ? o.output : [o.output]
+      for (const t of out) t.holds = o.inputs?.uX ? o.inputs.uX.holds : "other"
+    },
+    async read(t: Tex) { return Object.assign(new Float32Array(1), { holds: t.holds }) },
+    program: (s: string) => s,
+    texture: tex,
+    decodeLayers: 0,
+    readsPerSlice: 0
+  } as Record<string, unknown>, {
+    get: (t, k: string) => (k in t ? t[k] : () => undefined)
+  })
+  const state: Record<string, unknown> = {
+    config: { vocabSize: 128, hiddenSize: 4, intermediateSize: 4, headDim: 4, numHeads: 1, numKvHeads: 1,
+      layerTypes: ["full_attention"], ropeDimsFull: 4, ropeDimsSliding: 4, normEps: 1e-6 },
+    layers: [layer],
+    buffers,
+    gpu,
+    position: 0,
+    capacity: 64,
+    contextLength: 64,
+    kvShift: 10,
+    embedding: { bits: 8, quants: tex(), scales: tex(), blocks: 1, rowsPerColumn: 1, rowTexels: 1 },
+    mrt: {},
+    tuned: {},
+    slicing: new Map(),
+    quads: new Map(),
+    debug: null,
+    kvDebug: null,
+    prefixSaving: null,
+    async reserve() {},
+    async charge() {},
+    normInput: () => buffers.normed,
+    f32: tex,
+    f16Trim() {},
+    async attention() {},
+    addNormed() {},
+    splitPartials() { (buffers.partial as Tex).holds = "gateUp"; return 2 },
+    async project(_a: Tex, w: { name: string }, out: Tex, n: number) {
+      if (n <= 8) { (buffers.partial as Tex).holds = w.name; return 2 }
+      out.holds = w.name
+      return 0
+    },
+    async matmul(_a: Tex, w: { name: string }, out: Tex) { out.holds = w.name },
+    floatInput: () => undefined,
+    layerWork: () => 0
+  }
+  const engine = new Proxy(state, {
+    get(t, k: string) {
+      if (k in t) return t[k]
+      const real = Reflect.get(Engine.prototype, k)
+      return typeof real === "function" ? real : undefined
+    }
+  })
+  let seen: string | undefined
+  const forwardBatch = Reflect.get(Engine.prototype, "forwardBatch") as (...a: unknown[]) => Promise<number>
+  await forwardBatch.call(engine, Array(rows).fill(1), async (_l: number, name: string, read: () => Promise<{ data: { holds?: string } }>) => {
+    if (name === "qkvg") seen = (await read()).data.holds
+  })
+  return seen
+}
+
+test("the attention probe reads the q|k|v|gate projection the GPU computed, split or not", async () => {
+  // (A short probe, for a small context, takes the split matmul.)
+  for (const rows of [1, 8, 9, 40]) assert.equal(await probedQkvg(rows), "qkvg", `${rows} rows`)
+})
