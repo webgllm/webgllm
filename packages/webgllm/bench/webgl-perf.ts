@@ -22,11 +22,20 @@ const log = (s: string) => {
   document.querySelector("pre")!.textContent += `${s}\n`
   void fetch("/log", { method: "POST", body: `${id} ${s}` })
 }
-const result = (value: object) =>
-  fetch("/result", {
+// Every result upload, so the page can wait for them all before ALL DONE.
+const uploads = new Set<Promise<Response>>()
+const result = (value: object) => {
+  const upload = fetch("/result", {
     method: "POST",
     body: JSON.stringify({ id, at: new Date().toISOString(), render, ...value })
   })
+  uploads.add(upload)
+  void upload.then(
+    () => uploads.delete(upload),
+    () => uploads.delete(upload)
+  )
+  return upload
+}
 const canvas = document.querySelector("canvas")!
 const motion = document.querySelector<HTMLElement>("#css-motion")!
 const cssPhase = document.querySelector<HTMLElement>("#css-phase")!
@@ -79,7 +88,9 @@ function begin(name: string) {
   if (render === "css") cssPhase.textContent = name
   phaseStart = performance.now()
   if (name === "load") loadingStartedAt = phaseStart
-  last = phaseStart
+  // Keep the frame clock running: the frame interval that crosses this
+  // boundary belongs to the phase it ends in, so a stall at the boundary
+  // (such as the first token) is measured whole instead of being split.
   gaps = []
   log(`BEGIN ${name}`)
 }
@@ -550,6 +561,9 @@ async function run() {
   measuring = false
   document.documentElement.dataset.phase = "complete"
   await result({ phase: "complete" })
+  // Phases that end without waiting (prefill at the first token) upload in
+  // the background; ALL DONE means every result has reached the server.
+  await Promise.all(uploads)
   log("ALL DONE")
   // Completed telemetry is already persisted by /result. Do not retain
   // every frame through Safari's back/forward cache between test pages.
