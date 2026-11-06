@@ -1,3 +1,13 @@
+## 0.1.3 (2026-11-06)
+
+### 🚀 Features
+
+- **webgllm:** add onMemoryClaim so a host can count webgllm's memory in its own budget ([a3ed68e](https://github.com/webgllm/webgllm/commit/a3ed68e))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.2 (2026-11-06)
 
 ### 🩹 Fixes
