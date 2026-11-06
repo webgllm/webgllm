@@ -1,8 +1,8 @@
 name: Release
 
-# Run by hand from the Actions tab. Versions webgllm (packages/webgllm),
-# writes its changelog, commits and tags the release, publishes to npm,
-# and creates a GitHub release.
+# Run by hand from the Actions tab. Runs the CI checks (ci.yml), then
+# versions webgllm (packages/webgllm), writes its changelog, commits and tags
+# the release, publishes to npm, and creates a GitHub release.
 on:
   workflow_dispatch:
     inputs:
@@ -30,7 +30,15 @@ permissions:
   id-token: write
 
 jobs:
+  # The same build, typecheck and tests as pull requests (ci.yml): release
+  # only what passes them.
+  check:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
