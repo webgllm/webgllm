@@ -1,3 +1,23 @@
+## 0.1.2 (2026-11-06)
+
+### 🩹 Fixes
+
+- **webgllm:** close objects only where it narrows the schema, scope refs by name ([b191958](https://github.com/webgllm/webgllm/commit/b191958))
+- **webgllm:** cancel a queued resize without the reply, settle downloads on stored files ([13d0d13](https://github.com/webgllm/webgllm/commit/13d0d13))
+- **bench:** count a frame gap across the first token, wait for uploads ([2cd750d](https://github.com/webgllm/webgllm/commit/2cd750d))
+- **webgllm:** cap only formatting whitespace, not spaces inside strings ([50b67f8](https://github.com/webgllm/webgllm/commit/50b67f8))
+- **webgllm:** self-check the q|k|v|gate projection the GPU computed ([3d93afc](https://github.com/webgllm/webgllm/commit/3d93afc))
+- **webgllm:** keep a finished file whole under a second download, cap no-version retries ([426212e](https://github.com/webgllm/webgllm/commit/426212e))
+- **webgllm:** end a stream's waiting read on return, size GGUFs without HEAD ([ff4455f](https://github.com/webgllm/webgllm/commit/ff4455f))
+- **webgllm:** penalize only the reply's tokens, and keep thinking off when asked ([8179148](https://github.com/webgllm/webgllm/commit/8179148))
+- **webgllm:** close response_format objects as tool schemas are ([5cafb26](https://github.com/webgllm/webgllm/commit/5cafb26))
+- **webgllm:** let constrained JSON take the whitespace models write ([560279d](https://github.com/webgllm/webgllm/commit/560279d))
+- **webgllm:** close a spent thinking budget the way the template does ([0138f5a](https://github.com/webgllm/webgllm/commit/0138f5a))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.1 (2026-11-06)
 
 ### 🚀 Features
