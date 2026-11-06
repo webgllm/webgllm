@@ -11,7 +11,11 @@
   <p>Runs the public API end to end: <code>?model=&lt;id&gt;</code> (LFM2.5 350M GGUF by default), <code>&second=&lt;id&gt;</code> to also load a second model at once.</p>
   <pre id="out"></pre>
   <script type="module">
-    import { WebGLLM, WebGLLMError } from "/bundle/src/index.js"
+    // `?baseline=1` runs another checkout's sources, linked at bench/baseline-src
+    // (`ln -s /path/to/checkout/packages/webgllm/src bench/baseline-src`).
+    const { WebGLLM, WebGLLMError } = await import(
+      new URLSearchParams(location.search).get("baseline") === "1" ? "/bundle/bench/baseline-src/index.js" : "/bundle/src/index.js"
+    )
 
     const out = document.getElementById("out")
     const log = (...parts) => {
@@ -31,6 +35,12 @@
           if (p.progress === 1 || Math.round(p.progress * 100) % 25 === 0) log("progress", p.model, p.phase, p.progress.toFixed(2), p.cached)
         }
       })
+      // `?think=0`: thinking off for requests that don't ask for it, so a
+      // model that thinks by default (LFM3) answers within short max_tokens.
+      if (params.get("think") === "0") {
+        const create = webgllm.chat.completions.create.bind(webgllm.chat.completions)
+        webgllm.chat.completions.create = (body, options) => create({ reasoning_effort: "none", ...body }, options)
+      }
 
       const list = await webgllm.models.list()
       log("models", list.map((m) => `${m.id} downloaded=${m.downloaded} ctx=${m.contextLength} size=${m.size}`))
@@ -206,8 +216,175 @@
         }
       }
 
+      // Structured output with a stop string that occurs in the JSON: stop
+      // doesn't apply inside a constrained answer, so it stays valid.
+      const stopJson = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Reply in JSON with the capital of Norway as city." }],
+        stop: ["{", "\""],
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "capital", schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }
+        }
+      })
+      let stopParsed = null
+      try { stopParsed = JSON.parse(stopJson.choices[0].message.content ?? "") } catch {}
+      log("json with stop", stopJson.choices[0].message.content, stopJson.choices[0].finish_reason)
+      check("stop strings leave a structured answer valid", typeof stopParsed?.city === "string")
+
+      // A required call among two tools whose schemas use local $defs.
+      const defsTools = [
+        {
+          type: "function",
+          function: {
+            name: "set_alarm",
+            description: "Set an alarm",
+            parameters: {
+              type: "object",
+              $defs: { time: { type: "object", properties: { hour: { type: "integer" }, minute: { type: "integer" } }, required: ["hour", "minute"] } },
+              properties: { at: { $ref: "#/$defs/time" } },
+              required: ["at"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            description: "Get the current weather for a city",
+            parameters: { type: "object", definitions: { city: { type: "string" } }, properties: { city: { $ref: "#/definitions/city" } }, required: ["city"] }
+          }
+        }
+      ]
+      const alarm = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Set an alarm for 7:30 in the morning." }],
+        tools: defsTools,
+        tool_choice: "required",
+        temperature: 0
+      })
+      const alarmCall = alarm.choices[0].message.tool_calls?.[0]
+      const alarmArgs = alarmCall ? JSON.parse(alarmCall.function.arguments) : null
+      log("required with $defs", alarmCall?.function)
+      check(
+        "required call among tools with $defs matches its schema",
+        (alarmCall?.function.name === "set_alarm" && Number.isInteger(alarmArgs?.at?.hour) && Number.isInteger(alarmArgs?.at?.minute)) ||
+          (alarmCall?.function.name === "get_weather" && typeof alarmArgs?.city === "string")
+      )
+
+      // Reads made before the first chunk each get a chunk, in order.
+      const concurrent = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Count from 1 to 20, separated by commas." }],
+        temperature: 0,
+        stream: true
+      })
+      const iterator = concurrent[Symbol.asyncIterator]()
+      const reads = await Promise.race([
+        Promise.all([iterator.next(), iterator.next(), iterator.next()]),
+        new Promise((resolve) => setTimeout(() => resolve(null), 30000))
+      ])
+      for (let r = await iterator.next(); !r.done; r = await iterator.next());
+      log("concurrent reads", reads?.map((r) => r.done))
+      check("three reads made at once all settle", Array.isArray(reads) && reads.every((r) => r.done === false))
+
+      // A repetition penalty must be greater than 0.
+      try {
+        await webgllm.chat.completions.create({ model, messages: [{ role: "user", content: "hi" }], repetition_penalty: 0 })
+        check("repetition_penalty 0 is refused", false, "no error")
+      } catch (error) {
+        check("repetition_penalty 0 is refused", /repetition_penalty/.test(error?.message ?? ""), error?.message)
+      }
+
+      // Large top_k and nucleus sampling: seeded, so repeatable.
+      for (const sampling of [{ top_k: 2048 }, { top_k: 0, top_p: 0.9 }]) {
+        const draw = async () =>
+          (await webgllm.chat.completions.create({
+            model,
+            messages: [{ role: "user", content: "Invent a name for a ship." }],
+            temperature: 1,
+            seed: 7,
+            max_tokens: 16,
+            ...sampling
+          })).choices[0].message.content
+        const [x, y] = [await draw(), await draw()]
+        log("sampling", sampling, x, "|", y)
+        check(`seeded sampling repeats with ${JSON.stringify(sampling)}`, !!x && x === y)
+      }
+
+      // A new context length asked for while a reply streams: the reply
+      // finishes, then the model loads again for the new length.
+      const resizeStream = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Count from 1 to 40, separated by commas." }],
+        temperature: 0,
+        max_tokens: 96,
+        stream: true
+      })
+      let resizeText = "", resizeChunks = 0, resizeLoad
+      for await (const chunk of resizeStream) {
+        resizeText += chunk.choices[0]?.delta?.content ?? ""
+        if (++resizeChunks === 5) resizeLoad = webgllm.loadModel(model, { contextLength: 4096 })
+      }
+      await resizeLoad
+      const afterResize = await webgllm.chat.completions.create({ model, messages: [{ role: "user", content: "Say OK." }], max_tokens: 8 })
+      log("resize during reply", { chunks: resizeChunks, text: resizeText.slice(0, 80), after: afterResize.choices[0].message.content })
+      check("a reply finishes when a new context length is asked for", resizeChunks > 20 && resizeText.includes("20"))
+      check("the model answers at the new context length", (afterResize.choices[0].message.content ?? "").length > 0)
+
+      // Small contexts: 64 tokens loads and answers; below the minimum fails
+      // with no download.
+      await webgllm.loadModel(model, { contextLength: 64 })
+      const tiny = await webgllm.chat.completions.create({ model, messages: [{ role: "user", content: "Hi" }], max_tokens: 4 })
+      log("context 64", tiny.choices[0].message.content, tiny.usage)
+      check("a 64-token context loads and answers", tiny.choices[0].message.content !== undefined)
+      try {
+        await webgllm.loadModel(model, { contextLength: 2 })
+        check("a 2-token context is refused", false, "loaded")
+      } catch (error) {
+        check("a 2-token context is refused", true, `${error?.code ?? ""} ${error?.message ?? error}`)
+      }
+
+      // Download and load of the same model at once both settle.
+      const [downloaded, loaded] = await Promise.allSettled([
+        webgllm.downloadModel(model),
+        webgllm.loadModel(model, { contextLength: 8192 })
+      ])
+      log("download with load", downloaded.status, loaded.status, downloaded.reason?.message ?? "", loaded.reason?.message ?? "")
+      check("a download and a load at once both succeed", downloaded.status === "fulfilled" && loaded.status === "fulfilled")
+
       // A second model loaded at the same time.
       if (second) {
+        // Download a model that isn't stored yet while loading it.
+        await webgllm.models.delete(second).catch(() => {})
+        t = performance.now()
+        const [d2, l2] = await Promise.allSettled([
+          webgllm.downloadModel(second),
+          webgllm.loadModel(second, { contextLength: 8192 })
+        ])
+        log("fresh download with load", d2.status, l2.status, `${Math.round(performance.now() - t)} ms`, d2.reason?.message ?? "", l2.reason?.message ?? "")
+        check("a fresh download and load at once both succeed", d2.status === "fulfilled" && l2.status === "fulfilled")
+        // A load canceled while it waits for room doesn't unload the model
+        // it was waiting on (a budget that fits one model).
+        const tight = new WebGLLM({ memoryBudget: 1 })
+        await tight.loadModel(model, { contextLength: 2048 })
+        const busy = await tight.chat.completions.create({
+          model,
+          messages: [{ role: "user", content: "Count from 1 to 30, separated by commas." }],
+          temperature: 0,
+          stream: true
+        })
+        const cancel = new AbortController()
+        const pending = tight.loadModel(second, { contextLength: 2048, signal: cancel.signal }).then(() => "loaded", (e) => e?.name ?? String(e))
+        let busyChunks = 0
+        for await (const _ of busy) if (++busyChunks === 3) cancel.abort()
+        const outcome = await pending
+        const stillLoaded = (await tight.models.list()).filter((m) => m.loaded).map((m) => m.id)
+        log("canceled load", { outcome, busyChunks, stillLoaded })
+        check("a canceled load leaves the busy model loaded", outcome !== "loaded" && stillLoaded.includes(model))
+        await tight.unloadModel()
+
+
         t = performance.now()
         await webgllm.loadModel(second, { contextLength: 8192 })
         log("loaded second", second, `${Math.round(performance.now() - t)} ms`)
