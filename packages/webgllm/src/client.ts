@@ -1,230 +1,261 @@
 /**
- * The page's side of the WebGL 2 worker (worker.ts), which runs the model
- * off the main thread on an OffscreenCanvas. One worker, one model in it at
- * a time: loading another frees the previous one.
+ * The page's side of one WebGL 2 worker (worker.ts), which runs a model off
+ * the main thread on an OffscreenCanvas. One worker holds one model; the
+ * pool (pool.ts) keeps a worker per loaded model.
  */
-import { monitorFrames } from "./frame-pacing.js"
+import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
-import type { WebGlTextModel } from "./model-meta.js"
-import { claimMemory, releaseMemory, touchMemory } from "./model-memory.js"
-import type { GenerationPhase, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
-import type { Sampling } from "./sampler.js"
-import { createStore } from "./store.js"
-import type { Store } from "./store.js"
-import type { ChatMessage, ChatTool } from "./tokenizer.js"
+import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 
-export type ModelStatus =
-  | { state: "idle" }
-  | {
-      state: "loading"
-      /** 0-1 across downloading and uploading to the GPU. */
-      progress: number
-      /** True when the files come from the browser's storage, not the network. */
-      cached: boolean
-      loadedBytes?: number
-      totalBytes?: number
-    }
-  | { state: "ready" }
-  | { state: "error"; message: string }
-
-const statuses = new Map<string, Store<ModelStatus>>()
-
-/** Loading status of a model, by its name. */
-export function modelStatus(model: WebGlTextModel): Store<ModelStatus> {
-  let status = statuses.get(model)
-  if (!status) {
-    status = createStore<ModelStatus>({ state: "idle" })
-    statuses.set(model, status)
-  }
-  return status
+/** What a worker sends that the pool acts on. */
+export type WorkerEvents = {
+  onProgress: (progress: Extract<WorkerResponse, { type: "progress" }>) => void
+  /** The model needs about `bytes`: resolve once there's room. */
+  onClaim: (bytes: number) => Promise<void>
+  onLog: (text: string) => void
+  /** The worker failed to start or crashed: it's gone. */
+  onCrash: (error: Error) => void
 }
 
-type Generation = {
-  onPhase?: (phase: GenerationPhase) => void
-  onToken: (text: string) => void
-  onEnd: (error?: string, stats?: RunTimings) => void
+/** How a generation ended, as the worker reports it. */
+export type WorkerGenerationEnd = {
+  stats: RunTimings
+  finishReason: FinishReason
+  toolCall?: { name: string; arguments: Record<string, unknown> }
 }
-const generations = new Map<string, Generation>()
 
-type Pending = {
-  promise: Promise<void>
-  resolve: () => void
-  reject: (error: Error) => void
+type Pending<T> = {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (error: unknown) => void
 }
-let loaded: {
-  model: string
+
+function pending<T>(): Pending<T> {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  // Callers may stop waiting (an abort); an unread failure isn't an error.
+  promise.catch(() => undefined)
+  return { promise, resolve, reject }
+}
+
+type Generation = Pending<WorkerGenerationEnd> & { onToken: (text: string) => void }
+
+/** Engine knobs every new worker starts with (see setPromptBatch). */
+const tuning: Record<string, number> = {}
+const live = new Set<ModelWorker>()
+
+/** The bundled worker. Written out here so bundlers see the `new URL(…, import.meta.url)`. */
+export const defaultWorker = () =>
+  new Worker(new URL("./worker.js", import.meta.url), { type: "module", name: "webgllm" })
+
+export class ModelWorker {
+  private readonly worker: Worker
+  private load: (Pending<void> & { contextLength: number | undefined }) | null = null
+  private downloading: Pending<void> | null = null
+  private readonly generations = new Map<string, Generation>()
+  /** Loaded and ready, for the context it was asked for (see contextLength). */
+  ready = false
+  /** Tokens the loaded model holds, as the worker reported it. */
+  loadedContextLength: number | undefined
+  /** The context the model was asked for: undefined for the model's own. */
   contextLength: number | undefined
-  load: Pending
-} | null = null
-let worker: Worker | null = null
-let stopFrames: (() => void) | undefined
+  private gone: Error | null = null
 
-/** This runtime's name in the shared memory registry. */
-const OWNER = "webgl"
-
-/** Models never unloaded to make room for another runtime's (see setKeepLoaded). */
-const keepLoaded = new Set<string>()
-
-/**
- * Keeps `model` loaded when another runtime (Transformers.js, wllama) loads
- * a model past the memory budget; by default the least recently used goes.
- */
-export function setKeepLoaded(model: WebGlTextModel, keep: boolean) {
-  if (keep) keepLoaded.add(model)
-  else keepLoaded.delete(model)
-}
-
-/**
- * Frees the loaded model, all its GPU memory with it, by ending the worker
- * (the next load starts a new one). Another runtime loading a model past the
- * memory budget calls it too.
- */
-export function unloadModel() {
-  stopFrames?.()
-  stopFrames = undefined
-  worker?.terminate()
-  worker = null
-  releaseMemory(OWNER)
-  if (loaded) {
-    modelStatus(loaded.model as WebGlTextModel).set({ state: "idle" })
-    loaded.load.reject(new Error("The model was unloaded."))
-    loaded = null
-  }
-  for (const [id, generation] of generations) {
-    generations.delete(id)
-    generation.onEnd("The model was unloaded.")
-  }
-}
-
-function handleMessage({ data }: MessageEvent<WorkerResponse>) {
-  if (data.type === "progress") {
-    // A download (not a load from storage): worth keeping.
-    if (!data.cached) keepDownloads()
-    modelStatus(data.model as WebGlTextModel).set({
-      state: "loading",
-      progress: data.progress,
-      cached: data.cached,
-      ...(data.totalBytes !== undefined && {
-        loadedBytes: data.loadedBytes ?? 0,
-        totalBytes: data.totalBytes
-      })
-    })
-  } else if (data.type === "claim") {
-    const { model, bytes } = data
-    void claimMemory({
-      owner: OWNER,
-      model,
-      bytes,
-      keepLoaded: keepLoaded.has(model),
-      unload: unloadModel
-    }).then(() => post({ type: "claimed" }))
-  } else if (data.type === "ready") {
-    modelStatus(data.model as WebGlTextModel).set({ state: "ready" })
-    if (loaded?.model === data.model) loaded.load.resolve()
-  } else if (data.type === "load-error") {
-    modelStatus(data.model as WebGlTextModel).set({
-      state: "error",
-      message: data.message
-    })
-    if (loaded?.model === data.model) {
-      loaded.load.reject(new Error(data.message))
-      loaded = null
-      releaseMemory(OWNER)
+  constructor(
+    readonly model: string,
+    create: () => Worker,
+    private readonly events: WorkerEvents
+  ) {
+    this.worker = create()
+    this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.handle(event.data)
+    this.worker.onerror = (event: ErrorEvent) => {
+      const error = new Error(event.message || "The model's worker stopped.")
+      this.terminate(error)
+      this.events.onCrash(error)
     }
-  } else if (data.type === "phase") {
-    generations.get(data.id)?.onPhase?.(data.phase)
-  } else if (data.type === "token") {
-    generations.get(data.id)?.onToken(data.text)
-  } else if (data.type === "log") {
-    console.info(data.text)
-  } else {
-    const generation = generations.get(data.id)
-    generations.delete(data.id)
-    if (data.type === "error") generation?.onEnd(data.message)
-    else generation?.onEnd(undefined, data.stats)
+    live.add(this)
+    if (Object.keys(tuning).length) this.post({ type: "tune", values: { ...tuning } })
   }
-}
 
-function post(message: WorkerRequest) {
-  if (!worker) {
-    worker = new Worker(new URL("./worker.js", import.meta.url), {
-      type: "module",
-      name: "webgl"
+  get loading(): boolean {
+    return this.load !== null && !this.ready
+  }
+
+  get busy(): boolean {
+    return this.generations.size > 0
+  }
+
+  /** The load in progress or done, if one was asked for. */
+  get loadPromise(): Promise<void> | null {
+    return this.load?.promise ?? null
+  }
+
+  private idlers: Array<() => void> = []
+
+  /** Resolves once no generation is running (at once if none is). */
+  idle(): Promise<void> {
+    if (!this.busy || this.gone) return Promise.resolve()
+    return new Promise((resolve) => this.idlers.push(resolve))
+  }
+
+  private settled() {
+    if (this.busy) return
+    for (const resolve of this.idlers.splice(0)) resolve()
+  }
+
+  post(message: WorkerRequest) {
+    if (!this.gone) this.worker.postMessage(message)
+  }
+
+  /**
+   * Loads the model for chats of up to `contextLength` tokens (the model's
+   * own context when undefined); a different context loads it again.
+   */
+  loadModel(contextLength: number | undefined): Promise<void> {
+    if (this.gone) return Promise.reject(this.gone)
+    if (this.load && this.contextLength === contextLength) return this.load.promise
+    this.load?.reject(new Error("The model was loaded again for another context length."))
+    this.ready = false
+    this.contextLength = contextLength
+    this.load = { ...pending<void>(), contextLength }
+    this.post({ type: "load", model: this.model, ...(contextLength !== undefined && { contextLength }) })
+    return this.load.promise
+  }
+
+  /** Downloads the model's files to storage, without loading it. */
+  download(): Promise<void> {
+    if (this.gone) return Promise.reject(this.gone)
+    if (!this.downloading) {
+      this.downloading = pending<void>()
+      this.post({ type: "download", model: this.model })
+    }
+    return this.downloading.promise
+  }
+
+  /**
+   * Runs a generation, calling `onToken` with the model's raw text as it
+   * comes; settles when the worker ends it (stopped ones included).
+   */
+  generate(
+    request: Omit<Extract<WorkerRequest, { type: "generate" }>, "type" | "model" | "contextLength">,
+    onToken: (text: string) => void
+  ): Promise<WorkerGenerationEnd> {
+    if (this.gone) return Promise.reject(this.gone)
+    const generation = { ...pending<WorkerGenerationEnd>(), onToken }
+    this.generations.set(request.id, generation)
+    this.post({
+      type: "generate",
+      ...request,
+      model: this.model,
+      // Exactly what it was loaded for: another value loads it again.
+      ...(this.contextLength !== undefined && { contextLength: this.contextLength })
     })
-    stopFrames = monitorFrames((intervalMs, expectedMs, frames, startedAt, meanMs) =>
-      worker?.postMessage({
-        type: "frames",
-        intervalMs,
-        expectedMs,
-        frames,
-        startedAt,
-        meanMs
-      } satisfies WorkerRequest)
-    )
-    worker.onmessage = handleMessage
-    worker.onerror = (event) =>
-      failWorker(event.message || "The model's worker stopped.")
-    if (promptBatch !== undefined)
-      worker.postMessage({
-        type: "tune",
-        values: { promptBatch }
-      } satisfies WorkerRequest)
+    return generation.promise
   }
-  worker.postMessage(message)
-}
 
-/** See setPromptBatch. */
-let promptBatch: number | undefined
+  stop(id: string) {
+    this.post({ type: "stop", id })
+  }
+
+  /** Ends the worker, and with it the model and all its GPU memory. */
+  terminate(reason: Error) {
+    if (this.gone) return
+    this.gone = reason
+    this.ready = false
+    live.delete(this)
+    this.worker.terminate()
+    this.load?.reject(reason)
+    this.load = null
+    this.downloading?.reject(reason)
+    this.downloading = null
+    for (const generation of this.generations.values()) generation.reject(reason)
+    this.generations.clear()
+    this.settled()
+  }
+
+  get terminated(): boolean {
+    return this.gone !== null
+  }
+
+  private handle(data: WorkerResponse) {
+    switch (data.type) {
+      case "progress":
+        this.events.onProgress(data)
+        break
+      case "claim":
+        void this.events
+          .onClaim(data.bytes)
+          .catch(() => undefined)
+          .then(() => this.post({ type: "claimed" }))
+        break
+      case "ready":
+        if (this.load) {
+          this.ready = true
+          this.loadedContextLength = data.contextLength
+          this.load.resolve()
+        }
+        break
+      case "load-error":
+        if (this.load) {
+          this.load.reject(workerError(data.message, data.code))
+          this.load = null
+          this.ready = false
+        }
+        break
+      case "downloaded":
+        this.downloading?.resolve()
+        this.downloading = null
+        break
+      case "download-error":
+        this.downloading?.reject(workerError(data.message, data.code))
+        this.downloading = null
+        break
+      case "token":
+        this.generations.get(data.id)?.onToken(data.text)
+        break
+      case "done": {
+        const generation = this.generations.get(data.id)
+        this.generations.delete(data.id)
+        generation?.resolve({
+          stats: data.stats,
+          // (A worker from before finish reasons: its end-of-turn token.)
+          finishReason: data.finishReason ?? "stop",
+          ...(data.toolCall && { toolCall: data.toolCall })
+        })
+        this.settled()
+        break
+      }
+      case "error": {
+        const generation = this.generations.get(data.id)
+        this.generations.delete(data.id)
+        generation?.reject(workerError(data.message, data.code))
+        this.settled()
+        break
+      }
+      case "log":
+        this.events.onLog(data.text)
+        break
+      case "phase":
+        break
+    }
+  }
+}
 
 /**
- * Prompt tokens per forward batch from the next model load on (undefined:
- * the default, 512 on every device). Smaller batches take less memory and
- * read prompts slower: 128 holds Qwen3.5 2B's 8k-token chats in ~270 MiB
- * less (an iPhone page has ~2 GB), at about half the prompt speed (still
- * about twice what it read before its recurrence ran in chunks). A loaded
- * model keeps its batch until it loads again (unloadModel, then load).
+ * Prompt tokens per forward batch from each model's next load on
+ * (undefined: the default, 512 on every device). Smaller batches take less
+ * memory and read prompts slower: 128 holds Qwen3.5 2B's 8k-token chats in
+ * ~270 MiB less (an iPhone page has ~2 GB), at about half the prompt speed.
+ * A loaded model keeps its batch until it loads again.
  */
 export function setPromptBatch(tokens: number | undefined) {
-  promptBatch = tokens
-  worker?.postMessage({
-    type: "tune",
-    values: { promptBatch: tokens ?? 0 }
-  } satisfies WorkerRequest)
-}
-
-/**
- * The worker failed to start or crashed: everything waiting on it fails,
- * and the next request starts a new one.
- */
-function failWorker(message: string) {
-  stopFrames?.()
-  stopFrames = undefined
-  worker?.terminate()
-  worker = null
-  releaseMemory(OWNER)
-  if (loaded) {
-    modelStatus(loaded.model as WebGlTextModel).set({ state: "error", message })
-    loaded.load.reject(new Error(message))
-    loaded = null
-  }
-  for (const [id, generation] of generations) {
-    generations.delete(id)
-    generation.onEnd(message)
-  }
-}
-
-let askedToKeep = false
-/**
- * Asks the browser to keep this site's storage, so a downloaded model isn't
- * deleted to free space: once, when a model first downloads (not for one
- * loaded from storage). Not in Firefox, which asks the user with a
- * permission prompt. Browsers may say no; only pages can ask.
- */
-function keepDownloads() {
-  if (askedToKeep || typeof navigator === "undefined") return
-  askedToKeep = true
-  if (/Firefox\//.test(navigator.userAgent)) return
-  navigator.storage?.persist?.().catch(() => undefined)
+  if (tokens === undefined) delete tuning.promptBatch
+  else tuning.promptBatch = tokens
+  for (const worker of live) worker.post({ type: "tune", values: { promptBatch: tokens ?? 0 } })
 }
 
 /**
@@ -232,7 +263,7 @@ function keepDownloads() {
  * targets and big enough textures, on an OffscreenCanvas in a worker.
  */
 export function hasWebGl2(): boolean {
-  if (typeof OffscreenCanvas === "undefined") return false
+  if (typeof OffscreenCanvas === "undefined" || typeof Worker === "undefined") return false
   try {
     const gl = new OffscreenCanvas(1, 1).getContext("webgl2")
     const ok =
@@ -243,139 +274,4 @@ export function hasWebGl2(): boolean {
   } catch {
     return false
   }
-}
-
-/**
- * Loads a model (downloading it the first time), replacing any other, for
- * chats of up to `contextLength` tokens: the model's own context length by
- * default. A different context length loads the model again.
- */
-export function loadModel(
-  model: WebGlTextModel,
-  contextLength?: number
-): Promise<void> {
-  if (loaded?.model === model && loaded.contextLength === contextLength) {
-    return loaded.load.promise
-  }
-  if (loaded) {
-    modelStatus(loaded.model as WebGlTextModel).set({ state: "idle" })
-    loaded.load.reject(new Error("Switched to another model."))
-  }
-  let resolve!: () => void
-  let reject!: (error: Error) => void
-  const promise = new Promise<void>((res, rej) => {
-    resolve = res
-    reject = rej
-  })
-  promise.catch(() => undefined)
-  loaded = { model, contextLength, load: { promise, resolve, reject } }
-  modelStatus(model).set({ state: "loading", progress: 0, cached: true })
-  post({
-    type: "load",
-    model,
-    ...(contextLength !== undefined && { contextLength })
-  })
-  return promise
-}
-
-export type GenerationEnd = { failure?: string; stats?: RunTimings }
-
-/**
- * Runs one generation with the loaded model, yielding its text as it comes
- * (thinking and tool-call markup included, as the model writes them).
- */
-export async function* generate(request: {
-  id: string
-  model: WebGlTextModel
-  /** The context the model is loaded for (see loadModel). */
-  contextLength?: number
-  chat: Array<ChatMessage>
-  /** False resets retained prompt state before/after this generation, keeping model weights. */
-  cachePrompt?: boolean
-  tools: Array<ChatTool>
-  thinking?: boolean
-  /** Thinking content ceiling; must be a nonnegative safe integer. */
-  thinkingBudgetTokens?: number
-  outputSchema?: object
-  sampling: Sampling
-  maxTokens?: number
-  /** Speculative decoding by prompt lookup (default on). */
-  speculative?: boolean
-  /** Reading the likeliest next token ahead (default on). */
-  pipeline?: boolean
-  signal?: AbortSignal
-  /** Worker-measured prefill and decode boundaries; never sent to the worker. */
-  onPhase?: (phase: GenerationPhase) => void
-}): AsyncGenerator<string, GenerationEnd> {
-  const { id, signal } = request
-  // Stopped before it started (say, while the model downloaded).
-  if (signal?.aborted) return {}
-  const queue: Array<string> = []
-  let wake: (() => void) | null = null
-  let finished = false
-  let end: GenerationEnd = {}
-  generations.set(id, {
-    ...(request.onPhase && {
-      onPhase: (phase: GenerationPhase) => {
-        if (!signal?.aborted) request.onPhase?.(phase)
-      }
-    }),
-    onToken: (text) => {
-      queue.push(text)
-      wake?.()
-    },
-    onEnd: (failure, stats) => {
-      end = { failure, stats }
-      finished = true
-      wake?.()
-    }
-  })
-  const onAbort = () => post({ type: "stop", id })
-  signal?.addEventListener("abort", onAbort)
-  touchMemory(OWNER)
-  post({
-    type: "generate",
-    id,
-    ...(request.onPhase && { reportPhases: true }),
-    model: request.model,
-    ...(request.contextLength !== undefined && {
-      contextLength: request.contextLength
-    }),
-    chat: request.chat,
-    ...(request.cachePrompt !== undefined && { cachePrompt: request.cachePrompt }),
-    tools: request.tools,
-    ...(request.thinking !== undefined && { thinking: request.thinking }),
-    ...(request.thinkingBudgetTokens !== undefined && {
-      thinkingBudgetTokens: request.thinkingBudgetTokens
-    }),
-    ...(request.outputSchema !== undefined && { outputSchema: request.outputSchema }),
-    sampling: request.sampling,
-    ...(request.maxTokens !== undefined && { maxTokens: request.maxTokens }),
-    ...(request.speculative !== undefined && {
-      speculative: request.speculative
-    }),
-    ...(request.pipeline !== undefined && { pipeline: request.pipeline })
-  })
-  try {
-    while (!finished || queue.length > 0) {
-      const text = queue.shift()
-      if (text !== undefined) {
-        yield text
-        continue
-      }
-      await new Promise<void>((resolve) => {
-        wake = resolve
-      })
-      wake = null
-    }
-  } finally {
-    signal?.removeEventListener("abort", onAbort)
-    // The caller stopped reading before the end: stop the worker too, so it
-    // doesn't keep generating into the next request.
-    if (!finished) {
-      generations.delete(id)
-      post({ type: "stop", id })
-    }
-  }
-  return end
 }

@@ -24,6 +24,12 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./advanced": {
+      "webgllm/source": "./src/advanced.ts",
+      "types": "./dist/advanced.d.ts",
+      "import": "./dist/advanced.js",
+      "default": "./dist/advanced.js"
     }
   },
   "files": ["src", "dist", "!**/*.test.ts", "!**/*.tsbuildinfo"],

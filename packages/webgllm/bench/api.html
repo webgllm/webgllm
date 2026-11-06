@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGLLM API smoke test</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>WebGLLM API smoke test</h1>
+  <p>Runs the public API end to end: <code>?model=&lt;id&gt;</code> (LFM2.5 350M GGUF by default), <code>&second=&lt;id&gt;</code> to also load a second model at once.</p>
+  <pre id="out"></pre>
+  <script type="module">
+    import { WebGLLM, WebGLLMError } from "/bundle/src/index.js"
+
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM2.5-350M-GGUF"
+    const second = params.get("second")
+    const check = (name, ok, detail) => log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+
+    try {
+      log("isSupported", WebGLLM.isSupported())
+      const webgllm = new WebGLLM({
+        onProgress: (p) => {
+          if (p.progress === 1 || Math.round(p.progress * 100) % 25 === 0) log("progress", p.model, p.phase, p.progress.toFixed(2), p.cached)
+        }
+      })
+
+      const list = await webgllm.models.list()
+      log("models", list.map((m) => `${m.id} downloaded=${m.downloaded} ctx=${m.contextLength} size=${m.size}`))
+
+      let t = performance.now()
+      await webgllm.loadModel(model, { contextLength: 8192 })
+      log("loaded", model, `${Math.round(performance.now() - t)} ms`)
+      log("info", await webgllm.models.retrieve(model))
+
+      // Basic, non-streaming.
+      const basic = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "What is the capital of France? Answer in one short sentence." }],
+        temperature: 0
+      })
+      log("basic", basic.choices[0].message, basic.choices[0].finish_reason, basic.usage, basic.timings)
+      check("basic answer mentions Paris", /paris/i.test(basic.choices[0].message.content ?? ""))
+
+      // Streaming with usage.
+      const stream = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Count from 1 to 5, separated by commas." }],
+        temperature: 0,
+        stream: true,
+        stream_options: { include_usage: true }
+      })
+      let text = "", chunks = 0, usage
+      for await (const chunk of stream) {
+        chunks++
+        text += chunk.choices[0]?.delta?.content ?? ""
+        if (chunk.usage) usage = chunk.usage
+      }
+      log("stream", { text, chunks, usage })
+      check("stream yields several chunks and usage", chunks > 3 && !!usage)
+
+      // Stop sequence.
+      const stopped = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Count from 1 to 10, separated by commas." }],
+        temperature: 0,
+        stop: ["5"]
+      })
+      const stoppedText = stopped.choices[0].message.content ?? ""
+      log("stop", stoppedText, stopped.choices[0].finish_reason)
+      check("stop sequence cuts before 5", !stoppedText.includes("5") && stoppedText.includes("4"))
+
+      // max_tokens → length.
+      const short = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Write a long story about a dragon." }],
+        max_tokens: 8
+      })
+      log("max_tokens", short.choices[0].message.content, short.choices[0].finish_reason, short.usage.completion_tokens)
+      check("max_tokens ends with length", short.choices[0].finish_reason === "length")
+
+      // Seed reproducibility.
+      const seeded = async () =>
+        (await webgllm.chat.completions.create({
+          model,
+          messages: [{ role: "user", content: "Invent a name for a fantasy city." }],
+          temperature: 1,
+          seed: 42,
+          max_tokens: 24
+        })).choices[0].message.content
+      const [a, b] = [await seeded(), await seeded()]
+      log("seed", a, "|", b)
+      check("same seed gives the same reply", a === b)
+
+      // Structured output.
+      const json = await webgllm.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: "Extract: Ada Lovelace, born 1815 in London." }],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "person",
+            schema: {
+              type: "object",
+              properties: { name: { type: "string" }, born: { type: "integer" }, city: { type: "string" } },
+              required: ["name", "born", "city"],
+              additionalProperties: false
+            }
+          }
+        }
+      })
+      const parsed = JSON.parse(json.choices[0].message.content ?? "null")
+      log("json_schema", parsed)
+      check("json_schema answer parses with the fields", parsed && typeof parsed.born === "number" && typeof parsed.name === "string")
+
+      // Tool calls: auto, then a forced call.
+      const tools = [{
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get the current weather for a city",
+          parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
+        }
+      }]
+      const messages = [{ role: "user", content: "What's the weather in Paris right now?" }]
+      const auto = await webgllm.chat.completions.create({ model, messages, tools, temperature: 0 })
+      log("tools auto", auto.choices[0].message, auto.choices[0].finish_reason)
+
+      const forced = await webgllm.chat.completions.create({ model, messages, tools, tool_choice: "required", temperature: 0 })
+      const call = forced.choices[0].message.tool_calls?.[0]
+      log("tools required", forced.choices[0].message, forced.choices[0].finish_reason)
+      check("required tool_choice returns a get_weather call", call?.function.name === "get_weather" && forced.choices[0].finish_reason === "tool_calls")
+
+      if (call) {
+        const followup = await webgllm.chat.completions.create({
+          model,
+          tools,
+          temperature: 0,
+          messages: [
+            ...messages,
+            forced.choices[0].message,
+            { role: "tool", tool_call_id: call.id, content: JSON.stringify({ city: "Paris", temperature_c: 18, sky: "sunny" }) }
+          ]
+        })
+        log("tool result answer", followup.choices[0].message.content)
+        check("answer uses the tool result", /18/.test(followup.choices[0].message.content ?? ""))
+      }
+
+      // Abort mid-stream.
+      const controller = new AbortController()
+      let aborted = false
+      try {
+        const s = await webgllm.chat.completions.create(
+          { model, messages: [{ role: "user", content: "Write a long poem about the sea." }], stream: true },
+          { signal: controller.signal }
+        )
+        let n = 0
+        for await (const _ of s) if (++n === 5) controller.abort()
+      } catch (error) {
+        aborted = error instanceof DOMException && error.name === "AbortError"
+      }
+      check("abort rejects with AbortError", aborted)
+      const after = await webgllm.chat.completions.create({ model, messages: [{ role: "user", content: "Say OK." }], max_tokens: 8 })
+      check("the model still answers after an abort", (after.choices[0].message.content ?? "").length > 0, after.choices[0].message.content)
+
+      // Errors.
+      for (const [name, body, code] of [
+        ["unknown model", { model: "nope/nope", messages: [{ role: "user", content: "hi" }] }, "model-not-supported"],
+        ["n > 1", { model, n: 2, messages: [{ role: "user", content: "hi" }] }, "unsupported-parameter"]
+      ]) {
+        try {
+          await webgllm.chat.completions.create(body)
+          check(`error: ${name}`, false, "no error")
+        } catch (error) {
+          check(`error: ${name}`, error instanceof WebGLLMError && error.code === code, `${error?.code} ${error?.message}`)
+        }
+      }
+
+      // A second model loaded at the same time.
+      if (second) {
+        t = performance.now()
+        await webgllm.loadModel(second, { contextLength: 8192 })
+        log("loaded second", second, `${Math.round(performance.now() - t)} ms`)
+        const both = (await webgllm.models.list()).filter((m) => m.loaded).map((m) => m.id)
+        log("loaded models", both)
+        check("both models stay loaded", both.includes(model) && both.includes(second))
+        const think = await webgllm.chat.completions.create({
+          model: second,
+          messages: [{ role: "user", content: "Is 391 prime? Answer yes or no." }],
+          reasoning_effort: "high",
+          thinking_budget_tokens: 256
+        })
+        log("second thinking", { reasoning: (think.choices[0].message.reasoning_content ?? "").slice(0, 200), content: think.choices[0].message.content }, think.usage)
+        check("thinking arrives in reasoning_content", (think.choices[0].message.reasoning_content ?? "").length > 0)
+        const again = await webgllm.chat.completions.create({ model, messages: [{ role: "user", content: "Say hi." }], max_tokens: 8 })
+        check("first model still answers", (again.choices[0].message.content ?? "").length > 0)
+      }
+
+      await webgllm.unloadModel()
+      log("ALL DONE")
+    } catch (error) {
+      log("ERROR:", error?.code ?? "", error?.message ?? String(error), error?.stack ?? "")
+    }
+  </script>
+</html>

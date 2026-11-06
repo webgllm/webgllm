@@ -1,10 +1,10 @@
 ---
 title: Introduction
-description: LLM inference in the browser on WebGL 2.
+description: LLM inference in the browser on WebGL 2, with an OpenAI-compatible API.
 icon: Rocket
 ---
 
-WebGLLM runs language models in the browser on WebGL 2, for devices and browsers without WebGPU.
+WebGLLM runs language models in the browser on its own WebGL 2 engine, for devices and browsers without WebGPU. Its API follows OpenAI's Chat Completions.
 
 ## Install
 
@@ -12,4 +12,19 @@ WebGLLM runs language models in the browser on WebGL 2, for devices and browsers
 npm install webgllm
 ```
 
-The package is in early development.
+## First chat
+
+```ts
+import { WebGLLM } from "webgllm"
+
+const webgllm = new WebGLLM()
+
+const completion = await webgllm.chat.completions.create({
+  model: "LiquidAI/LFM3-1.7B-GGUF",
+  messages: [{ role: "user", content: "What is the capital of France?" }]
+})
+
+console.log(completion.choices[0].message.content)
+```
+
+The first call downloads the model into the browser's storage and loads it. The package is in early development; the API may change.

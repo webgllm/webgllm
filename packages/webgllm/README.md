@@ -1,173 +1,143 @@
-# @tanstack-ai-browser/webgl
+# webgllm
 
-A [TanStack AI](https://tanstack.com/ai) adapter for LFM3 1.7B, LFM2.5 and Qwen3.5 2B running in the browser on its own WebGL 2 inference engine, in a Web Worker on an OffscreenCanvas. It runs with or without WebGPU (the demo app starts on it everywhere, iPhone Safari included); where there's no WebGPU, Firefox on Android among them, it reads prompts on the GPU about three times as fast as llama.cpp on the CPU.
+LLM inference in the browser on WebGL 2, with an OpenAI-compatible API. It runs LFM3, LFM2.5 and Qwen3.5 on its own WebGL 2 engine in a Web Worker, so it works where WebGPU doesn't: Firefox on Android, older iPhones, and everywhere else.
 
 ```sh
-npm install @tanstack-ai-browser/webgl @tanstack/ai
+npm install webgllm
 ```
 
 ```ts
-import { chat } from "@tanstack/ai"
-import { webglText } from "@tanstack-ai-browser/webgl"
+import { WebGLLM } from "webgllm"
 
-const stream = chat({
-  adapter: webglText("LiquidAI/LFM3-1.7B-GGUF"),
-  messages,
-  threadId
+const webgllm = new WebGLLM()
+
+const completion = await webgllm.chat.completions.create({
+  model: "LiquidAI/LFM3-1.7B-GGUF",
+  messages: [{ role: "user", content: "What is the capital of France?" }]
+})
+
+console.log(completion.choices[0].message.content)
+```
+
+The first call downloads the model into the browser's storage (the Origin Private File System) and loads it; later calls and page loads reuse it. Pages don't need cross-origin isolation.
+
+**Status:** early (0.x); the API may change. Docs: [webgllm.dev](https://webgllm.dev).
+
+## Requirements
+
+WebGL 2 with float render targets (`EXT_color_buffer_float`) and OffscreenCanvas in workers, which current Chrome, Firefox and Safari have. `WebGLLM.isSupported()` checks.
+
+## Usage
+
+### Loading with progress
+
+```ts
+await webgllm.loadModel("unsloth/Qwen3.5-2B-GGUF", {
+  contextLength: 8192,
+  onProgress: ({ phase, progress }) => console.log(phase, Math.round(progress * 100))
 })
 ```
 
-It needs WebGL 2 with float render targets (`EXT_color_buffer_float`) and OffscreenCanvas in workers, which Firefox, Chrome and Safari have; `hasWebGl2()` checks.
+`loadModel` is optional: `create()` loads its model on demand, and takes `{ onProgress }` in its second argument for that case. `downloadModel(model)` fetches the files without loading them.
 
-## Models
+### Streaming and cancelling
 
-`WEBGL_TEXT_MODELS` lists the models, and `WEBGL_MODEL_META` has each one's files (each repository's latest version, main), context, capabilities, reasoning levels and the sampling from its card (LFM3: temperature 0.1, top-k 50, repetition penalty 1.1; LFM2.5 Instruct/350M: temperature 0.1, top-k 50, repetition penalty 1.05; LFM2.5 Thinking: temperature 0.05, top-k 50, repetition penalty 1.05; Qwen3.5 text: temperature 1, top-k 20, top-p 1 and presence penalty 2 without thinking, top-p 0.95 and presence penalty 1.5 with thinking).
+```ts
+const controller = new AbortController()
+const stream = await webgllm.chat.completions.create(
+  { model, messages, stream: true, stream_options: { include_usage: true } },
+  { signal: controller.signal }
+)
+for await (const chunk of stream) {
+  output.textContent += chunk.choices[0]?.delta.content ?? ""
+}
+```
 
-| Model                            | Weights                                                       | Download |
-| -------------------------------- | ------------------------------------------------------------- | -------- |
-| `LiquidAI/LFM3-1.7B-GGUF`        | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)        | 1.05 GB  |
-| `daveycodez/LFM3-1.7B-Web-ONNX`  | 4-bit ONNX build for the web, with a 49k-token vocabulary     | 900 MB   |
-| `onnx-community/Qwen3.5-2B-ONNX` | onnx-community's q4f16 decoder (its lm_head is the embedding) | 1.09 GB  |
-| `unsloth/Qwen3.5-2B-GGUF`        | unsloth's Q4_0 GGUF (its few Q4_1 and Q5_K matrices as 8-bit) | 1.21 GB  |
+Aborting rejects with a `DOMException` named `AbortError` and stops the generation.
 
-LFM3 thinks by default, Qwen3.5 doesn't; `chat({ reasoning })` switches it through the chat template's `enable_thinking`. **Tools**, **usage** (with `promptTokensDetails.cachedTokens`, and timings in `usage.providerUsageDetails`), `modelOptions` sampling and `chat({ outputSchema })` work as with the package's other adapters. `loadModel(model)` downloads and loads a model ahead of time, and `modelStatus(model)` is a store of its progress.
+### Thinking
 
-Model defaults come from the [LFM3](https://huggingface.co/LiquidAI/LFM3-1.7B), [LFM2.5 Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct), [LFM2.5 Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking), [LFM2.5 350M](https://huggingface.co/LiquidAI/LFM2.5-350M), and [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) model cards. GGUF/ONNX variants share their source model's preset. Qwen's preset follows text recommendations and switches with `reasoning`; its repetition penalty is 1 and min-p is 0 in both modes. Presence penalties count generated tokens only and apply on the GPU before candidate selection, including speculative drafts. Callers can override individual sampling fields through `modelOptions`. The supported models declare no default output cap in their generation configs. When neither `modelOptions.maxTokens` nor its legacy alias `max_new_tokens` is supplied, generation continues until EOS or the remaining configured model context is exhausted. An explicit value is honored in both streaming and structured-output calls and bounded by remaining context; `maxTokens` wins if both names are supplied. Thinking budgets are separate from this total output limit.
+```ts
+const stream = await webgllm.chat.completions.create({
+  model: "unsloth/Qwen3.5-2B-GGUF",
+  messages,
+  reasoning_effort: "high",        // "none" turns it off
+  thinking_budget_tokens: 512,     // optional cap
+  stream: true
+})
+for await (const chunk of stream) {
+  const { reasoning_content, content } = chunk.choices[0].delta
+}
+```
+
+### Tools
+
+OpenAI's `tools` and `tool_choice` (`"auto"`, `"none"`, `"required"` or a named function). Calls come back as `message.tool_calls` with `arguments` as a JSON string; send results back as `tool` messages. A forced call (`"required"` or a name) is constrained to the tool's JSON Schema; objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode.
 
 ### Structured output
 
-`chat({ outputSchema })` forwards the schema to the worker, where a generation-local matcher constrains answer tokens. The allowed-token bitset is applied before GPU candidate selection, argmax and top-k, and before sampling on the CPU-logits path. Model inference remains on WebGL. Unsupported schema features and constraint dead ends fail explicitly; exhausting the caller's output/context allowance before a valid answer reports truncation.
-
-Thinking and answer generation have separate states. Thinking uses its normal pipeline/speculative optimizations and caller budget, with EOS suppressed until an answer can be produced. Natural or budget-forced thinking completion activates the schema mask. Models that emit their own opening thinking marker receive that marker before constrained generation when thinking is requested. The constrained answer phase supports pipeline guesses and speculative drafts. Each proposed answer prefix uses a cloned grammar state and its own GPU mask; invalid suffixes are dropped before forwarding, and only accepted tokens advance the live matcher. A draft batch crossing the thinking boundary is rewound to its accepted prefix before selecting the first constrained token. Unconstrained text calls retain their existing decoding paths.
-
-### Prompt caching
-
-The engine reuses only matching rendered token IDs. System instructions, message
-roles, schemas and tool guidance keep their existing serialization; no extra user
-messages, layout options or application-managed cache boundaries are required.
-Changing a schema or earlier message can reduce the reusable prefix.
-
-A token-verified system/tool checkpoint shares the existing snapshot budget with
-the ordinary conversational anchor. System checkpoints tag existing legacy prefill endpoints without changing batch
-sizes or adding model forwards; no exact-prefix split is introduced. Ordinary
-conversational anchors retain their original positions and supported
-in-batch behavior. This avoids adding model passes to short requests merely to
-save speculative checkpoints.
-
-Actual reuse is reported in `promptTokensDetails.cachedTokens`. Optional
-`providerUsageDetails` fields separate prompt, tokenizer, schema and cache-restore
-work and report the selected checkpoints. Restore timing measures CPU matching and
-command submission; queued GPU restoration completes with subsequent prompt work.
-
-`chat({ promptCache: "none" })` clears owned inference-cache state before and after
-the call, including error/cancellation paths, and skips optional checkpoint work.
-Weights remain loaded and generation retains its own autoregressive KV state.
-Omitted/`"short"`/`"long"` retain existing budgets/lifetimes; no TTL is added. Cache
-keys cannot substitute for matching tokens and do not create separate GPU caches.
-
-### Tool calls
-
-Automatic tool choice retains the model's native routing and answer format. Before tool-call events are emitted, each parsed call must name a declared tool and its arguments must validate against that tool's schema. Valid arguments are retained without another model call; invalid arguments are regenerated once under the selected tool's constrained schema. Unknown tools and malformed envelopes fail explicitly. Required/named choices use constrained selection and arguments. There is no unconstrained retry loop. Tool calls still use TanStack AI's normal execution/result loop.
-
-### Thinking budget
-
-Every thinking-capable WebGL model accepts an optional thinking-token ceiling through the shared reasoning option:
-
 ```ts
-const stream = chat({
-  adapter: webglText("LiquidAI/LFM3-1.7B-GGUF"),
-  messages,
-  threadId,
-  reasoning: { level: "high", budgetTokens: 512 },
-  modelOptions: { maxTokens: 8192 }
+const reply = await webgllm.chat.completions.create({
+  model,
+  messages: [{ role: "user", content: "Extract as JSON: Ada Lovelace, born 1815 in London." }],
+  response_format: { type: "json_schema", json_schema: { name: "person", schema } }
 })
+const person = JSON.parse(reply.choices[0].message.content!)
 ```
 
-The worker counts emitted thinking content tokens, forces `</think>` at the ceiling, and continues the answer in the same generation. Opening and closing markers do not count toward the thinking budget; they do count toward `maxTokens`, which still limits the entire output. Leave enough total output tokens for the final answer. A zero budget closes thinking immediately. Omitting `budgetTokens` preserves unlimited thinking within the total output limit; `level: "off"` disables thinking and ignores a valid budget. Negative, fractional, or unsafe budgets are rejected. This applies to every LFM3, LFM2.5 Thinking, and Qwen3.5 variant.
+Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values.
 
-After an explicitly exhausted thinking span closes, ordinary text generation masks further actual thinking control tokens. Structured answers remain governed by their schema mask so tag-like text inside JSON strings stays data.
+### Several models
 
-The low-level worker/client generation option is `thinkingBudgetTokens`. Budgeted runs report `thinkingTokens`, `thinkingBudgetTokens`, and `thinkingBudgetExhausted` in `usage.providerUsageDetails`.
+Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
 
-### Speed
+```ts
+await webgllm.models.list()      // the supported models, with downloaded / loaded
+await webgllm.models.delete(id)  // remove a model's files from storage
+await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
+```
 
-Pixel 10 Pro (PowerVR DXT-48-1536), Firefox 159, a 515-token prompt:
+### Other request fields
 
-|                                         | Prompt reading      | Writing       | First token |
-| --------------------------------------- | ------------------- | ------------- | ----------- |
-| `daveycodez/LFM3-1.7B-Web-ONNX`         | 75.6 tokens/s       | 9.2 tokens/s  | 6.8 s       |
-| `LiquidAI/LFM3-1.7B-GGUF`               | 71.9 tokens/s       | 7.9 tokens/s  | 7.2 s       |
-| wllama (CPU, relaxed SIMD), LFM3 Q4_K_M | 24.5 to 30 tokens/s | 11.6 tokens/s | 18.2 s      |
+`max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, image or audio content) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.
 
-Writing is still slower than on the CPU: each token pays a GPU round trip and about 400 small draws. The Web build writes faster than the GGUF one, its output head being 49k rows of 4 bits rather than 128k of 8.
+### Errors
 
-Qwen3.5 2B on a Mac (M3 Ultra, Chrome), a 535-token prompt, median of 3:
+`WebGLLMError` has a `code`: `webgl2-unavailable`, `model-not-supported`, `model-not-loaded`, `download-failed`, `storage-full`, `out-of-memory`, `gpu-context-lost`, `context-length-exceeded`, `invalid-schema` or `unsupported-parameter`.
 
-|                                                | Prompt reading | Writing       | First token |
-| ---------------------------------------------- | -------------- | ------------- | ----------- |
-| `onnx-community/Qwen3.5-2B-ONNX` (WebGL)       | 2,777 tokens/s | 81.2 tokens/s | 0.20 s      |
-| `unsloth/Qwen3.5-2B-GGUF` Q4_0 (WebGL)         | 2,138 tokens/s | 70.0 tokens/s | 0.26 s      |
-| Transformers.js (WebGPU), the same ONNX        | 17.7 tokens/s  | 19.7 tokens/s | 30.3 s      |
-| wllama (WebGPU), unsloth's Q4_K_M              | 595 tokens/s   | 20.4 tokens/s | 0.90 s      |
+## Models
 
-The WebGL rows read prompts with the Gated DeltaNet recurrence in chunks (see How it runs), 512 tokens at a time, the weight layout fixed to RGBA4, medians of 18–21 runs; a token at a time they read 653 and 607 tokens/s, writing the same. A follow-up question (~80 tokens, after a 64-token reply) reads 159 tokens in 90 ms (ONNX) and 146 ms (GGUF). The other rows are from an earlier run.
+| Model                                | Weights                                                  |
+| ------------------------------------ | -------------------------------------------------------- |
+| `LiquidAI/LFM3-1.7B-GGUF`            | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)   |
+| `onnx-community/LFM3-1.7B-ONNX`      | onnx-community's q4f16 export                            |
+| `unsloth/Qwen3.5-2B-GGUF`            | unsloth's Q4_0 GGUF                                      |
+| `onnx-community/Qwen3.5-2B-ONNX`     | onnx-community's q4f16 decoder                           |
+| `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` | official QAD Q4_0                                        |
+| `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` | official Q4_0; always thinks                             |
+| `LiquidAI/LFM2.5-350M-GGUF`          | official QAD Q4_0                                        |
+| `LiquidAI/LFM2.5-1.2B-Instruct-ONNX`, `LiquidAI/LFM2.5-1.2B-Thinking-ONNX`, `LiquidAI/LFM2.5-350M-ONNX` | Liquid AI's 4-bit ONNX exports |
 
-### Correctness
+LFM3 thinks by default and Qwen3.5 doesn't; `reasoning_effort` switches it through the chat template's `enable_thinking`. Sampling defaults come from each model card. See [LFM2.5 GGUF validation](bench/LFM2-GGUF.md).
 
-Both builds were checked tensor by tensor against a reference:
+## Advanced
 
-- **GGUF against llama.cpp** at the commit wllama builds (`19cce69`), on a 345-token prompt (past the 256-token sliding window): mean KL 1.1e-3 between the logits, below the 3.0e-3 between llama.cpp's own CPU and Metal backends; the same top token at 31 of 32 single-token decode steps. Every layer's output has a cosine similarity of at least 0.9992. The same holds on the Pixel with mediump matmuls.
-- **ONNX against onnxruntime** (CPU, exact 4-bit math): mean KL 2.2e-5, every top token the same, the greedy continuation identical over 32 tokens.
-- **Qwen3.5 2B**, on a 204-token chat prompt and 32 greedy tokens: the ONNX build against onnxruntime, mean KL 8e-6 (prompt) and 1.1e-5 (writing), the greedy continuation identical; the GGUF build against llama.cpp (CPU), mean KL 2.1e-3 and 1.9e-3, the same top token at 31 of 32 steps, every layer's output at a cosine similarity of at least 0.9989. Most of that gap is llama.cpp's: its CPU matmuls quantize their inputs to 8 bits, and the Gated DeltaNet's output projection takes heavy-tailed ones (peak 27× the RMS), which costs it 3.4% there; with that quantization applied to its own input, the engine's dequantized Q5_K weights give llama.cpp's output to 2e-7.
-
-`bench/check.html` runs these checks (see `bench/README.md`); `docs/llama-cpp-lfm3.md` is LFM3's graph as llama.cpp computes it, which the engine follows.
+`webgllm/advanced` exports the engine underneath (`Engine`, `loadGguf`, `loadOnnx`, `loadTokenizer`, byte sources, `setPromptBatch`) for experiments. It's not covered by semver while the package is 0.x.
 
 ## How it runs
 
-`chat()` runs tools and the agent loop; each model call is one generation in the worker. The worker downloads the files to the Origin Private File System (resuming a dropped download), then streams the weights from there into textures, one layer at a time.
+Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `chat.completions.create` call is one generation there. The worker downloads the files to the Origin Private File System (resuming a dropped download), then streams the weights from there into textures, one layer at a time.
 
 - **Loaders:** `loadGguf` and `loadOnnx` read either format into the same weights (`weights.ts`): 4-bit blocks of 32 in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is kept as it is and read natively in the shader, so its weights are exactly llama.cpp's. The embedding goes to the GPU in chunks of rows, so it's never all in JavaScript memory. Only tensors are read from the ONNX graph; its ops aren't run.
 - **Kernels:** fragment shaders, one output texel per fragment (`gpu/kernels.ts`). Matmuls read weights from byte textures and activations as packed halves, eight per texel. A one-token matmul splits its rows' blocks across fragments, so the GPU has enough work. Every op of LFM3's graph is a pass: RMSNorm, the gated short convolution with its state, QK-norm and RoPE, attention over a half-precision KV cache (sliding-window layers see their last 256 tokens), the sigmoid output gate, SwiGLU, and the sandwich norms.
-- **Prompts** are read 512 tokens at a time on every device (`setPromptBatch` for fewer: see Memory); big passes are split into bands of rows, under mobile GPUs' watchdogs.
+- **Prompts** are read 512 tokens at a time on every device (`setPromptBatch` in `webgllm/advanced` for fewer); big passes are split into bands of rows, under mobile GPUs' watchdogs.
 - **Sampling:** with top-k (LFM3's 50), the GPU applies the repetition penalty and picks the 50 chunks of 256 logits with the largest logits, which hold the top 50 tokens for sure, so writing a token reads back ~50 KB rather than every logit. Readbacks go through a pixel buffer and a fence.
 - **Qwen3.5's Gated DeltaNet** (18 of its 24 layers) is a pass each for the gates (beta, decay), the causal convolution with its state, and q and k's L2 norms, then the recurrence over each head's 128×128 fp32 state, and the gated RMSNorm. Writing runs the recurrence as two passes a token (the delta and output, then the update). Prompt batches run it in chunks of 32 tokens, as llama.cpp and flash-linear-attention do (`delta-rule.ts` has the math): the decays summed within a chunk, the chunk's Gram matrices, a triangular solve and the products that don't read the state, for every chunk at once, then two passes a chunk that do (its deltas and outputs, then the state after it). Its full-attention layers gate their output per dim.
-- **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state, Qwen3.5's recurrent state and the sliding-window layers' last window are saved (snapshots) to resume from: LFM3's after each prompt batch and reply (the latest 8, ~3 MB each), Qwen3.5's (~20 MB each) after the reply and at the anchor, where the next question's prompt stops sharing the chat, 2 in all. Qwen3.5's template writes a past reply back without the `<think>` tags its generation prompt opened, so a follow-up differs from `<|im_start|>assistant` on; the anchor is saved there, from inside the prompt's last batch (its recurrence chunks laid out so one ends there), and a follow-up reads only the reply and the new message (159 tokens rather than 687 in `bench/compare.html?followup=1`). `src/prompt.ts` finds where a template's follow-ups stop sharing, once per template (LFM3's write the reply back as it was: the anchor is the prompt's end). A tool's result keeps the last question's anchor, the reply before it being written back as it was. Qwen3.5 writes without speculative drafts (keeping only part of a draft batch would need the recurrent state after each of its tokens).
+- **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state, Qwen3.5's recurrent state and the sliding-window layers' last window are saved (snapshots) to resume from: LFM3's after each prompt batch and reply (the latest 8, ~3 MB each), Qwen3.5's (~20 MB each) after the reply and at the anchor, where the next question's prompt stops sharing the chat, 2 in all. Qwen3.5's template writes a past reply back without the `<think>` tags its generation prompt opened, so a follow-up differs from `<|im_start|>assistant` on; the anchor is saved there, from inside the prompt's last batch (its recurrence chunks laid out so one ends there), and a follow-up reads only the reply and the new message. `src/prompt.ts` finds where a template's follow-ups stop sharing, once per template (LFM3's write the reply back as it was: the anchor is the prompt's end). A tool's result keeps the last question's anchor, the reply before it being written back as it was. Qwen3.5 writes without speculative drafts (keeping only part of a draft batch would need the recurrent state after each of its tokens).
 - **Context:** the model's own (LFM3: 262,144 tokens; LFM2.5: 128,000). Full-attention caches start at 1,024 tokens and grow 512 at a time as a chat grows (doubling left up to half of it unused), wrapping into side-by-side blocks past the GPU's texture height; sliding-window layers keep only their window plus a batch, in a ring. Past 8,192 keys, attention reads them in segments and combines them.
 
-### Memory
+Memory and speed measurements are in [bench/WEBGL-PERFORMANCE.md](bench/WEBGL-PERFORMANCE.md) and the bench pages ([bench/README.md](bench/README.md)).
 
-GPU textures over a chat on an M3 Ultra in Chrome (`bench/mem.html`: a first message of 64, 2,048 or 8,192 tokens, a 64-token reply, then a short follow-up), at the 512-token batch every device takes, the most held at once, MiB. "Page" adds what Chrome's GPU process and the renderer took on top of the textures (both measured against their state before the load), as an estimate of a page's total; Safari's own overhead isn't measured here.
+## License
 
-| Model                            | 64 tokens | 2,048 tokens | 8,192 tokens | Page at 8,192 | Before (64 / 2,048 / 8,192; page) |
-| -------------------------------- | --------- | ------------ | ------------ | ------------- | --------------------------------- |
-| `onnx-community/Qwen3.5-2B-ONNX` | 1,532     | 1,550        | 1,622        | ~2,210        | 1,603 / 1,677 / 1,821; ~2,340     |
-| `unsloth/Qwen3.5-2B-GGUF`        | 1,613     | 1,631        | 1,703        | ~2,140        | 1,670 / 1,745 / 1,889; ~2,320     |
-| `daveycodez/LFM3-1.7B-Web-ONNX`  | 1,247     | 1,275        | 1,365        | ~1,810        | 1,283 / 1,329 / 1,492; ~1,930     |
-| `LiquidAI/LFM3-1.7B-GGUF`        | 1,361     | 1,389        | 1,480        | ~1,920        | 1,397 / 1,443 / 1,607; ~2,070     |
-
-A first load also holds the self-check's scratch for a moment (LFM3: up to 1,270 and 1,384 MiB). What went: the self-check's scratch once it's done (29–36 MiB), Qwen3.5's unused conv buffers and the logits and head scratch for draft batches it never reads (49–63 MiB), its third snapshot and the one made before the oldest went (39 MiB at the peak), and the cache's doubling (it grows 512 positions at a time: 18 MiB at 2k, 90 MiB just past 8k). Qwen3.5's chunked recurrence added 21 MiB.
-
-Phones take the same 512-token batch: nothing a GPU reports tells an iPhone's ~2 GB page from a desktop's, and smaller batches read LFM3's prompts slower than it read them before (a third slower at 256). `setPromptBatch(128)` before a load trades prompt speed for memory on any model:
-
-| Prompt batch | Qwen3.5 ONNX: 8k textures, prompt | Qwen3.5 GGUF | LFM3 Web ONNX | LFM3 GGUF |
-| ------------ | --------------------------------- | ------------ | ------------- | --------- |
-| 512          | 1,622 MiB, 2,750–2,815 tokens/s   | 1,703, 2,110–2,140 | 1,365, 2,930–2,960 | 1,480, 2,920–2,950 |
-| 256          | 1,485, 1,860–1,920                | 1,566, 1,340 | 1,240, 1,990  | 1,354, 2,000 |
-| 128          | 1,353, 1,235–1,280                | 1,433, 770–800 | 1,099, 1,230–1,280 | 1,214, 1,230–1,280 |
-| Before, 512  | 1,821, 650                        | 1,889, 610   | 1,492, 2,900–2,940 | 1,607, 2,920–2,950 |
-
-(M3 Ultra, Chrome; prompt reading on 535- and 2,075-token first messages, `bench/compare.html`. 128-token batches take no 4-token matmuls; with them, `TUNING.quadMinBatch` 128, they read 9–23% faster for 62–64 MiB more.) Qwen3.5 at 128 reads prompts about twice as fast as at 512 before, and its 8k chat's page comes to an estimated ~1,910 MiB in Chrome; whether that fits an iPhone's page, and how fast it reads there, `bench/mem.html` measures on the phone (see `bench/README.md`).
-
-The most JavaScript memory a load takes is ~110 MiB: it streams the weights, a layer or a chunk of the embedding at a time. The worker claims the textures it measured from the page's memory budget (`setMemoryBudget`; before a load, an estimate: 1.4× the weight files), and claims again as the cache grows; if the GPU runs out of memory growing the cache, the reply stops with an error asking for a new session.
-
-**Status:** early (0.x); the API may change. See the [repository README](https://github.com/daveycodez/tanstack-ai-browser#readme).
-
-## LFM2.5 GGUF variants
-
-WebGL also supports `LiquidAI/LFM2.5-350M-GGUF`,
-`LiquidAI/LFM2.5-1.2B-Instruct-GGUF`, and
-`LiquidAI/LFM2.5-1.2B-Thinking-GGUF`. The first two use official QAD Q4_0 files;
-Thinking uses its official Q4_0 file and always reasons, with native reasoning-budget
-support. Each inherits its model-card sampling recommendations; caller overrides and
-model context/output defaults retain their existing behavior. Lofi lists them under
-WebGL. See [validation and reproduction](bench/LFM2-GGUF.md).
+Apache 2.0

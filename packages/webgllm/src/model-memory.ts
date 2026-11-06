@@ -1,41 +1,20 @@
 /**
- * The memory the page's models take, shared by this project's runtimes
- * (Transformers.js, WebGL, wllama), each of which loads models in its own
- * worker. Before a runtime loads a model it claims the memory: other
- * runtimes' least recently used models are unloaded until everything fits
- * the budget. A phone can't hold two 1 GB models (an iPhone Safari tab has
- * 2 GB), and small models still stay loaded side by side.
- *
- * The packages each carry this file and share one registry through
- * globalThis, so they find each other even when bundled apart. Keep the
- * copies identical (packages/{transformers-js,webgl,wllama}/src).
+ * The memory a WebGLLM's loaded models take together. Each model loads in
+ * its own worker; before it loads (and when its cache grows) the worker
+ * claims its bytes, and the least recently used other models are unloaded
+ * until everything fits the budget. A phone can't hold two 1 GB models (an
+ * iPhone Safari tab has 2 GB), and small models still stay loaded side by
+ * side.
  */
 
-/** A runtime's loaded model, as the registry knows it. */
+/** A loaded model, as the budget knows it. */
 type Held = {
-  /** The runtime ("transformers-js", "webgl" or "wllama"). */
-  owner: string
   model: string
   /** Its memory, estimated: weights and cache. */
   bytes: number
   lastUsed: number
-  /** Never unloaded to make room for another runtime's model. */
+  /** Never unloaded to make room for another model. */
   keepLoaded: boolean
-  unload: () => unknown
-}
-
-type Registry = {
-  version: 1
-  held: Map<string, Held>
-  /** Bytes all models may take together; the device's default if unset. */
-  budget?: number
-}
-
-const KEY = Symbol.for("webgllm/model-memory")
-
-function registry(): Registry {
-  const scope = globalThis as unknown as Record<symbol, Registry | undefined>
-  return (scope[KEY] ??= { version: 1, held: new Map() })
 }
 
 /**
@@ -54,48 +33,75 @@ export function defaultMemoryBudget(): number {
   return gigabytes ? gigabytes * 0.5e9 : 4e9
 }
 
-/**
- * Sets how many bytes the page's models may take together, across this
- * project's runtimes, from the next load on; undefined for the default.
- */
-export function setMemoryBudget(bytes: number | undefined) {
-  registry().budget = bytes
-}
+export class MemoryBudget {
+  private readonly held = new Map<string, Held>()
+  /** Claims one at a time, so two loads don't both count on the same room. */
+  private claims: Promise<void> = Promise.resolve()
+  /** A counter, not the time: two uses in one millisecond still order. */
+  private clock = 0
 
-/**
- * Makes room for `owner`'s model of about `bytes`, unloading other runtimes'
- * models, least recently used first, until it fits the budget (models kept
- * loaded stay), then records it in place of `owner`'s previous one.
- */
-export async function claimMemory(model: {
-  owner: string
-  model: string
-  bytes: number
-  keepLoaded: boolean
-  unload: () => unknown
-}) {
-  const { held, budget } = registry()
-  const limit = budget ?? defaultMemoryBudget()
-  held.delete(model.owner)
-  const others = [...held.values()].sort((a, b) => a.lastUsed - b.lastUsed)
-  let total = others.reduce((sum, h) => sum + h.bytes, model.bytes)
-  for (const other of others) {
-    if (total <= limit) break
-    if (other.keepLoaded) continue
-    held.delete(other.owner)
-    total -= other.bytes
-    await other.unload()
+  constructor(
+    /** Bytes all models may take together. */
+    private readonly limit: () => number,
+    /** Unloads a model to make room (it may wait for the model's generation to end). */
+    private readonly unload: (model: string) => Promise<void> | void
+  ) {}
+
+  /**
+   * Makes room for `model`'s `bytes` (in place of what it held before),
+   * unloading other models, least recently used first, until it fits
+   * (models kept loaded stay, even past the budget), then records it.
+   */
+  claim(model: string, bytes: number, keepLoaded: boolean): Promise<void> {
+    const run = this.claims.then(async () => {
+      const limit = this.limit()
+      const own = this.held.get(model)
+      this.held.delete(model)
+      const others = [...this.held.values()].sort((a, b) => a.lastUsed - b.lastUsed)
+      let total = others.reduce((sum, h) => sum + h.bytes, bytes)
+      for (const other of others) {
+        if (total <= limit) break
+        if (other.keepLoaded) continue
+        this.held.delete(other.model)
+        total -= other.bytes
+        await this.unload(other.model)
+      }
+      this.held.set(model, {
+        model,
+        bytes,
+        // A claim isn't a use: a growing cache keeps its model's place.
+        lastUsed: own?.lastUsed ?? ++this.clock,
+        keepLoaded
+      })
+    })
+    this.claims = run.catch(() => undefined)
+    return run
   }
-  held.set(model.owner, { ...model, lastUsed: Date.now() })
-}
 
-/** Marks `owner`'s model as just used (for least recently used order). */
-export function touchMemory(owner: string) {
-  const held = registry().held.get(owner)
-  if (held) held.lastUsed = Date.now()
-}
+  /** Marks `model` as just used (for least recently used order). */
+  touch(model: string) {
+    const held = this.held.get(model)
+    if (held) held.lastUsed = ++this.clock
+  }
 
-/** Forgets `owner`'s model, once it's unloaded or failed to load. */
-export function releaseMemory(owner: string) {
-  registry().held.delete(owner)
+  setKeepLoaded(model: string, keep: boolean) {
+    const held = this.held.get(model)
+    if (held) held.keepLoaded = keep
+  }
+
+  /** Forgets `model`, once it's unloaded or failed to load. */
+  release(model: string) {
+    this.held.delete(model)
+  }
+
+  /** Bytes held by every model together. */
+  get total(): number {
+    let sum = 0
+    for (const h of this.held.values()) sum += h.bytes
+    return sum
+  }
+
+  models(): Array<string> {
+    return [...this.held.keys()]
+  }
 }

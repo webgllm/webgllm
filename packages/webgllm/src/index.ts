@@ -1,41 +1,49 @@
 /**
- * WebGLLM: LLM inference in the browser on WebGL 2, for devices without
- * WebGPU. The engine runs in a Web Worker on an OffscreenCanvas.
+ * webgllm: LLM inference in the browser on WebGL 2, for devices without
+ * WebGPU, behind OpenAI's Chat Completions API. Each model runs in a Web
+ * Worker on an OffscreenCanvas. The engine itself is in `webgllm/advanced`.
+ *
+ * @example
+ * ```ts
+ * import { WebGLLM } from "webgllm"
+ *
+ * const llm = new WebGLLM()
+ * const completion = await llm.chat.completions.create({
+ *   model: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+ *   messages: [{ role: "user", content: "Hello!" }]
+ * })
+ * console.log(completion.choices[0].message.content)
+ * ```
  */
-export {
-  hasWebGl2,
-  loadModel,
-  modelStatus,
-  setPromptBatch,
-  unloadModel
-} from "./client.js"
-export { setMemoryBudget } from "./model-memory.js"
-export type { ModelStatus } from "./client.js"
-export type { GenerationPhase } from "./protocol.js"
-export { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
-export type { ModelFile, ModelReasoning, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
-export type { ToolFormat } from "./tool-calls.js"
-export { Engine } from "./engine.js"
-export type { EngineOptions, LayerProbe } from "./engine.js"
-export type { Sampling } from "./sampler.js"
-export type { Store } from "./store.js"
-export type { ByteSource, ModelConfig, ModelWeights, QuantMatrix, WeightPiece } from "./weights.js"
-export { loadTokenizer } from "./tokenizer.js"
+export { WebGLLM } from "./webgllm.js"
+export type { DownloadModelOptions, LoadModelOptions, LogLevel, RequestOptions, WebGLLMOptions } from "./webgllm.js"
+export { WebGLLMError } from "./errors.js"
+export type { WebGLLMErrorCode } from "./errors.js"
 export type {
-  ChatMessage,
-  ChatTemplateOptions,
-  ChatTool,
-  ChatToolCall,
-  SpecialTokenIds,
-  StreamDecoder,
-  Tokenizer,
-  TokenizerFiles
-} from "./tokenizer.js"
-export { blobSource, httpSource } from "./byte-source.js"
-export type { HttpSourceOptions } from "./byte-source.js"
-export { loadGguf } from "./load-gguf.js"
-export type { LoadGgufOptions } from "./load-gguf.js"
-export { loadOnnx } from "./load-onnx.js"
-export type { LoadOnnxOptions } from "./load-onnx.js"
-export { readGgufHeader } from "./gguf.js"
-export type { GgufHeader, GgufTensorInfo, GgufValue } from "./gguf.js"
+  ChatCompletion,
+  ChatCompletionAssistantMessageParam,
+  ChatCompletionChunk,
+  ChatCompletionChunkDelta,
+  ChatCompletionChunkToolCall,
+  ChatCompletionContent,
+  ChatCompletionContentPartText,
+  ChatCompletionCreateParams,
+  ChatCompletionCreateParamsBase,
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+  ChatCompletionMessage,
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  ChatCompletionSystemMessageParam,
+  ChatCompletionTool,
+  ChatCompletionToolChoiceOption,
+  ChatCompletionToolMessageParam,
+  ChatCompletionUserMessageParam,
+  CompletionTimings,
+  CompletionUsage,
+  FinishReason,
+  LoadProgress,
+  ModelInfo,
+  ReasoningEffort,
+  ResponseFormat
+} from "./openai.js"

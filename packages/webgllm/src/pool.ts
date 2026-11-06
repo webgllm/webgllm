@@ -1,0 +1,413 @@
+/**
+ * The loaded models of one WebGLLM: a worker per model, as many as fit the
+ * memory budget (the least recently used unloaded to make room, unless kept
+ * loaded), and one queue for their generations. Only one generation runs
+ * at a time across all models: they'd contend for the GPU, and frame
+ * pacing assumes one.
+ */
+import { ModelWorker } from "./client.js"
+import type { WorkerGenerationEnd } from "./client.js"
+import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
+import { monitorFrames } from "./frame-pacing.js"
+import type { ModelStorage } from "./model-files.js"
+import { MemoryBudget } from "./model-memory.js"
+import type { WebGlTextModel } from "./model-meta.js"
+import type { LoadProgress } from "./openai.js"
+import type { WorkerRequest, WorkerResponse } from "./protocol.js"
+
+export type LogLevel = "debug" | "info" | "warn" | "error" | "silent"
+
+export type PoolOptions = {
+  createWorker: () => Worker
+  /** Bytes all loaded models may take together. */
+  memoryBudget: () => number
+  storage: ModelStorage
+  /** Every load's and download's progress (the instance's listeners). */
+  onProgress: (progress: LoadProgress) => void
+  log: (level: Exclude<LogLevel, "silent">, text: string) => void
+}
+
+type ProgressListener = (progress: LoadProgress) => void
+
+type Entry = {
+  model: WebGlTextModel
+  worker: ModelWorker
+  keepLoaded: boolean
+  /** Callers waiting on its load: the last to abort stops the load. */
+  waiters: number
+  /** Per-call listeners of its load in progress. */
+  listeners: Set<ProgressListener>
+  /** Being unloaded to make room (once its generation ends). */
+  evicting: Promise<void> | null
+}
+
+type Download = {
+  worker: ModelWorker
+  promise: Promise<void>
+  waiters: number
+  listeners: Set<ProgressListener>
+}
+
+type GenerateFields = Omit<
+  Extract<WorkerRequest, { type: "generate" }>,
+  "type" | "id" | "model" | "contextLength"
+>
+
+/** One task at a time, in the order they came. */
+export class TaskQueue {
+  private tail: Promise<void> = Promise.resolve()
+
+  /** Runs `task` after the ones before it; one aborted while it waits is skipped. */
+  run<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const result = this.tail.then(() => {
+      throwIfAborted(signal)
+      return task()
+    })
+    this.tail = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
+  }
+}
+
+const unloaded = (model: string) =>
+  new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
+
+let nextId = 0
+
+export class ModelPool {
+  private readonly entries = new Map<string, Entry>()
+  private readonly downloads = new Map<string, Download>()
+  private readonly budget: MemoryBudget
+  private readonly queue = new TaskQueue()
+  private stopFrames: (() => void) | undefined
+  private askedToKeep = false
+
+  constructor(private readonly options: PoolOptions) {
+    this.budget = new MemoryBudget(options.memoryBudget, (model) => this.evict(model))
+  }
+
+  /** Loaded and ready (not being unloaded). */
+  isLoaded(model: string): boolean {
+    const entry = this.entries.get(model)
+    return !!entry && entry.worker.ready && !entry.evicting
+  }
+
+  /** The context a loaded model was asked for (undefined: its own). */
+  requestedContext(model: string): number | undefined {
+    return this.entries.get(model)?.worker.contextLength
+  }
+
+  /** The context a loaded model holds, as its worker reported it. */
+  loadedContext(model: string): number | undefined {
+    return this.isLoaded(model) ? this.entries.get(model)?.worker.loadedContextLength : undefined
+  }
+
+  loadedModels(): Array<string> {
+    return [...this.entries.keys()].filter((model) => this.isLoaded(model))
+  }
+
+  /** Bytes the loaded models claim together. */
+  get memoryUsed(): number {
+    return this.budget.total
+  }
+
+  /**
+   * Loads `model` for chats of up to `contextLength` tokens (its own when
+   * undefined), downloading it the first time; loaded for another context,
+   * it loads again.
+   */
+  async load(
+    model: WebGlTextModel,
+    options: { contextLength?: number; keepLoaded?: boolean; onProgress?: ProgressListener; signal?: AbortSignal } = {}
+  ): Promise<void> {
+    const { contextLength, signal } = options
+    throwIfAborted(signal)
+    // A download of it in another worker: let it finish (they'd write the same files).
+    const download = this.downloads.get(model)
+    if (download) await abortable(download.promise.catch(() => undefined), signal)
+    let entry = this.entries.get(model)
+    if (entry?.evicting) {
+      await abortable(entry.evicting, signal)
+      entry = this.entries.get(model)
+    }
+    entry ??= this.spawn(model)
+    if (options.keepLoaded !== undefined) {
+      entry.keepLoaded = options.keepLoaded
+      this.budget.setKeepLoaded(model, options.keepLoaded)
+    }
+    if (entry.worker.ready && entry.worker.contextLength === contextLength) {
+      this.budget.touch(model)
+      return
+    }
+    await this.waitForLoad(entry, entry.worker.loadModel(contextLength), options.onProgress, signal)
+  }
+
+  /**
+   * `model` loaded for whatever context it is (or loading for), else loaded
+   * for `contextLength`: a generation's load.
+   */
+  async ensureLoaded(
+    model: WebGlTextModel,
+    contextLength: number | undefined,
+    onProgress: ProgressListener | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<Entry> {
+    for (;;) {
+      const entry = this.entries.get(model)
+      if (entry?.evicting) {
+        await abortable(entry.evicting, signal)
+        continue
+      }
+      if (entry?.worker.ready) return entry
+      const loading = entry?.worker.loadPromise
+      if (!entry || !loading) {
+        await this.load(model, { contextLength, onProgress, signal })
+        continue
+      }
+      try {
+        await this.waitForLoad(entry, loading, onProgress, signal)
+      } catch (error) {
+        // Superseded by a load for another context: wait for that one instead.
+        const next = entry.worker.loadPromise
+        if (signal?.aborted || !next || next === loading || entry.worker.terminated) throw error
+      }
+    }
+  }
+
+  private async waitForLoad(
+    entry: Entry,
+    load: Promise<void>,
+    onProgress: ProgressListener | undefined,
+    signal: AbortSignal | undefined
+  ) {
+    entry.waiters++
+    if (onProgress) entry.listeners.add(onProgress)
+    try {
+      await abortable(load, signal)
+      this.budget.touch(entry.model)
+    } catch (error) {
+      if (signal?.aborted) {
+        // Nobody wants it any more: stop the load.
+        if (entry.waiters === 1 && !entry.worker.ready && entry.worker.loadPromise === load) {
+          this.drop(entry, abortError(signal) as Error)
+        }
+      } else if (!entry.worker.ready && entry.worker.loadPromise === null) {
+        // A failed load frees its worker (and what it claimed); the next try starts afresh.
+        // (Not one superseded by a load for another context: that one goes on.)
+        this.drop(entry, error as Error)
+      }
+      throw error
+    } finally {
+      entry.waiters--
+      if (onProgress) entry.listeners.delete(onProgress)
+    }
+  }
+
+  /** Unloads `model`, or every model; their running generations fail with "model-not-loaded". */
+  unload(model?: string) {
+    for (const entry of [...this.entries.values()]) {
+      if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model))
+    }
+  }
+
+  /** Downloads `model`'s files to storage without loading it (in a worker of its own). */
+  async download(
+    model: WebGlTextModel,
+    options: { onProgress?: ProgressListener; signal?: AbortSignal } = {}
+  ): Promise<void> {
+    const { onProgress, signal } = options
+    throwIfAborted(signal)
+    const entry = this.entries.get(model)
+    // Loaded means downloaded; a load in progress downloads it.
+    if (entry?.worker.ready) return
+    const loading = entry?.worker.loadPromise
+    if (entry && loading) return this.waitForLoad(entry, loading, onProgress, signal)
+    if (await abortable(this.options.storage.downloaded(model), signal)) return
+    let download = this.downloads.get(model)
+    if (!download) {
+      const listeners = new Set<ProgressListener>()
+      const worker = new ModelWorker(model, this.options.createWorker, {
+        onProgress: (data) => this.progress(downloadProgress(data), listeners),
+        onClaim: () => Promise.resolve(),
+        onLog: (text) => this.options.log("info", text),
+        onCrash: () => this.downloads.delete(model)
+      })
+      const promise = worker.download().finally(() => {
+        worker.terminate(new Error("The download ended."))
+        if (this.downloads.get(model) === created) this.downloads.delete(model)
+      })
+      const created: Download = { worker, promise, waiters: 0, listeners }
+      download = created
+      this.downloads.set(model, download)
+    }
+    download.waiters++
+    if (onProgress) download.listeners.add(onProgress)
+    try {
+      await abortable(download.promise, signal)
+    } catch (error) {
+      // The last caller gave up: stop it (storage keeps what came, to resume from).
+      if (signal?.aborted && download.waiters === 1) {
+        download.worker.terminate(abortError(signal) as Error)
+        this.downloads.delete(model)
+      }
+      throw error
+    } finally {
+      download.waiters--
+      if (onProgress) download.listeners.delete(onProgress)
+    }
+  }
+
+  /** Stops a download of `model` in progress, if there is one. */
+  cancelDownload(model: string) {
+    const download = this.downloads.get(model)
+    if (!download) return
+    download.worker.terminate(abortError() as Error)
+    this.downloads.delete(model)
+  }
+
+  /**
+   * Runs one generation on `model`, loading it first if it isn't loaded
+   * (for `contextLength`), after the generations queued before it. Settles
+   * when the worker ends it; aborting `signal` stops it.
+   */
+  async generate(
+    model: WebGlTextModel,
+    fields: GenerateFields,
+    options: {
+      contextLength?: number
+      onToken: (text: string) => void
+      onProgress?: ProgressListener
+      signal?: AbortSignal
+    }
+  ): Promise<WorkerGenerationEnd> {
+    const { signal } = options
+    // Load outside the queue, so other models generate meanwhile.
+    await this.ensureLoaded(model, options.contextLength, options.onProgress, signal)
+    return this.queue.run(async () => {
+      // (Unloaded while it waited: load it again.)
+      const entry = await this.ensureLoaded(model, options.contextLength, options.onProgress, signal)
+      throwIfAborted(signal)
+      this.budget.touch(model)
+      const id = `gen_${(nextId++).toString(36)}`
+      const ended = entry.worker.generate({ id, ...fields }, options.onToken)
+      const stop = () => entry.worker.stop(id)
+      signal?.addEventListener("abort", stop, { once: true })
+      try {
+        return await ended
+      } finally {
+        signal?.removeEventListener("abort", stop)
+      }
+    }, signal)
+  }
+
+  private spawn(model: WebGlTextModel): Entry {
+    const entry: Entry = {
+      model,
+      keepLoaded: false,
+      waiters: 0,
+      listeners: new Set(),
+      evicting: null,
+      worker: new ModelWorker(model, this.options.createWorker, {
+        onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
+        onClaim: async (bytes) => {
+          if (this.entries.get(model) !== entry) return
+          await this.budget.claim(model, bytes, entry.keepLoaded)
+          // (Unloaded while it claimed: what it claimed isn't held.)
+          if (!this.entries.has(model)) this.budget.release(model)
+        },
+        onLog: (text) => this.options.log("info", text),
+        onCrash: (error) => {
+          this.options.log("error", `${model}'s worker stopped: ${error.message}`)
+          this.drop(entry, error)
+        }
+      })
+    }
+    this.entries.set(model, entry)
+    this.stopFrames ??= monitorFrames((intervalMs, expectedMs, frames, startedAt, meanMs) => {
+      const message = { type: "frames", intervalMs, expectedMs, frames, startedAt, meanMs } as const
+      for (const { worker } of this.entries.values()) worker.post(message)
+    })
+    return entry
+  }
+
+  /** Ends `entry`'s worker, freeing its model and memory; what waits on it fails with `reason`. */
+  private drop(entry: Entry, reason: Error) {
+    entry.worker.terminate(reason)
+    if (this.entries.get(entry.model) !== entry) return
+    this.entries.delete(entry.model)
+    this.budget.release(entry.model)
+    if (this.entries.size === 0) {
+      this.stopFrames?.()
+      this.stopFrames = undefined
+    }
+  }
+
+  /**
+   * Unloads `model` to make room for another: at once, or when its running
+   * generation ends (queued ones load it again when their turn comes).
+   */
+  private evict(model: string): Promise<void> {
+    const entry = this.entries.get(model)
+    if (!entry) return Promise.resolve()
+    entry.evicting ??= entry.worker.idle().then(() => {
+      this.options.log("info", `Unloaded ${model} to make room for another model.`)
+      this.drop(entry, unloaded(model))
+    })
+    return entry.evicting
+  }
+
+  private progress(progress: LoadProgress, listeners: Set<ProgressListener>) {
+    if (!progress.cached) this.keepDownloads()
+    this.options.onProgress(progress)
+    for (const listener of listeners) listener(progress)
+  }
+
+  /**
+   * Asks the browser to keep this site's storage, so a downloaded model isn't
+   * deleted to free space: once, when a model first downloads. Not in
+   * Firefox, which asks the user with a permission prompt. Browsers may say
+   * no; only pages can ask.
+   */
+  private keepDownloads() {
+    if (this.askedToKeep || typeof navigator === "undefined") return
+    this.askedToKeep = true
+    if (/Firefox\//.test(navigator.userAgent)) return
+    navigator.storage?.persist?.().catch(() => undefined)
+  }
+}
+
+type WorkerProgress = Extract<WorkerResponse, { type: "progress" }>
+
+const bytes = (data: WorkerProgress) =>
+  data.totalBytes !== undefined ? { loadedBytes: data.loadedBytes ?? 0, totalBytes: data.totalBytes } : {}
+
+/**
+ * A load's progress as the worker counts it: downloading takes 0–0.9 and
+ * reading into the GPU the rest; from storage, reading takes 0–1.
+ */
+export function loadProgress(data: WorkerProgress): LoadProgress {
+  return {
+    model: data.model,
+    phase: data.cached || data.progress >= 0.9 ? "load" : "download",
+    progress: data.progress,
+    cached: data.cached,
+    ...bytes(data)
+  }
+}
+
+/** A download's progress across 0–1 (as a "download" request counts it): its bytes when known. */
+export function downloadProgress(data: WorkerProgress): LoadProgress {
+  const progress =
+    data.totalBytes && data.loadedBytes !== undefined
+      ? data.loadedBytes / data.totalBytes
+      : data.progress
+  return {
+    model: data.model,
+    phase: "download",
+    progress: Math.min(Math.max(progress, 0), 1),
+    cached: data.cached,
+    ...bytes(data)
+  }
+}
