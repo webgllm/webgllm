@@ -122,7 +122,7 @@ export const MessageTiming: FC<{
             )}
             {stats?.outputTokens !== undefined && (
             <div className="flex items-center justify-between gap-4">
-              <span className="text-fd-muted-foreground">Output tokens</span>
+              <span className="text-fd-muted-foreground">Completion tokens</span>
               <span className="font-mono tabular-nums">
                 {stats.outputTokens}
               </span>
