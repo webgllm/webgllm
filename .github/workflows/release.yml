@@ -1,0 +1,68 @@
+name: Release
+
+# Run by hand from the Actions tab. Versions webgllm (packages/webgllm),
+# writes its changelog, commits and tags the release, publishes to npm,
+# and creates a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      specifier:
+        description: "Version or bump (patch, minor, 0.0.1). Leave empty to work it out from conventional commits."
+        required: false
+        default: ""
+      first-release:
+        description: "First release (no earlier tag to compare with)"
+        type: boolean
+        default: false
+      dry-run:
+        description: "Dry run: show what would change, publish nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  # Push the release commit and tags, and create GitHub releases.
+  contents: write
+  # npm provenance and trusted publishing.
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history and tags, to find the last release and read commits since.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+        with:
+          cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - run: pnpm install --frozen-lockfile
+
+      # Release commits are authored as the maintainer, so the repository
+      # lists only them as a contributor (not github-actions[bot]).
+      - name: Configure git
+        run: |
+          git config user.name "daveycodez"
+          git config user.email "daveycodez@gmail.com"
+
+      - name: Release
+        run: pnpm nx release $SPECIFIER --yes $FIRST_RELEASE $DRY_RUN
+        env:
+          SPECIFIER: ${{ inputs.specifier }}
+          FIRST_RELEASE: ${{ inputs.first-release && '--first-release' || '' }}
+          DRY_RUN: ${{ inputs.dry-run && '--dry-run' || '' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # npm trusted publishing: pnpm trades the workflow's OIDC token
+          # (id-token: write above) for a one-time publish token. No npm
+          # secret is needed, and provenance is added automatically.
+          NPM_CONFIG_PROVENANCE: true

@@ -1,8 +1,41 @@
 {
   "$schema": "./node_modules/nx/schemas/nx-schema.json",
   "targetDefaults": {
-    "build": { "dependsOn": ["^build"], "outputs": ["{projectRoot}/dist", "{projectRoot}/.output"], "cache": true },
-    "typecheck": { "dependsOn": ["^build"], "cache": true }
+    "build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        "{projectRoot}/dist",
+        "{projectRoot}/.output"
+      ],
+      "cache": true
+    },
+    "typecheck": {
+      "dependsOn": [
+        "^build"
+      ],
+      "cache": true
+    }
+  },
+  "release": {
+    "projects": [
+      "webgllm"
+    ],
+    "projectsRelationship": "independent",
+    "releaseTag": {
+      "pattern": "{projectName}@{version}"
+    },
+    "version": {
+      "conventionalCommits": true,
+      "adjustSemverBumpsForZeroMajorVersion": true,
+      "preVersionCommand": "pnpm nx run webgllm:build"
+    },
+    "changelog": {
+      "projectChangelogs": {
+        "createRelease": "github"
+      }
+    }
   },
   "analytics": false
 }
