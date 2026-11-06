@@ -170,10 +170,10 @@ test("closing still closes plain objects, pure unions and referenced definitions
   // A root that only points at its model closes the model.
   const root = closeObjects({ $ref: "#/$defs/m", $defs: { m: { type: "object", properties: { a: { type: "string" } } } } }) as any
   assert.equal(root.$defs.m.additionalProperties, false)
-  // Properties of an allOf branch are new values: they close.
+  // Properties of an allOf branch are new values: they close (here the branch merges into its object).
   const all = closeObjects({ allOf: [{ type: "object", properties: { inner: { type: "object", properties: { a: { type: "string" } } } } }] }) as any
-  assert.equal(all.allOf[0].additionalProperties, undefined)
-  assert.equal(all.allOf[0].properties.inner.additionalProperties, false)
+  assert.equal(all.allOf, undefined)
+  assert.equal(all.properties.inner.additionalProperties, false)
 })
 
 test("required with several scopes references under properties named like data keywords", async () => {
@@ -188,4 +188,55 @@ test("required with several scopes references under properties named like data k
   assert.equal(await validateStructuredValue(plan.schema, { name: "a", arguments: { default: 3, const: 4 } }), true)
   assert.equal(await validateStructuredValue(plan.schema, { name: "a", arguments: { default: "x" } }), false)
   assert.equal(await validateStructuredValue(plan.schema, { name: "b", arguments: { x: "y" } }), true)
+})
+
+test("an object made of allOf branches closes over the keys its branches declare", async () => {
+  const both = { allOf: [{ type: "object", properties: { name: { type: "string" } }, required: ["name"] }, { type: "object", properties: { born: { type: "integer" } }, required: ["born"] }] }
+  const closed = closeObjects(both)
+  assert.equal(await validateStructuredValue(closed, { name: "Ada", born: 1815 }), true)
+  assert.equal(await validateStructuredValue(closed, { name: "Ada", born: "1815" }), false, "the branches still check their values")
+  assert.equal(await validateStructuredValue(closed, { name: "Ada", born: 1815, city: "London" }), false, "no invented keys")
+  // Branches by reference, as schema libraries write them.
+  const refs = closeObjects({ allOf: [{ $ref: "#/$defs/a" }, { $ref: "#/$defs/b" }], $defs: { a: { type: "object", properties: { a: { type: "string" } }, required: ["a"] }, b: { type: "object", properties: { b: { type: "string" } } } } })
+  assert.equal(await validateStructuredValue(refs, { a: "x", b: "y" }), true)
+  assert.equal(await validateStructuredValue(refs, { a: "x", c: "y" }), false)
+  // The object's own properties count too.
+  const own = closeObjects({ type: "object", properties: { id: { type: "integer" } }, allOf: [{ type: "object", properties: { a: { type: "string" } } }] })
+  assert.equal(await validateStructuredValue(own, { id: 1, a: "x" }), true)
+  assert.equal(await validateStructuredValue(own, { id: 1, z: "x" }), false)
+})
+
+test("plain allOf branches merge into one object, which llguidance masks far faster", async () => {
+  const both = { allOf: [{ type: "object", properties: { name: { type: "string" } }, required: ["name"] }, { type: "object", properties: { born: { type: "integer" } }, required: ["born"] }] }
+  assert.deepEqual(closeObjects(both), {
+    type: "object",
+    properties: { name: { type: "string" }, born: { type: "integer" } },
+    required: ["name", "born"],
+    additionalProperties: false
+  })
+  // A key in two branches keeps both schemas.
+  const shared = closeObjects({ allOf: [{ properties: { n: { type: "integer" } } }, { properties: { n: { minimum: 3 } } }] }) as any
+  assert.deepEqual(shared.properties.n, { allOf: [{ type: "integer" }, { minimum: 3 }] })
+  assert.equal(await validateStructuredValue(shared, { n: 4 }), true)
+  assert.equal(await validateStructuredValue(shared, { n: 2 }), false)
+  // Nested objects in the branches close as before.
+  const nested = closeObjects({ allOf: [{ properties: { p: { type: "object", properties: { q: { type: "string" } } } } }] }) as any
+  assert.equal(nested.properties.p.additionalProperties, false)
+  // A branch with other keywords keeps allOf, closed over the declared keys instead.
+  const other = closeObjects({ allOf: [{ properties: { a: {} } }, { properties: { b: {} }, minProperties: 1 }] }) as any
+  assert.ok(Array.isArray(other.allOf))
+  assert.equal(other.additionalProperties, false)
+  assert.equal(await validateStructuredValue(other, { a: 1, b: 2 }), true)
+  assert.equal(await validateStructuredValue(other, { a: 1, c: 2 }), false)
+})
+
+test("allOf objects whose keys can't all be known stay open", async () => {
+  // A branch that asks to be open, takes keys from elsewhere, or requires a key nobody declares.
+  for (const schema of [
+    { allOf: [{ type: "object", properties: { a: {} } }, { type: "object", additionalProperties: true }] },
+    { allOf: [{ type: "object", properties: { a: {} } }, { type: "object", patternProperties: { "^x": {} } }] },
+    { allOf: [{ type: "object", properties: { a: {} } }, { anyOf: [{ type: "object", properties: { b: {} } }] }] },
+    { allOf: [{ type: "object", properties: { a: {} } }, { required: ["b"] }] },
+    { type: "object", properties: { a: {} }, allOf: [{ properties: { b: {} } }], anyOf: [{ properties: { c: {} } }] }
+  ]) assert.equal((closeObjects(schema) as Record<string, unknown>).additionalProperties, undefined, JSON.stringify(schema))
 })
