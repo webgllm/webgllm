@@ -1,5 +1,6 @@
 import type { JsonGuidanceRuntime } from "llguidance/json-schema"
 import { canonicalAsciiObject, canonicalTokenMask } from "./canonical-mask.js"
+import { whitespaceTokenIds } from "./whitespace.js"
 
 /** Exact model tokenizer, not token strings decoded independently. */
 export type ConstraintTokenizer = object
@@ -9,7 +10,23 @@ export type ConstraintOptions = {
   /** Override when a runtime keeps EOS on its model config rather than tokenizer. */
   eosTokenId?: number
   maxTokens?: number
+  /**
+   * How the JSON may be laid out. "model" (the default) takes whitespace
+   * where models write it, as they write it: held to compact JSON, a model
+   * that writes `"key": "value"` (LFM3) gets no ` "` token after the colon
+   * or a comma, picks `":` instead and starts a value (or, in an open
+   * object, a key) with a stray colon. "compact" is JSON.stringify's
+   * layout, for checking parsed values.
+   */
+  layout?: "model" | "compact"
 }
+
+/**
+ * Whitespace-only tokens in a row before whitespace is refused until the
+ * JSON goes on: a laid-out document needs a few between two tokens, and a
+ * model stuck writing whitespace would otherwise run to its output limit.
+ */
+export const MAX_WHITESPACE_RUN = 8
 
 export class StructuredOutputError extends Error {
   constructor(readonly code: "unsupported-schema" | "invalid-tokenizer" | "constraint-dead-end" | "constraint-violation" | "schema-mismatch", message: string, options?: ErrorOptions) {
@@ -62,8 +79,13 @@ class JsonConstraint implements Constraint {
     private readonly endAtAcceptance: boolean,
     private readonly canonicalMask?: Uint32Array,
     /** The full schema, when the mask runs on a looser one (see prunableSchema). */
-    private readonly shadow?: Interpreter
+    private readonly shadow?: Interpreter,
+    /** Whitespace-only tokens, when the layout takes whitespace (see MAX_WHITESPACE_RUN). */
+    private readonly whitespace?: Uint32Array
   ) {}
+
+  /** Whitespace-only tokens accepted in a row. */
+  private whitespaceRun = 0
 
   /**
    * Whether the full schema takes the value as it stands. The shadow only
@@ -99,7 +121,10 @@ class JsonConstraint implements Constraint {
       return this.mask = mask
     }
     const canonical = this.canonicalMask
-    const allowed = canonical ? result.mask.map((word, index) => word & canonical[index]) : result.mask
+    const whitespace = this.whitespace && this.whitespaceRun >= MAX_WHITESPACE_RUN ? this.whitespace : undefined
+    const allowed = canonical || whitespace
+      ? result.mask.map((word, index) => word & (canonical ? canonical[index] : ~0) & (whitespace ? ~whitespace[index] : ~0))
+      : result.mask
     // The looser mask may end a value the full schema refuses: keep generating, or fail fast.
     if (this.shadow && tokenAllowed(allowed, this.eosTokenId) && !this.fullSchemaAccepts()) {
       allowed[this.eosTokenId >>> 5] &= ~(1 << (this.eosTokenId & 31))
@@ -127,6 +152,7 @@ class JsonConstraint implements Constraint {
     const result = this.interpreter.commitToken(token)
     if (result.backtrack || result.ffTokens.length) throw new StructuredOutputError("constraint-violation", "Unexpected constraint backtracking or token insertion.")
     this.mask = undefined
+    if (this.whitespace) this.whitespaceRun = tokenAllowed(this.whitespace, token) ? this.whitespaceRun + 1 : 0
     if (this.shadow) {
       // The full schema refuses some impossible values as they're written: fail fast.
       try {
@@ -140,8 +166,9 @@ class JsonConstraint implements Constraint {
 
   clone(): Constraint {
     this.check()
-    const copy = new JsonConstraint(this.interpreter.clone(), this.vocabSize, this.eosTokenId, this.endAtAcceptance, this.canonicalMask, this.shadow?.clone())
+    const copy = new JsonConstraint(this.interpreter.clone(), this.vocabSize, this.eosTokenId, this.endAtAcceptance, this.canonicalMask, this.shadow?.clone(), this.whitespace)
     copy.shadowEnded = this.shadowEnded
+    copy.whitespaceRun = this.whitespaceRun
     return copy
   }
 
@@ -169,9 +196,21 @@ function excludesNumericRoot(schema: unknown): boolean {
   return Array.isArray(s.allOf) && s.allOf.some(excludesNumericRoot)
 }
 
+type Layout = { whitespace_flexible: boolean; key_separator: string; item_separator: string }
+/** JSON.stringify's layout. */
+const COMPACT: Layout = { whitespace_flexible: false, key_separator: ":", item_separator: "," }
+/**
+ * Whitespace between any two tokens, and the key separator's space required
+ * (flexible alone also takes `":` again after a key's colon). Items stay ","
+ * apart: llguidance 0.2.1 takes a comma after a closed object's last key when
+ * items are ", " apart (its pruning is conservative), leaving no way on.
+ */
+const MODEL: Layout = { whitespace_flexible: true, key_separator: ": ", item_separator: "," }
+/** MODEL when the tokenizer's whitespace tokens can't be read to cap their runs. */
+const MODEL_FIXED: Layout = { whitespace_flexible: false, key_separator: ": ", item_separator: "," }
+
 /** Formatting-only compiler hints; instance assertions and string contents stay intact. */
-function compactSchema(schema: unknown): unknown {
-  const compact = { whitespace_flexible: false, key_separator: ":", item_separator: "," }
+function compactSchema(schema: unknown, compact: Layout): unknown {
   if (schema && typeof schema === "object" && !Array.isArray(schema)) {
     const source = schema as Record<string, unknown>
     const hints = source["x-guidance"]
@@ -258,14 +297,16 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
   const source = withEos(options.tokenizer, options.eosTokenId)
   const limits = { maxTokens: options.maxTokens ?? Number.MAX_SAFE_INTEGER, maxOutputBytes: Number.MAX_SAFE_INTEGER }
   const prunable = prunableSchema(options.schema)
+  const whitespaceIds = options.layout === "compact" ? null : whitespaceTokenIds(source)
+  const layout = options.layout === "compact" ? COMPACT : whitespaceIds?.length ? MODEL : MODEL_FIXED
   let interpreter: Interpreter
   let shadow: Interpreter | undefined
   try {
     // The full schema first, so what it doesn't support still fails here.
-    const full = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(options.schema) }, limits })
+    const full = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(options.schema, layout) }, limits })
     if (prunable.loosened) {
       shadow = full
-      interpreter = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(prunable.schema) }, limits })
+      interpreter = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(prunable.schema, layout) }, limits })
     } else interpreter = full
   } catch (cause) {
     shadow?.dispose()
@@ -288,8 +329,13 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
     if (cause instanceof StructuredOutputError) throw cause
     throw new StructuredOutputError("invalid-tokenizer", cause instanceof Error ? cause.message : String(cause), { cause })
   }
+  let whitespace: Uint32Array | undefined
+  if (layout === MODEL && whitespaceIds) {
+    whitespace = new Uint32Array(Math.ceil(vocabSize / 32))
+    for (const id of whitespaceIds) if (id >= 0 && id < vocabSize) whitespace[id >>> 5] |= 1 << (id & 31)
+  }
   return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(options.schema),
-    canonicalAsciiObject(options.schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow)
+    canonicalAsciiObject(options.schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace)
 }
 const VALIDATION_EOS = 256
 const validationTokenizer = {
@@ -315,7 +361,7 @@ function jsonValue(value: unknown, ancestors = new Set<object>()): boolean {
 export async function validateStructuredValue(schema: unknown, value: unknown): Promise<boolean> {
   let constraint: Constraint
   try {
-    constraint = await createConstraint({ schema, tokenizer: validationTokenizer })
+    constraint = await createConstraint({ schema, tokenizer: validationTokenizer, layout: "compact" })
   } catch (error) {
     // A supported but unsatisfiable schema has no accepted value.
     if (error instanceof StructuredOutputError && error.code === "constraint-dead-end") return false
