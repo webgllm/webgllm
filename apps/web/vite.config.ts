@@ -34,6 +34,8 @@ export default defineConfig({
     react(),
     // Static output in .output/public, served by Cloudflare as static assets (wrangler.jsonc).
     nitro({
+      // Prerender in Node so static server functions can write their JSON to disk.
+      preset: 'node-server',
       prerender: { routes: imageRoutes },
     }),
   ],
