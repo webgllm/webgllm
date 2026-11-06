@@ -23,11 +23,12 @@ export const diskName = (file: ModelFile) => safe(`${file.repo}@main/${file.path
 
 const marker = (file: ModelFile) => `${diskName(file)}.done`
 
-/** The version (ETag) of a download in progress, to resume only from it. */
+/** The version (ETag or Last-Modified) of a download in progress, to resume only from it. */
 const etagName = (file: ModelFile) => `${diskName(file)}.etag`
 
 type SyncAccessHandle = {
   getSize: () => number
+  read: (buffer: Uint8Array, options: { at: number }) => number
   truncate: (size: number) => void
   write: (data: Uint8Array, options: { at: number }) => number
   flush: () => void
@@ -68,8 +69,14 @@ export type GpuNote = {
 
 const NOTES = "gpu-notes.json"
 
+/** The notes; {} if there are none or they can't be read. */
 export async function readGpuNotes(): Promise<Record<string, GpuNote>> {
-  return (await readNotes()) ?? {}
+  try {
+    const file = await (await (await dir()).getFileHandle(NOTES)).getFile()
+    return JSON.parse(await file.text()) as Record<string, GpuNote>
+  } catch {
+    return {}
+  }
 }
 
 /** Tuning choices from the same GPU, browser, model and settings. */
@@ -86,25 +93,11 @@ export function previousGpuTuning(
   )?.[1]
 }
 
-/** The notes; {} if there are none yet, null if they couldn't be read. */
-async function readNotes(): Promise<Record<string, GpuNote> | null> {
-  let file: File
-  try {
-    file = await (await (await dir()).getFileHandle(NOTES)).getFile()
-  } catch (error) {
-    return error instanceof DOMException && error.name === "NotFoundError"
-      ? {}
-      : null
-  }
-  try {
-    return JSON.parse(await file.text()) as Record<string, GpuNote>
-  } catch {
-    // Unreadable or torn: written over.
-    return {}
-  }
-}
-
-/** Note writes, one at a time (a file's sync access handle is exclusive). */
+/**
+ * Note writes, one at a time in this worker. Workers each have their own
+ * queue, so a write reads the notes through the file's sync access handle,
+ * which is exclusive across workers and tabs: none can write in between.
+ */
 let noteWrites: Promise<void> = Promise.resolve()
 
 export function writeGpuNote(key: string, note: GpuNote): Promise<void> {
@@ -114,19 +107,23 @@ export function writeGpuNote(key: string, note: GpuNote): Promise<void> {
 
 async function writeNote(key: string, note: GpuNote) {
   try {
-    // (Notes that exist but can't be read now, say another tab holds the
-    // file, aren't written over with this one alone.)
-    const notes = await readNotes()
-    if (!notes) return
-    // Notes for this GPU, browser and model from older engine code (the
-    // key's last part) are stale: dropped.
-    const prefix = key.slice(0, key.lastIndexOf("|") + 1)
-    for (const k of Object.keys(notes))
-      if (k.startsWith(prefix)) delete notes[k]
-    notes[key] = note
     const handle = await (await dir()).getFileHandle(NOTES, { create: true })
     const access = await openAccess(handle, undefined, 1)
     try {
+      const old = new Uint8Array(access.getSize())
+      access.read(old, { at: 0 })
+      let notes: Record<string, GpuNote> = {}
+      try {
+        if (old.byteLength) notes = JSON.parse(new TextDecoder().decode(old)) as Record<string, GpuNote>
+      } catch {
+        // Unreadable or torn: written over.
+      }
+      // Notes for this GPU, browser and model from older engine code (the
+      // key's last part) are stale: dropped.
+      const prefix = key.slice(0, key.lastIndexOf("|") + 1)
+      for (const k of Object.keys(notes))
+        if (k.startsWith(prefix)) delete notes[k]
+      notes[key] = note
       const bytes = new TextEncoder().encode(JSON.stringify(notes))
       access.truncate(0)
       access.write(bytes, { at: 0 })
@@ -250,8 +247,8 @@ async function removeOldVersions(
  * request) and a closed access handle (browsers close them, iOS Safari
  * for a page it suspends): a new handle, from the bytes on disk. Files are
  * at main, so one can change between tries: a resume asks for the rest only
- * of the same version (If-Range with its ETag), and gets the whole new file
- * otherwise.
+ * of the same version (If-Range with its ETag or Last-Modified), and gets
+ * the whole new file otherwise. Bytes with no version to check aren't resumed.
  */
 export async function download(
   file: ModelFile,
@@ -279,7 +276,13 @@ export async function download(
   }
   try {
     let loaded = await size()
-    let etag = loaded > 0 ? await readText(folder, etagName(file)) : ""
+    // The version (ETag, or Last-Modified) the bytes on disk are from: a
+    // resume without one could join an old prefix to a newer file.
+    let version = loaded > 0 ? await readText(folder, etagName(file)) : ""
+    if (loaded > 0 && !version) {
+      access.truncate(0)
+      loaded = 0
+    }
     // The file's size, from the server once it answers.
     let total = 0
     // Failures in a row with no bytes gained: an interruption that made
@@ -291,39 +294,51 @@ export async function download(
         const headers: Record<string, string> = {}
         if (loaded > 0) {
           headers.Range = `bytes=${loaded}-`
-          if (etag) headers["If-Range"] = etag
+          headers["If-Range"] = version
         }
         const response = await fetch(fileUrl(file), {
           signal,
           headers,
           referrerPolicy: "no-referrer"
         })
-        // Nothing past the end: the file was whole already.
-        if (response.status === 416 && loaded > 0) break
+        /** Drops the bytes on disk and asks for the whole file. */
+        const restart = () => {
+          void response.body?.cancel().catch(() => undefined)
+          // (Already asking for the whole file: a failure, not a loop.)
+          if (start === 0) throw new Error(`HTTP ${response.status} for ${file.path} without the whole file`)
+          access.truncate(0)
+          loaded = 0
+          version = ""
+        }
+        if (response.status === 416 && loaded > 0) {
+          // "bytes */size": nothing past the end, so the same version is
+          // whole on disk, if the sizes agree. Otherwise the partial is stale.
+          const whole = /^bytes \*\/(\d+)$/.exec(response.headers.get("Content-Range") ?? "")
+          if (whole && Number(whole[1]) === loaded && (!total || total === loaded)) break
+          restart()
+          continue
+        }
         if (!response.ok) {
           throw new Error(`HTTP ${response.status} for ${file.path}`)
         }
         if (response.status === 206) {
           // "bytes start-end/total": the rest, from where the file stops,
-          // or start over (a range from anywhere else would misplace it).
-          const range = /^bytes (\d+)-\d+\/(\d+)/.exec(
+          // of the size it had. Anything else would misplace it: start over.
+          const range = /^bytes (\d+)-\d+\/(\d+)$/.exec(
             response.headers.get("Content-Range") ?? ""
           )
-          if (range && Number(range[1]) !== loaded) {
-            void response.body?.cancel().catch(() => undefined)
-            access.truncate(0)
-            loaded = 0
-            etag = ""
+          if (!range || Number(range[1]) !== loaded || (total && Number(range[2]) !== total)) {
+            restart()
             continue
           }
-          if (range) total = Number(range[2])
+          total = Number(range[2])
         } else {
           // The whole file: a first download, a server that ignores
           // ranges, or a file that changed since the last try.
           if (loaded > 0) access.truncate(0)
           loaded = 0
-          etag = response.headers.get("ETag") ?? ""
-          await writeText(folder, etagName(file), etag, signal)
+          version = response.headers.get("ETag") ?? response.headers.get("Last-Modified") ?? ""
+          await writeText(folder, etagName(file), version, signal)
           total = Number(response.headers.get("Content-Length") ?? 0)
         }
         const reader = response.body?.getReader()
@@ -348,6 +363,11 @@ export async function download(
         if (signal?.aborted || isQuotaError(error)) throw error
         loaded = await size()
         attempt = loaded > start ? 1 : attempt + 1
+        if (loaded > 0 && !version) {
+          // No version to resume from: the next try asks for the whole file.
+          access.truncate(0)
+          loaded = 0
+        }
         if (attempt >= ATTEMPTS) throw error
         await sleep(1000 * 2 ** (attempt - 1), signal)
       }
