@@ -113,6 +113,28 @@ function toOpenAI(messages: readonly ThreadMessage[]): ChatCompletionMessagePara
   return out;
 }
 
+/** The pages a web tool's result lists, from its "Title:" and "URL:" lines. */
+function resultSources(text: string): Array<{ url: string; title?: string }> {
+  const out: Array<{ url: string; title?: string }> = [];
+  for (const match of text.matchAll(/^(?:Title: (.*)\n)?URL: (https?:\/\/\S+)/gm)) {
+    const title = match[1]?.trim();
+    out.push({ url: match[2]!, ...(title && title !== 'N/A' && { title }) });
+  }
+  return out;
+}
+
+/** Source parts for the pages the reply's tool calls returned, once each. */
+function replySources(message: ThreadMessage) {
+  const seen = new Set<string>();
+  return message.content.flatMap((part) =>
+    part.type !== 'tool-call' || part.isError || typeof part.result !== 'string'
+      ? []
+      : resultSources(part.result)
+          .filter(({ url }) => !seen.has(url) && Boolean(seen.add(url)))
+          .map(({ url, title }) => ({ type: 'source' as const, sourceType: 'url' as const, id: url, url, ...(title && { title }) })),
+  );
+}
+
 const parse = (json: string): ReadonlyJSONObject => {
   try {
     const value: unknown = JSON.parse(json);
@@ -186,7 +208,13 @@ export function chatModel(getModel: () => ModelId): ChatModelAdapter {
           }
           yield { content: content() };
         }
-        if (calls.length === 0) return;
+        if (calls.length === 0) {
+          // The answer: the pages its web searches found go under it as
+          // source parts, which assistant-ui renders as chips.
+          const sources = replySources(current);
+          if (sources.length > 0) yield { content: [...content(), ...sources] };
+          return;
+        }
         // assistant-ui's local runtime doesn't run tools itself: run each
         // call's tool here, then hand back. With every call answered, the
         // runtime calls the model again with the results (up to maxSteps).

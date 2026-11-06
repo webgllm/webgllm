@@ -33,12 +33,14 @@ import type { CSSProperties, FC } from 'react';
 import { cn } from '@/lib/cn';
 import { IconButton } from './icon-button';
 import { MarkdownText } from './markdown-text';
+import { Source } from './sources';
 import { ReasoningGroup, ToolFallback, ToolGroup } from './tool-ui';
 
 const groupBy = groupPartByType({
   reasoning: ['group-chainOfThought', 'group-reasoning'],
   'tool-call': ['group-chainOfThought', 'group-tool'],
   'standalone-tool-call': [],
+  source: ['group-sources'],
 });
 
 // The startup placeholder thread counts as a new chat, so the composer mounts centered.
@@ -226,6 +228,10 @@ const AssistantMessage: FC = () => (
               return <div>{children}</div>;
             case 'group-tool':
               return <ToolGroup group={part}>{children}</ToolGroup>;
+            case 'group-sources':
+              return <div className="mt-3 mb-1 flex flex-wrap gap-1.5">{children}</div>;
+            case 'source':
+              return <Source {...part} />;
             case 'group-reasoning':
               return <ReasoningGroup group={part}>{children}</ReasoningGroup>;
             case 'text':
