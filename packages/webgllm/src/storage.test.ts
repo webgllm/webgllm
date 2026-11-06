@@ -282,6 +282,59 @@ describe("download", () => {
     assert.equal(await got.text(), "abcde")
     assert.deepEqual(asked[1], { Range: "bytes=2-", "If-Range": modified })
   })
+
+  test("drops with no version to keep their bytes still run out of tries", async (t) => {
+    useFolder(t)
+    // No waiting between tries.
+    t.mock.method(globalThis, "setTimeout", (fn: () => void) => { queueMicrotask(fn); return 0 })
+    let asked = 0
+    t.mock.method(globalThis, "fetch", async () => {
+      // (A stop for the loop if it never gives up.)
+      if (++asked > 20) throw new Error("refused")
+      return new Response(dropsAfter("ab"), { status: 200, headers: { "Content-Length": "5" } })
+    })
+    await assert.rejects(download(file, () => undefined), /dropped/)
+    assert.equal(asked, 6)
+  })
+
+  test("a second download that waited for the lock leaves the finished file whole", async (t) => {
+    const fake = useFolder(t)
+    let finish!: () => void
+    let fetched!: () => void
+    const streaming = new Promise<void>((resolve) => { fetched = resolve })
+    let firstLocked!: () => void
+    const locked = new Promise<void>((resolve) => { firstLocked = resolve })
+    let locks = 0
+    // The second download asks for the file's lock while the first holds it.
+    fake.onLock((n) => { if (n === name && ++locks === 2) firstLocked() })
+    const second = new AbortController()
+    let asked = 0
+    t.mock.method(globalThis, "fetch", async () => {
+      if (++asked === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            finish = () => {
+              c.enqueue(new TextEncoder().encode("abcde"))
+              c.close()
+            }
+            fetched()
+          }
+        })
+        return new Response(body, { status: 200, headers: { ETag: '"v1"', "Content-Length": "5" } })
+      }
+      // The second download fetching again: canceled.
+      second.abort(new Error("canceled"))
+      throw second.signal.reason
+    })
+    const a = download(file, () => undefined)
+    const b = download(file, () => undefined, second.signal)
+    await Promise.all([locked, streaming])
+    finish()
+    assert.equal(await (await a).text(), "abcde")
+    assert.equal(await (await b).text(), "abcde")
+    assert.equal(asked, 1)
+    assert.equal(fake.text(name), "abcde")
+  })
 })
 
 test("a note written by another worker during a write isn't lost", async (t) => {

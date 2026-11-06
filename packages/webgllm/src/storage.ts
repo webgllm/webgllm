@@ -260,6 +260,11 @@ export async function download(
   const folder = await dir()
   const handle = await folder.getFileHandle(diskName(file), { create: true })
   let access = await openAccess(handle, signal)
+  // Another download may have finished it while this one waited for the lock.
+  if (await storedFile(file)) {
+    access.close()
+    return handle.getFile()
+  }
   /** The bytes on disk, through a new handle if the browser closed this one. */
   const size = async () => {
     try {
@@ -362,12 +367,13 @@ export async function download(
         // A full disk stays full: no point trying again.
         if (signal?.aborted || isQuotaError(error)) throw error
         loaded = await size()
-        attempt = loaded > start ? 1 : attempt + 1
         if (loaded > 0 && !version) {
           // No version to resume from: the next try asks for the whole file.
           access.truncate(0)
           loaded = 0
         }
+        // (Progress is only bytes kept for the next try.)
+        attempt = loaded > start ? 1 : attempt + 1
         if (attempt >= ATTEMPTS) throw error
         await sleep(1000 * 2 ** (attempt - 1), signal)
       }
@@ -379,6 +385,10 @@ export async function download(
         `${file.path} downloaded as ${final} bytes, expected ${total}.`
       )
     }
+    // Marked done while still holding the lock: a download waiting for it
+    // then sees the file finished instead of starting it over.
+    await folder.getFileHandle(marker(file), { create: true })
+    await folder.removeEntry(etagName(file)).catch(() => undefined)
   } finally {
     try {
       access.close()
@@ -386,8 +396,6 @@ export async function download(
       // Already closed.
     }
   }
-  await folder.getFileHandle(marker(file), { create: true })
-  await folder.removeEntry(etagName(file)).catch(() => undefined)
   await removeOldVersions(folder, file)
   return handle.getFile()
 }
