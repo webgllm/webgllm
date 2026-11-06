@@ -144,12 +144,6 @@ export const MessageTiming: FC<{
               </span>
             </div>
             )}
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-fd-muted-foreground">Chunks</span>
-              <span className="font-mono tabular-nums">
-                {timing.totalChunks}
-              </span>
-            </div>
           </div>
         </TooltipContent>
       </Tooltip>
