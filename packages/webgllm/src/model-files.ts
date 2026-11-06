@@ -41,7 +41,10 @@ export { fileKey }
 const sizes = new Map<string, Promise<number>>()
 const contexts = new Map<string, Promise<number>>()
 
-/** A file's bytes: from storage when it's there, else the server's (a HEAD request). */
+/**
+ * A file's bytes: from storage when it's there, else the server's (a HEAD
+ * request, or a one-byte range request when HEAD gives no size).
+ */
 function fileSize(file: ModelFile): Promise<number> {
   const key = fileKey(file)
   let size = sizes.get(key)
@@ -49,10 +52,18 @@ function fileSize(file: ModelFile): Promise<number> {
     size = (async () => {
       const stored = await storedFile(file)
       if (stored) return stored.size
-      const head = await fetch(fileUrl(file), { method: "HEAD", referrerPolicy: "no-referrer" })
-      const length = Number(head.headers.get("content-length") ?? Number.NaN)
-      if (!head.ok || !(length >= 0)) throw new Error(`No size for ${file.path}`)
-      return length
+      const url = fileUrl(file)
+      const head = await fetch(url, { method: "HEAD", referrerPolicy: "no-referrer" }).catch(() => undefined)
+      // A compressed response's length isn't the file's.
+      if (head?.ok && !head.headers.get("content-encoding")) {
+        const length = Number(head.headers.get("content-length") ?? Number.NaN)
+        if (length >= 0) return length
+      }
+      const probe = await fetch(url, { headers: { Range: "bytes=0-0" }, referrerPolicy: "no-referrer" })
+      const total = probe.headers.get("content-range")?.match(/\/(\d+)\s*$/)
+      await probe.body?.cancel()
+      if (probe.status !== 206 || !total) throw new Error(`No size for ${file.path}`)
+      return Number(total[1])
     })()
     // A failed lookup is tried again next time.
     size.catch(() => sizes.delete(key))

@@ -52,6 +52,33 @@ test("a model's files are the ones the worker fetches", () => {
   assert.equal(onnx.length, 5)
 })
 
+test("without HEAD, a GGUF's size and context length come from a one-byte range request", async () => {
+  // (Before the cold listing below: sizes and context lengths are kept per page.)
+  const model = "LiquidAI/LFM2.5-350M-GGUF"
+  const header = new Uint8Array(await gguf([["general.architecture", "lfm2"], ["lfm2.context_length", 128000]]).arrayBuffer())
+  const file = new Uint8Array(1 << 20)
+  file.set(header)
+  const probes: Array<string> = []
+  const real = globalThis.fetch
+  globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
+    if (init.method === "HEAD") return new Response(null, { status: 405 })
+    const body = input.endsWith(".gguf") ? file : new Uint8Array(10)
+    const match = new Headers(init.headers).get("range")?.match(/bytes=(\d+)-(\d+)/)
+    if (!match) return new Response(body)
+    if (match[0] === "bytes=0-0") probes.push(input)
+    const slice = body.slice(Number(match[1]), Number(match[2]) + 1)
+    return new Response(slice, { status: 206, headers: { "content-range": `bytes ${match[1]}-${match[2]}/${body.length}` } })
+  }) as typeof fetch
+  try {
+    assert.equal(await browserStorage.contextLength(model), 128000)
+    const files = modelFiles(WEBGL_MODEL_META[model])
+    assert.equal(await browserStorage.size(model), file.length + (files.length - 1) * 10)
+  } finally {
+    globalThis.fetch = real
+  }
+  assert.equal(new Set(probes).size, probes.length, "each file's size is probed once")
+})
+
 test("a cold model listing asks the server for each GGUF's size once", async () => {
   const header = new Uint8Array(await gguf([["general.architecture", "lfm2"], ["lfm2.context_length", 32768]]).arrayBuffer())
   const file = new Uint8Array(1 << 20)

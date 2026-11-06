@@ -144,6 +144,21 @@ test("leaving a stream early stops the worker", async () => {
   assert.ok(worker.sent.some((m) => m.type === "stop" && m.id === id))
 })
 
+test("leaving a stream ends a read still waiting, and later messages are dropped", async () => {
+  const { llm: client, workers } = llm()
+  const stream = await client.chat.completions.create({ model: LFM2, messages: hi, stream: true })
+  await settle()
+  const worker = workers.of(LFM2)!
+  const id = worker.generations()[0]!.id
+  const iterator = stream[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  assert.deepEqual(await iterator.return!(), { value: undefined, done: true })
+  worker.emit({ type: "token", id, text: "late" })
+  worker.finish(id)
+  assert.deepEqual(await pending, { value: undefined, done: true })
+  assert.deepEqual(await iterator.next(), { value: undefined, done: true })
+})
+
 test("aborting a whole completion rejects at once", async () => {
   const { llm: client } = llm()
   const abort = new AbortController()

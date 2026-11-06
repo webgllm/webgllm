@@ -295,8 +295,13 @@ class Completions {
     const signal = options.signal
     const chunks: Array<ChatCompletionChunk> = []
     let finished = false
+    // Set by return(): reads end, and later messages are dropped.
+    let closed = false
     let failure: { error: unknown } | null = null
     let wake: (() => void) | null = null
+    const emit = (...more: Array<ChatCompletionChunk>) => {
+      if (!closed) chunks.push(...more)
+    }
     const notify = () => {
       wake?.()
       wake = null
@@ -311,7 +316,7 @@ class Completions {
       .generate(plan.model, plan.generate, {
         contextLength: this.llm.contextLength,
         onToken: (text) => {
-          for (const d of reader.push(text)) chunks.push(writer.delta(d))
+          for (const d of reader.push(text)) emit(writer.delta(d))
           notify()
         },
         ...(options.onProgress && { onProgress: options.onProgress }),
@@ -319,15 +324,15 @@ class Completions {
       })
       .then(async (end) => {
         const last = reader.finish(end)
-        for (const d of last.deltas) chunks.push(writer.delta(d))
+        for (const d of last.deltas) emit(writer.delta(d))
         notify()
         const settled = await this.settleToolCalls(plan, last, stop.signal)
-        for (const d of settled.deltas) chunks.push(writer.delta(d))
+        for (const d of settled.deltas) emit(writer.delta(d))
         const toolCalls = reader.toolCalls(settled.calls)
-        chunks.push(...writer.toolCalls(toolCalls))
+        emit(...writer.toolCalls(toolCalls))
         const timings = timingsOf(end.stats)
-        chunks.push(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
-        if (plan.includeUsage) chunks.push(writer.usage(usageOf(end.stats, settled.repairs), timings))
+        emit(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
+        if (plan.includeUsage) emit(writer.usage(usageOf(end.stats, settled.repairs), timings))
       })
       .then(
         () => undefined,
@@ -343,6 +348,7 @@ class Completions {
 
     const read = async (): Promise<IteratorResult<ChatCompletionChunk>> => {
       for (;;) {
+        if (closed) return { value: undefined, done: true }
         if (signal?.aborted) throw abortError(signal)
         const chunk = chunks.shift()
         if (chunk) return { value: chunk, done: false }
@@ -371,7 +377,9 @@ class Completions {
       async return() {
         // The reader left early: stop the worker too.
         if (!finished) stop.abort(abortError())
+        closed = true
         chunks.length = 0
+        notify()
         return { value: undefined, done: true }
       }
     }
