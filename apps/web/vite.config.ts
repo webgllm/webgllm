@@ -8,6 +8,8 @@ import { fumadocsMdx } from 'fumadocs-mdx/vite';
 export default defineConfig({
   server: {
     port: 3000,
+    // Cloudflare quick tunnels, for trying the dev server on a phone.
+    allowedHosts: ['.trycloudflare.com'],
   },
   plugins: [
     fumadocsMdx(),

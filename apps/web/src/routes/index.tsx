@@ -12,6 +12,7 @@ import {
   Cpu,
   Gauge,
   HardDriveDownload,
+  MessageSquare,
   Plug,
   ShieldCheck,
   Wrench,
@@ -30,7 +31,10 @@ function Home() {
   return (
     <HomeLayout
       {...baseOptions()}
-      links={[{ text: 'Docs', url: '/docs', active: 'nested-url' }]}
+      links={[
+        { text: 'Docs', url: '/docs', active: 'nested-url' },
+        { text: 'Demo', url: '/demo', active: 'url' },
+      ]}
     >
       <main className="flex flex-col">
         <Hero />
@@ -84,6 +88,13 @@ function Hero() {
             >
               Get started
               <ArrowRight className="size-4" />
+            </Link>
+            <Link
+              to="/demo"
+              className={cn(buttonVariants({ variant: 'outline' }), 'h-10 gap-2 px-5')}
+            >
+              <MessageSquare className="size-4" />
+              Try the demo
             </Link>
             <a
               href={githubUrl}
@@ -398,6 +409,9 @@ function Footer() {
         <nav className="flex gap-6">
           <Link to="/docs/$" params={{ _splat: '' }} className="hover:text-fd-foreground">
             Docs
+          </Link>
+          <Link to="/demo" className="hover:text-fd-foreground">
+            Demo
           </Link>
           <a href={githubUrl} className="hover:text-fd-foreground">
             GitHub
