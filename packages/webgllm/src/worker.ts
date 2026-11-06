@@ -24,7 +24,7 @@ import { download, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote } f
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
-import { createThinkingBudget } from "./thinking-budget.js"
+import { budgetWrapUp, createThinkingBudget, templateClosing } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
@@ -587,7 +587,9 @@ async function generate(request: GenerateRequest) {
   const thinkingBudget = createThinkingBudget(
     request.thinkingBudgetTokens,
     tokenizer.specialTokens,
-    startsInThinking
+    startsInThinking,
+    request.thinkingBudgetTokens === undefined ? undefined : templateClosing(tokenizer),
+    request.thinkingBudgetTokens === undefined ? undefined : budgetWrapUp(tokenizer)
   )
   // LFM2.5 Thinking writes its opening marker itself; its template ends at
   // assistant\n. Seed that expected marker so the answer grammar never suppresses reasoning.

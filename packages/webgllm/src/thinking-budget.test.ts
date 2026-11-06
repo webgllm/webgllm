@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { createThinkingBudget } from "./thinking-budget.js"
+import { BUDGET_WRAP_UP, budgetWrapUp, createThinkingBudget, templateClosing } from "./thinking-budget.js"
 
 // Synthetic ids for LFM3's single-token thinking delimiters and generated text.
 const markers = { think: 64400, thinkEnd: 64401 }
@@ -150,4 +150,123 @@ test("natural early closing and omitted budgets preserve normal control-token be
   assert.equal(zero.closedControlMask(64), undefined)
   zero.observe(32)
   assert.ok(zero.closedControlMask(64))
+})
+
+describe("closing the way the chat template does", () => {
+  // Qwen3.5's template writes "\n</think>\n\n" between a reply's reasoning
+  // and its answer: a newline, the marker, a blank line (ids 5, 32, 6 here).
+  const markers = { think: 31, thinkEnd: 32 }
+  const closing = [5, 32, 6]
+
+  test("an exhausted budget forces the template's whole closing, in order", () => {
+    const b = createThinkingBudget(2, markers, true, closing)!
+    b.observe(10)
+    b.observe(11)
+    const forced: number[] = []
+    for (let token = b.forcedToken; token !== null; token = b.forcedToken) {
+      forced.push(token)
+      b.observe(token)
+    }
+    assert.deepEqual(forced, closing)
+    b.observe(12) // The answer is the model's own.
+    assert.equal(b.forcedToken, null)
+    assert.equal(b.stats.thinkingTokens, 2, "the forced newline isn't counted as thinking")
+    assert.equal(b.stats.thinkingBudgetExhausted, true)
+  })
+
+  test("a natural close forces nothing", () => {
+    const b = createThinkingBudget(5, markers, true, closing)!
+    b.observe(10)
+    b.observe(32)
+    b.observe(12)
+    assert.equal(b.forcedToken, null)
+  })
+
+  test("drafts stop at the cap and the close continues from there", () => {
+    const b = createThinkingBudget(1, markers, true, closing)!
+    b.observe(10)
+    assert.equal(b.forcedToken, 5)
+    b.observe(5)
+    assert.equal(b.forcedToken, 32)
+    assert.equal(b.closedControlMask(64), undefined, "the marker is still to come")
+    b.observe(32)
+    assert.equal(b.forcedToken, 6)
+    b.observe(6)
+    assert.equal(b.forcedToken, null)
+    assert.ok(b.closedControlMask(64), "both markers masked once it has closed")
+  })
+
+  test("a closing without exactly one end marker is refused", () => {
+    for (const bad of [[5, 6], [32, 5, 32], []]) {
+      assert.throws(() => createThinkingBudget(1, markers, true, bad), /closing/)
+    }
+  })
+})
+
+describe("templateClosing", () => {
+  // A tokenizer stand-in: one id per character, the marker as one id.
+  const tokenizerFor = (between: string) => ({
+    specialTokens: { think: 31, thinkEnd: 32 },
+    applyChatTemplate: (messages: Array<{ role: "user" | "assistant"; content: string; reasoning_content?: string }>) =>
+      messages.map((m) => m.role === "assistant" ? `<think>${m.reasoning_content}${between}${m.content}` : m.content).join("|"),
+    encode: (text: string) => {
+      const ids: number[] = []
+      for (let i = 0; i < text.length; i++) {
+        if (text.startsWith("</think>", i)) { ids.push(32); i += "</think>".length - 1 }
+        else ids.push(text.charCodeAt(i))
+      }
+      return ids
+    }
+  })
+
+  test("reads what the template writes between a reply's reasoning and its answer", () => {
+    assert.deepEqual(templateClosing(tokenizerFor("\n</think>\n\n")), [10, 32, 10, 10])
+    assert.deepEqual(templateClosing(tokenizerFor("</think>")), [32])
+  })
+
+  test("falls back to the marker alone when the template shows no single close", () => {
+    assert.deepEqual(templateClosing(tokenizerFor("")), [32])
+    assert.deepEqual(templateClosing(tokenizerFor("</think></think>")), [32])
+  })
+})
+
+describe("wrapping up before the close", () => {
+  const markers = { think: 31, thinkEnd: 32 }
+  const closing = [5, 32, 6]
+  const wrapUp = [7, 8]
+  const drain = (b: ReturnType<typeof createThinkingBudget> & object) => {
+    const forced: number[] = []
+    for (let token = b.forcedToken; token !== null; token = b.forcedToken) {
+      forced.push(token)
+      b.observe(token)
+    }
+    return forced
+  }
+
+  test("after some thinking, the wrap-up goes into the thinking before the close", () => {
+    const b = createThinkingBudget(2, markers, true, closing, wrapUp)!
+    b.observe(10)
+    b.observe(11)
+    assert.deepEqual(drain(b), [7, 8, 5, 32, 6])
+    assert.equal(b.stats.thinkingTokens, 2, "the wrap-up isn't counted as thinking")
+    assert.ok(b.closedControlMask(64))
+  })
+
+  test("a zero budget closes with no wrap-up: there's nothing to wrap up", () => {
+    const b = createThinkingBudget(0, markers, true, closing, wrapUp)!
+    assert.deepEqual(drain(b), closing)
+  })
+
+  test("a wrap-up holding a marker is refused", () => {
+    assert.throws(() => createThinkingBudget(1, markers, true, closing, [7, 32]), /wrap-up/)
+    assert.throws(() => createThinkingBudget(1, markers, true, closing, [31]), /wrap-up/)
+  })
+})
+
+test("budgetWrapUp encodes the wrap-up once per tokenizer", () => {
+  let calls = 0
+  const tokenizer = { encode: (text: string) => { calls++; return [text.length] } }
+  assert.deepEqual(budgetWrapUp(tokenizer), [BUDGET_WRAP_UP.length])
+  budgetWrapUp(tokenizer)
+  assert.equal(calls, 1)
 })
