@@ -13,7 +13,8 @@
     },
     "typecheck": {
       "dependsOn": [
-        "^build"
+        "^build",
+        "build"
       ],
       "cache": true
     }
