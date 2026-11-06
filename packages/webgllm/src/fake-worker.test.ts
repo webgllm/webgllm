@@ -34,6 +34,8 @@ export type FakeOptions = {
   stored?: (model: string) => void
   /** Holds a load after its files are stored until this resolves. */
   hold?: (model: string) => Promise<void>
+  /** Holds a download until this resolves. */
+  holdDownload?: (model: string) => Promise<void>
 }
 
 export class FakeWorker {
@@ -103,6 +105,8 @@ export class FakeWorker {
       })
       this.emit({ type: "ready", model: message.model, loadId: message.loadId })
     } else if (message.type === "download") {
+      this.model = message.model
+      await this.options.holdDownload?.(message.model)
       this.emit({ type: "progress", model: message.model, progress: 0.45, cached: false, loadedBytes: 50, totalBytes: 100 })
       this.emit({ type: "downloaded", model: message.model })
     } else if (message.type === "generate") {

@@ -103,6 +103,9 @@ export class ModelPool {
   private readonly queue = new TaskQueue()
   private stopFrames: (() => void) | undefined
   private askedToKeep = false
+  /** Unloads asked for, by model and for every model: a load waiting meanwhile stops (see unloadMark). */
+  private readonly unloads = new Map<string, number>()
+  private unloadsOfAll = 0
 
   constructor(private readonly options: PoolOptions) {
     this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
@@ -140,18 +143,31 @@ export class ModelPool {
    */
   async load(
     model: WebGlTextModel,
-    options: { contextLength?: number; keepLoaded?: boolean; onProgress?: ProgressListener; signal?: AbortSignal } = {}
+    options: {
+      contextLength?: number
+      keepLoaded?: boolean
+      onProgress?: ProgressListener
+      signal?: AbortSignal
+      /** unloadMark when the caller started waiting (ensureLoaded's own waits count too). */
+      since?: number
+    } = {}
   ): Promise<void> {
     const { contextLength, signal } = options
+    const since = options.since ?? this.unloadMark(model)
     throwIfAborted(signal)
     // A download of it in another worker: let it finish (they'd write the same files).
     const download = this.downloads.get(model)
-    if (download) await abortable(download.promise.catch(() => undefined), signal)
+    if (download) {
+      await abortable(download.promise.catch(() => undefined), signal)
+      this.throwIfUnloaded(model, since)
+    }
     let entry = this.entries.get(model)
     if (entry?.evicting) {
       await abortable(entry.evicting, signal)
+      this.throwIfUnloaded(model, since)
       entry = this.entries.get(model)
     }
+    this.throwIfUnloaded(model, since)
     entry ??= this.spawn(model)
     if (options.keepLoaded !== undefined) {
       entry.keepLoaded = options.keepLoaded
@@ -164,6 +180,16 @@ export class ModelPool {
     const load = entry.worker.loadModel(contextLength)
     this.watch(entry, load, contextLength)
     await this.waitForLoad(entry, load, options.onProgress, signal)
+  }
+
+  /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
+  private unloadMark(model: string): number {
+    return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
+  }
+
+  /** Rejects as an unloaded model's load does if `model` was unloaded since `mark`. */
+  private throwIfUnloaded(model: string, mark: number) {
+    if (this.unloadMark(model) !== mark) throw unloaded(model)
   }
 
   /** Dispatches "loadstart" for a new load, and "load" when it's ready. */
@@ -192,16 +218,18 @@ export class ModelPool {
     onProgress: ProgressListener | undefined,
     signal: AbortSignal | undefined
   ): Promise<Entry> {
+    const since = this.unloadMark(model)
     for (;;) {
       const entry = this.entries.get(model)
       if (entry?.evicting) {
         await abortable(entry.evicting, signal)
+        this.throwIfUnloaded(model, since)
         continue
       }
       if (entry?.worker.ready) return entry
       const loading = entry?.worker.loadPromise
       if (!entry || !loading) {
-        await this.load(model, { contextLength, onProgress, signal })
+        await this.load(model, { contextLength, onProgress, signal, since })
         continue
       }
       try {
@@ -254,6 +282,10 @@ export class ModelPool {
 
   /** Unloads `model`, or every model; their running generations fail with "model-not-loaded". */
   unload(model?: string) {
+    // Loads still waiting (for a download or an eviction of it) have no
+    // entry to drop: they see this and stop.
+    if (model === undefined) this.unloadsOfAll++
+    else this.unloads.set(model, (this.unloads.get(model) ?? 0) + 1)
     for (const entry of [...this.entries.values()]) {
       if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }

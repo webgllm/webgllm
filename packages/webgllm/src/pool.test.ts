@@ -459,3 +459,98 @@ test("an onMemoryClaim that unloads another model to make room doesn't deadlock"
   assert.deepEqual(p.loadedModels(), [B])
   assert.equal(p.memoryUsed, 60)
 })
+
+/** A download of each model held until `release(model)`. */
+function heldDownloads() {
+  const held = new Map<string, () => void>()
+  return {
+    holdDownload: (model: string) => new Promise<void>((resolve) => held.set(model, resolve)),
+    release: (model: string) => held.get(model)?.()
+  }
+}
+
+test("unloading a model while its load waits for a download stops the load", async () => {
+  const downloads = heldDownloads()
+  const claims: Array<string> = []
+  const { pool: p, workers, events } = pool({ budget: 1000, holdDownload: downloads.holdDownload, onMemoryClaim: ({ model }) => void claims.push(model) })
+  const downloading = p.download(A)
+  await settle()
+  const loading = p.load(A)
+  const failed = assert.rejects(loading, (error: unknown) => error instanceof WebGLLMError && error.code === "model-not-loaded")
+  await settle()
+  p.unload(A)
+  downloads.release(A)
+  await downloading
+  await failed
+  await settle()
+  assert.equal(workers.workers.length, 1, "only the download's worker")
+  assert.deepEqual(events.map((e) => e.type), [])
+  assert.deepEqual(claims, [])
+  assert.equal(p.isLoaded(A), false)
+})
+
+test("a completion's load waiting for a download stops when the model is unloaded", async () => {
+  const downloads = heldDownloads()
+  const { pool: p, workers } = pool({ budget: 1000, holdDownload: downloads.holdDownload })
+  const downloading = p.download(A)
+  await settle()
+  const generating = assert.rejects(p.generate(A, fields, { onToken: () => undefined }), (error: unknown) =>
+    error instanceof WebGLLMError && error.code === "model-not-loaded")
+  await settle()
+  p.unload(A)
+  downloads.release(A)
+  await downloading
+  await generating
+  await settle()
+  assert.equal(workers.workers.length, 1)
+})
+
+test("unloading a model while its load waits for its eviction stops the load", async () => {
+  const { pool: p, workers, events } = pool()
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  // B needs A's room; A goes once its reply ends.
+  const loadingB = p.load(B)
+  await settle()
+  const loadingA = p.load(A)
+  const failed = assert.rejects(loadingA, (error: unknown) => error instanceof WebGLLMError && error.code === "model-not-loaded")
+  await settle()
+  p.unload(A)
+  await running.catch(() => undefined)
+  await failed
+  await loadingB
+  await settle()
+  assert.equal(workers.workers.filter((w) => w.model === A).length, 1, "no new worker for A")
+  assert.equal(events.filter((e) => e.type === "loadstart" && e.model === A).length, 1, "only A's first load")
+  assert.deepEqual(p.loadedModels(), [B])
+})
+
+test("unloading every model stops every load still waiting", async () => {
+  const downloads = heldDownloads()
+  const { pool: p, workers } = pool({ budget: 1000, holdDownload: downloads.holdDownload })
+  const downloadingA = p.download(A)
+  const downloadingB = p.download(B)
+  await settle()
+  const notLoaded = (error: unknown) => error instanceof WebGLLMError && error.code === "model-not-loaded"
+  const failedA = assert.rejects(p.load(A), notLoaded)
+  const failedB = assert.rejects(p.load(B), notLoaded)
+  await settle()
+  p.unload()
+  for (const model of [A, B]) downloads.release(model)
+  await Promise.all([downloadingA, downloadingB, failedA, failedB])
+  await settle()
+  assert.equal(workers.workers.length, 2, "only the downloads' workers")
+})
+
+test("a load that waited for a download, with no unload, still loads", async () => {
+  const downloads = heldDownloads()
+  const { pool: p } = pool({ budget: 1000, holdDownload: downloads.holdDownload })
+  const downloading = p.download(A)
+  await settle()
+  const loading = p.load(A)
+  downloads.release(A)
+  await downloading
+  await loading
+  assert.equal(p.isLoaded(A), true)
+})
