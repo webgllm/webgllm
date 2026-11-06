@@ -155,9 +155,24 @@ test("response_format becomes the output schema", () => {
     tools: [weather],
     response_format: { type: "json_schema", json_schema: { name: "a", schema, strict: true } }
   })
-  assert.deepEqual(plan.generate.outputSchema, schema)
+  assert.deepEqual(plan.generate.outputSchema, { ...schema, additionalProperties: false })
   assert.equal(plan.parseTools, false)
   assert.equal("outputSchema" in planCompletion({ model: LFM3, messages: hi, response_format: { type: "text" } }).generate, false)
+})
+
+test("json_schema objects that don't set additionalProperties are closed, as tools' are", () => {
+  const outputSchema = (schema: Record<string, unknown>) =>
+    planCompletion({ model: LFM3, messages: hi, response_format: { type: "json_schema", json_schema: { name: "a", schema } } }).generate.outputSchema
+  // Nested objects too: an open object's free-form keys are slow to constrain and let a model invent keys.
+  assert.deepEqual(
+    outputSchema({ type: "object", properties: { author: { type: "object", properties: { name: { type: "string" } } } } }),
+    { type: "object", properties: { author: { type: "object", properties: { name: { type: "string" } }, additionalProperties: false } }, additionalProperties: false }
+  )
+  // Saying so keeps an object open.
+  const open = { type: "object", properties: { a: { type: "string" } }, additionalProperties: true }
+  assert.deepEqual(outputSchema(open), open)
+  // JSON mode is any object.
+  assert.deepEqual(planCompletion({ model: LFM3, messages: hi, response_format: { type: "json_object" } }).generate.outputSchema, { type: "object" })
 })
 
 test("tools and tool_choice", () => {

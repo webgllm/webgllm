@@ -203,7 +203,9 @@ const COMPACT: Layout = { whitespace_flexible: false, key_separator: ":", item_s
  * Whitespace between any two tokens, and the key separator's space required
  * (flexible alone also takes `":` again after a key's colon). Items stay ","
  * apart: llguidance 0.2.1 takes a comma after a closed object's last key when
- * items are ", " apart (its pruning is conservative), leaving no way on.
+ * items are ", " apart, then dead-ends
+ * (https://github.com/nico-martin/llguidance-js/issues/6). Use ", " once that
+ * is fixed.
  */
 const MODEL: Layout = { whitespace_flexible: true, key_separator: ": ", item_separator: "," }
 /** MODEL when the tokenizer's whitespace tokens can't be read to cap their runs. */

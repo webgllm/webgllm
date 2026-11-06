@@ -26,6 +26,7 @@ import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
 import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
+import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
 /** The generate request's fields a completion decides (the page adds id, model and context). */
@@ -265,7 +266,10 @@ function outputSchemaFor(format: unknown): object | undefined {
     if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
       throw new WebGLLMError("invalid-schema", "response_format.json_schema.schema must be a JSON Schema object.")
     }
-    return schema
+    // Closed as tools' are (OpenAI's strict mode): a free-form key costs the
+    // constraint about a second a token on a real vocabulary
+    // (https://github.com/nico-martin/llguidance-js/issues/5).
+    return closeObjects(schema) as object
   }
   throw unsupported(`response_format type "${String(f.type)}" isn't supported.`)
 }
