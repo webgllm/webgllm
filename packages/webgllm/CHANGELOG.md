@@ -1,3 +1,13 @@
+## 0.1.5 (2026-11-06)
+
+### 🩹 Fixes
+
+- **webgllm:** close and merge allOf objects so they're fast to constrain ([5122079](https://github.com/webgllm/webgllm/commit/5122079))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.4 (2026-11-06)
 
 ### 🩹 Fixes
