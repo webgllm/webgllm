@@ -1,5 +1,6 @@
 /** Bundle untouched engine sources, adding only allocation counters for memory runs. */
 import { build } from "esbuild"
+import { existsSync } from "node:fs"
 import { mkdir } from "node:fs/promises"
 import { resolve } from "node:path"
 const root = process.argv[2]
@@ -10,8 +11,13 @@ if (!root || (process.argv[4] !== undefined && !trace))
     "Usage: node bench/build-workers.mjs /path/to/baseline-checkout [output.js] [trace]"
   )
 await mkdir(new URL("./dist/", import.meta.url), { recursive: true })
-const gpu = resolve(root, "packages/webgl/src/gpu/gl.ts"),
-  worker = resolve(root, "packages/webgl/src/worker.ts")
+// A checkout of this repo (packages/webgllm) or of tanstack-ai-browser from
+// before the engine moved (packages/webgl).
+const source = existsSync(resolve(root, "packages/webgllm/src/worker.ts"))
+  ? resolve(root, "packages/webgllm/src")
+  : resolve(root, "packages/webgl/src")
+const gpu = resolve(source, "gpu/gl.ts"),
+  worker = resolve(source, "worker.ts")
 await build({
   stdin: {
     contents: `import {Gpu} from ${JSON.stringify(gpu)};

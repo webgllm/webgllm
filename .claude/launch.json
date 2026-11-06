@@ -4,14 +4,35 @@
     {
       "name": "web",
       "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["nx", "dev", "web"],
+      "runtimeArgs": [
+        "nx",
+        "dev",
+        "web"
+      ],
       "port": 3000
     },
     {
       "name": "web-static",
       "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["--dir", "apps/web", "exec", "wrangler", "dev", "--port", "8788"],
+      "runtimeArgs": [
+        "--dir",
+        "apps/web",
+        "exec",
+        "wrangler",
+        "dev",
+        "--port",
+        "8788"
+      ],
       "port": 8788
+    },
+    {
+      "name": "bench",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "packages/webgllm/bench/server.mjs",
+        "8790"
+      ],
+      "port": 8790
     }
   ]
 }

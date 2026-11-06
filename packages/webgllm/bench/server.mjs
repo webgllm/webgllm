@@ -1,16 +1,21 @@
 /**
  * Serves the bench pages, cross-origin isolated (COOP same-origin, COEP
- * require-corp) so wllama gets threads, and prints what the pages post.
- * `/bundle/<path>.js` is the package's `<path>.ts` bundled with esbuild on
- * request, so pages and workers can run the engine's TypeScript.
+ * require-corp) so SharedArrayBuffer and precise timers are available, and
+ * prints what the pages post (`[page] …`). `/bundle/<path>.js` is this
+ * package's `<path>.ts` bundled with esbuild on request, so pages and
+ * workers can run the engine's TypeScript.
  *
- *   node bench/server.mjs [port]     MODELS_DIR=… for model files, REF_DIR=… for reference tensors
+ *   node packages/webgllm/bench/server.mjs [port]
+ *     MODELS_DIR=… model files (and the phone driver's job.json)
+ *     HF_DIR=…     tokenizer files for GGUF checks
+ *     REF_DIR=… / REF_ONNX_DIR=…  reference tensors (llama.cpp / onnxruntime)
+ *     ONNX_COMMUNITY_DIR=… / ONNX_DIR=…  ONNX builds for check.html
  *
  * Listens on localhost only (HOST=0.0.0.0 to serve the network; phones reach
  * it through `adb reverse` or a tunnel to localhost).
  *
  * On a phone over USB: `adb reverse tcp:8787 tcp:8787`, then open
- * http://localhost:8787/?run=gpu (localhost counts as a secure context).
+ * http://localhost:8787/gl-info.html (localhost counts as a secure context).
  */
 import { createReadStream, appendFileSync, statSync } from "node:fs"
 import { createServer } from "node:http"
@@ -28,21 +33,14 @@ import { build } from "esbuild"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkg = join(here, "..")
-const repo = join(here, "../../..")
 const port = Number(process.argv[2] ?? 8787)
 const resultsFile = process.env.RESULTS_FILE ?? join(here, "results.jsonl")
 
 const roots = {
-  // The wllama package's own wllama JavaScript, from the same build as its
-  // wasm/ (npm's @wllama/wllama doesn't match those builds).
-  "/wllama/": join(repo, "packages/wllama/vendor/wllama/"),
-  "/wasm/": join(repo, "packages/wllama/wasm/"),
-  // The wllama package's builds, next to its bundled client (/bundle-wllama/).
-  "/bundle-wllama/wasm/": join(repo, "packages/wllama/wasm/"),
   "/models/": process.env.MODELS_DIR ?? join(here, "models/"),
   "/ref/": process.env.REF_DIR ?? join(here, "ref/"),
   "/ref-onnx/": process.env.REF_ONNX_DIR ?? join(here, "ref-onnx/"),
-  "/onnx-web/": process.env.ONNX_DIR ?? join(here, "onnx-web/"),
+  "/onnx/": process.env.ONNX_DIR ?? join(here, "onnx/"),
   "/onnx-community/":
     process.env.ONNX_COMMUNITY_DIR ?? join(here, "onnx-community/"),
   "/hf/": process.env.HF_DIR ?? join(here, "hf/"),
@@ -84,20 +82,13 @@ function resolve(url) {
   return null
 }
 
-/** `/bundle/src/worker.js` → packages/webgl/src/worker.ts, bundled. */
+/** `/bundle/src/worker.js` → packages/webgllm/src/worker.ts, bundled. */
 async function bundle(path, res) {
-  // /bundle-tjs/… and /bundle-wllama/… are the transformers-js and wllama
-  // packages' sources, for comparisons.
-  const base = path.startsWith("/bundle-tjs/")
-    ? join(repo, "packages/transformers-js")
-    : path.startsWith("/bundle-wllama/")
-      ? join(repo, "packages/wllama")
-      : pkg
   const entry = resolvePath(
-    base,
-    `./${path.replace(/^\/bundle(-tjs|-wllama)?\//, "").replace(/\.js$/, ".ts")}`
+    pkg,
+    `./${path.replace(/^\/bundle\//, "").replace(/\.js$/, ".ts")}`
   )
-  if (!inside(base, entry)) return res.writeHead(404, isolation).end()
+  if (!inside(pkg, entry)) return res.writeHead(404, isolation).end()
   try {
     const out = await build({
       entryPoints: [entry],
@@ -105,6 +96,10 @@ async function bundle(path, res) {
       format: "esm",
       platform: "browser",
       target: "es2022",
+      // The package's own source entry, if a page imports "webgllm"; its
+      // dependencies resolve from packages/webgllm/node_modules.
+      conditions: ["webgllm/source"],
+      nodePaths: [join(pkg, "node_modules")],
       write: false,
       sourcemap: "inline",
       logLevel: "silent"
@@ -122,9 +117,7 @@ createServer((req, res) => {
   if (
     req.method === "GET" &&
     path.endsWith(".js") &&
-    (path.startsWith("/bundle/") ||
-      path.startsWith("/bundle-tjs/") ||
-      path.startsWith("/bundle-wllama/"))
+    path.startsWith("/bundle/")
   )
     return void bundle(path, res)
   if (req.method === "POST") {

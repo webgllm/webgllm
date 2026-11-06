@@ -4,7 +4,7 @@
 //
 //   ios_webkit_debug_proxy -c <udid>:9333 --no-frontend   # not 9222 (the Pixel's adb forward)
 //   curl -s http://127.0.0.1:9333/json                     # the tabs and their webSocketDebuggerUrl
-//   node packages/webgl/bench/ios-tab.mjs <ws url> '<async function body>' [watch seconds]
+//   node packages/webgllm/bench/ios-tab.mjs <ws url> '<async function body>' [watch seconds]
 //
 // The body runs inside an async function: `return` a JSON-able value.
 const [url, expression, watchSeconds = "0"] = process.argv.slice(2)

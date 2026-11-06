@@ -158,15 +158,15 @@ refined; final SDK/profile checks exercise the completed policy. Final Checkers
 records were captured after the last metadata-retention guards and build checks.
 
 ```sh
-node packages/webgl/bench/prepare-short-prefix.mjs aaf9992
-# Reuse the Checkers dev server. In Chrome, open:
-# http://localhost:3002/__short-prefix-qa.html
-# http://localhost:3002/__short-prefix-sdk-qa.html
-# Select a model and explicitly Run. No inference starts during preparation.
-node packages/webgl/bench/prepare-short-prefix.mjs --clean
-NX_DAEMON=false NX_TUI=false NX_LOAD_DOT_ENV_FILES=false pnpm nx run-many -p webgl checkers -t test typecheck lint build --outputStyle=static
+node packages/webgllm/bench/prepare-short-prefix.mjs <baseline commit>
+node packages/webgllm/bench/server.mjs 8795
+# In Chrome, open http://localhost:8795/short-prefix.html,
+# select a model and explicitly Run. No inference starts during preparation.
+node packages/webgllm/bench/prepare-short-prefix.mjs --clean
 ```
 
-The preparation script freezes only baseline TypeScript source, records checksums,
-and creates owned temporary pages. Cleanup removes only those generated files and
-never touches browser model storage. No environment files are read.
+The preparation script freezes only baseline TypeScript source (into
+`packages/webgllm/.short-prefix-qa/`) and records checksums. Cleanup removes only
+that snapshot and never touches browser model storage. No environment files are read.
+The original runs used the Checkers dev server in tanstack-ai-browser (baseline
+`aaf9992` there); the SDK page that drove the adapter stays in that repo.

@@ -1,4 +1,5 @@
 /** Record reproducible source/build identities without reading configuration secrets. */
+// Commits are this repo's (history rewritten from tanstack-ai-browser: e53f549 was 2c10f9e, 9b40e53 was 6a6e641).
 import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
@@ -14,49 +15,49 @@ const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
 const hash = (file) =>
   createHash("sha256").update(fs.readFileSync(file)).digest("hex")
 const changed = [
-  ...execFileSync("git", ["diff", "2c10f9e", "--name-only", "--", "packages/webgl"], {
+  ...execFileSync("git", ["diff", "e53f549", "--name-only", "--", "packages/webgllm"], {
     encoding: "utf8"
   })
     .trim()
     .split("\n"),
   ...execFileSync(
     "git",
-    ["ls-files", "--others", "--exclude-standard", "packages/webgl"],
+    ["ls-files", "--others", "--exclude-standard", "packages/webgllm"],
     { encoding: "utf8" }
   )
     .trim()
     .split("\n")
 ].filter((file) => /\.(ts|mjs|html|py)$/.test(file))
 const manifest = {
-  baselineCommit: execFileSync("git", ["rev-parse", "2c10f9e"], {
+  baselineCommit: execFileSync("git", ["rev-parse", "e53f549"], {
     encoding: "utf8"
   }).trim(),
   branch: execFileSync("git", ["branch", "--show-current"], {
     encoding: "utf8"
   }).trim(),
   engineCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
-  clientCadenceGuardCommit: "6a6e641",
+  clientCadenceGuardCommit: "9b40e53",
   clientCadenceGuardCoverage: "Rounded-millisecond 60/120 Hz paths were unit-tested after timing runs; measured fractional-ms estimator unchanged.",
   recordedAt: new Date().toISOString(),
   node: process.version,
   modelMeasurements:
     "Physical Pixel and iPhone, followed by the user-authorized M3 Ultra Chrome benchmark.",
-  baselineWorkerSha256: hash("packages/webgl/bench/dist/baseline-worker.js"),
+  baselineWorkerSha256: hash("packages/webgllm/bench/dist/baseline-worker.js"),
   phoneVerifiedCommit: "70d3ea0",
   phoneVerifiedEngineCode: 446196241,
-  phoneVerifiedWorkerSha256: hash("packages/webgl/bench/dist/phone-verified-worker.js"),
+  phoneVerifiedWorkerSha256: hash("packages/webgllm/bench/dist/phone-verified-worker.js"),
   priorPixelMacCommit: "f9ffe1d",
   priorPixelMacEngineCode: 2693625472,
-  priorPixelMacWorkerSha256: hash("packages/webgl/bench/dist/pre-load-shortcut-worker.js"),
-  proofScreenshotSha256: hash("packages/webgl/bench/results/mac-final-proof.jpg"),
-  presentationClipsSha256: Object.fromEntries(["before", "after"].map(mode => [mode, hash(`packages/webgl/bench/results/presentation-${mode}.mp4`)])),
-  selectedResultsSha256: hash("packages/webgl/bench/results/webgl-performance-2026-11-03.jsonl"),
-  presentationMotionSummarySha256: hash("packages/webgl/bench/results/presentation-motion-summary.json"),
-  presentationFramesSha256: hash("packages/webgl/bench/results/presentation-motion-frames.jsonl"),
-  reportSha256: hash("packages/webgl/bench/WEBGL-PERFORMANCE.md"),
-  optimizedWorkerSha256: hash("packages/webgl/bench/dist/current-worker.js"),
+  priorPixelMacWorkerSha256: hash("packages/webgllm/bench/dist/pre-load-shortcut-worker.js"),
+  proofScreenshotSha256: hash("packages/webgllm/bench/results/mac-final-proof.jpg"),
+  presentationClipsSha256: Object.fromEntries(["before", "after"].map(mode => [mode, hash(`packages/webgllm/bench/results/presentation-${mode}.mp4`)])),
+  selectedResultsSha256: hash("packages/webgllm/bench/results/webgl-performance-2026-11-03.jsonl"),
+  presentationMotionSummarySha256: hash("packages/webgllm/bench/results/presentation-motion-summary.json"),
+  presentationFramesSha256: hash("packages/webgllm/bench/results/presentation-motion-frames.jsonl"),
+  reportSha256: hash("packages/webgllm/bench/WEBGL-PERFORMANCE.md"),
+  optimizedWorkerSha256: hash("packages/webgllm/bench/dist/current-worker.js"),
   buildCommand:
-    "node packages/webgl/bench/build-workers.mjs CHECKOUT current-worker.js",
+    "node packages/webgllm/bench/build-workers.mjs CHECKOUT current-worker.js",
   sources: Object.fromEntries(
     [...new Set(changed)]
       .sort()

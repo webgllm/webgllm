@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGL 2 Q4_0 matmul</title>
+    <style>
+      body {
+        font:
+          13px/1.4 ui-monospace,
+          monospace;
+        margin: 12px;
+        background: #fff;
+        color: #111;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      button {
+        font: inherit;
+        padding: 6px 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="gpu">Run</button>
+    <pre id="out"></pre>
+    <script type="module">
+      // The Q4_0 matmul kernel variants (gpu-bench-worker.js, q4-matmul.js)
+      // on every LFM3 projection shape, checked against a JavaScript
+      // reference first. ?m=128 sets the token count; ?run=gpu runs on load.
+      // Results go to the page and to the server (POST /log, /result).
+      const params = new URLSearchParams(location.search)
+      const out = document.getElementById("out")
+      const log = (text) => {
+        out.textContent += `${text}\n`
+        console.log(text)
+        void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+      }
+      const report = (data) =>
+        void fetch("/result", { method: "POST", body: JSON.stringify(data) }).catch(
+          () => undefined
+        )
+
+      function runGpu() {
+        const M = Number(params.get("m") ?? 128)
+        log(`--- GPU: WebGL 2 Q4_0 matmul, ${M} tokens, in a worker`)
+        return new Promise((resolve) => {
+          const worker = new Worker(new URL("./gpu-bench-worker.js", import.meta.url), {
+            type: "module"
+          })
+          worker.onmessage = ({ data }) => {
+            if (data.type === "log") log(data.text)
+            else if (data.type === "result") report(data.data)
+            else if (data.type === "error") {
+              log(`ERROR: ${data.message}`)
+              worker.terminate()
+              resolve()
+            } else if (data.type === "done") {
+              log("--- GPU done")
+              worker.terminate()
+              resolve()
+            }
+          }
+          worker.onerror = (e) => {
+            log(`ERROR: GPU worker: ${e.message}`)
+            resolve()
+          }
+          worker.postMessage({ type: "run", M })
+        })
+      }
+
+      document.getElementById("gpu").onclick = () => void runGpu()
+      log(navigator.userAgent)
+      if (params.get("run") === "gpu") {
+        let wakeLock = null
+        try {
+          wakeLock = await navigator.wakeLock?.request("screen")
+        } catch {
+          // Not offered: the phone may dim, which slows it down.
+        }
+        await runGpu()
+        log("ALL DONE")
+        void wakeLock?.release()
+      }
+    </script>
+  </body>
+</html>

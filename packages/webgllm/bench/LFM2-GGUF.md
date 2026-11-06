@@ -94,10 +94,10 @@ warnings remain; no new production warnings were introduced.
 Keep model weights outside the repository. Prepare matching tokenizer inputs:
 
 ```sh
-packages/webgl/node_modules/.bin/esbuild packages/webgl/bench/prepare-lfm2-gguf.ts --bundle --platform=node --format=esm --outfile=/tmp/prepare-lfm2-gguf.mjs
+packages/webgllm/node_modules/.bin/esbuild packages/webgllm/bench/prepare-lfm2-gguf.ts --bundle --platform=node --format=esm --outfile=/tmp/prepare-lfm2-gguf.mjs
 node /tmp/prepare-lfm2-gguf.mjs /path/to/models
-python3 packages/webgl/bench/lfm2-gguf-reference.py /path/to/models /path/to/llama-server
-MODELS_DIR=/path/to/models node packages/webgl/bench/server.mjs 8797
+python3 packages/webgllm/bench/lfm2-gguf-reference.py /path/to/models /path/to/llama-server
+MODELS_DIR=/path/to/models node packages/webgllm/bench/server.mjs 8797
 ```
 
 Open `http://localhost:8797/lfm2-gguf.html` in Chrome and explicitly run each model.
@@ -107,11 +107,8 @@ The optional F16 control expects `instruct/refs-f16.json`, generated with the re
 script's `--key instruct --f16-control /path/to/dequantized.gguf` option. It always
 compares the original quantized GPU weights with that separate CPU control.
 
-For adapter reproduction, copy `lfm2-gguf-adapter.html.template` to
-`apps/lofi-agent/__lfm25-gguf-qa.html` and `lfm2-gguf-adapter.js.template` to
-`apps/lofi-agent/__lfm25-gguf-qa.js`, then open the HTML on Lofi's dev origin. The
-script is retained as text to avoid turning this development harness into a product
-entry point. Remove both temporary files afterward; saved-game/thread data is untouched.
+The adapter checks (structured outputs, prompt caching and tool calls through the
+TanStack AI adapter) live with the adapter in tanstack-ai-browser.
 
 Evidence: summary (raw run archived locally),
 manifest (raw run archived locally),

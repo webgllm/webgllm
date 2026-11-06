@@ -4,19 +4,33 @@ Raw run artifacts are no longer tracked. Keep only [the latest compact summary](
 regenerate raw files locally as needed. Fixed regression fixtures remain separate.
 
 
-Pages for checking and timing the engine, served cross-origin isolated by `server.mjs`, which also bundles the package's TypeScript on request (`/bundle/<path>.js` is `<path>.ts`).
+Pages for checking and timing the engine (WebGL 2 only), served cross-origin isolated by `server.mjs`, which also bundles the package's TypeScript on request (`/bundle/<path>.js` is `packages/webgllm/<path>.ts`, bundled with esbuild).
+
+Benchmarks against other runtimes (Transformers.js, wllama: `compare.html`, `tools.html`, the go/no-go page) and the TanStack AI adapter's checks live in tanstack-ai-browser, not here.
 
 ```sh
-MODELS_DIR=… REF_DIR=… REF_ONNX_DIR=… ONNX_DIR=… HF_DIR=… node packages/webgl/bench/server.mjs   # :8787
+MODELS_DIR=… REF_DIR=… REF_ONNX_DIR=… ONNX_COMMUNITY_DIR=… HF_DIR=… node packages/webgllm/bench/server.mjs   # :8787
 adb reverse tcp:8787 tcp:8787        # a phone over USB: localhost is a secure context
 ```
 
-- `MODELS_DIR`: `LFM3-1.7B-QAD-Q4_0.gguf` (and `LFM3-1.7B-Q4_K_M.gguf` for the CPU baseline)
-- `ONNX_DIR`: a copy of `daveycodez/LFM3-1.7B-Web-ONNX` (config, tokenizer, `onnx/model_q4f16.onnx*`)
+- `MODELS_DIR`: GGUFs such as `LFM3-1.7B-QAD-Q4_0.gguf`; also where `driver.html` reads its `job.json`
+- `ONNX_COMMUNITY_DIR` (served at `/onnx-community/`): a copy of `onnx-community/LFM3-1.7B-ONNX` (config, tokenizer, `onnx/model_q4f16.onnx*`), `check.html`'s ONNX build by default; `ONNX_DIR` (served at `/onnx/`, `&onnx=onnx`) for another ONNX build
 - `HF_DIR`: `LiquidAI/LFM3-1.7B`'s `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`
 - `REF_DIR`, `REF_ONNX_DIR`: reference tensors from llama.cpp and onnxruntime (`manifest.json`, `tokens.json`, `logits.bin`, `gen_logits.bin`, `l_out-N.bin`, …)
+- `RESULTS_FILE`: where pages' `POST /result` lines go (default `bench/results.jsonl`)
 
-Results print in the server's terminal.
+Results print in the server's terminal: each line a page logs is `[page] …`.
+
+Pages:
+
+- `check.html`: correctness against llama.cpp/onnxruntime references, and smoke runs (below).
+- `mem.html`: memory and speed over a chat, also the iPhone page (below).
+- `webgl-perf.html`: load, prompt and writing throughput with painted-frame cadence (below).
+- `gl-info.html`: what this browser's WebGL 2 offers against what the engine needs.
+- `bandwidth.html`, `mm2.html`, `q4-matmul.html`, `tf.html`: kernel and texture-layout experiments (below).
+- `lfm2-gguf.html`: LFM2.5 GGUF logits against llama.cpp's CPU ([LFM2-GGUF.md](LFM2-GGUF.md)).
+- `short-prefix.html`: short shared-prefix caching, a frozen baseline against this checkout ([FINDINGS](short-prefix-results/FINDINGS.md)).
+- `driver.html`: one phone tab that loads each job written to `$MODELS_DIR/job.json` (`{"id":"<unique>","url":"/mem.html?…"}`) in a frame; `idle.html` or `about:blank` parks it.
 
 ## check.html
 
@@ -29,10 +43,6 @@ Results print in the server's terminal.
 - `&attnab=knob:a,b&decodeAt=7900` (smoke): attention alone. Reads `decodeAt` tokens, then times one writing token's attention passes in every attention layer (scores, chunks, combine; nothing else of the step), 32 queued, at 64, 512, 1,024, 2,048 and `decodeAt` cached tokens (`&attnAt=512,7900` for others), values alternating over `&rounds=12`; prints the median and best ms. Several knobs at once: `attnab=default|flashDecode:1,flashChunkTexels:64|…`; `skip:attend` leaves out passes of a name. On an M3 a pass costs tens of µs whatever it does, so whole writing steps there are mostly passes; this shows what attention's work costs.
 - Every smoke run ends with `LOGITS HASH`: the bits of the prompt's logits and of 8 writing steps', hashed. Two builds or settings with the same hash computed the same numbers. Fix the weight layout (`&tune=layerRgba4:1`) when comparing: an M3's timing probe picks RGBA4 or bytes from load to load, and they round differently.
 
-## compare.html
-
-`?run=webgl&model=…&len=512&speculative=0&tune=knob:v,…`: the worker as the app runs it (downloading the model to the page's storage the first time): a short warm-up reply, then three runs of a `len`-token chat prompt (each with its own first line, so none reuses the last), 64 greedy tokens each; prints each run and the median prompt reading, writing and first-token time, then a retry of the last prompt. `tune` sets TUNING knobs in the worker before the load (`promptBatch:256` for another prompt batch, `layerRgba4:1` to fix the weight layout). `&followup=1` instead times a follow-up: each run a first message, its reply, then an ~80-token question with the reply in the chat, as the app sends it; prints how many of the follow-up's prompt tokens were read again and how long that took.
-
 ## mem.html: memory and speed over a chat (and the iPhone page)
 
 Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
@@ -43,54 +53,16 @@ Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s ba
 - `mode=ab&variants=default|f16Matmul:2|packZeros:0|batch:256|batch:128&rounds=2`: each variant in a load of its own (TUNING knobs as `knob:v,…`, `batch:N` for the prompt batch), timed on a `len`-token first message and its reply, rounds in alternating order; prints each run, then the medians: prompt reading, first token, writing, textures at load and at the peak.
 - `cdp=1` waits at each checkpoint for a driver to measure the JS heaps and the GPU process over the DevTools protocol.
 
-On an iPhone: start the server on the Mac (`node packages/webgl/bench/server.mjs 8787`; the page needs none of the model directories), then either
+On an iPhone: start the server on the Mac (`node packages/webgllm/bench/server.mjs 8787`; the page needs none of the model directories), then either
 
 - tunnel it over HTTPS (`cloudflared tunnel --url http://localhost:8787`, or `ngrok http 8787`) and open `https://<tunnel>/mem.html?…` in Safari: a secure context, so the model downloads once (about 1.1 GB) and loads from the page's storage after that, and the log also prints in the server's terminal; or
-- serve the network (`HOST=0.0.0.0 node packages/webgl/bench/server.mjs 8787`) and open `http://<the Mac's address>:8787/mem.html?…` on the same Wi-Fi: no storage there, so each load streams the model from Hugging Face again.
+- serve the network (`HOST=0.0.0.0 node packages/webgllm/bench/server.mjs 8787`) and open `http://<the Mac's address>:8787/mem.html?…` on the same Wi-Fi: no storage there, so each load streams the model from Hugging Face again.
 
 For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html?model=qwen-gguf&len=2048&follow=1024&reply=128&target=8192&ctx=8192` (`&batch=128` for the smallest batch's memory). The timings a phone's defaults would need: `mem.html?model=qwen-gguf&mode=ab&len=535&reply=64&rounds=3&variants=default|f16Matmul:2|packZeros:0|batch:512|batch:256|batch:128|batch:128,quadMinBatch:128` (`packZeros` only matters for the ONNX builds; run it on each build). A tab that reloads by itself ran out of memory.
 
-## tools.html: does the reply start with a tool call?
+## q4-matmul.html: the first kernel
 
-Prompts that need a tool (weather, web search, calendar, run Python), with thinking off, as token ids from `REF_DIR/<set>/tool_prompts.json`. For each prompt it prints the probability that the reply starts with `<tool_call>`, the top token, and KL against each CPU reference in the set at that position, then writes a 48-token greedy reply to `RESULTS_FILE`.
-
-- `?set=lfm3&runtime=webgl&format=onnx&onnx=onnx-community`: this engine on the ONNX build in `ONNX_COMMUNITY_DIR` (`&graph=` for another graph path).
-- `?set=lfm3&runtime=webgl&format=gguf&model=LFM3-1.7B-QAD-Q4_0.gguf`: this engine on a GGUF in `MODELS_DIR`.
-- `?set=lfm3&runtime=tjs&onnx=onnx-community`: Transformers.js 4.3.2 on WebGPU (q4f16), with the app's ONNX Runtime.
-
-`tool-ref/` makes the sets: `make_lfm3_ref.py` (prompts and onnxruntime CPU logits), `add_lfm3_ref.py` (another CPU reference, such as exact 4-bit math), `make_qwen_ref.py` (the same prompts in Qwen3.5's template, no logits) and `llama_ref.py` (a running llama-server's first-token probabilities and replies, for GGUFs).
-
-LFM3 1.7B, 20 prompts, Apple M3 Ultra (Nov 1):
-
-| | Starts with a tool call | Greedy calls first | No call in 48 tokens |
-|---|---|---|---|
-| fp16 (onnxruntime CPU) | 0.966 | 20/20 | |
-| LiquidAI's QAD Q4_0 GGUF, this engine | 0.960 | 20/20 | 0 |
-| the same GGUF, llama.cpp CPU | 0.965 | 20/20 | 0 |
-| onnx-community's q4f16, this engine | 0.634 | 16/20 | 4 |
-| the same, onnxruntime CPU, exact 4-bit math | 0.634 | 16/20 | 4 |
-| the same, onnxruntime CPU as shipped | 0.607 | 13/20 | 5 |
-| the same, Transformers.js (WebGPU) | 0.576 | 14/20 | 4 |
-
-The engine matches exact math (mean KL 1.1e-4, same top token at 20 of 20) and llama.cpp; Transformers.js is 200× further from exact math (KL 2.1e-2). onnx-community's graph sets `accuracy_level` 4 on its 4-bit matmuls, so onnxruntime's CPU quantizes their activations to 8 bits: an exact-math reference needs a copy with 0. The q4f16 build's misses are in its weights: on three calendar prompts and one weather prompt it reasons in text (it doesn't know today's date) where fp16 and the GGUF call the tool.
-
-Qwen3.5 2B, the same prompts with thinking off, 96-token replies (`?set=qwen&steps=96`; its template allows reasoning before a call):
-
-| | Starts with a tool call | Greedy calls first | No call in 96 tokens |
-|---|---|---|---|
-| unsloth's Q4_0 GGUF, this engine | 0.967 | 20/20 | 0 |
-| the same GGUF, llama.cpp CPU | 0.969 | 20/20 | 0 |
-| onnx-community's q4f16, this engine (`&graph=onnx/decoder_model_merged_q4f16.onnx`) | 0.741 | 18/20 | 1 |
-
-The q4f16 build talks before one call, and answers "sort [5, 3, 9, 1] with Python" with a code block (that doesn't sort) instead of a call.
-
-## tjs-mem.html: the Transformers.js worker's memory
-
-`?model=onnx-community/Qwen3.5-2B-ONNX&len=2048&max=128&ctx=8192`: the transformers-js package's worker (debug on) loads the model, reads a chat prompt padded to about `len` tokens (counted with the model's own tokenizer from Hugging Face) and writes `max` tokens greedily. It prints the worker's memory log, then a summary: GPU buffers at the load peak, after the prompt and at the reply's peak and end, WebAssembly memory, and the prompt and writing speeds. `&wait=` ms between load and prompt, `&runs=` prompts in a row.
-
-## index.html: the go/no-go benchmark
-
-The first step, before the engine: one Q4_0 matmul kernel on every LFM3 projection shape at 128 tokens (`?run=gpu`), against wllama's relaxed-SIMD build reading the same number of tokens (`?run=cpu`). On a Pixel 10 Pro in Firefox, LFM3's matmuls for 128 tokens took 1.49 s (86 tokens/s) against 24.5 prompt tokens/s for wllama's whole model, so the engine was built.
+The first step, before the engine: one Q4_0 matmul kernel (`q4-matmul.js`, run by `gpu-bench-worker.js`) on every LFM3 projection shape at 128 tokens (`?m=128`; `?run=gpu` runs on load), each variant checked against a JavaScript reference first. On a Pixel 10 Pro in Firefox, LFM3's matmuls for 128 tokens took 1.49 s (86 tokens/s) against 24.5 prompt tokens/s for a whole-model llama.cpp CPU build, so the engine was built (that comparison page stays in tanstack-ai-browser).
 
 Pitfalls it found: PowerVR merges and skips full-screen draws whose output is overwritten later, even across framebuffer switches, so a timed draw must read the previous draw's output; `unpackUnorm2x16` returns wrong values on that driver; a readback costs 10 to 35 ms of fixed latency there.
 
@@ -201,7 +173,7 @@ Where a Qwen3.5 2B prompt's time went (`skip=recurrence`, ONNX, M3 Ultra, Chrome
 
 ## Memory and follow-ups (Nov 1)
 
-`mem.html` (see above) on an M3 Ultra in Chrome, the four builds at 512-token batches; `compare.html` for speed, the weight layout fixed to RGBA4 on both sides of every comparison (`tune=layerRgba4:1`: the M3's layout probe picks RGBA4 or bytes from load to load, and the worker remembers its first pick per code version, which made some comparisons compare layouts).
+`mem.html` (see above) on an M3 Ultra in Chrome, the four builds at 512-token batches; `compare.html` (now in tanstack-ai-browser) for speed, the weight layout fixed to RGBA4 on both sides of every comparison (`tune=layerRgba4:1`: the M3's layout probe picks RGBA4 or bytes from load to load, and the worker remembers its first pick per code version, which made some comparisons compare layouts).
 
 - Kept, each the same speed within the runs' noise (prompt ±2–4%, writing ±1.5%, 3 runs a side): the self-check frees its scratch (29–36 MiB on a first load); Qwen3.5 makes no conv buffers and logits for one row (it reads no draft batches: 49–63 MiB); the anchor snapshot (follow-ups read 159 tokens in 90 ms rather than 687 in 274 ms, ONNX; GGUF 146 ms against 391; 2 snapshots kept, saved after the oldest is freed: 39 MiB less at the peak); the cache growing 512 positions at a time (an 8,192-token prompt's `LOGITS HASH` the same with `kvStep:0`, Qwen3.5 ONNX); no f16 scratch where no 4-token matmuls run (small batches).
 - The anchor first came as a batch of its own for the generation prompt's 7 tokens, as long as a writing step (~12 ms, 6% of a 535-token first message's first token): it's now saved from inside the batch, its recurrence chunks laid out so one ends there (`delta-rule.ts` checks that layout against a token at a time; `check.html?…&anchor=1` the logits both ways: KL 3e-6 and 1e-5).
@@ -269,9 +241,9 @@ settings and gives each run a new result ID. Automation can pass `render=css`
 or `render=canvas` (the default). Every result records the renderer.
 
 ```sh
-node packages/webgl/bench/build-workers.mjs /path/to/original/checkout baseline-worker.js
-node packages/webgl/bench/build-workers.mjs /path/to/optimized/checkout current-worker.js
-RESULTS_FILE=/tmp/webgl-perf.jsonl node packages/webgl/bench/server.mjs 8788
+node packages/webgllm/bench/build-workers.mjs /path/to/original/checkout baseline-worker.js
+node packages/webgllm/bench/build-workers.mjs /path/to/optimized/checkout current-worker.js
+RESULTS_FILE=/tmp/webgl-perf.jsonl node packages/webgllm/bench/server.mjs 8788
 # Same tab: /webgl-perf.html?id=before&baseline=1&rounds=3&len=512
 # Same tab: /webgl-perf.html?id=after&production=1&rounds=3&len=512
 ```
@@ -304,17 +276,18 @@ snapshot only this model's notes; `cold=1` removes only these derived notes.
 natural throughput. It is not a CPU peak measurement. The helpers never create or
 close browser tabs.
 
-The final comparison is in [WEBGL-PERFORMANCE.md](WEBGL-PERFORMANCE.md).
-Validation in a worktree with linked dependencies used:
-
-```sh
-NX_DAEMON=false NX_ISOLATE_PLUGINS=false pnpm --config.verify-deps-before-run=false exec nx run-many -t test typecheck build lint -p webgl --output-style=static
-```
-
-The pnpm option avoids automatic dependency installation into the linked worktree.
+`build-workers.mjs` takes a checkout of this repo or of tanstack-ai-browser from
+before the engine moved (`packages/webgl`). The final comparison is in
+[WEBGL-PERFORMANCE.md](WEBGL-PERFORMANCE.md); its commits are tanstack-ai-browser's.
 
 ## Short shared-prefix caching
 
 See [native Chrome results and reproduction](short-prefix-results/FINDINGS.md) for
 inside-batch state extraction, preserved cold batches and long-prefix behavior,
-SDK tool/cancellation checks, bounded memory, and explicit remaining matcher failures.
+bounded memory, and explicit remaining matcher failures (the SDK-level checks ran
+through the adapter, in tanstack-ai-browser). `prepare-short-prefix.mjs <commit>`
+freezes the baseline source that `short-prefix.html` compares against.
+
+[review-followups/qwen-dead-end-findings.md](review-followups/qwen-dead-end-findings.md)
+records the Qwen finite-string matcher dead end behind `src/constraint/canonical-mask.ts`;
+`qwen-dead-end-replay.mjs` replays it on the CPU with this package's llguidance.

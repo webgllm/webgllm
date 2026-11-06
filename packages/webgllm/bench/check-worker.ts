@@ -19,13 +19,13 @@ type Manifest = {
 
 const log = (text: string) => postMessage({ type: "log", text })
 
-/** Where the ONNX build's files are served: /onnx-web/ or /onnx-community/. */
-let onnxDir = "/onnx-web"
+/** Where the ONNX build's files are served: /onnx-community/ (ONNX_COMMUNITY_DIR) or /onnx/ (ONNX_DIR). */
+let onnxDir = "/onnx-community"
 
 /** Where the reference tensors are: /ref/ (llama.cpp, GGUF) or /ref-onnx/ (onnxruntime). */
 let refBase = "/ref/"
 
-/** The model's weights: the GGUF from /models/, or the ONNX build from /onnx-web/. */
+/** The model's weights: the GGUF from /models/, or the ONNX build from /onnx-community/. */
 async function modelPieces(params: {
   model: string
   format?: "gguf" | "onnx"
@@ -370,7 +370,7 @@ async function run(params: {
   let klSum = 0
   const forwardStart = performance.now()
   // Every position scored too, against the fp32 reference where there is
-  // one and the main reference (as the Transformers.js quality page does).
+  // one and the main reference.
   const hasFp32 = files.has("logits_fp32.bin")
   const all = { fp32: { kl: 0, top1: 0 }, main: { kl: 0, top1: 0 } }
   const checkedFp32 = { kl: 0, top1: 0, n: 0 }
@@ -773,7 +773,7 @@ async function formats(engine: Engine, headOnly: boolean) {
 async function smoke(params: {
   model: string
   format?: "gguf" | "onnx"
-  /** The ONNX build's directory on the server (default onnx-web). */
+  /** The ONNX build's directory on the server (default onnx-community). */
   onnx?: string
   batch: number
   precision: "highp" | "mediump"

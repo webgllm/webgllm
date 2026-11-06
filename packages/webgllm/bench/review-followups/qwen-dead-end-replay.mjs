@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-const require = createRequire(new URL('../../../structured-output/package.json', import.meta.url));
+const require = createRequire(new URL('../../package.json', import.meta.url));
 const { loadJsonGuidance } = await import(pathToFileURL(require.resolve('llguidance/json-schema')));
 const file = process.argv[2];
 if (!file) throw Error('Pass the exact public Qwen tokenizer.json path.');

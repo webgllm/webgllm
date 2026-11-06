@@ -32,15 +32,16 @@ function accounting(engine: Engine) {
   const points = [...(Reflect.get(engine, "snapshots") as Map<number, { conv: { bytes: number }[]; windows: { bytes: number }[]; linear: { bytes: number }[]; hidden?: { bytes: number }; prefix?: boolean; anchor?: boolean }>)].map(([at, s]) => ({ at, prefix: !!s.prefix, anchor: !!s.anchor, bytes: [...s.conv, ...s.windows, ...s.linear, ...(s.hidden ? [s.hidden] : [])].reduce((a, t) => a + t.bytes, 0) }))
   return { count: points.length, limit: engine.snapshotLimit, bytes: points.reduce((a, p) => a + p.bytes, 0), points, gpuBytes: engine.gpu.bytes }
 }
+/** Each variant's engine and prompt modules, bundled by bench/server.mjs: "before" is the snapshot prepare-short-prefix.mjs wrote. */
 async function runtime(variant: string): Promise<Runtime> {
-  const directory = variant === "before" ? "../.short-prefix-qa/before/" : "../src/"
-  return { ...await import(/* @vite-ignore */new URL(directory + "engine.ts", import.meta.url).href), ...await import(/* @vite-ignore */new URL(directory + "prompt.ts", import.meta.url).href) }
+  const url = variant === "before" ? "/bundle/.short-prefix-qa/before/runtime.js" : "/bundle/bench/short-prefix-runtime.js"
+  return await import(url) as Runtime
 }
 let active = false
 self.addEventListener("message", async ({ data }: MessageEvent<{ model: WebGlTextModel; rounds?: number; pairedOnly?: boolean; blockingWait?: boolean }>) => {
   if (active) return
   active = true
-  const report: Record<string, unknown> = { model: data.model, startedAt: new Date().toISOString(), results: [], errors: [], scope: "Cold pp/s includes GPU completion, excludes output head. Forced decode includes logits readback. SDK benchmark separately measures production generation. Five samples per cold length per variant/round; two warmups." }
+  const report: Record<string, unknown> = { model: data.model, startedAt: new Date().toISOString(), results: [], errors: [], scope: "Cold pp/s includes GPU completion, excludes output head. Forced decode includes logits readback. Five samples per cold length per variant/round; two warmups." }
   const results = report.results as Record<string, unknown>[]
   try {
     emit("status", "Loading model/tokenizer files from the normal browser cache…")

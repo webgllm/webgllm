@@ -18,4 +18,4 @@ The first-party guard recognizes only plain strict objects of finite printable-A
 
 The historical saved tool-London failure has no accepted-token trace. Its exact cause cannot be reconstructed; the fresh cache-disabled reproduction proves this failure mechanism exists independently of engine restoration, not the historical run's precise path. Earlier invalid diagnostic-harness outcomes are excluded.
 
-CPU replay: download the public tokenizer matching qwen-guard-manifest.json's SHA256, then run node packages/webgl/bench/review-followups/qwen-dead-end-replay.mjs /absolute/path/to/tokenizer.json. The raw matcher reproducer intentionally bypasses the first-party wrapper.
+CPU replay: download the public tokenizer matching qwen-guard-manifest.json's SHA256, then run node packages/webgllm/bench/review-followups/qwen-dead-end-replay.mjs /absolute/path/to/tokenizer.json. The raw matcher reproducer intentionally bypasses the first-party wrapper.

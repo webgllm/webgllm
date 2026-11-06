@@ -23,7 +23,7 @@
     <pre id="out"></pre>
     <script type="module">
       // What this browser's WebGL 2 offers, against what the engine needs
-      // (see hasWebGl2 in src/client.ts).
+      // (the engine's own WebGL 2 support check).
       const out = document.getElementById("out")
       const log = (text) => {
         out.textContent += `${text}\n`
