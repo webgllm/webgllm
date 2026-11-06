@@ -161,3 +161,40 @@ export function verify(
   for (let i = 0; i < rest.length; i++) rest[i] /= total
   return { kept: false, token: draw({ ids: d.ids, p: rest }, random) }
 }
+
+/**
+ * The token at `u` (in [0, 1)) of `d`'s cumulative distribution, with its
+ * tokens taken in ascending id order: the same token for the same
+ * distribution, whatever order its candidates were read back in (seeded
+ * sampling; see seeded-random.ts).
+ */
+export function drawAt(d: { ids: Int32Array; p: Float32Array }, u: number): number {
+  const n = d.ids.length
+  let ordered = true
+  for (let j = 1; j < n && ordered; j++) ordered = d.ids[j] > d.ids[j - 1]
+  const order = ordered ? null : Array.from({ length: n }, (_, j) => j).sort((a, b) => d.ids[a] - d.ids[b])
+  let left = u
+  let best = order ? order[0] : 0
+  for (let k = 0; k < n; k++) {
+    const j = order ? order[k] : k
+    if (d.p[j] > d.p[best]) best = j
+    left -= d.p[j]
+    if (left < 0 && d.p[j] > 0) return d.ids[j]
+  }
+  return d.ids[best]
+}
+
+/**
+ * verify for seeded sampling: the token at `u` is drawn (drawAt), and the
+ * draft is kept exactly when it's that token. Kept with the probability
+ * `d` gives it, and replaced by a draw from `d` without it otherwise, as
+ * verify does; and a reply's tokens don't depend on which were drafted.
+ */
+export function verifyAt(
+  d: { ids: Int32Array; p: Float32Array },
+  drafted: number,
+  u: number
+): { kept: true } | { kept: false; token: number } {
+  const token = drawAt(d, u)
+  return token === drafted ? { kept: true } : { kept: false, token }
+}

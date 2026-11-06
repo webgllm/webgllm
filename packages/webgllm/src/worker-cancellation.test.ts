@@ -26,6 +26,10 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { outputTokenLimit } from './generation-limits.js';
   import { StructuredGeneration } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
+  import { planToolChoice } from './tool-choice.js';
+  import { createStopFilter } from './stop-sequences.js';
+  import { seededUniforms } from './seeded-random.js';
+  import { CodedError } from './worker-errors.js';
   export function makeGenerate(state) {
     const stopped=state.stopped,post=m=>state.messages.push(m);
     const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();

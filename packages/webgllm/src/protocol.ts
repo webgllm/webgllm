@@ -4,6 +4,25 @@ import type { ChatMessage, ChatTool } from "./tokenizer.js"
 
 export type GenerationPhase = "processing" | "generating"
 
+/** Why a generation ended: its end-of-turn token or a stop sequence, or maxTokens. */
+export type FinishReason = "stop" | "length"
+
+/** Error codes the worker attaches to failures (WebGLLMError.code on the page). */
+export type WorkerErrorCode =
+  | "webgl2-unavailable"
+  | "download-failed"
+  | "storage-full"
+  | "out-of-memory"
+  | "gpu-context-lost"
+  | "context-length-exceeded"
+  | "invalid-schema"
+
+/**
+ * OpenAI's tool_choice: "auto" lets the model decide, "none" offers no tools,
+ * "required" makes it call one of them, a name makes it call that one.
+ */
+export type ToolChoice = "auto" | "none" | "required" | { name: string }
+
 /** Token counts and timings of one generation, measured in the worker. */
 export type RunTimings = {
   /** Tokens of the prompt, including any already in the cache. */
@@ -74,6 +93,15 @@ export type WorkerRequest =
       sampling: Sampling
       /** Most tokens to generate; EOS or remaining model context when left out. */
       maxTokens?: number
+      /**
+       * End the reply where any of these strings first appears in its
+       * answer (not in its thinking); the stop string itself is not sent.
+       */
+      stop?: Array<string>
+      /** Seeds the sampler: the same seed, prompt and settings give the same reply. */
+      seed?: number
+      /** "auto" when left out. A forced call is sent as `toolCall` in "done", not as text. */
+      toolChoice?: ToolChoice
       /** Draft tokens by prompt lookup (speculative decoding); on by default. */
       speculative?: boolean
       /**
@@ -83,6 +111,8 @@ export type WorkerRequest =
       pipeline?: boolean
     }
   | { type: "stop"; id: string }
+  /** Download a model's files to storage without loading it ("progress", then "downloaded"). */
+  | { type: "download"; model: string }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
   /** The page made room for the model (see "claim"): the worker loads it. */
   | { type: "claimed" }
@@ -101,10 +131,14 @@ export type WorkerResponse =
   | {
       type: "ready"
       model: string
+      /** Tokens the loaded model holds, prompt and reply together. */
+      contextLength?: number
       /** Milliseconds each phase of the load took (a fresh load only). */
       timings?: Record<string, number>
     }
-  | { type: "load-error"; model: string; message: string }
+  | { type: "load-error"; model: string; message: string; code?: WorkerErrorCode }
+  | { type: "downloaded"; model: string }
+  | { type: "download-error"; model: string; message: string; code?: WorkerErrorCode }
   /**
    * The model takes about `bytes` once loaded: the page makes room for it
    * (unloading other runtimes' models past the memory budget, see
@@ -113,6 +147,13 @@ export type WorkerResponse =
   | { type: "claim"; model: string; bytes: number }
   | { type: "phase"; id: string; phase: GenerationPhase }
   | { type: "token"; id: string; text: string }
-  | { type: "done"; id: string; stats: RunTimings }
-  | { type: "error"; id: string; message: string }
+  | {
+      type: "done"
+      id: string
+      stats: RunTimings
+      finishReason: FinishReason
+      /** The call a forced toolChoice ("required" or a name) produced. */
+      toolCall?: { name: string; arguments: Record<string, unknown> }
+    }
+  | { type: "error"; id: string; message: string; code?: WorkerErrorCode }
   | { type: "log"; text: string }

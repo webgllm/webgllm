@@ -19,7 +19,7 @@ const safe = (name: string) => name.replace(/[^\w.@-]+/g, "_")
  * The file's name on disk: its repository and path, at main (files saved
  * by earlier versions of this package carry a pinned commit instead).
  */
-const diskName = (file: ModelFile) => safe(`${file.repo}@main/${file.path}`)
+export const diskName = (file: ModelFile) => safe(`${file.repo}@main/${file.path}`)
 
 const marker = (file: ModelFile) => `${diskName(file)}.done`
 
@@ -138,6 +138,10 @@ async function writeNote(key: string, note: GpuNote) {
     // Remembering is optional.
   }
 }
+
+/** The origin's storage quota ran out (a DOMException: not an Error in every engine). */
+export const isQuotaError = (error: unknown) =>
+  !!error && typeof error === "object" && (error as { name?: unknown }).name === "QuotaExceededError"
 
 /** Waits `ms`, or rejects when `signal` aborts. */
 const sleep = (ms: number, signal?: AbortSignal) =>
@@ -340,7 +344,8 @@ export async function download(
         }
         break
       } catch (error) {
-        if (signal?.aborted) throw error
+        // A full disk stays full: no point trying again.
+        if (signal?.aborted || isQuotaError(error)) throw error
         loaded = await size()
         attempt = loaded > start ? 1 : attempt + 1
         if (attempt >= ATTEMPTS) throw error

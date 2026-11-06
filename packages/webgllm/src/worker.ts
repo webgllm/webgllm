@@ -17,9 +17,9 @@ import { modelMeta } from "./model-meta.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile, WebGlTextModel } from "./model-meta.js"
-import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
-import { createSampler, draw, verify } from "./sampler.js"
+import { createSampler, draw, drawAt, verify, verifyAt } from "./sampler.js"
 import { download, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
@@ -29,6 +29,12 @@ import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
+import { planToolChoice } from "./tool-choice.js"
+import type { ToolCall } from "./tool-choice.js"
+import { createStopFilter } from "./stop-sequences.js"
+import { seededUniforms } from "./seeded-random.js"
+import { CodedError, downloadError, errorCode } from "./worker-errors.js"
+import { createSharedDownloads } from "./shared-download.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -130,7 +136,15 @@ class Superseded extends Error {
   }
 }
 
-async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
+/** Downloads in progress, shared by a "download" request and a load (see shared-download.ts). */
+const downloads = createSharedDownloads<File>()
+
+/**
+ * The model's files, downloaded unless they're stored. Progress goes up to
+ * `share` (a load's uploading takes the rest). Needs no GPU: a worker may
+ * only download.
+ */
+async function fetchFiles(model: WebGlTextModel, signal: AbortSignal, share = 0.9) {
   const meta = modelMeta(model)
   const weights: Array<ModelFile> =
     meta.files.kind === "gguf"
@@ -156,7 +170,7 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
     post({
       type: "progress",
       model,
-      progress: total() ? Math.min(sum / total(), 1) * 0.9 : 0,
+      progress: total() ? Math.min(sum / total(), 1) * share : 0,
       cached: false,
       loadedBytes: sum,
       totalBytes: total()
@@ -166,8 +180,9 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
     all.map((file, i) =>
       stored[i]
         ? Promise.resolve(stored[i])
-        : download(
-            file,
+        : downloads(
+            `${file.repo}/${file.path}`,
+            (onProgress, shared) => download(file, onProgress, shared),
             (bytes, size) => {
               loaded[i] = bytes
               totals[i] = Math.max(totals[i], size)
@@ -176,7 +191,9 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal) {
             signal
           )
     )
-  )
+  ).catch((error: unknown) => {
+    throw downloadError(error, signal)
+  })
   const [tokenizerFile, tokenizerConfigFile, ...rest] = files
   // tokenizer_config.json's template when the model has no file for it.
   const templateFile = template.length ? rest.shift() : undefined
@@ -449,7 +466,7 @@ function startLoad(
     current.contextLength === contextLength &&
     !current.engine.gpu.isLost
   ) {
-    post({ type: "ready", model })
+    post({ type: "ready", model, contextLength: current.engine.contextLength })
     return Promise.resolve(current)
   }
   if (loading?.model === model && loading.contextLength === contextLength) {
@@ -473,15 +490,30 @@ function startLoad(
       }
       loading = null
       current = loaded
-      post({ type: "ready", model, timings: loaded.timings })
+      post({ type: "ready", model, contextLength: loaded.engine.contextLength, timings: loaded.timings })
     },
     (error: unknown) => {
       if (loading !== entry) return
       loading = null
-      post({ type: "load-error", model, message: errorMessage(error) })
+      post({ type: "load-error", model, message: errorMessage(error), code: errorCode(error) })
     }
   )
   return promise
+}
+
+/**
+ * Downloads `model`'s files to storage without loading it: no GL context,
+ * so a worker spawned just for this works where WebGL 2 doesn't.
+ */
+async function downloadModel(model: string) {
+  try {
+    if (!modelMeta(model as WebGlTextModel)) throw new Error(`${model} isn't a model this engine runs.`)
+    const { cached } = await fetchFiles(model as WebGlTextModel, new AbortController().signal, 1)
+    post({ type: "progress", model, progress: 1, cached })
+    post({ type: "downloaded", model })
+  } catch (error) {
+    post({ type: "download-error", model, message: errorMessage(error), code: errorCode(error) })
+  }
 }
 
 const stopped = new Set<string>()
@@ -506,29 +538,34 @@ async function generate(request: GenerateRequest) {
     promptMs: 0,
     decodeMs: 0
   }
-  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   // The model this request is for: loaded again if its GPU context was
   // lost, or loaded if another was asked for since.
   const model = await startLoad(request.model, request.contextLength)
-  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   const calibration = model.engine.gpu.calibratePromptPacing()
   if (calibration) {
     await calibration
-    if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+    if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   }
   return withPromptCachePolicy(model, request.cachePrompt, async () => {
   if (request.reportPhases) post({ type: "phase", id, phase: "processing" })
   const { engine, tokenizer } = model
   const compiledBefore = engine.gpu.compiled.count
+  const toolPlan = planToolChoice(request.tools, request.toolChoice)
+  const tools = toolPlan.tools.length ? toolPlan.tools : undefined
+  const forced = toolPlan.mode === "forced" ? toolPlan : undefined
+  // A forced call is the reply: its arguments' schema takes the answer's place.
+  const answerSchema = forced ? forced.schema : request.outputSchema
   const tokenizeAt = performance.now()
   const prompt = tokenizer.encodeChat(request.chat, {
-    tools: request.tools.length ? request.tools : undefined,
+    tools,
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
     addGenerationPrompt: true
   })
   const cacheEnabled = request.cachePrompt !== false
-  const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
-  const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, request.tools.length ? request.tools : undefined) : undefined
+  const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
+  const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
   const tokenizeMs = performance.now() - tokenizeAt
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
@@ -545,11 +582,11 @@ async function generate(request: GenerateRequest) {
   // assistant\n. Seed that expected marker so the answer grammar never suppresses reasoning.
   const reasoning = modelMeta(request.model as WebGlTextModel).reasoning
   const mandatoryThinking = !!reasoning && "levels" in reasoning && !("off" in reasoning.levels)
-  const openThinking = request.outputSchema !== undefined && !startsInThinking && think !== null &&
+  const openThinking = answerSchema !== undefined && !startsInThinking && think !== null &&
     (request.thinking === true || (request.thinking === undefined && mandatoryThinking))
   const schemaAt = performance.now()
-  const structured = request.outputSchema === undefined ? undefined : new StructuredGeneration(
-    await createConstraint({ schema: request.outputSchema, tokenizer: tokenizer.constraintTokenizer }),
+  const structured = answerSchema === undefined ? undefined : new StructuredGeneration(
+    await createConstraint({ schema: answerSchema, tokenizer: tokenizer.constraintTokenizer }),
     tokenizer.specialTokens.eos,
     tokenizer.specialTokens.thinkEnd,
     startsInThinking || openThinking,
@@ -557,12 +594,13 @@ async function generate(request: GenerateRequest) {
   )
   const schemaMs = performance.now() - schemaAt
   try {
-  if (stopped.has(id)) return post({ type: "done", id, stats: empty })
+  if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   engine.setAllowedTokens(null)
   const room = engine.contextLength - prompt.length
   if (room <= 0) {
-    throw new Error(
-      `This session is too long for the model: ${prompt.length} tokens, and it can read ${engine.contextLength} at most, reply included. Start a new session to keep going.`
+    throw new CodedError(
+      `This session is too long for the model: ${prompt.length} tokens, and it can read ${engine.contextLength} at most, reply included. Start a new session to keep going.`,
+      "context-length-exceeded"
     )
   }
 
@@ -632,7 +670,7 @@ async function generate(request: GenerateRequest) {
     model.cached.length < prompt.length
   ) {
     if (structured && !stopped.has(id)) throw new Error("Structured output was truncated before generation could produce a schema-valid answer.")
-    return post({ type: "done", id, stats })
+    return post({ type: "done", id, stats, finishReason: maxTokens <= 0 && !stopped.has(id) ? "length" : "stop" })
   }
 
   const { sampling } = request
@@ -649,6 +687,14 @@ async function generate(request: GenerateRequest) {
   )
   if (onGpu) engine.setSeen(prompt, vocab)
   else sampler.see(prompt)
+  // With a seed, the number each token is drawn with comes from the seed
+  // and the token's place in the reply (see seeded-random.ts); else
+  // Math.random, as before. Greedy picks don't depend on either.
+  const uniform = request.seed === undefined ? undefined : seededUniforms(request.seed)
+  const pick = (d: { ids: Int32Array; p: Float32Array }) =>
+    uniform ? drawAt(d, uniform(stats.outputTokens)) : draw(d)
+  const check = (d: { ids: Int32Array; p: Float32Array }, drafted: number) =>
+    uniform ? verifyAt(d, drafted, uniform(stats.outputTokens)) : verify(d, drafted)
   // The likeliest token is read forward while each token is drawn (see
   // Engine.forwardGuess), while that's usually the token drawn.
   const guesses: Array<boolean> = []
@@ -775,16 +821,31 @@ async function generate(request: GenerateRequest) {
     })
   }
 
+  // Stop sequences end the answer (see stop-sequences.ts); a forced call's
+  // JSON isn't text: it's kept, and sent as the call (see "done").
+  const stopFilter = createStopFilter(request.stop)
+  let stopHit = false
+  let sawEos = false
+  let callText = ""
+  /** Sends reply text; false once a stop sequence ended the reply. */
+  const send = (text: string) => {
+    if (!stopFilter) {
+      post({ type: "token", id, text })
+      return true
+    }
+    const out = stopFilter.push(text)
+    if (out.text) post({ type: "token", id, text: out.text })
+    stopHit = out.stopped
+    return !stopHit
+  }
   // When the template opens the thinking itself (LFM3 with thinking on ends
   // the prompt with `<think>`, Qwen3.5 with `<think>\n`), the reply starts
   // inside it: say so first, as the model would have, so the thinking
   // reads as thinking.
-  if (startsInThinking) {
-    post({ type: "token", id, text: THINK_OPEN })
-  }
+  if (startsInThinking) send(THINK_OPEN)
 
   // A zero budget may close a template-opened span before any sampling.
-  let token = openThinking ? think as number : thinkingBudget?.forcedToken ?? draw(await distribution(row, guessing()))
+  let token = openThinking ? think as number : thinkingBudget?.forcedToken ?? pick(await distribution(row, guessing()))
   stats.promptMs = performance.now() - promptStart
   if (request.reportPhases && !stopped.has(id)) {
     post({ type: "phase", id, phase: "generating" })
@@ -798,15 +859,23 @@ async function generate(request: GenerateRequest) {
   // Writes out a token of the reply; false once the reply is over.
   const emit = (t: number) => {
     stats.outputTokens++
+    // (Whether this token is the call's, before it may close the thinking.)
+    const calling = !!forced && structured!.answering
     structured?.observe(t)
-    if (t === eos) return false
+    if (t === eos) {
+      sawEos = true
+      return false
+    }
     thinkingBudget?.observe(t)
     if (onGpu) engine.markSeen(t)
     else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
     const text = decoder.push(t)
-    if (text) post({ type: "token", id, text })
+    if (text) {
+      if (calling) callText += text
+      else if (!send(text)) return false
+    }
     return stats.outputTokens < maxTokens
   }
   let going = emit(token)
@@ -828,7 +897,7 @@ async function generate(request: GenerateRequest) {
           !draftsNext()
         const guess = more && guessing()
         const d = await distribution(0, guess)
-        token = thinkingBudget?.forcedToken ?? draw(d)
+        token = thinkingBudget?.forcedToken ?? pick(d)
         if (!guess) scoreGuess(d, token)
         policy.alone(performance.now() - stepStart)
         going = emit(token)
@@ -881,13 +950,13 @@ async function generate(request: GenerateRequest) {
       const last = i + 1 === batch.length
       const d = all ? all[i] : await distribution(i, last && guessLast)
       if (last) {
-        next = draw(d)
+        next = pick(d)
         if (!guessLast) scoreGuess(d, next)
         break
       }
-      const check = verify(d, batch[i + 1])
-      if (!check.kept) {
-        next = check.token
+      const verdict = check(d, batch[i + 1])
+      if (!verdict.kept) {
+        next = verdict.token
         break
       }
       kept++
@@ -916,7 +985,7 @@ async function generate(request: GenerateRequest) {
     model.cached.push(...batch.slice(0, kept))
     if (constrainedRow >= 0 && going) {
       engine.dropGuess()
-      next = draw(await distribution(constrainedRow, false))
+      next = pick(await distribution(constrainedRow, false))
     }
     if (!going || next < 0) break
     token = next
@@ -925,7 +994,12 @@ async function generate(request: GenerateRequest) {
   // A guess still pending is for a token that wasn't drawn.
   engine.dropGuess()
   const rest = decoder.flush()
-  if (rest) post({ type: "token", id, text: rest })
+  if (rest && !stopHit) {
+    if (forced && structured!.answering) callText += rest
+    else send(rest)
+  }
+  const held = stopHit ? "" : stopFilter?.flush()
+  if (held) post({ type: "token", id, text: held })
   if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
   if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)
@@ -953,9 +1027,16 @@ async function generate(request: GenerateRequest) {
     model.claimed = engine.gpu.bytes
     void claimMemory(model.model, model.claimed)
   }
-  if (structured && !stopped.has(id) && !structured.complete) {
+  // (A stop sequence the caller asked for may end a JSON answer early.)
+  if (structured && !stopped.has(id) && !stopHit && !structured.complete) {
     throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
   }
+  let toolCall: ToolCall | undefined
+  if (forced && structured?.complete) toolCall = forced.read(JSON.parse(callText))
+  // "length": maxTokens or the context ended it, not its end-of-turn token,
+  // a stop sequence or a stop request.
+  const finishReason: FinishReason =
+    !sawEos && !stopHit && !stopped.has(id) && stats.outputTokens >= maxTokens ? "length" : "stop"
   // Extend the startup-tested overlap only from completed real inference.
   // Persist in the background so OPFS never delays completion.
   const pacing = engine.gpu.validatedPresentation
@@ -966,7 +1047,7 @@ async function generate(request: GenerateRequest) {
     model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
     void writeGpuNote(model.noteKey, model.note)
   }
-  post({ type: "done", id, stats })
+  post({ type: "done", id, stats, finishReason, ...(toolCall && { toolCall }) })
   } finally {
     structured?.dispose()
     engine.setAllowedTokens(null)
@@ -997,6 +1078,8 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
     void startLoad(data.model, data.contextLength).catch(() => undefined)
   } else if (data.type === "stop") {
     stopped.add(data.id)
+  } else if (data.type === "download") {
+    void downloadModel(data.model)
   } else {
     queue = queue
       .then(() => generate(data))
@@ -1004,7 +1087,8 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
         // A lost GPU context can't be used again: the next generation
         // loads the model afresh. Otherwise the cache may hold part of a
         // batch (or a failed growth): forget it.
-        if (current?.engine.gpu.isLost) current = null
+        const lost = !!current?.engine.gpu.isLost
+        if (lost) current = null
         else if (current) {
           current.cached.length = 0
           try {
@@ -1013,7 +1097,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
             current = null
           }
         }
-        post({ type: "error", id: data.id, message: errorMessage(error) })
+        post({ type: "error", id: data.id, message: errorMessage(error), code: lost ? "gpu-context-lost" : errorCode(error) })
       })
       .finally(() => {
         stopped.delete(data.id)
