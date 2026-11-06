@@ -48,10 +48,16 @@ type Entry = {
   evicting: Promise<void> | null
   /** The load "loadstart" was dispatched for (one per load, however many wait for it). */
   watched: Promise<void> | null
+  /** Aborted when it's dropped: its claims for memory stop. */
+  gone: AbortController
 }
 
+/** Getting a model's files into storage: one at a time per model. */
 type Download = {
-  worker: ModelWorker
+  /** Stops it, before its worker starts or after. */
+  abort: AbortController
+  /** Its own worker, once it needs one (not when a load or storage has the files). */
+  worker: ModelWorker | null
   promise: Promise<void>
   waiters: number
   listeners: Set<ProgressListener>
@@ -94,7 +100,7 @@ export class ModelPool {
   private askedToKeep = false
 
   constructor(private readonly options: PoolOptions) {
-    this.budget = new MemoryBudget(options.memoryBudget, (model) => this.evict(model))
+    this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
   }
 
   /** Loaded and ready (not being unloaded). */
@@ -239,33 +245,33 @@ export class ModelPool {
     }
   }
 
-  /** Downloads `model`'s files to storage without loading it (in a worker of its own). */
+  /**
+   * Downloads `model`'s files to storage without loading it: settles once
+   * they're there, whatever a load of it meanwhile does on the GPU.
+   */
   async download(
     model: WebGlTextModel,
     options: { onProgress?: ProgressListener; signal?: AbortSignal } = {}
   ): Promise<void> {
     const { onProgress, signal } = options
     throwIfAborted(signal)
-    const entry = this.entries.get(model)
-    // Loaded means downloaded; a load in progress downloads it.
-    if (entry?.worker.ready) return
-    const loading = entry?.worker.loadPromise
-    if (entry && loading) return this.waitForLoad(entry, loading, onProgress, signal)
-    if (await abortable(this.options.storage.downloaded(model), signal)) return
+    // Loaded means downloaded.
+    if (this.entries.get(model)?.worker.ready) return
     let download = this.downloads.get(model)
     if (!download) {
-      const listeners = new Set<ProgressListener>()
-      const worker = new ModelWorker(model, this.options.createWorker, {
-        onProgress: (data) => this.progress(downloadProgress(data), listeners),
-        onClaim: () => Promise.resolve(),
-        onLog: (text) => this.options.log("info", text),
-        onCrash: () => this.downloads.delete(model)
-      })
-      const promise = worker.download().finally(() => {
-        worker.terminate(new Error("The download ended."))
+      // Registered at once, so a load starting meanwhile waits for it.
+      const created: Download = {
+        abort: new AbortController(),
+        worker: null,
+        promise: Promise.resolve(),
+        waiters: 0,
+        listeners: new Set()
+      }
+      created.promise = this.fetchFiles(model, created).finally(() => {
+        created.worker?.terminate(new Error("The download ended."))
         if (this.downloads.get(model) === created) this.downloads.delete(model)
       })
-      const created: Download = { worker, promise, waiters: 0, listeners }
+      created.promise.catch(() => undefined)
       download = created
       this.downloads.set(model, download)
     }
@@ -275,10 +281,7 @@ export class ModelPool {
       await abortable(download.promise, signal)
     } catch (error) {
       // The last caller gave up: stop it (storage keeps what came, to resume from).
-      if (signal?.aborted && download.waiters === 1) {
-        download.worker.terminate(abortError(signal) as Error)
-        this.downloads.delete(model)
-      }
+      if (signal?.aborted && download.waiters === 1) this.stopDownload(model, download, abortError(signal) as Error)
       throw error
     } finally {
       download.waiters--
@@ -286,12 +289,52 @@ export class ModelPool {
     }
   }
 
+  /**
+   * Gets `model`'s files into storage: a load in progress fetches them (its
+   * GPU failing after doesn't matter), else storage has them, else a worker
+   * of the download's own fetches them.
+   */
+  private async fetchFiles(model: WebGlTextModel, download: Download): Promise<void> {
+    const { signal } = download.abort
+    const entry = this.entries.get(model)
+    const loading = entry?.worker.loadPromise
+    if (entry && loading) {
+      // Its downloading, as a download's 0–1.
+      const forward = (progress: LoadProgress) => {
+        if (progress.phase !== "download") return
+        const share = progress.totalBytes ? (progress.loadedBytes ?? 0) / progress.totalBytes : progress.progress / 0.9
+        for (const listener of download.listeners) listener({ ...progress, progress: Math.min(Math.max(share, 0), 1) })
+      }
+      entry.listeners.add(forward)
+      try {
+        await abortable(loading.catch(() => undefined), signal)
+      } finally {
+        entry.listeners.delete(forward)
+      }
+    }
+    if (await abortable(this.options.storage.downloaded(model), signal)) return
+    const worker = new ModelWorker(model, this.options.createWorker, {
+      onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
+      onClaim: () => Promise.resolve(),
+      onLog: (text) => this.options.log("info", text),
+      onCrash: () => {
+        if (this.downloads.get(model) === download) this.downloads.delete(model)
+      }
+    })
+    download.worker = worker
+    await worker.download()
+  }
+
+  private stopDownload(model: string, download: Download, reason: Error) {
+    download.abort.abort(reason)
+    download.worker?.terminate(reason)
+    if (this.downloads.get(model) === download) this.downloads.delete(model)
+  }
+
   /** Stops a download of `model` in progress, if there is one. */
   cancelDownload(model: string) {
     const download = this.downloads.get(model)
-    if (!download) return
-    download.worker.terminate(abortError() as Error)
-    this.downloads.delete(model)
+    if (download) this.stopDownload(model, download, abortError() as Error)
   }
 
   /**
@@ -337,11 +380,12 @@ export class ModelPool {
       listeners: new Set(),
       evicting: null,
       watched: null,
+      gone: new AbortController(),
       worker: new ModelWorker(model, this.options.createWorker, {
         onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
         onClaim: async (bytes) => {
           if (this.entries.get(model) !== entry) return
-          await this.budget.claim(model, bytes, entry.keepLoaded)
+          await this.budget.claim(model, bytes, entry.keepLoaded, entry.gone.signal)
           // (Unloaded while it claimed: what it claimed isn't held.)
           if (!this.entries.has(model)) this.budget.release(model)
         },
@@ -363,6 +407,7 @@ export class ModelPool {
   /** Ends `entry`'s worker, freeing its model and memory; what waits on it fails with `reason`. */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
     entry.worker.terminate(reason)
+    entry.gone.abort(reason)
     if (this.entries.get(entry.model) !== entry) return
     this.entries.delete(entry.model)
     this.budget.release(entry.model)
@@ -377,15 +422,30 @@ export class ModelPool {
   /**
    * Unloads `model` to make room for another: at once, or when its running
    * generation ends (queued ones load it again when their turn comes).
+   * Resolves false, the model staying, if `signal` (the claimant's) aborts
+   * before then.
    */
-  private evict(model: string): Promise<void> {
+  private evict(model: string, signal?: AbortSignal): Promise<boolean> {
     const entry = this.entries.get(model)
-    if (!entry) return Promise.resolve()
-    entry.evicting ??= entry.worker.idle().then(() => {
+    if (!entry) return Promise.resolve(true)
+    if (entry.evicting) return entry.evicting.then(() => this.entries.get(model) !== entry)
+    const evicting = abortable(entry.worker.idle(), signal).then(
+      () => true,
+      () => false
+    ).then((go) => {
+      if (this.entries.get(model) !== entry) return true
+      // The claimant went away while it waited: the model stays.
+      if (!go || signal?.aborted) {
+        if (entry.evicting === done) entry.evicting = null
+        return false
+      }
       this.options.log("info", `Unloaded ${model} to make room for another model.`)
       this.drop(entry, unloaded(model), "evicted")
+      return true
     })
-    return entry.evicting
+    const done = evicting.then(() => undefined)
+    entry.evicting = done
+    return evicting
   }
 
   private progress(progress: LoadProgress, listeners: Set<ProgressListener>) {

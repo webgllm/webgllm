@@ -6,6 +6,7 @@
  * iPhone Safari tab has 2 GB), and small models still stay loaded side by
  * side.
  */
+import { throwIfAborted } from "./errors.js"
 
 /** A loaded model, as the budget knows it. */
 type Held = {
@@ -43,17 +44,23 @@ export class MemoryBudget {
   constructor(
     /** Bytes all models may take together. */
     private readonly limit: () => number,
-    /** Unloads a model to make room (it may wait for the model's generation to end). */
-    private readonly unload: (model: string) => Promise<void> | void
+    /**
+     * Unloads a model to make room (it may wait for the model's generation
+     * to end); false when `signal` aborted first and it stays loaded.
+     */
+    private readonly unload: (model: string, signal?: AbortSignal) => Promise<boolean | void> | boolean | void
   ) {}
 
   /**
    * Makes room for `model`'s `bytes` (in place of what it held before),
    * unloading other models, least recently used first, until it fits
    * (models kept loaded stay, even past the budget), then records it.
+   * Aborting `signal` (the claimant went away) stops it: models not yet
+   * unloaded stay, and nothing is recorded for `model`.
    */
-  claim(model: string, bytes: number, keepLoaded: boolean): Promise<void> {
+  claim(model: string, bytes: number, keepLoaded: boolean, signal?: AbortSignal): Promise<void> {
     const run = this.claims.then(async () => {
+      throwIfAborted(signal)
       const limit = this.limit()
       const own = this.held.get(model)
       this.held.delete(model)
@@ -64,7 +71,8 @@ export class MemoryBudget {
         if (other.keepLoaded) continue
         this.held.delete(other.model)
         total -= other.bytes
-        await this.unload(other.model)
+        if ((await this.unload(other.model, signal)) === false) this.held.set(other.model, other)
+        throwIfAborted(signal)
       }
       this.held.set(model, {
         model,

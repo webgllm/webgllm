@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { blobSource } from "./byte-source.js"
-import { ggufContextLength, modelFiles } from "./model-files.js"
-import { WEBGL_MODEL_META } from "./model-meta.js"
+import { browserStorage, ggufContextLength, modelFiles } from "./model-files.js"
+import { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
 
 /** A GGUF header with these keys (strings, u32s and a string array). */
 function gguf(entries: Array<[string, string | number | Array<string>]>) {
@@ -50,4 +50,32 @@ test("a model's files are the ones the worker fetches", () => {
   assert.deepEqual(gguf.map((f) => f.path), ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "Qwen3.5-2B-Q4_0.gguf"])
   const onnx = modelFiles(WEBGL_MODEL_META["onnx-community/LFM3-1.7B-ONNX"])
   assert.equal(onnx.length, 5)
+})
+
+test("a cold model listing asks the server for each GGUF's size once", async () => {
+  const header = new Uint8Array(await gguf([["general.architecture", "lfm2"], ["lfm2.context_length", 32768]]).arrayBuffer())
+  const file = new Uint8Array(1 << 20)
+  file.set(header)
+  const calls: Array<string> = []
+  const real = globalThis.fetch
+  globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
+    const method = init.method ?? "GET"
+    const range = new Headers(init.headers).get("range")
+    calls.push(`${method} ${input}${range ? ` ${range}` : ""}`)
+    const body = input.endsWith(".gguf") ? file : new TextEncoder().encode(JSON.stringify({ max_position_embeddings: 4096 }))
+    if (method === "HEAD") return new Response(null, { headers: { "content-length": String(body.length) } })
+    const match = range?.match(/bytes=(\d+)-(\d+)/)
+    if (!match) return new Response(body)
+    const slice = body.slice(Number(match[1]), Number(match[2]) + 1)
+    return new Response(slice, { status: 206, headers: { "content-range": `bytes ${match[1]}-${match[2]}/${body.length}` } })
+  }) as typeof fetch
+  try {
+    // (No OPFS here: nothing is stored.)
+    await Promise.all(WEBGL_TEXT_MODELS.map((model) => Promise.all([browserStorage.contextLength(model), browserStorage.size(model), browserStorage.downloaded(model)])))
+  } finally {
+    globalThis.fetch = real
+  }
+  const heads = calls.filter((c) => c.startsWith("HEAD"))
+  console.log(`fetch calls: ${calls.length}`)
+  assert.equal(new Set(heads).size, heads.length, `duplicate size probes: ${heads.filter((c, i) => heads.indexOf(c) !== i).join(", ")}`)
 })

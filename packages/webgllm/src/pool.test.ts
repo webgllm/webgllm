@@ -259,3 +259,53 @@ test("the task queue runs tasks in order, one at a time", async () => {
   await Promise.all([first, second])
   assert.deepEqual(order, ["first start", "first end", "second"])
 })
+
+test("a download waiting on a load settles when the files are there, whatever the GPU says", async () => {
+  // Stored files: the load's GPU failure isn't the download's.
+  const gpu = { message: "no WebGL 2", code: "webgl2-unavailable" as const }
+  const stored = pool({ loadError: () => gpu, downloaded: new Set([A]) })
+  const load = stored.pool.load(A)
+  const download = stored.pool.download(A)
+  await assert.rejects(load, { message: "no WebGL 2" })
+  await download
+  // Not stored: the download goes on in a worker of its own once the load fails.
+  const fresh = pool({ loadError: () => gpu })
+  const failing = fresh.pool.load(A)
+  const downloading = fresh.pool.download(A)
+  await assert.rejects(failing, { message: "no WebGL 2" })
+  await downloading
+  assert.deepEqual(fresh.workers.workers.map((w) => w.sent[0]?.type), ["load", "download"])
+})
+
+test("a load started while a download checks storage waits for that download", async () => {
+  const { pool: p, workers } = pool()
+  const download = p.download(A)
+  const load = p.load(A)
+  await Promise.all([download, load])
+  // One worker fetches the files at a time: the download's, then the load's.
+  assert.deepEqual(workers.workers.map((w) => w.sent[0]?.type), ["download", "load"])
+  assert.equal(p.isLoaded(A), true)
+})
+
+test("a load canceled while it waits for room doesn't unload the model it was waiting on", async () => {
+  const { pool: p, workers } = pool()
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const abort = new AbortController()
+  const loadB = p.load(B, { signal: abort.signal })
+  await settle()
+  abort.abort()
+  await assert.rejects(loadB, { name: "AbortError" })
+  const a = workers.of(A)!
+  a.finish(a.generations()[0]!.id)
+  await running
+  await settle()
+  assert.equal(a.terminated, false)
+  assert.equal(p.isLoaded(A), true)
+  assert.equal(p.isLoaded(B), false)
+  assert.equal(p.memoryUsed, 60)
+  // And the next claim isn't stuck behind it.
+  await p.load(C)
+  assert.equal(p.isLoaded(C), true)
+})

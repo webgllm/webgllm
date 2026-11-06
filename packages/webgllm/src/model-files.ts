@@ -4,7 +4,7 @@
  * the model's context length, and removing them. Facts that don't change
  * (sizes, context lengths) are looked up once per page.
  */
-import { httpSource, blobSource } from "./byte-source.js"
+import { blobSource } from "./byte-source.js"
 import { fileUrl, modelMeta } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
 import { diskName, isOldVersion, storedFile } from "./storage.js"
@@ -61,9 +61,32 @@ function fileSize(file: ModelFile): Promise<number> {
   return size
 }
 
+/**
+ * A file's bytes to read: from storage, else range requests to the server,
+ * sized by fileSize's lookup (shared with the model's size, not a second
+ * HEAD request).
+ */
 async function source(file: ModelFile): Promise<ByteSource> {
   const stored = await storedFile(file)
-  return stored ? blobSource(stored) : httpSource(fileUrl(file))
+  if (stored) return blobSource(stored)
+  const url = fileUrl(file)
+  const size = await fileSize(file)
+  return {
+    size,
+    read: async (offset, length) => {
+      const end = offset + length - 1
+      const response = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` }, referrerPolicy: "no-referrer" })
+      // A 200 is the whole file: fine when that's what was asked for.
+      const whole = response.status === 200 && offset === 0 && length === size
+      if (response.status !== 206 && !whole) {
+        await response.body?.cancel()
+        throw new Error(`${file.path}: range request failed (status ${response.status})`)
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      if (bytes.length !== length) throw new Error(`${file.path}: asked for ${length} bytes, got ${bytes.length}`)
+      return bytes
+    }
+  }
 }
 
 /** Bytes of each GGUF scalar type (gguf.ts's GgufValueType). */
