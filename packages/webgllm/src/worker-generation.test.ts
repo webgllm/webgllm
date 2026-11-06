@@ -62,6 +62,8 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const queue = script.slice()
   const stopped = new Set<string>(), messages: WorkerResponse[] = []
   const masks: Array<Uint32Array | null> = []
+  // What the penalties were given: the tokens set as seen, and each pick's penalties.
+  const seen: number[][] = [], penalties: Array<[number, number]> = []
   let position = 0
   const engine = {
     contextLength: options.contextLength ?? 8192, snapshotLimit: 2, canSaveInside: false, canDraft: false, guessing: false, guessedToken: -1,
@@ -75,8 +77,11 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     batchSizes(count: number) { return [count] },
     preparePrompt: async () => undefined,
     async forwardHidden(batch: number[]) { position += batch.length; return batch.length - 1 },
-    setSeen() {}, markSeen() {},
-    async argmax() { return Int32Array.of(queue.shift() ?? EOS) },
+    setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {},
+    async argmax(_row: number, _rows: number, penalty: number, _drafts: number[], _guess: boolean, presence = 0) {
+      penalties.push([penalty, presence])
+      return Int32Array.of(queue.shift() ?? EOS)
+    },
     async candidates() {
       const [ids, logits] = options.candidates!
       return { ids: Int32Array.from(ids), logits: Float32Array.from(logits) }
@@ -94,7 +99,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     createStreamDecoder: () => ({ push: (t: number) => TEXT[t] ?? "", flush: () => "" })
   }
   const state = { stopped, messages, model: { engine, tokenizer, cached: [] as number[] }, constraint: options.constraint }
-  return { generate: makeGenerate(state) as (r: Request) => Promise<void>, messages, masks }
+  return { generate: makeGenerate(state) as (r: Request) => Promise<void>, messages, masks, seen, penalties }
 }
 
 type Request = Extract<WorkerRequest, { type: "generate" }>
@@ -230,4 +235,38 @@ test("stop sequences don't apply inside a structured answer: it stays valid JSON
   const t = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
   await t.generate(request({ outputSchema: schema, stop: ["{"], thinking: true }))
   assert.equal(text(t.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
+})
+
+test("the repetition penalty counts only the reply's tokens, not the prompt's", async () => {
+  const s = scripted([id("Oslo")])
+  await s.generate(request({ sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 } }))
+  // A value copied from the prompt (a name to extract) mustn't be pushed away.
+  assert.deepEqual(s.seen, [[]])
+})
+
+test("no repetition or presence penalty inside a constrained answer", async () => {
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
+  const j = jsonConstraint(id("}"))
+  const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
+  await s.generate(request({ outputSchema: schema, thinking: true, sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1, presence_penalty: 1.5 } }))
+  assert.equal(text(s.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
+  // Thinking: the request's penalties. The answer: none (its quotes, keys and
+  // copied values repeat by design).
+  assert.deepEqual(s.penalties.slice(0, 2), [[1.1, 1.5], [1.1, 1.5]])
+  assert.deepEqual(new Set(s.penalties.slice(2).map(String)), new Set(["1,0"]))
+})
+
+test("with thinking switched off, the reply can't open or close thinking", async () => {
+  const s = scripted([id("Hello")])
+  await s.generate(request({ thinking: false }))
+  const mask = s.masks.find((m) => m !== null)
+  assert.ok(mask, "a mask is applied")
+  const allowed = (t: number) => (mask[t >>> 5] & (1 << (t & 31))) !== 0
+  assert.equal(allowed(THINK), false)
+  assert.equal(allowed(THINK_END), false)
+  assert.equal(allowed(id("Hello")), true)
+  // Thinking left to the template (or on) is untouched.
+  const on = scripted([id("Hello")])
+  await on.generate(request({ thinking: undefined }))
+  assert.deepEqual(on.masks.filter((m) => m !== null), [])
 })

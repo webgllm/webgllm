@@ -698,8 +698,10 @@ async function generate(request: GenerateRequest) {
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
-  if (onGpu) engine.setSeen(prompt, vocab)
-  else sampler.see(prompt)
+  // The penalties count the reply's own tokens: the prompt's would push the
+  // model off values it copies from them (LFM3 wrote "Ada_Lovelace" for a
+  // name in the prompt). setSeen still bans the padding ids.
+  if (onGpu) engine.setSeen([], vocab)
   // With a seed, the number each token is drawn with comes from the seed
   // and the token's place in the reply (see seeded-random.ts); else
   // Math.random, as before. Greedy picks don't depend on either.
@@ -753,24 +755,39 @@ async function generate(request: GenerateRequest) {
   // token ids and probabilities; with `guess`, the likeliest token is read
   // forward meanwhile.
   let appliedMask: Uint32Array | null | undefined
+  // Thinking switched off: the template closed it (LFM3's `<think></think>`)
+  // or left it out, and the reply can't open it again. A repetition penalty
+  // on the prompt's markers used to hide LFM3 reopening it.
+  const markers = [tokenizer.specialTokens.think, tokenizer.specialTokens.thinkEnd].filter((t): t is number => t !== null && t >= 0 && t < vocab)
+  let thinkingOff: Uint32Array | null = null
+  if (request.thinking === false && markers.length) {
+    thinkingOff = new Uint32Array(Math.ceil(vocab / 32)).fill(0xffffffff)
+    for (const t of markers) thinkingOff[t >>> 5] &= ~(1 << (t & 31))
+  }
   const updateAllowed = () => {
     // JSON literals are governed by their grammar. Only unconstrained replies
-    // reserve control markers after an explicit budgeted reasoning span closes.
-    const mask = structured ? structured.mask() : thinkingBudget?.closedControlMask(vocab) ?? null
+    // reserve control markers: with thinking off, or after an explicit
+    // budgeted reasoning span closes.
+    const mask = structured ? structured.mask() : thinkingOff ?? thinkingBudget?.closedControlMask(vocab) ?? null
     if (structured?.answering || appliedMask !== mask) engine.setAllowedTokens(mask)
     appliedMask = mask
     return mask ?? undefined
   }
+  // No penalties inside a constrained answer: its quotes, keys and the values
+  // it copies from the prompt repeat by design.
+  const penalize = () => !structured?.answering
+  const penalty = () => penalize() ? sampling.repetition_penalty : 1
+  const presence = () => penalize() ? sampling.presence_penalty : 0
   const distribution = async (r: number, guess = false) => {
     const mask = updateAllowed()
     if (greedy) {
       const [token] = await engine.argmax(
         r,
         1,
-        sampling.repetition_penalty,
+        penalty(),
         [],
         guess,
-        sampling.presence_penalty
+        presence()
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       return { ids: Int32Array.of(token), p: Float32Array.of(1) }
@@ -779,9 +796,9 @@ async function generate(request: GenerateRequest) {
       const { ids, logits } = await engine.candidates(
         r,
         sampling.top_k,
-        sampling.repetition_penalty,
+        penalty(),
         guess,
-        sampling.presence_penalty
+        presence()
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       const d = sampler.distribution(logits)
@@ -790,7 +807,7 @@ async function generate(request: GenerateRequest) {
     const logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
     if (mask) maskLogits(logits, mask)
-    return sampler.distribution(logits)
+    return sampler.distribution(logits, penalize())
   }
   // On the GPU: the distributions after rows 0..rows-1 of a batch whose
   // inputs after the first are `drafts`, in one pass and one readback.
@@ -806,10 +823,10 @@ async function generate(request: GenerateRequest) {
       const tokens = await engine.argmax(
         0,
         rows,
-        sampling.repetition_penalty,
+        penalty(),
         drafts,
         guess,
-        sampling.presence_penalty
+        presence()
       )
       if (guess && engine.guessing) guessed = engine.guessedToken
       return Array.from(tokens, (token) => ({
@@ -821,11 +838,11 @@ async function generate(request: GenerateRequest) {
       0,
       rows,
       sampling.top_k,
-      sampling.repetition_penalty,
+      penalty(),
       drafts,
       guess,
       0,
-      sampling.presence_penalty
+      presence()
     )
     if (guess && engine.guessing) guessed = engine.guessedToken
     return picked.map(({ ids, logits }) => {

@@ -208,3 +208,11 @@ describe("selection matches the rescanning reference", () => {
     }
   })
 })
+
+test("distribution(logits, false) leaves out the repetition and presence penalties", () => {
+  const s = createSampler({ temperature: 0, top_k: 1, repetition_penalty: 10, presence_penalty: 5 })
+  s.see([0], true)
+  // Token 0 leads by a little: penalized it loses, unpenalized it wins.
+  assert.deepEqual(Array.from(s.distribution(Float32Array.of(2, 1.9)).ids), [1])
+  assert.deepEqual(Array.from(s.distribution(Float32Array.of(2, 1.9), false).ids), [0])
+})

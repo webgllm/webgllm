@@ -14,9 +14,11 @@ export type Sampling = {
 }
 
 /**
- * A sampler for one reply. It applies the repetition penalty to every token
- * seen (prompt and reply, as Transformers.js does), keeps the top_k
- * likeliest tokens, and draws one at the temperature (greedy at 0).
+ * A sampler for one reply. It applies the repetition penalty to the tokens
+ * it's told it has seen (the worker passes the reply's own: penalizing the
+ * prompt's too, as Transformers.js does, pushes a model off values it copies
+ * from it, such as a name to extract), keeps the top_k likeliest tokens, and
+ * draws one at the temperature (greedy at 0).
  */
 export function createSampler({
   temperature,
@@ -29,7 +31,7 @@ export function createSampler({
   const seen = new Set<number>()
   const generated = new Set<number>()
   return {
-    /** Tokens to penalize from now on: the prompt, then each one drawn. */
+    /** Tokens to penalize from now on: each one drawn. */
     see(tokens: Iterable<number>, output = false) {
       for (const t of tokens) {
         seen.add(t)
@@ -40,17 +42,18 @@ export function createSampler({
      * The distribution the next token is drawn from: the kept tokens
      * (indices into `logits`) and their probabilities, after the penalty,
      * top-k, temperature and top-p (one token at probability 1 when
-     * greedy). Changes `logits`.
+     * greedy). Changes `logits`. `penalize` false leaves out the repetition
+     * and presence penalties (a constrained answer repeats tokens by design).
      */
-    distribution(logits: Float32Array): { ids: Int32Array; p: Float32Array } {
-      if (repetition_penalty !== 1) {
+    distribution(logits: Float32Array, penalize = true): { ids: Int32Array; p: Float32Array } {
+      if (penalize && repetition_penalty !== 1) {
         for (const token of seen) {
           const x = logits[token]
           logits[token] =
             x < 0 ? x * repetition_penalty : x / repetition_penalty
         }
       }
-      if (presence_penalty !== 0) {
+      if (penalize && presence_penalty !== 0) {
         for (const token of generated) logits[token] -= presence_penalty
       }
       const k = Math.max(
