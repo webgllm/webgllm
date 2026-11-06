@@ -1,0 +1,11 @@
+{
+  "pages": [
+    "loading-models",
+    "chat-and-streaming",
+    "thinking",
+    "tool-calling",
+    "structured-output",
+    "events-and-errors",
+    "sharing-memory"
+  ]
+}

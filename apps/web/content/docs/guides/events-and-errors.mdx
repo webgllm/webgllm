@@ -1,0 +1,58 @@
+---
+title: Events and errors
+description: Follow model state, and handle failures.
+---
+
+## Events
+
+A `WebGLLM` instance dispatches events for every model, whatever started them: `loadModel`, a completion loading its model, or room made for another model.
+
+```ts
+webgllm.addEventListener("progress", ({ model, progress }) => setProgress(model, progress))
+webgllm.addEventListener("loadstart", ({ model }) => setStatus(model, "loading"))
+webgllm.addEventListener("load", ({ model, contextLength }) => setStatus(model, "ready"))
+webgllm.addEventListener("error", ({ model, error }) => setStatus(model, "error", error.message))
+webgllm.addEventListener("unload", ({ model, reason }) => setStatus(model, "idle"))
+```
+
+`unload`'s `reason` is one of:
+
+| Reason | When |
+| --- | --- |
+| `unloaded` | `unloadModel` was called |
+| `evicted` | Unloaded to make room for another model |
+| `aborted` | Its load was aborted |
+| `failed` | Its load failed (after an `error`) |
+| `crashed` | Its worker stopped (after an `error`) |
+
+## Errors
+
+Failures webgllm can name throw a `WebGLLMError` with a `code`:
+
+```ts
+import { WebGLLMError } from "webgllm"
+
+try {
+  await webgllm.chat.completions.create({ model, messages })
+} catch (error) {
+  if (error instanceof WebGLLMError && error.code === "context-length-exceeded") {
+    // Trim the chat and try again.
+  }
+}
+```
+
+| Code | Meaning |
+| --- | --- |
+| `webgl2-unavailable` | The browser lacks what webgllm needs |
+| `model-not-supported` | Not a listed model |
+| `model-not-loaded` | The model isn't loaded |
+| `download-failed` | A file couldn't be downloaded |
+| `storage-full` | No room left in browser storage |
+| `out-of-memory` | Not enough GPU memory, or a memory claim was refused |
+| `gpu-context-lost` | The browser dropped the GPU context |
+| `context-length-exceeded` | The chat is longer than the loaded context |
+| `invalid-schema` | A tool or response schema can't be used |
+| `invalid-output` | The answer couldn't satisfy the schema |
+| `unsupported-parameter` | A request field the engine can't honour |
+
+An aborted call rejects with a `DOMException` named `AbortError`. Other failures are plain `Error`s.

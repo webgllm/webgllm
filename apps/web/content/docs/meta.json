@@ -1,0 +1,14 @@
+{
+  "pages": [
+    "index",
+    "quickstart",
+    "requirements",
+    "models",
+    "---Guides---",
+    "...guides",
+    "---Integrations---",
+    "...integrations",
+    "---Reference---",
+    "...reference"
+  ]
+}

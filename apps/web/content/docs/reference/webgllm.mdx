@@ -1,0 +1,81 @@
+---
+title: webgllm
+description: The WebGLLM class, its options and methods.
+---
+
+```ts
+import { WebGLLM, WebGLLMError } from "webgllm"
+```
+
+The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) and its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`).
+
+## `new WebGLLM(options?)`
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `contextLength` | `number` | The context a completion loads a model for. The model's own when left out. |
+| `memoryBudget` | `number` | Bytes all loaded models may take together. Picked from the device when left out. |
+| `onProgress` | `(progress: LoadProgress) => void` | Every load's and download's progress. |
+| `onMemoryClaim` | `({ model, bytes, signal }) => Promise<void> \| void` | See [Sharing memory](/docs/guides/sharing-memory). |
+| `logLevel` | `"debug" \| "info" \| "warn" \| "error" \| "silent"` | Which worker messages reach the console. Default `"warn"`. |
+| `worker` | `() => Worker` | Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))`. |
+
+## `WebGLLM.isSupported()`
+
+Returns `true` when the browser has what webgllm needs. See [Requirements](/docs/requirements).
+
+## `chat.completions.create(body, options?)`
+
+OpenAI's Chat Completions. Returns a `ChatCompletion`, or an async iterable of `ChatCompletionChunk` when `stream: true`. See [Chat and streaming](/docs/guides/chat-and-streaming).
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `signal` | `AbortSignal` | Stops the generation; rejects with an `AbortError`. |
+| `onProgress` | `(progress: LoadProgress) => void` | The model's load progress, when this call loads it. |
+
+## `loadModel(model, options?)`
+
+Loads a model, downloading it first if needed.
+
+| Option | Type | Description |
+| --- | --- | --- |
+| `contextLength` | `number` | Most tokens a chat may hold. Never more than the model's own. |
+| `keepLoaded` | `boolean` | Never unloaded to make room for another model. |
+| `onProgress` | `(progress: LoadProgress) => void` | |
+| `signal` | `AbortSignal` | Stops the load, unless another call waits for it too. |
+
+## `downloadModel(model, options?)`
+
+Downloads a model's files into storage without loading them. Takes `onProgress` and `signal`; an aborted download resumes next time.
+
+## `unloadModel(model?)`
+
+Frees a model's GPU memory, or every model's with no argument.
+
+## `models`
+
+| Method | Returns |
+| --- | --- |
+| `models.list()` | `Promise<ModelInfo[]>`: every supported model |
+| `models.retrieve(id)` | `Promise<ModelInfo>` |
+| `models.delete(id)` | Removes a model's files from storage |
+
+`ModelInfo` has `id`, `format` (`"gguf"` or `"onnx"`), `contextLength`, `size` (bytes to download), `downloaded`, `loaded`, `loadedContextLength`, and `supports: { tools, thinking }`.
+
+## `addEventListener(type, listener)`
+
+Events: `progress`, `loadstart`, `load`, `error`, `unload`. See [Events and errors](/docs/guides/events-and-errors).
+
+## `LoadProgress`
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `model` | `string` | |
+| `phase` | `"download" \| "load"` | |
+| `progress` | `number` | 0 to 1 across both phases |
+| `cached` | `boolean` | The files come from storage, not the network |
+| `loadedBytes`, `totalBytes` | `number` | When known |
+
+## `WebGLLMError`
+
+An `Error` with a `code`. See [Events and errors](/docs/guides/events-and-errors#errors) for the codes.

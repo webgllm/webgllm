@@ -1,0 +1,52 @@
+---
+title: Loading models
+description: Download, load, unload and cache models.
+---
+
+## Load on demand or ahead of time
+
+`chat.completions.create()` loads its model if it isn't loaded. To load it ahead of time, with progress:
+
+```ts
+await webgllm.loadModel("unsloth/Qwen3.5-2B-GGUF", {
+  contextLength: 8192,
+  onProgress: ({ phase, progress }) => console.log(phase, Math.round(progress * 100))
+})
+```
+
+When a completion loads its model, pass `{ onProgress }` as its second argument instead.
+
+`progress` runs from 0 to 1 across both phases: `"download"` takes 0 to 0.9 and `"load"` the rest. A model already in storage loads across 0 to 1, with `cached: true`.
+
+## Download without loading
+
+`downloadModel` fetches the files into storage without using GPU memory, for example to prepare a model in the background:
+
+```ts
+await webgllm.downloadModel("LiquidAI/LFM3-1.7B-GGUF", { onProgress })
+```
+
+Aborting keeps what came; the next download resumes.
+
+## Context length
+
+`contextLength` is the most tokens a chat may hold, prompt and reply together. It defaults to the model's own (LFM3: 262,144 tokens), but memory grows only as a chat does. Set a smaller one to cap memory. Loading the same model for another value loads it again.
+
+## Several models
+
+Several models can be loaded at once, one worker each, up to a memory budget. The budget is picked from the device; set your own with `new WebGLLM({ memoryBudget })`. Loading past it unloads the least recently used model, unless that model was loaded with `keepLoaded: true`.
+
+```ts
+await webgllm.models.list()      // supported models, with downloaded / loaded
+await webgllm.models.delete(id)  // remove a model's files from storage
+await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
+```
+
+## Cancelling a load
+
+```ts
+const controller = new AbortController()
+await webgllm.loadModel(model, { signal: controller.signal })
+```
+
+A load that another call is also waiting for keeps going.

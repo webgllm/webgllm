@@ -1,0 +1,29 @@
+---
+title: Structured output
+description: Answers that always match a JSON Schema.
+---
+
+```ts
+const reply = await webgllm.chat.completions.create({
+  model,
+  messages: [{ role: "user", content: "Extract as JSON: Ada Lovelace, born 1815 in London." }],
+  response_format: { type: "json_schema", json_schema: { name: "person", schema } }
+})
+
+const person = JSON.parse(reply.choices[0].message.content!)
+```
+
+Tokens are constrained to the schema while they're picked, so the answer is always valid against it. `{ type: "json_object" }` (OpenAI's JSON mode) takes any object.
+
+<Callout>
+  Say in the prompt that you want JSON. Small models constrained to a schema they weren't asked for write poor values.
+</Callout>
+
+## Schemas
+
+- Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. A free-form key is slow to constrain and lets the model invent keys. Set `additionalProperties: true` for an open object.
+- Objects composed with `not`, `if`, `oneOf`, `contains`, `allOf`, `const`, `enum`, or a `$ref` beside their own keywords stay as written.
+- `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends, not while it's written. An answer that can't satisfy them fails with `invalid-output`.
+- `stop` sequences don't apply inside the answer: the schema decides where it ends.
+
+An invalid schema throws `invalid-schema`.

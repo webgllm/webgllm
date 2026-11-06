@@ -1,0 +1,30 @@
+---
+title: Thinking
+description: Reasoning output, and switching it on or off.
+---
+
+Models that think write their reasoning to `reasoning_content`, separate from the answer in `content`.
+
+```ts
+const stream = await webgllm.chat.completions.create({
+  model: "unsloth/Qwen3.5-2B-GGUF",
+  messages,
+  reasoning_effort: "high",     // "none" turns it off
+  thinking_budget_tokens: 512,  // optional cap
+  stream: true
+})
+
+for await (const chunk of stream) {
+  const { reasoning_content, content } = chunk.choices[0].delta
+}
+```
+
+Without streaming, the reasoning is in `message.reasoning_content`.
+
+## Defaults
+
+- LFM3 thinks by default; Qwen3.5 doesn't. `reasoning_effort` switches it through the chat template.
+- `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` always thinks and ignores `"none"`.
+- `models.list()` says which models think (`supports.thinking`).
+
+`thinking_budget_tokens` caps the reasoning; the model then answers. Reasoning tokens count in `max_completion_tokens` and in `usage.completion_tokens_details.reasoning_tokens`.

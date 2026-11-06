@@ -1,0 +1,25 @@
+---
+title: TanStack AI
+description: Use webgllm as a TanStack AI adapter.
+---
+
+[`@tanstack-ai-browser/webgllm`](https://github.com/daveycodez/tanstack-ai-browser/tree/main/packages/webgllm) is a [TanStack AI](https://tanstack.com/ai) adapter for webgllm.
+
+```bash
+npm install @tanstack-ai-browser/webgllm @tanstack/ai
+```
+
+```ts
+import { chat } from "@tanstack/ai"
+import { webgllmText } from "@tanstack-ai-browser/webgllm"
+
+const stream = chat({
+  adapter: webgllmText("LiquidAI/LFM3-1.7B-GGUF"),
+  messages,
+  threadId
+})
+```
+
+Thinking, text, tool calls and structured output come back as TanStack's standard stream events, so an app can swap this adapter for TanStack's OpenAI or OpenRouter adapter without other changes. `webgllmText(model, { contextLength, keepLoaded })` takes the same load options as [`loadModel`](/docs/guides/loading-models).
+
+The adapter's README has the full mapping of options and events.

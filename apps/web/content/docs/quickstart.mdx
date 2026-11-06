@@ -1,0 +1,57 @@
+---
+title: Quickstart
+description: Install webgllm and run your first chat.
+---
+
+## Install
+
+```bash
+npm install webgllm
+```
+
+## First chat
+
+```ts
+import { WebGLLM } from "webgllm"
+
+const webgllm = new WebGLLM()
+
+const completion = await webgllm.chat.completions.create({
+  model: "LiquidAI/LFM3-1.7B-GGUF",
+  messages: [{ role: "user", content: "What is the capital of France?" }]
+})
+
+console.log(completion.choices[0].message.content)
+```
+
+The first call downloads the model into the browser's storage (the Origin Private File System) and loads it. Later calls and page loads reuse it. Pages don't need cross-origin isolation.
+
+## Show progress
+
+A first download takes a while, so show it:
+
+```ts
+await webgllm.loadModel("LiquidAI/LFM3-1.7B-GGUF", {
+  onProgress: ({ phase, progress }) => console.log(phase, Math.round(progress * 100))
+})
+```
+
+## Stream the reply
+
+```ts
+const stream = await webgllm.chat.completions.create({
+  model: "LiquidAI/LFM3-1.7B-GGUF",
+  messages: [{ role: "user", content: "Write a haiku about the sea." }],
+  stream: true
+})
+
+for await (const chunk of stream) {
+  output.textContent += chunk.choices[0]?.delta.content ?? ""
+}
+```
+
+## Next
+
+- [Requirements](/docs/requirements): check the browser first with `WebGLLM.isSupported()`.
+- [Loading models](/docs/guides/loading-models): progress, context length and several models.
+- [Chat and streaming](/docs/guides/chat-and-streaming): cancelling and request fields.
