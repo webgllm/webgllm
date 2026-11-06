@@ -1,7 +1,7 @@
 import {
   AssistantRuntimeProvider,
   AuiConfig,
-  AuiIf,
+  useAuiState,
   type AssistantState,
   createSimpleTitleAdapter,
   Suggestions,
@@ -69,8 +69,8 @@ function useDemoRuntime(chatId: string | undefined, onChatChange: (chatId: strin
 
 /**
  * The chat in the URL isn't on screen yet: the server can't read the saved
- * chats, and the browser loads them after it starts. The thread waits for
- * it, so a reload doesn't flash the welcome. A chat that no longer exists
+ * chats, and the browser loads them after it starts. The thread shows its
+ * loading skeleton meanwhile, not the welcome. A chat that no longer exists
  * shows the welcome once the list has loaded.
  */
 const isRestoring = (s: AssistantState, chatId: string | undefined) => {
@@ -133,15 +133,19 @@ export function DemoApp({
             <ModelStatusLine />
           </div>
           <div className="flex-1 overflow-hidden">
-            <AuiIf condition={(s) => !isRestoring(s, chatId)}>
-              <Thread components={threadComponents} autoFocus={false} />
-            </AuiIf>
+            <DemoThread chatId={chatId} />
           </div>
         </div>
       </DocsLayout>
     </AssistantRuntimeProvider>
   );
 }
+
+/** Their thread, with its loading skeleton while the chat in the URL comes back from storage. */
+const DemoThread: FC<{ chatId: string | undefined }> = ({ chatId }) => {
+  const restoring = useAuiState((s) => isRestoring(s, chatId));
+  return <Thread components={threadComponents} autoFocus={false} loading={restoring} />;
+};
 
 /** Closes Fumadocs' mobile drawer once a chat is picked or started from it. */
 const CloseSidebarOnSwitch: FC = () => {

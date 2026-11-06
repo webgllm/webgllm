@@ -157,6 +157,8 @@ const taskAwareGroupBy = (
 export type ThreadProps = {
   components?: ThreadComponents | undefined;
   autoFocus?: boolean | undefined;
+  /** Shows the history skeleton instead of the welcome: a chat is still coming back from storage. */
+  loading?: boolean | undefined;
 };
 
 const EMPTY_COMPONENTS: ThreadComponents = {};
@@ -201,19 +203,21 @@ const ThreadHistorySkeleton: FC = () => (
 export const Thread: FC<ThreadProps> = ({
   components = EMPTY_COMPONENTS,
   autoFocus = true,
+  loading = false,
 }) => {
-  const isEmpty = useAuiState(isNewChatView);
+  const isEmpty = useAuiState(isNewChatView) && !loading;
 
   return (
     <ThreadComponentsContext.Provider value={components}>
-      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} />
+      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} loading={loading} />
     </ThreadComponentsContext.Provider>
   );
 };
 
-const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
+const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; loading: boolean }> = ({
   isEmpty,
   autoFocus,
+  loading,
 }) => {
   const { Welcome = ThreadWelcome } = useContext(ThreadComponentsContext);
 
@@ -238,12 +242,18 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
             isEmpty && "justify-center",
           )}
         >
-          <AuiIf condition={isNewChatView}>
-            <Welcome />
-          </AuiIf>
-          <AuiIf condition={isHistoryLoadingView}>
+          {loading ? (
             <ThreadHistorySkeleton />
-          </AuiIf>
+          ) : (
+            <>
+              <AuiIf condition={isNewChatView}>
+                <Welcome />
+              </AuiIf>
+              <AuiIf condition={isHistoryLoadingView}>
+                <ThreadHistorySkeleton />
+              </AuiIf>
+            </>
+          )}
 
           <ThreadLoadEarlier />
 
@@ -266,7 +276,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
             <ThreadScrollToBottom />
             <ThreadFollowupSuggestions />
             <Composer autoFocus={autoFocus} />
-            <AuiIf condition={(s) => isNewChatView(s) && s.composer.isEmpty}>
+            <AuiIf condition={(s) => !loading && isNewChatView(s) && s.composer.isEmpty}>
               <ThreadSuggestions />
             </AuiIf>
           </ThreadPrimitive.ViewportFooter>
