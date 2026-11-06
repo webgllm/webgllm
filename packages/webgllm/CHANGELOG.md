@@ -1,3 +1,13 @@
+## 0.1.4 (2026-11-06)
+
+### 🩹 Fixes
+
+- **webgllm:** stop a load still waiting when its model is unloaded ([01d2b9a](https://github.com/webgllm/webgllm/commit/01d2b9a))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.3 (2026-11-06)
 
 ### 🚀 Features
