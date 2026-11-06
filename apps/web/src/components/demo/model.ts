@@ -1,17 +1,35 @@
 import type { ChatModelAdapter, ThreadMessage, ToolCallMessagePart } from '@assistant-ui/react';
-import type { ChatCompletionMessageParam, ChatCompletionTool } from 'webgllm';
+import type { ChatCompletionMessageParam, ChatCompletionTool, ReasoningEffort } from 'webgllm';
 import { WebGLLM } from 'webgllm';
+import { WEBGL_MODEL_META } from 'webgllm/advanced';
+import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 
 /** The models the demo offers: regular GGUF builds, each with tools. */
-export const MODELS = [
-  { id: 'LiquidAI/LFM3-1.7B-GGUF', label: 'LFM3 1.7B' },
-  { id: 'unsloth/Qwen3.5-2B-GGUF', label: 'Qwen3.5 2B' },
-  { id: 'LiquidAI/LFM2.5-1.2B-Instruct-GGUF', label: 'LFM2.5 1.2B Instruct' },
-  { id: 'LiquidAI/LFM2.5-1.2B-Thinking-GGUF', label: 'LFM2.5 1.2B Thinking' },
-  { id: 'LiquidAI/LFM2.5-350M-GGUF', label: 'LFM2.5 350M' },
+const MODEL_NAMES = [
+  ['LiquidAI/LFM3-1.7B-GGUF', 'LFM3 1.7B'],
+  ['unsloth/Qwen3.5-2B-GGUF', 'Qwen3.5 2B'],
+  ['LiquidAI/LFM2.5-1.2B-Instruct-GGUF', 'LFM2.5 1.2B Instruct'],
+  ['LiquidAI/LFM2.5-1.2B-Thinking-GGUF', 'LFM2.5 1.2B Thinking'],
+  ['LiquidAI/LFM2.5-350M-GGUF', 'LFM2.5 350M'],
 ] as const;
 
-export type ModelId = (typeof MODELS)[number]['id'];
+/**
+ * webgllm's thinking is on or off ("none" turns it off, any other level on),
+ * so a model that can switch it off offers those two levels.
+ */
+const THINKING_LEVELS: ModelSelectorEffortOption[] = [
+  { id: 'none', name: 'Off' },
+  { id: 'medium', name: 'On' },
+];
+
+/** The models, as assistant-ui's model selector takes them. */
+export const MODELS: ModelOption[] = MODEL_NAMES.map(([id, name]) => {
+  const reasoning = WEBGL_MODEL_META[id].reasoning;
+  const switchable = reasoning !== undefined && 'off' in reasoning.levels;
+  return { id, name, description: id, ...(switchable && { efforts: THINKING_LEVELS }) };
+});
+
+export type ModelId = (typeof MODEL_NAMES)[number][0];
 
 /** Where the selected model is: loading it shows here, as the chat waits for it. */
 export type ModelStatus =
@@ -32,22 +50,6 @@ export const modelStatus = {
   subscribe: (listener: () => void) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
-  },
-};
-
-let selected: ModelId = MODELS[0].id;
-const selectionListeners = new Set<() => void>();
-
-/** The model new replies use, picked in the header. */
-export const selectedModel = {
-  get: () => selected,
-  set: (model: ModelId) => {
-    selected = model;
-    for (const listener of selectionListeners) listener();
-  },
-  subscribe: (listener: () => void) => {
-    selectionListeners.add(listener);
-    return () => selectionListeners.delete(listener);
   },
 };
 
@@ -150,7 +152,7 @@ const parse = (json: string): ReadonlyJSONObject => {
  * with the thread's tools, and streams the reply's reasoning, text and tool
  * calls. Each yield is the whole reply so far.
  */
-export function chatModel(getModel: () => ModelId): ChatModelAdapter {
+export function chatModel(): ChatModelAdapter {
   return {
     async *run({ messages, abortSignal, context, unstable_getMessage }) {
       // `messages` ends at the user's message. After a tool call, the reply
@@ -185,7 +187,11 @@ export function chatModel(getModel: () => ModelId): ChatModelAdapter {
       try {
         const stream = await webgllm().chat.completions.create(
           {
-            model: getModel(),
+            // Set by assistant-ui's model selector through the model context.
+            model: context.config?.modelName ?? MODELS[0]!.id,
+            ...(context.config?.reasoningEffort && {
+              reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
+            }),
             messages: [
               ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
               ...toOpenAI(thread),

@@ -2,7 +2,7 @@ import type { Toolkit } from '@assistant-ui/react';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { useEffect, useState } from 'react';
-import { ToolFallback } from './tool-ui';
+import { ToolFallback } from './tool-fallback';
 
 /** Exa's hosted MCP server: it allows browser calls and needs no key. */
 const EXA_URL = 'https://mcp.exa.ai/mcp';

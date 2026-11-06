@@ -1,68 +1,210 @@
-import type { SourceMessagePartComponent } from '@assistant-ui/react';
-import { memo, useState } from 'react';
+"use client";
 
-// assistant-ui's sources element (registry "sources"), on Fumadocs tokens.
+import {
+  forwardRef,
+  memo,
+  useCallback,
+  useState,
+  type ComponentProps,
+} from "react";
+import { FileTextIcon } from "lucide-react";
+import { cva, type VariantProps } from "class-variance-authority";
+import type { SourceMessagePartComponent } from "@assistant-ui/react";
+import { cn } from "@/lib/cn";
+import { Badge } from "./ui";
+import { hostOf, safeHref } from "./href";
 
-const ALLOWED_PROTOCOLS = new Set(['http:', 'https:']);
+const sourceVariants = cva(
+  "inline-flex items-center justify-center gap-1 rounded-md text-xs font-medium transition-colors motion-reduce:transition-none [&_svg]:size-3 [&_svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        outline:
+          "border-fd-border text-fd-muted-foreground [a&]:hover:bg-fd-accent [a&]:hover:text-fd-accent-foreground border bg-transparent",
+        secondary:
+          "bg-fd-secondary text-fd-secondary-foreground [a&]:hover:bg-fd-secondary/80",
+        muted:
+          "bg-fd-muted text-fd-muted-foreground [a&]:hover:bg-fd-muted/80 [a&]:hover:text-fd-foreground",
+        ghost:
+          "text-fd-muted-foreground [a&]:hover:bg-fd-accent [a&]:hover:text-fd-accent-foreground bg-transparent",
+        info: "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300 [a&]:hover:bg-blue-100/80",
+        warning:
+          "bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300 [a&]:hover:bg-amber-100/80",
+        success:
+          "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300 [a&]:hover:bg-emerald-100/80",
+        destructive:
+          "bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300 [a&]:hover:bg-red-100/80",
+      },
+      size: {
+        sm: "px-1.5 py-0.5",
+        default: "px-2 py-1",
+        lg: "px-2.5 py-1.5 text-sm",
+      },
+    },
+    defaultVariants: {
+      variant: "outline",
+      size: "default",
+    },
+  },
+);
 
-/** `url` when following it runs no script; links come from web results. */
-function safeHref(url: string): string | undefined {
-  try {
-    return ALLOWED_PROTOCOLS.has(new URL(url).protocol) ? url : undefined;
-  } catch {
-    return undefined;
+const defaultFaviconUrl = (domain: string) =>
+  `https://icons.duckduckgo.com/ip3/${domain}.ico`;
+
+const SourceIcon = forwardRef<
+  HTMLSpanElement,
+  ComponentProps<"span"> & {
+    url: string;
+    faviconUrl?: ((domain: string) => string) | undefined;
   }
-}
+>(function SourceIcon(
+  { url, className, faviconUrl = defaultFaviconUrl, ...props },
+  ref,
+) {
+  const domain = hostOf(url);
+  const src = domain === undefined ? undefined : faviconUrl(domain);
+  const [errorSrc, setErrorSrc] = useState<string | undefined>(undefined);
+  const hasError = src === undefined || errorSrc === src;
+  const imageRef = useCallback(
+    (el: HTMLImageElement | null) => {
+      // A server-rendered image that fails before hydration never fires onError.
+      if (el?.complete && el.naturalWidth === 0) setErrorSrc(src);
+      if (typeof ref === "function") return ref(el);
+      if (ref) ref.current = el;
+    },
+    [ref, src],
+  );
 
-/** The host `url` points at, without a leading `www.`. */
-function hostOf(url: string): string | undefined {
-  const href = safeHref(url);
-  return href ? new URL(href).hostname.replace(/^www\./, '') || undefined : undefined;
-}
-
-function SourceIcon({ domain }: { domain: string | undefined }) {
-  const [failed, setFailed] = useState(false);
-  if (!domain || failed) {
+  if (hasError) {
     return (
-      <span className="flex size-3.5 shrink-0 items-center justify-center rounded-sm bg-fd-muted text-[10px] font-medium">
-        {domain?.charAt(0).toUpperCase() || '?'}
+      <span
+        ref={ref}
+        data-slot="source-icon-fallback"
+        className={cn(
+          "bg-fd-muted flex size-3 shrink-0 items-center justify-center rounded-sm text-[10px] font-medium",
+          className,
+        )}
+        {...props}
+      >
+        {domain?.charAt(0).toUpperCase() || "?"}
       </span>
     );
   }
+
   return (
     <img
-      src={`https://icons.duckduckgo.com/ip3/${domain}.ico`}
+      data-slot="source-icon"
+      src={src}
       alt=""
-      className="size-3.5 shrink-0 rounded-sm"
-      onError={() => setFailed(true)}
+      className={cn("size-3 shrink-0 rounded-sm", className)}
+      onError={() => setErrorSrc(src)}
+      {...(props as ComponentProps<"img">)}
+      ref={imageRef}
+    />
+  );
+});
+
+function SourceTitle({ className, ...props }: ComponentProps<"span">) {
+  return (
+    <span
+      data-slot="source-title"
+      className={cn("max-w-37.5 truncate", className)}
+      {...props}
     />
   );
 }
 
-/** One web source: favicon, title and a link that opens in a new tab. */
-export const Source: SourceMessagePartComponent = memo(function Source(part) {
-  if (part.sourceType !== 'url') return null;
-  const href = safeHref(part.url);
-  const domain = hostOf(part.url);
-  const content = (
-    <>
-      <SourceIcon domain={domain} />
-      <span className="max-w-40 truncate">{part.title || domain || part.url}</span>
-    </>
-  );
-  const className =
-    'inline-flex items-center gap-1.5 rounded-md border bg-fd-card px-2 py-1 text-xs font-medium text-fd-muted-foreground transition-colors';
-  return href ? (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      title={part.title ? `${part.title}\n${part.url}` : part.url}
-      className={`${className} hover:bg-fd-accent hover:text-fd-accent-foreground`}
+function DocumentSourceIcon({ className, ...props }: ComponentProps<"span">) {
+  return (
+    <span
+      data-slot="source-document-icon"
+      className={cn(
+        "text-fd-muted-foreground flex size-3 shrink-0 items-center justify-center",
+        className,
+      )}
+      {...props}
     >
-      {content}
-    </a>
-  ) : (
-    <span className={className}>{content}</span>
+      <FileTextIcon className="size-3" />
+    </span>
   );
-});
+}
+
+export type SourceProps = ComponentProps<"a"> &
+  VariantProps<typeof sourceVariants>;
+
+function Source({
+  className,
+  variant,
+  size,
+  target = "_blank",
+  rel = "noopener noreferrer",
+  ...props
+}: SourceProps) {
+  return (
+    <a
+      data-slot="source"
+      className={cn(
+        sourceVariants({ variant, size }),
+        "focus-visible:border-fd-ring focus-visible:ring-fd-ring/50 outline-none focus-visible:ring-1",
+        className,
+      )}
+      target={target}
+      rel={rel}
+      {...props}
+    />
+  );
+}
+
+const SourcesImpl: SourceMessagePartComponent = (part) => {
+  if (part.sourceType === "url" && part.url) {
+    const href = safeHref(part.url);
+    const domain = hostOf(part.url);
+    const displayTitle = part.title || domain || part.url;
+    const content = (
+      <>
+        <SourceIcon url={part.url} />
+        <SourceTitle>{displayTitle}</SourceTitle>
+      </>
+    );
+
+    return href ? (
+      <Source href={href}>{content}</Source>
+    ) : (
+      <span
+        data-slot="source"
+        className={cn(sourceVariants(), "cursor-default")}
+      >
+        {content}
+      </span>
+    );
+  }
+
+  if (part.sourceType === "document") {
+    return (
+      <Badge
+        variant="secondary"
+        className="focus-visible:border-fd-ring focus-visible:ring-fd-ring/50 outline-none focus-visible:ring-1"
+      >
+        <span data-slot="source" className="inline-flex items-center gap-1.5">
+          <DocumentSourceIcon />
+          <SourceTitle>{part.title}</SourceTitle>
+        </span>
+      </Badge>
+    );
+  }
+
+  return null;
+};
+
+const Sources = memo(SourcesImpl) as unknown as SourceMessagePartComponent & {
+  Root: typeof Source;
+  Icon: typeof SourceIcon;
+  Title: typeof SourceTitle;
+};
+
+Sources.displayName = "Sources";
+Sources.Root = Source;
+Sources.Icon = SourceIcon;
+Sources.Title = SourceTitle;
+
+export { Sources, Source, SourceIcon, SourceTitle, sourceVariants };
