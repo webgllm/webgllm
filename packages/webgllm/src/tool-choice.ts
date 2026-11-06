@@ -53,6 +53,21 @@ function argumentSchema(tool: ChatTool): Record<string, unknown> {
   return closeObjects({ type: "object", ...parameters }) as Record<string, unknown>
 }
 
+/** Keywords whose values are data, not schemas: a "$ref" there isn't a reference. */
+const DATA_KEYWORDS = new Set(["const", "enum", "default", "examples"])
+
+/** `schema` with its local references ("#..." pointers) moved beneath `base`. */
+function scopeRefs(schema: unknown, base: string): unknown {
+  if (Array.isArray(schema)) return schema.map((s) => scopeRefs(s, base))
+  if (!isObject(schema)) return schema
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "$ref" && typeof value === "string" && value.startsWith("#")) out[key] = base + value.slice(1)
+    else out[key] = DATA_KEYWORDS.has(key) ? value : scopeRefs(value, base)
+  }
+  return out
+}
+
 const argumentsOf = (value: unknown, name: string) => {
   if (!isObject(value)) throw new Error(`Tool ${name}'s arguments aren't a JSON object.`)
   return value
@@ -84,13 +99,22 @@ export function planToolChoice(tools: Array<ChatTool>, choice: ToolChoice = "aut
     return { mode: "forced", tools, schema: argumentSchema(chosen[0]), read: (value) => ({ name, arguments: argumentsOf(value, name) }) }
   }
   // Several: the name first (each branch fixes it), then its arguments.
+  // Each tool's arguments sit in the root's $defs, and its local references
+  // point beneath them: nested under anyOf, "#/$defs/x" would resolve
+  // against the union's root instead of the tool's own schema.
+  const $defs: Record<string, unknown> = {}
   const schema = {
-    anyOf: chosen.map((tool) => ({
-      type: "object",
-      properties: { name: { const: tool.function.name }, arguments: argumentSchema(tool) },
-      required: ["name", "arguments"],
-      additionalProperties: false
-    }))
+    anyOf: chosen.map((tool, i) => {
+      const key = `tool${i}`
+      $defs[key] = scopeRefs(argumentSchema(tool), `#/$defs/${key}`)
+      return {
+        type: "object",
+        properties: { name: { const: tool.function.name }, arguments: { $ref: `#/$defs/${key}` } },
+        required: ["name", "arguments"],
+        additionalProperties: false
+      }
+    }),
+    $defs
   }
   return {
     mode: "forced",

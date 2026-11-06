@@ -88,3 +88,29 @@ test("forced calls close objects that don't say otherwise, nested ones too", () 
   const loose = planToolChoice([tool("loose", { type: "object", additionalProperties: true })], "required")
   assert.equal((loose as { schema: { additionalProperties?: unknown } }).schema.additionalProperties, true)
 })
+
+test("required with several keeps each tool's local $defs references", async () => {
+  const setter = tool("set_value", {
+    type: "object",
+    properties: { value: { $ref: "#/$defs/value" } },
+    required: ["value"],
+    $defs: { value: { type: "integer" } }
+  })
+  const namer = tool("set_name", {
+    type: "object",
+    properties: { name: { $ref: "#/definitions/value" } },
+    required: ["name"],
+    definitions: { value: { type: "string" } }
+  })
+  // One tool alone compiles.
+  const one = planToolChoice([setter], "required")
+  assert.ok(one.mode === "forced")
+  assert.equal(await validateStructuredValue(one.schema, { value: 3 }), true)
+  // Several: each branch's references still resolve to its own definitions.
+  const plan = planToolChoice([setter, namer], "required")
+  assert.ok(plan.mode === "forced")
+  assert.equal(await validateStructuredValue(plan.schema, { name: "set_value", arguments: { value: 3 } }), true)
+  assert.equal(await validateStructuredValue(plan.schema, { name: "set_value", arguments: { value: "x" } }), false)
+  assert.equal(await validateStructuredValue(plan.schema, { name: "set_name", arguments: { name: "x" } }), true)
+  assert.equal(await validateStructuredValue(plan.schema, { name: "set_name", arguments: { name: 3 } }), false)
+})

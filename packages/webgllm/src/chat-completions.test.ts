@@ -138,6 +138,8 @@ test("models outside the catalog and malformed values are refused", () => {
   assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, temperature: 3 })), "RangeError")
   assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, max_tokens: 1.5 })), "RangeError")
   assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, top_k: "5" as never })), "TypeError")
+  // Zero would divide the seen logits by zero (and turn masked ones into NaN).
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, repetition_penalty: 0 } as ChatCompletionCreateParams)), "RangeError")
   assert.equal(
     code(() => planCompletion({ model: LFM3, messages: hi, response_format: { type: "json_schema", json_schema: { name: "x", schema: [] as never } } })),
     "invalid-schema"

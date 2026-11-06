@@ -341,24 +341,32 @@ class Completions {
         notify()
       })
 
-    const iterator: AsyncIterator<ChatCompletionChunk> = {
-      async next() {
-        for (;;) {
-          if (signal?.aborted) throw abortError(signal)
-          const chunk = chunks.shift()
-          if (chunk) return { value: chunk, done: false }
-          if (finished) {
-            if (failure) {
-              const { error } = failure
-              failure = null
-              throw error
-            }
-            return { value: undefined, done: true }
+    const read = async (): Promise<IteratorResult<ChatCompletionChunk>> => {
+      for (;;) {
+        if (signal?.aborted) throw abortError(signal)
+        const chunk = chunks.shift()
+        if (chunk) return { value: chunk, done: false }
+        if (finished) {
+          if (failure) {
+            const { error } = failure
+            failure = null
+            throw error
           }
-          await new Promise<void>((resolve) => {
-            wake = resolve
-          })
+          return { value: undefined, done: true }
         }
+        await new Promise<void>((resolve) => {
+          wake = resolve
+        })
+      }
+    }
+    // Reads run one at a time, in call order: two waiting at once would
+    // share the one wake callback, and one would never wake.
+    let reads: Promise<unknown> = Promise.resolve()
+    const iterator: AsyncIterator<ChatCompletionChunk> = {
+      next() {
+        const result = reads.then(read)
+        reads = result.catch(() => undefined)
+        return result
       },
       async return() {
         // The reader left early: stop the worker too.

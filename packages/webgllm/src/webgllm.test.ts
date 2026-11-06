@@ -111,6 +111,25 @@ test("aborting a stream rejects with AbortError and stops the worker", async () 
   assert.ok(worker.sent.some((m) => m.type === "stop" && m.id === id))
 })
 
+test("reads made before any chunk arrives each get a chunk, in order", async () => {
+  const { llm: client, workers } = llm()
+  const stream = await client.chat.completions.create({ model: LFM2, messages: hi, stream: true })
+  await settle()
+  const worker = workers.of(LFM2)!
+  const id = worker.generations()[0]!.id
+  const iterator = stream[Symbol.asyncIterator]()
+  const reads = [iterator.next(), iterator.next(), iterator.next()]
+  worker.emit({ type: "token", id, text: "a" })
+  worker.finish(id)
+  const timeout = new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 200).unref())
+  const results = await Promise.race([Promise.all(reads), timeout])
+  assert.notEqual(results, "hung")
+  const [first, second, third] = results as Array<IteratorResult<ChatCompletionChunk>>
+  assert.equal(first.value?.choices[0]?.delta.content, "a")
+  assert.equal(second.value?.choices[0]?.finish_reason, "stop")
+  assert.equal(third.done, true)
+})
+
 test("leaving a stream early stops the worker", async () => {
   const { llm: client, workers } = llm()
   const stream = await client.chat.completions.create({ model: LFM2, messages: hi, stream: true })

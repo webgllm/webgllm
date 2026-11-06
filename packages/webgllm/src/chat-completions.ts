@@ -59,7 +59,7 @@ const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "
 function numberField(
   body: Record<string, unknown>,
   key: string,
-  range: { min?: number; max?: number; integer?: boolean } = {}
+  range: { min?: number; max?: number; integer?: boolean; positive?: boolean } = {}
 ): number | undefined {
   const value = body[key]
   if (value === undefined || value === null) return undefined
@@ -72,6 +72,7 @@ function numberField(
   if ((range.min !== undefined && value < range.min) || (range.max !== undefined && value > range.max)) {
     throw new RangeError(`${key} must be between ${range.min ?? "-∞"} and ${range.max ?? "∞"}.`)
   }
+  if (range.positive && !(value > 0)) throw new RangeError(`${key} must be greater than 0.`)
   return value
 }
 
@@ -246,7 +247,7 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
   return {
     temperature: numberField(body, "temperature", { min: 0, max: 2 }) ?? base.temperature,
     top_k: numberField(body, "top_k", { min: 0, integer: true }) ?? base.top_k,
-    repetition_penalty: numberField(body, "repetition_penalty", { min: 0 }) ?? base.repetition_penalty,
+    repetition_penalty: numberField(body, "repetition_penalty", { positive: true }) ?? base.repetition_penalty,
     ...(top_p !== undefined && { top_p }),
     ...(min_p !== undefined && { min_p }),
     ...(presence_penalty !== undefined && { presence_penalty })
