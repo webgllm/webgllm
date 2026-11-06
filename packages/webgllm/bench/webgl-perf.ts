@@ -105,6 +105,14 @@ document.addEventListener("visibilitychange", () => {
 async function end(extra: object = {}) {
   // Include a frame after the last worker response to capture a trailing stall.
   await new Promise<void>((r) => requestAnimationFrame(() => r()))
+  await finish(extra)
+}
+/**
+ * Ends the current phase now: snapshots its frames synchronously, logs it,
+ * and returns the result upload, so a caller can begin the next phase at
+ * this exact moment without waiting for the network.
+ */
+function finish(extra: object = {}) {
   const sorted = gaps.slice().sort((a, b) => a - b),
     durationMs = performance.now() - phaseStart
   const percentile = (p: number) =>
@@ -141,7 +149,7 @@ async function end(extra: object = {}) {
       .map((f) => ({ at: performance.timeOrigin + f.at, gap: f.gap }))
   }
   log(JSON.stringify(data))
-  await result({
+  return result({
     ...data,
     subphases:
       phase === "load"
@@ -402,8 +410,11 @@ async function run() {
     } else if (data.type === "token") {
       reply += data.text
       if (first) {
+        // The first token ends prefill: switch phases synchronously, so the
+        // decode measurement never waits on the prefill result's upload.
         first = false
-        void end().then(() => begin("decode"))
+        void finish()
+        begin("decode")
       }
     } else if (data.type === "done") done(data.stats)
     else if (data.type === "load-error" || data.type === "error")

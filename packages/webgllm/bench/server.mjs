@@ -112,8 +112,37 @@ async function bundle(path, res) {
   }
 }
 
+/**
+ * A `Range: bytes=…` header against a file of `size` bytes: null when there's
+ * no single byte range to honour (serve the whole file), `{ start, end }`
+ * (inclusive) when it is satisfiable, or "unsatisfiable" (answer 416).
+ */
+function byteRange(header, size) {
+  const range = /^bytes=(\d*)-(\d*)$/.exec(header?.trim() ?? "")
+  if (!range || (!range[1] && !range[2])) return null
+  let start, end
+  if (!range[1]) {
+    // Suffix range: the last N bytes.
+    const length = Number(range[2])
+    if (length === 0) return "unsatisfiable"
+    start = Math.max(size - length, 0)
+    end = size - 1
+  } else {
+    start = Number(range[1])
+    end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1
+  }
+  return start <= end && start < size ? { start, end } : "unsatisfiable"
+}
+
 createServer((req, res) => {
-  const path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)
+  let path
+  try {
+    path = decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)
+  } catch {
+    // A malformed percent escape (or URL) is the client's error, not a crash.
+    res.writeHead(400, isolation).end("bad request")
+    return
+  }
   if (
     req.method === "GET" &&
     path.endsWith(".js") &&
@@ -146,12 +175,14 @@ createServer((req, res) => {
     "Content-Type": types[extname(file)] ?? "application/octet-stream",
     "Accept-Ranges": "bytes"
   }
-  const range = /bytes=(\d*)-(\d*)/.exec(req.headers.range ?? "")
+  const range = byteRange(req.headers.range, stat.size)
+  if (range === "unsatisfiable") {
+    res.writeHead(416, { ...headers, "Content-Range": `bytes */${stat.size}` })
+    res.end()
+    return
+  }
   if (range) {
-    const start = range[1] ? Number(range[1]) : 0
-    const end = range[2]
-      ? Math.min(Number(range[2]), stat.size - 1)
-      : stat.size - 1
+    const { start, end } = range
     res.writeHead(206, {
       ...headers,
       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
