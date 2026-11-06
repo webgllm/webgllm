@@ -19,7 +19,7 @@ const MODEL_NAMES = [
  */
 const THINKING_LEVELS: ModelSelectorEffortOption[] = [
   { id: 'none', name: 'Off' },
-  { id: 'medium', name: 'On' },
+  { id: 'high', name: 'High' },
 ];
 
 /** The models, as assistant-ui's model selector takes them. */
