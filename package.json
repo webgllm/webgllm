@@ -1,0 +1,17 @@
+{
+  "name": "webgllm-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@12.16.1",
+  "scripts": {
+    "build": "nx run-many -t build",
+    "dev": "nx run web:dev",
+    "typecheck": "nx run-many -t typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "nx": "24.0.4",
+    "typescript": "^7.0.2"
+  }
+}

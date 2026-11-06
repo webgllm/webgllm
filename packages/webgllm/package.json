@@ -1,0 +1,32 @@
+{
+  "name": "webgllm",
+  "version": "0.0.1",
+  "description": "LLM inference in the browser on WebGL 2, for devices without WebGPU.",
+  "license": "Apache-2.0",
+  "author": "daveycodez",
+  "homepage": "https://webgllm.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webgllm/webgllm.git",
+    "directory": "packages/webgllm"
+  },
+  "bugs": "https://github.com/webgllm/webgllm/issues",
+  "keywords": ["webgl", "webgl2", "llm", "inference", "browser", "gguf", "onnx"],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

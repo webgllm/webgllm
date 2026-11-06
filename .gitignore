@@ -1,0 +1,12 @@
+node_modules
+dist
+.output
+.nitro
+.tanstack
+.source
+.wrangler
+*.tsbuildinfo
+.DS_Store
+.nx/cache
+.nx/workspace-data
+.claude/settings.local.json
