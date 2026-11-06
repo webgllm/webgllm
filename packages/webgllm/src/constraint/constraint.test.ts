@@ -135,6 +135,26 @@ test("JSON takes whitespace where models write it, in runs of at most MAX_WHITES
   array.dispose()
 })
 
+test("the whitespace cap leaves spaces inside strings alone", async () => {
+  const spaces = " ".repeat(MAX_WHITESPACE_RUN + 1)
+  const c = await createConstraint({ schema: { const: spaces }, tokenizer })
+  accept(c, `"${spaces}"`)
+  assert.equal(c.complete, true)
+  c.dispose()
+
+  // Escapes and keys: a quote inside a string doesn't end it, and a key is a string too.
+  const tricky = `a\\"${spaces}`
+  const s = await createConstraint({ schema: { type: "object", properties: { [spaces]: { const: tricky } }, required: [spaces], additionalProperties: false }, tokenizer })
+  accept(s, `{"${spaces}": ${JSON.stringify(tricky)}`)
+  const copy = s.clone()
+  for (let i = 0; i < MAX_WHITESPACE_RUN; i++) accept(s, " ")
+  assert.equal(tokenAllowed(s.computeMask(), 32), false, "formatting whitespace after the string is still capped")
+  assert.equal(tokenAllowed(copy.computeMask(), 32), true, "a clone keeps its own state")
+  accept(s, "}")
+  assert.equal(s.complete, true)
+  s.dispose(); copy.dispose()
+})
+
 test("open objects take a space before their next key: no stray-colon keys", async () => {
   const open = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
   const c = await createConstraint({ schema: open, tokenizer: lfmTokenizer })
