@@ -83,7 +83,10 @@ const isRestoring = (s: AssistantState, chatId: string | undefined) => {
 };
 
 /** assistant-ui's model selector, in the composer's slot for it. */
-const ComposerModelSelector: FC = () => <ModelSelector models={MODELS} variant="ghost" size="sm" />;
+// Thinking starts On, so the selector shows a level from the start.
+const ComposerModelSelector: FC = () => (
+  <ModelSelector models={MODELS} defaultEffort="medium" variant="ghost" size="sm" />
+);
 
 const threadComponents = { ComposerExtra: ComposerModelSelector };
 
