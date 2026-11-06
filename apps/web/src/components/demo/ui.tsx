@@ -51,18 +51,18 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       type={type}
       className={cn(
-        // shadcn's button keeps icons at their size, as the ported components expect.
-        '[&_svg]:pointer-events-none [&_svg]:shrink-0',
+        // shadcn's button spacing and icon sizing, which the ported components are laid out for.
+        'gap-2 whitespace-nowrap [&_svg]:pointer-events-none [&_svg]:shrink-0',
         variant === 'destructive'
-          ? fdButtonVariants({ size: size === 'icon' ? 'icon-sm' : size === 'sm' ? 'sm' : undefined }) +
-              ' bg-red-500 text-white hover:bg-red-500/90'
+          ? fdButtonVariants({ size: size === 'icon' ? 'icon-sm' : undefined }) + ' bg-red-500 text-white hover:bg-red-500/90'
           : variant === 'link'
             ? 'inline-flex items-center text-sm font-medium text-fd-primary underline-offset-4 hover:underline'
             : fdButtonVariants({
                 variant: BUTTON_VARIANTS[variant],
-                size: size === 'icon' ? 'icon-sm' : size === 'sm' ? 'sm' : undefined,
+                size: size === 'icon' ? 'icon-sm' : undefined,
               }),
-        size === 'default' && 'h-9 px-4',
+        size === 'default' && 'h-9 px-4 py-2',
+        size === 'sm' && 'h-8 gap-1.5 px-3',
         size === 'lg' && 'h-10 px-6',
         size === 'icon' && 'size-9',
         className,
