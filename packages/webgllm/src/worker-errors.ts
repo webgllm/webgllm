@@ -25,7 +25,12 @@ const GPU_CODES: Array<[RegExp, WorkerErrorCode]> = [
 /** The code for `error`, if the worker can tell what it was. */
 export function errorCode(error: unknown): WorkerErrorCode | undefined {
   if (error instanceof CodedError) return error.code
-  if (error instanceof StructuredOutputError) return error.code === "unsupported-schema" ? "invalid-schema" : undefined
+  if (error instanceof StructuredOutputError) {
+    if (error.code === "unsupported-schema") return "invalid-schema"
+    // From the workaround for https://github.com/nico-martin/llguidance-js/issues/4 (constraint/index.ts).
+    if (error.code === "schema-mismatch") return "invalid-output"
+    return undefined
+  }
   if (isQuotaError(error)) return "storage-full"
   if (error instanceof GpuError) return GPU_CODES.find(([pattern]) => pattern.test(error.message))?.[1]
   return undefined

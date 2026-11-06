@@ -16,6 +16,8 @@ export type WorkerErrorCode =
   | "gpu-context-lost"
   | "context-length-exceeded"
   | "invalid-schema"
+  /** The output couldn't satisfy the schema's pattern, format or numeric constraints. */
+  | "invalid-output"
 
 /**
  * OpenAI's tool_choice: "auto" lets the model decide, "none" offers no tools,

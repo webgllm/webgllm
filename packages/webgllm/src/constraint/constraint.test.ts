@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { createConstraint, tokenAllowed, type Constraint } from "./index.js"
+import { createConstraint, StructuredOutputError, tokenAllowed, type Constraint } from "./index.js"
 const EOS = 256
 const tokenizer = { tokens: Array.from({ length: 257 }, (_, id) => id === EOS ? [] : [id]), eos_token_id: EOS, special_token_ids: [EOS] }
 const schema = { type: "object", properties: { moveId: { type: "string", enum: ["b6-a5", "d6-c5"] } }, required: ["moveId"], additionalProperties: false }
@@ -196,4 +196,92 @@ test("explicit EOS replaces existing camel-case and snake-case metadata consiste
   }
   assert.equal(source.eosTokenId, 256)
   assert.equal(source.eos_token_id, 256)
+})
+
+// Workaround for https://github.com/nico-martin/llguidance-js/issues/4 (see prunableSchema).
+test("prunableSchema leaves out what llguidance doesn't prune, only ever loosening", async () => {
+  const { prunableSchema } = await import("./index.js")
+  const { schema, loosened } = prunableSchema({
+    type: "object",
+    properties: {
+      code: { type: "string", pattern: "^[A-Z]{3}$", maxLength: 3 },
+      day: { type: "string", format: "date" },
+      n: { type: "integer", minimum: 1, maximum: 3 },
+      pick: { enum: [1, 2, 3] },
+      word: { enum: ["a", "b"] },
+      nested: { type: "array", items: { type: "number", multipleOf: 0.5 } }
+    },
+    not: { properties: { code: { pattern: "^X" } } },
+    if: { properties: { n: { minimum: 2 } } },
+    then: { required: ["day"] }
+  })
+  assert.equal(loosened, true)
+  assert.deepEqual(schema, {
+    type: "object",
+    properties: {
+      code: { type: "string", maxLength: 3 },
+      day: { type: "string" },
+      n: { type: "integer" },
+      pick: { type: "integer" },
+      word: { enum: ["a", "b"] },
+      nested: { type: "array", items: { type: "number" } }
+    }
+  })
+  assert.deepEqual(prunableSchema(schema).loosened, false)
+})
+
+const walk = (c: Constraint, text: string) => {
+  for (const token of bytes(text)) {
+    if (!tokenAllowed(c.computeMask(), token)) return `refused ${String.fromCharCode(token)}`
+    c.accept(token)
+  }
+  return "ok"
+}
+
+test("a value that breaks pattern or bounds fails fast instead of running on", async () => {
+  const pattern = { type: "object", properties: { code: { type: "string", pattern: "^[A-Z]{3}$" } }, required: ["code"], additionalProperties: false }
+  const good = await createConstraint({ schema: pattern, tokenizer })
+  assert.equal(walk(good, '{"code":"CDG"}'), "ok")
+  assert.equal(good.complete, true)
+  // As the worker does: EOS goes in too, and the value stays complete.
+  good.accept(EOS)
+  assert.equal(good.complete, true)
+  assert.doesNotThrow(() => good.computeMask())
+  good.dispose()
+  const bad = await createConstraint({ schema: pattern, tokenizer })
+  // The loose mask lets the string close; the full schema then refuses to end it.
+  assert.throws(() => walk(bad, '{"code":",x"}'), (e: unknown) => e instanceof StructuredOutputError && e.code === "schema-mismatch")
+  bad.dispose()
+
+  const days = { type: "object", properties: { days: { type: "integer", minimum: 1, maximum: 3 } }, required: ["days"], additionalProperties: false }
+  const inRange = await createConstraint({ schema: days, tokenizer })
+  assert.equal(walk(inRange, '{"days":2}'), "ok")
+  assert.equal(inRange.complete, true)
+  inRange.dispose()
+  const outOfRange = await createConstraint({ schema: days, tokenizer })
+  assert.throws(() => walk(outOfRange, '{"days":7}'), (e: unknown) => e instanceof StructuredOutputError && e.code === "schema-mismatch")
+  outOfRange.dispose()
+})
+
+test("a numeric root keeps going while the full schema can't end it yet", async () => {
+  const c = await createConstraint({ schema: { type: "integer", minimum: 10 }, tokenizer })
+  c.accept(bytes("1")[0]!)
+  // 1 is below the minimum: no EOS yet, but more digits are fine.
+  assert.equal(tokenAllowed(c.computeMask(), EOS), false)
+  assert.equal(tokenAllowed(c.computeMask(), bytes("2")[0]!), true)
+  c.accept(bytes("2")[0]!)
+  assert.equal(tokenAllowed(c.computeMask(), EOS), true)
+  c.dispose()
+})
+
+test("validation stays exact for what the mask leaves out", async () => {
+  const { validateStructuredValue } = await import("./index.js")
+  assert.equal(await validateStructuredValue({ type: "string", pattern: "^[A-Z]{3}$" }, "CDG"), true)
+  assert.equal(await validateStructuredValue({ type: "string", pattern: "^[A-Z]{3}$" }, "Paris"), false)
+  assert.equal(await validateStructuredValue({ type: "integer", minimum: 1, maximum: 3 }, 2), true)
+  assert.equal(await validateStructuredValue({ type: "integer", minimum: 1, maximum: 3 }, 7), false)
+  assert.equal(await validateStructuredValue({ enum: [1, 2, 3] }, 2), true)
+  assert.equal(await validateStructuredValue({ enum: [1, 2, 3] }, 9), false)
+  assert.equal(await validateStructuredValue({ not: { type: "string", pattern: "^X" } }, "Xyz"), false)
+  assert.equal(await validateStructuredValue({ not: { type: "string", pattern: "^X" } }, "abc"), true)
 })

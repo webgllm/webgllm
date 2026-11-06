@@ -85,7 +85,7 @@ const reply = await webgllm.chat.completions.create({
 const person = JSON.parse(reply.choices[0].message.content!)
 ```
 
-Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values.
+Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values. `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends rather than while it's written (a limitation of the constraint library, [llguidance-js#4](https://github.com/nico-martin/llguidance-js/issues/4)): an answer that can't satisfy them fails fast with `invalid-output`.
 
 ### Several models
 
@@ -103,7 +103,7 @@ await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 
 ### Errors
 
-`WebGLLMError` has a `code`: `webgl2-unavailable`, `model-not-supported`, `model-not-loaded`, `download-failed`, `storage-full`, `out-of-memory`, `gpu-context-lost`, `context-length-exceeded`, `invalid-schema` or `unsupported-parameter`.
+`WebGLLMError` has a `code`: `webgl2-unavailable`, `model-not-supported`, `model-not-loaded`, `download-failed`, `storage-full`, `out-of-memory`, `gpu-context-lost`, `context-length-exceeded`, `invalid-schema`, `invalid-output` or `unsupported-parameter`.
 
 ## Models
 
