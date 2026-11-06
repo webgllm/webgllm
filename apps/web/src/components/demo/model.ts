@@ -1,5 +1,11 @@
 import type { ChatModelAdapter, ThreadMessage, ToolCallMessagePart } from '@assistant-ui/react';
-import type { ChatCompletionMessageParam, ChatCompletionTool, ReasoningEffort } from 'webgllm';
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+  CompletionTimings,
+  CompletionUsage,
+  ReasoningEffort,
+} from 'webgllm';
 import { WebGLLM } from 'webgllm';
 import { WEBGL_MODEL_META } from 'webgllm/advanced';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
@@ -194,11 +200,20 @@ export function chatModel(): ChatModelAdapter {
             ],
             ...(tools.length > 0 && { tools }),
             stream: true,
+            stream_options: { include_usage: true },
           },
           { signal: abortSignal },
         );
         setStatus({ state: 'ready' });
+        // Timed from here, once the model is loaded, so a download doesn't count.
+        const streamStartTime = Date.now();
+        let totalChunks = 0;
+        let usage: CompletionUsage | undefined;
+        let timings: CompletionTimings | undefined;
         for await (const chunk of stream) {
+          totalChunks++;
+          usage = chunk.usage ?? usage;
+          timings = chunk.timings ?? timings;
           const delta = chunk.choices[0]?.delta;
           if (!delta) continue;
           if (delta.reasoning_content) reasoning += delta.reasoning_content;
@@ -211,11 +226,20 @@ export function chatModel(): ChatModelAdapter {
           }
           yield { content: content() };
         }
+        // assistant-ui's message timing, from what webgllm measured.
+        const timing = {
+          streamStartTime,
+          totalStreamTime: Date.now() - streamStartTime,
+          ...(timings?.first_token_ms != null && { firstTokenTime: timings.first_token_ms }),
+          ...(usage && { tokenCount: usage.completion_tokens }),
+          ...(timings && { tokensPerSecond: timings.decode_tokens_per_second }),
+          totalChunks,
+          toolCallCount: calls.length,
+        };
         if (calls.length === 0) {
           // The answer: the pages its web searches found go under it as
           // source parts, which assistant-ui renders as chips.
-          const sources = replySources(current);
-          if (sources.length > 0) yield { content: [...content(), ...sources] };
+          yield { content: [...content(), ...replySources(current)], metadata: { timing } };
           return;
         }
         // assistant-ui's local runtime doesn't run tools itself: run each
@@ -245,7 +269,7 @@ export function chatModel(): ChatModelAdapter {
             return { ...part, ...results[index] };
           }),
           status: { type: 'requires-action', reason: 'tool-calls' },
-          metadata: { steps: [{}] },
+          metadata: { steps: [{}], timing },
         };
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return;

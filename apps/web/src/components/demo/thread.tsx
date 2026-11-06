@@ -2,6 +2,7 @@
 
 import { ThreadFollowupSuggestions } from "./follow-up-suggestions";
 import { MarkdownText } from "./markdown-text";
+import { MessageTiming } from "./message-timing";
 import { Sources } from "./sources";
 import {
   Reasoning,
@@ -813,6 +814,7 @@ const AssistantActionBar: FC = () => {
           <RefreshCwIcon />
         </TooltipIconButton>
       </ActionBarPrimitive.Reload>
+      <MessageTiming />
       <ActionBarMorePrimitive.Root>
         <ActionBarMorePrimitive.Trigger asChild>
           <TooltipIconButton

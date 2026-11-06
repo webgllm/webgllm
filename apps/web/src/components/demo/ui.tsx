@@ -138,11 +138,11 @@ export function TooltipContent({
   sideOffset = 4,
   className,
   children,
-}: {
+  ...props
+}: Omit<ComponentPropsWithoutRef<'div'>, 'className'> & {
   side?: 'top' | 'bottom' | 'left' | 'right';
   sideOffset?: number;
   className?: string;
-  children: ReactNode;
 }) {
   return (
     <BaseTooltip.Portal>
@@ -152,6 +152,7 @@ export function TooltipContent({
             'rounded-md border bg-fd-popover px-2 py-1 text-xs text-fd-popover-foreground shadow-md',
             className,
           )}
+          {...props}
         >
           {children}
         </BaseTooltip.Popup>
