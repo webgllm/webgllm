@@ -43,6 +43,8 @@ export type {
   CompletionUsage,
   FinishReason,
   LoadProgress,
+  ModelUnloadReason,
+  WebGLLMEventMap,
   ModelInfo,
   ReasoningEffort,
   ResponseFormat

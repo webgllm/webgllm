@@ -6,7 +6,7 @@
 export { setPromptBatch } from "./client.js"
 export { defaultMemoryBudget } from "./model-memory.js"
 export { WEBGL_MODEL_META, WEBGL_TEXT_MODELS, fileUrl } from "./model-meta.js"
-export type { ModelFile, ModelReasoning, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
+export type { ModelFile, ModelReasoning, WebGlModelMeta, WebGlModelReasoning, WebGlTextModel } from "./model-meta.js"
 export { createThinkingSplitter, splitThinking } from "./reply.js"
 export type { ReplyPiece } from "./reply.js"
 export { createToolCallSplitter, parseToolCalls } from "./tool-calls.js"

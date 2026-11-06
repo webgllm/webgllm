@@ -258,3 +258,20 @@ export type ModelInfo = {
   loadedContextLength?: number
   supports: { tools: boolean; thinking: boolean }
 }
+
+/** Why a model left memory: unloadModel, room for another model, nobody waiting for its load, a failed load, or its worker stopped. */
+export type ModelUnloadReason = "unloaded" | "evicted" | "aborted" | "failed" | "crashed"
+
+/** The events a WebGLLM instance dispatches, by type. */
+export type WebGLLMEventMap = {
+  /** Every load's and download's progress. */
+  progress: LoadProgress
+  /** A model began loading (from loadModel, or on demand for a completion). */
+  loadstart: { model: string; contextLength?: number }
+  /** A model is loaded and ready, holding `contextLength` tokens. */
+  load: { model: string; contextLength: number }
+  /** A model's load failed, or its worker stopped. */
+  error: { model: string; error: Error }
+  /** A model left memory. */
+  unload: { model: string; reason: ModelUnloadReason }
+}

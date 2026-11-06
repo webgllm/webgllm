@@ -40,6 +40,18 @@ await webgllm.loadModel("unsloth/Qwen3.5-2B-GGUF", {
 
 `loadModel` is optional: `create()` loads its model on demand, and takes `{ onProgress }` in its second argument for that case. `downloadModel(model)` fetches the files without loading them.
 
+### Events
+
+```ts
+webgllm.addEventListener("progress", (p) => setProgress(p.model, p.progress))
+webgllm.addEventListener("loadstart", ({ model }) => setStatus(model, "loading"))
+webgllm.addEventListener("load", ({ model, contextLength }) => setStatus(model, "ready"))
+webgllm.addEventListener("error", ({ model, error }) => setStatus(model, "error", error.message))
+webgllm.addEventListener("unload", ({ model, reason }) => setStatus(model, "idle"))
+```
+
+They fire whatever started them: `loadModel`, a completion loading its model on demand, or room made for another model. `unload`'s `reason` is `"unloaded"`, `"evicted"`, `"aborted"`, `"failed"` (after an `error`) or `"crashed"` (after an `error`).
+
 ### Streaming and cancelling
 
 ```ts

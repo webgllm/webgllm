@@ -12,7 +12,7 @@ import { monitorFrames } from "./frame-pacing.js"
 import type { ModelStorage } from "./model-files.js"
 import { MemoryBudget } from "./model-memory.js"
 import type { WebGlTextModel } from "./model-meta.js"
-import type { LoadProgress } from "./openai.js"
+import type { LoadProgress, ModelUnloadReason, WebGLLMEventMap } from "./openai.js"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 
 export type LogLevel = "debug" | "info" | "warn" | "error" | "silent"
@@ -24,10 +24,17 @@ export type PoolOptions = {
   storage: ModelStorage
   /** Every load's and download's progress (the instance's listeners). */
   onProgress: (progress: LoadProgress) => void
+  /** Models starting to load, loaded, failing and leaving memory (the instance's listeners). */
+  onModelEvent?: (event: ModelEvent) => void
   log: (level: Exclude<LogLevel, "silent">, text: string) => void
 }
 
 type ProgressListener = (progress: LoadProgress) => void
+
+/** A model lifecycle event: WebGLLMEventMap's, tagged with its type. */
+export type ModelEvent = {
+  [K in Exclude<keyof WebGLLMEventMap, "progress">]: { type: K } & WebGLLMEventMap[K]
+}[Exclude<keyof WebGLLMEventMap, "progress">]
 
 type Entry = {
   model: WebGlTextModel
@@ -39,6 +46,8 @@ type Entry = {
   listeners: Set<ProgressListener>
   /** Being unloaded to make room (once its generation ends). */
   evicting: Promise<void> | null
+  /** The load "loadstart" was dispatched for (one per load, however many wait for it). */
+  watched: Promise<void> | null
 }
 
 type Download = {
@@ -141,7 +150,25 @@ export class ModelPool {
       this.budget.touch(model)
       return
     }
-    await this.waitForLoad(entry, entry.worker.loadModel(contextLength), options.onProgress, signal)
+    const load = entry.worker.loadModel(contextLength)
+    this.watch(entry, load, contextLength)
+    await this.waitForLoad(entry, load, options.onProgress, signal)
+  }
+
+  /** Dispatches "loadstart" for a new load, and "load" when it's ready. */
+  private watch(entry: Entry, load: Promise<void>, contextLength: number | undefined) {
+    if (entry.watched === load) return
+    entry.watched = load
+    this.options.onModelEvent?.({ type: "loadstart", model: entry.model, ...(contextLength !== undefined && { contextLength }) })
+    load.then(
+      () => {
+        if (this.entries.get(entry.model) !== entry || entry.watched !== load || !entry.worker.ready) return
+        const held = entry.worker.loadedContextLength ?? contextLength ?? 0
+        this.options.onModelEvent?.({ type: "load", model: entry.model, contextLength: held })
+      },
+      // Failures dispatch from drop(); a load superseded by another context has its own events.
+      () => undefined
+    )
   }
 
   /**
@@ -191,12 +218,12 @@ export class ModelPool {
       if (signal?.aborted) {
         // Nobody wants it any more: stop the load.
         if (entry.waiters === 1 && !entry.worker.ready && entry.worker.loadPromise === load) {
-          this.drop(entry, abortError(signal) as Error)
+          this.drop(entry, abortError(signal) as Error, "aborted")
         }
       } else if (!entry.worker.ready && entry.worker.loadPromise === null) {
         // A failed load frees its worker (and what it claimed); the next try starts afresh.
         // (Not one superseded by a load for another context: that one goes on.)
-        this.drop(entry, error as Error)
+        this.drop(entry, error as Error, "failed")
       }
       throw error
     } finally {
@@ -208,7 +235,7 @@ export class ModelPool {
   /** Unloads `model`, or every model; their running generations fail with "model-not-loaded". */
   unload(model?: string) {
     for (const entry of [...this.entries.values()]) {
-      if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model))
+      if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }
   }
 
@@ -309,6 +336,7 @@ export class ModelPool {
       waiters: 0,
       listeners: new Set(),
       evicting: null,
+      watched: null,
       worker: new ModelWorker(model, this.options.createWorker, {
         onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
         onClaim: async (bytes) => {
@@ -320,7 +348,7 @@ export class ModelPool {
         onLog: (text) => this.options.log("info", text),
         onCrash: (error) => {
           this.options.log("error", `${model}'s worker stopped: ${error.message}`)
-          this.drop(entry, error)
+          this.drop(entry, error, "crashed")
         }
       })
     }
@@ -333,11 +361,13 @@ export class ModelPool {
   }
 
   /** Ends `entry`'s worker, freeing its model and memory; what waits on it fails with `reason`. */
-  private drop(entry: Entry, reason: Error) {
+  private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
     entry.worker.terminate(reason)
     if (this.entries.get(entry.model) !== entry) return
     this.entries.delete(entry.model)
     this.budget.release(entry.model)
+    if (why === "failed" || why === "crashed") this.options.onModelEvent?.({ type: "error", model: entry.model, error: reason })
+    this.options.onModelEvent?.({ type: "unload", model: entry.model, reason: why })
     if (this.entries.size === 0) {
       this.stopFrames?.()
       this.stopFrames = undefined
@@ -353,7 +383,7 @@ export class ModelPool {
     if (!entry) return Promise.resolve()
     entry.evicting ??= entry.worker.idle().then(() => {
       this.options.log("info", `Unloaded ${model} to make room for another model.`)
-      this.drop(entry, unloaded(model))
+      this.drop(entry, unloaded(model), "evicted")
     })
     return entry.evicting
   }

@@ -22,7 +22,7 @@ import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js
 import { browserStorage, fileKey, modelFiles } from "./model-files.js"
 import type { ModelStorage } from "./model-files.js"
 import { defaultMemoryBudget } from "./model-memory.js"
-import { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+import { modelMeta, WEBGL_TEXT_MODELS } from "./model-meta.js"
 import type { WebGlTextModel } from "./model-meta.js"
 import type {
   ChatCompletion,
@@ -31,7 +31,8 @@ import type {
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionCreateParamsStreaming,
   LoadProgress,
-  ModelInfo
+  ModelInfo,
+  WebGLLMEventMap
 } from "./openai.js"
 import { ModelPool } from "./pool.js"
 import type { LogLevel } from "./pool.js"
@@ -99,7 +100,8 @@ export class WebGLLM {
   readonly chat: { readonly completions: Completions }
   readonly models: Models
   private readonly pool: ModelPool
-  private readonly listeners = new Set<(progress: LoadProgress) => void>()
+  /** Listeners by event type (typed at addEventListener and dispatch). */
+  private readonly listeners = new Map<keyof WebGLLMEventMap, Set<(event: unknown) => void>>()
   private readonly storage: ModelStorage
   private checked = false
 
@@ -112,8 +114,9 @@ export class WebGLLM {
       storage: this.storage,
       onProgress: (progress) => {
         options.onProgress?.(progress)
-        for (const listener of this.listeners) listener(progress)
+        this.dispatch("progress", progress)
       },
+      onModelEvent: ({ type, ...event }) => this.dispatch(type, event as never),
       log: (at, text) => {
         if (LEVELS[at] < level) return
         if (at === "error") console.error(text)
@@ -127,12 +130,31 @@ export class WebGLLM {
     this.models = new Models(this, this.pool, this.storage)
   }
 
-  addEventListener(type: "progress", listener: (progress: LoadProgress) => void): void {
-    if (type === "progress") this.listeners.add(listener)
+  /**
+   * Listens for load progress ("progress") and models' lifecycle:
+   * "loadstart", "load" (ready), "error" and "unload", whatever started
+   * them: loadModel, a completion loading on demand, or room made for
+   * another model.
+   */
+  addEventListener<K extends keyof WebGLLMEventMap>(type: K, listener: (event: WebGLLMEventMap[K]) => void): void {
+    let set = this.listeners.get(type)
+    if (!set) this.listeners.set(type, (set = new Set()))
+    set.add(listener as (event: unknown) => void)
   }
 
-  removeEventListener(type: "progress", listener: (progress: LoadProgress) => void): void {
-    if (type === "progress") this.listeners.delete(listener)
+  removeEventListener<K extends keyof WebGLLMEventMap>(type: K, listener: (event: WebGLLMEventMap[K]) => void): void {
+    this.listeners.get(type)?.delete(listener as (event: unknown) => void)
+  }
+
+  private dispatch<K extends keyof WebGLLMEventMap>(type: K, event: WebGLLMEventMap[K]) {
+    // A throwing listener mustn't break the engine's bookkeeping.
+    for (const listener of this.listeners.get(type) ?? []) {
+      try {
+        listener(event)
+      } catch (error) {
+        console.error(error)
+      }
+    }
   }
 
   /**
@@ -351,7 +373,7 @@ class Completions {
 
 const readerFor = (plan: CompletionPlan) =>
   createReplyReader({
-    format: WEBGL_MODEL_META[plan.model].toolFormat ?? "lfm3",
+    format: modelMeta(plan.model).toolFormat ?? "lfm3",
     parseTools: plan.parseTools,
     parallelToolCalls: plan.parallelToolCalls
   })
@@ -382,14 +404,14 @@ class Models {
     for (const other of WEBGL_TEXT_MODELS) {
       if (other === id) continue
       if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
-        for (const file of modelFiles(WEBGL_MODEL_META[other])) keep.add(fileKey(file))
+        for (const file of modelFiles(modelMeta(other))) keep.add(fileKey(file))
       }
     }
     await this.storage.remove(id, keep)
   }
 
   private async info(model: WebGlTextModel): Promise<ModelInfo> {
-    const meta = WEBGL_MODEL_META[model]
+    const meta = modelMeta(model)
     const loaded = this.pool.isLoaded(model)
     const [contextLength, size, downloaded] = await Promise.all([
       this.storage.contextLength(model),

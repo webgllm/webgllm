@@ -263,3 +263,71 @@ test("tool-call repair runs before a stream's tool calls, and valid calls aren't
   const call = chunks.flatMap((c) => c.choices[0]?.delta.tool_calls ?? [])[0]
   assert.equal(call?.function?.arguments, '{"city":"Oslo"}')
 })
+
+function recordEvents(client: WebGLLM) {
+  const events: Array<string> = []
+  client.addEventListener("loadstart", (e) => events.push(`loadstart ${e.model}`))
+  client.addEventListener("load", (e) => events.push(`load ${e.model}`))
+  client.addEventListener("error", (e) => events.push(`error ${e.model}: ${e.error.message}`))
+  client.addEventListener("unload", (e) => events.push(`unload ${e.model} ${e.reason}`))
+  return events
+}
+
+test("lifecycle events: loadModel, an on-demand load, and unloadModel", async () => {
+  const { llm: client } = llm({ reply: () => ({ tokens: ["hi"] }) })
+  const events = recordEvents(client)
+  await client.loadModel(LFM2)
+  assert.deepEqual(events, [`loadstart ${LFM2}`, `load ${LFM2}`])
+  // Loaded already: no events. A completion for another model loads it on demand.
+  await client.chat.completions.create({ model: LFM2, messages: hi })
+  await client.chat.completions.create({ model: QWEN, messages: hi })
+  assert.deepEqual(events.slice(2), [`loadstart ${QWEN}`, `load ${QWEN}`])
+  await client.unloadModel(LFM2)
+  assert.deepEqual(events.slice(4), [`unload ${LFM2} unloaded`])
+})
+
+test("lifecycle events: a model evicted for room, a failed load, an aborted load, a crash", async () => {
+  // Each model claims 600 of the 1,000-byte budget: loading the second evicts the first.
+  const evicting = llm({ bytes: () => 600 })
+  const evictions = recordEvents(evicting.llm)
+  await evicting.llm.loadModel(LFM2)
+  await evicting.llm.loadModel(QWEN)
+  assert.ok(evictions.includes(`unload ${LFM2} evicted`), evictions.join(", "))
+
+  const failing = llm({ loadError: () => ({ message: "no luck", code: "download-failed" }) })
+  const failures = recordEvents(failing.llm)
+  await assert.rejects(failing.llm.loadModel(LFM2))
+  assert.deepEqual(failures, [`loadstart ${LFM2}`, `error ${LFM2}: no luck`, `unload ${LFM2} failed`])
+
+  const aborting = llm()
+  const aborts = recordEvents(aborting.llm)
+  const controller = new AbortController()
+  const load = aborting.llm.loadModel(LFM2, { signal: controller.signal })
+  controller.abort()
+  await assert.rejects(load)
+  await settle()
+  assert.deepEqual(aborts, [`loadstart ${LFM2}`, `unload ${LFM2} aborted`])
+
+  const crashing = llm()
+  const crashes = recordEvents(crashing.llm)
+  await crashing.llm.loadModel(LFM2)
+  crashing.workers.of(LFM2)!.onerror?.({ message: "boom" })
+  await settle()
+  assert.equal(crashes[2]?.startsWith(`error ${LFM2}:`), true, crashes.join(", "))
+  assert.equal(crashes[3], `unload ${LFM2} crashed`)
+})
+
+test("a throwing listener doesn't break loading", async () => {
+  const { llm: client } = llm()
+  client.addEventListener("loadstart", () => {
+    throw new Error("listener bug")
+  })
+  const original = console.error
+  console.error = () => undefined
+  try {
+    await client.loadModel(LFM2)
+  } finally {
+    console.error = original
+  }
+  assert.equal((await client.models.retrieve(LFM2)).loaded, true)
+})

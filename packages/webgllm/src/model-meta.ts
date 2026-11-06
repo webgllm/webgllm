@@ -162,13 +162,18 @@ const LFM3_1_7B_ONNX = {
  * a 4-bit GatherBlockQuantized embedding that is also the output head),
  * at its latest version (main).
  */
-function lfm2Onnx(o: {
-  name: string
+/** LFM2.5's reasoning as a type: Thinking builds always think, the rest don't. */
+type Lfm2Reasoning<Thinking extends boolean> = Thinking extends true
+  ? { readonly reasoning: typeof ALWAYS_THINKS }
+  : { readonly reasoning?: undefined }
+
+function lfm2Onnx<const Name extends string, const Thinking extends boolean>(o: {
+  name: Name
   size: string
-  thinking: boolean
+  thinking: Thinking
 }) {
   const repo = { repo: o.name }
-  return {
+  const meta = {
     name: o.name,
     format: "onnx",
     files: {
@@ -188,6 +193,8 @@ function lfm2Onnx(o: {
     sampling: o.thinking ? LFM2_5_THINKING_SAMPLING : LFM2_5_SAMPLING,
     toolFormat: "lfm2"
   } as const satisfies WebGlModelMeta
+  // `thinking` decides `reasoning` at run time; this says so in the type.
+  return meta as unknown as Omit<typeof meta, "reasoning"> & Lfm2Reasoning<Thinking>
 }
 
 const LFM2_5_1_2B = lfm2Onnx({
@@ -203,10 +210,10 @@ const LFM2_5_1_2B_THINKING = lfm2Onnx({
 })
 
 /** Official Q4_0 GGUFs; QAD tokenizers/templates accompany those exact builds. */
-function lfm2Gguf<const T extends string>(o: { name: T; file: string; size: string; thinking: boolean; tokenizerRepo: string; tokenizerPrefix?: string }) {
+function lfm2Gguf<const Name extends string, const Thinking extends boolean>(o: { name: Name; file: string; size: string; thinking: Thinking; tokenizerRepo: string; tokenizerPrefix?: string }) {
   const tokenizer = { repo: o.tokenizerRepo }
   const prefix = o.tokenizerPrefix ?? ""
-  return {
+  const meta = {
     name: o.name, format: "gguf",
     files: { kind: "gguf", model: { repo: o.name, path: o.file } },
     tokenizer: {
@@ -220,6 +227,8 @@ function lfm2Gguf<const T extends string>(o: { name: T; file: string; size: stri
     sampling: o.thinking ? LFM2_5_THINKING_SAMPLING : LFM2_5_SAMPLING,
     toolFormat: "lfm2"
   } as const satisfies WebGlModelMeta
+  // `thinking` decides `reasoning` at run time; this says so in the type.
+  return meta as unknown as Omit<typeof meta, "reasoning"> & Lfm2Reasoning<Thinking>
 }
 const LFM2_5_350M_GGUF = lfm2Gguf({
   name: "LiquidAI/LFM2.5-350M-GGUF", file: "LFM2.5-350M-QAD-Q4_0.gguf", size: "350m", thinking: false,
@@ -333,9 +342,12 @@ export const WEBGL_TEXT_MODELS = [
 /** A model this package runs. */
 export type WebGlTextModel = (typeof WEBGL_TEXT_MODELS)[number]
 
-export const WEBGL_MODEL_META: Readonly<
-  Record<WebGlTextModel, WebGlModelMeta>
-> = {
+/**
+ * Each model's files, capabilities, reasoning and sampling. `satisfies`
+ * rather than a type annotation keeps each entry's exact type, so a
+ * model's reasoning levels can be read per model (see WebGlModelReasoning).
+ */
+export const WEBGL_MODEL_META = {
   [LFM3_1_7B_GGUF.name]: LFM3_1_7B_GGUF,
   [LFM3_1_7B_ONNX.name]: LFM3_1_7B_ONNX,
   [LFM2_5_1_2B.name]: LFM2_5_1_2B,
@@ -346,7 +358,10 @@ export const WEBGL_MODEL_META: Readonly<
   [LFM2_5_1_2B_THINKING_GGUF.name]: LFM2_5_1_2B_THINKING_GGUF,
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
   [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX
-}
+} as const satisfies Readonly<Record<WebGlTextModel, WebGlModelMeta>>
+
+/** A model's reasoning, exactly: its levels, or undefined for a model that doesn't think. */
+export type WebGlModelReasoning<Model extends WebGlTextModel> = (typeof WEBGL_MODEL_META)[Model]["reasoning"]
 
 export const modelMeta = (model: WebGlTextModel): WebGlModelMeta =>
   WEBGL_MODEL_META[model]

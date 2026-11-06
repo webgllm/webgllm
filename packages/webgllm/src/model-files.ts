@@ -5,7 +5,7 @@
  * (sizes, context lengths) are looked up once per page.
  */
 import { httpSource, blobSource } from "./byte-source.js"
-import { fileUrl, WEBGL_MODEL_META } from "./model-meta.js"
+import { fileUrl, modelMeta } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
 import { diskName, isOldVersion, storedFile } from "./storage.js"
 import type { ByteSource } from "./weights.js"
@@ -169,12 +169,12 @@ async function folder(): Promise<FileSystemDirectoryHandle> {
 /** The browser's storage (OPFS), read from the page. */
 export const browserStorage: ModelStorage = {
   async downloaded(model) {
-    const stored = await Promise.all(modelFiles(WEBGL_MODEL_META[model]).map(storedFile))
+    const stored = await Promise.all(modelFiles(modelMeta(model)).map(storedFile))
     return stored.every(Boolean)
   },
   async size(model) {
     try {
-      const all = await Promise.all(modelFiles(WEBGL_MODEL_META[model]).map(fileSize))
+      const all = await Promise.all(modelFiles(modelMeta(model)).map(fileSize))
       return all.reduce((a, b) => a + b, 0)
     } catch {
       return 0
@@ -183,7 +183,7 @@ export const browserStorage: ModelStorage = {
   contextLength(model) {
     let length = contexts.get(model)
     if (!length) {
-      length = readContextLength(WEBGL_MODEL_META[model]).catch(() => {
+      length = readContextLength(modelMeta(model)).catch(() => {
         contexts.delete(model)
         return 0
       })
@@ -198,7 +198,7 @@ export const browserStorage: ModelStorage = {
     } catch {
       return
     }
-    const files = modelFiles(WEBGL_MODEL_META[model]).filter((f) => !keep.has(fileKey(f)))
+    const files = modelFiles(modelMeta(model)).filter((f) => !keep.has(fileKey(f)))
     const names = new Set<string>()
     for (const file of files) {
       const name = diskName(file)

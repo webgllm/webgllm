@@ -6,7 +6,7 @@
  */
 import { validateStructuredValue } from "./constraint/index.js"
 import { WebGLLMError } from "./errors.js"
-import { WEBGL_MODEL_META } from "./model-meta.js"
+import { modelMeta, WEBGL_MODEL_META } from "./model-meta.js"
 import type { WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
 import type {
   ChatCompletion,
@@ -278,7 +278,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     throw new WebGLLMError("model-not-supported", `${body.model} isn't a model webgllm runs (see models.list()).`)
   }
   const model = body.model
-  const meta = WEBGL_MODEL_META[model]
+  const meta = modelMeta(model)
 
   const n = numberField(body, "n", { min: 1, integer: true })
   if (n !== undefined && n > 1) throw unsupported("n > 1 isn't supported: one choice per request.")
@@ -504,7 +504,7 @@ export async function planRepairs(
  */
 export function repairRequest(plan: CompletionPlan, repair: ToolRepair): GenerateFields {
   const { stop: _stop, thinkingBudgetTokens: _budget, ...rest } = plan.generate
-  const meta = WEBGL_MODEL_META[plan.model]
+  const meta = modelMeta(plan.model)
   const format = meta.toolFormat ?? "lfm3"
   const names = plan.generate.tools.map((t) => t.function.name).join(", ")
   const attempt: ChatMessage =
