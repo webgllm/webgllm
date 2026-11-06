@@ -88,14 +88,6 @@ export const MessageTiming: FC<{
                 {formatTimingMs(timing.totalStreamTime)}
               </span>
             </div>
-            {timing.tokensPerSecond !== undefined && (
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-fd-muted-foreground">Speed</span>
-                <span className="font-mono tabular-nums">
-                  {timing.tokensPerSecond.toFixed(1)} tok/s
-                </span>
-              </div>
-            )}
             {stats?.promptTokensPerSecond !== undefined && (
             <div className="flex items-center justify-between gap-4">
               <span className="text-fd-muted-foreground">Prompt speed</span>
@@ -103,6 +95,14 @@ export const MessageTiming: FC<{
                 {stats.promptTokensPerSecond.toFixed(1)} tok/s
               </span>
             </div>
+            )}
+            {timing.tokensPerSecond !== undefined && (
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-fd-muted-foreground">Decode speed</span>
+                <span className="font-mono tabular-nums">
+                  {timing.tokensPerSecond.toFixed(1)} tok/s
+                </span>
+              </div>
             )}
             {stats?.promptTokens !== undefined && (
             <div className="flex items-center justify-between gap-4">
