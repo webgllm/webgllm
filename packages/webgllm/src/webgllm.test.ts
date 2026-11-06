@@ -365,3 +365,19 @@ test("a throwing listener doesn't break loading", async () => {
   }
   assert.equal((await client.models.retrieve(LFM2)).loaded, true)
 })
+
+test("onMemoryClaim forwards each model's claims, released at its unload event", async () => {
+  const workers = fakeWorkers({ bytes: () => 700 })
+  internals.storage = fakeStorage(new Set([QWEN]))
+  const host = new Map<string, number>()
+  const instance = new WebGLLM({
+    worker: workers.create,
+    memoryBudget: 1000,
+    onMemoryClaim: ({ model, bytes }) => void host.set(model, bytes)
+  })
+  instance.addEventListener("unload", ({ model }) => host.delete(model))
+  await instance.loadModel(QWEN)
+  assert.deepEqual([...host], [[QWEN, 700]])
+  await instance.unloadModel(QWEN)
+  assert.deepEqual([...host], [])
+})

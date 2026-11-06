@@ -50,6 +50,16 @@ export type WebGLLMOptions = {
   logLevel?: LogLevel
   /** Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))` themselves. */
   worker?: () => Worker
+  /**
+   * Called each time a model's worker claims memory, with the bytes the
+   * model will hold in all (replacing its previous claim). The worker
+   * allocates only after the returned promise resolves, so the host can
+   * make room elsewhere first. Rejecting fails the load (or the cache
+   * growth) as a refused claim does. `signal` aborts when the model is
+   * unloaded or the claimant goes away; stop waiting then.
+   * The model's memory is free again at its "unload" event.
+   */
+  onMemoryClaim?: (claim: { model: string; bytes: number; signal: AbortSignal }) => Promise<void> | void
 }
 
 export type LoadModelOptions = {
@@ -117,6 +127,7 @@ export class WebGLLM {
         this.dispatch("progress", progress)
       },
       onModelEvent: ({ type, ...event }) => this.dispatch(type, event as never),
+      ...(options.onMemoryClaim && { onMemoryClaim: options.onMemoryClaim }),
       log: (at, text) => {
         if (LEVELS[at] < level) return
         if (at === "error") console.error(text)

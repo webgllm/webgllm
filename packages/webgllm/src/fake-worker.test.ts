@@ -62,6 +62,14 @@ export class FakeWorker {
     if (!this.terminated) this.onmessage?.({ data })
   }
 
+  /** Claims memory again (a cache growing during a reply); resolves once "claimed". */
+  claim(bytes: number) {
+    return new Promise<void>((resolve) => {
+      this.claimed.push(resolve)
+      this.emit({ type: "claim", model: this.model!, bytes })
+    })
+  }
+
   /** Ends a held generation. */
   finish(id: string, tokens: Array<string> = [], done: Partial<Extract<WorkerResponse, { type: "done" }>> = {}) {
     this.open.delete(id)

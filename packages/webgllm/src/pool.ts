@@ -26,10 +26,15 @@ export type PoolOptions = {
   onProgress: (progress: LoadProgress) => void
   /** Models starting to load, loaded, failing and leaving memory (the instance's listeners). */
   onModelEvent?: (event: ModelEvent) => void
+  /** The host's own budget, asked after webgllm's for each claim (see WebGLLMOptions). */
+  onMemoryClaim?: MemoryClaimHook
   log: (level: Exclude<LogLevel, "silent">, text: string) => void
 }
 
 type ProgressListener = (progress: LoadProgress) => void
+
+/** WebGLLMOptions.onMemoryClaim. */
+export type MemoryClaimHook = (claim: { model: string; bytes: number; signal: AbortSignal }) => Promise<void> | void
 
 /** A model lifecycle event: WebGLLMEventMap's, tagged with its type. */
 export type ModelEvent = {
@@ -400,7 +405,11 @@ export class ModelPool {
           if (this.entries.get(model) !== entry) return
           await this.budget.claim(model, bytes, entry.keepLoaded, entry.gone.signal)
           // (Unloaded while it claimed: what it claimed isn't held.)
-          if (!this.entries.has(model)) this.budget.release(model)
+          if (this.entries.get(model) !== entry) {
+            if (!this.entries.has(model)) this.budget.release(model)
+            return
+          }
+          await this.hostClaim(entry, bytes)
         },
         onLog: (text) => this.options.log("info", text),
         onCrash: (error) => {
@@ -415,6 +424,26 @@ export class ModelPool {
       for (const { worker } of this.entries.values()) worker.post(message)
     })
     return entry
+  }
+
+  /**
+   * Asks the host's budget for `entry`'s claim, after webgllm's own and
+   * outside its queue of claims, so a host making room by unloading another
+   * model can't wait on a claim in progress. A refusal fails the model (its
+   * load or the reply whose cache grew) and frees what webgllm's budget held
+   * for it; unloading it stops the wait.
+   */
+  private async hostClaim(entry: Entry, bytes: number) {
+    const hook = this.options.onMemoryClaim
+    if (!hook) return
+    const { signal } = entry.gone
+    try {
+      await abortable(Promise.resolve().then(() => hook({ model: entry.model, bytes, signal })), signal)
+    } catch (error) {
+      if (signal.aborted) return
+      const reason = error instanceof Error ? error.message : String(error)
+      this.drop(entry, new WebGLLMError("out-of-memory", `${entry.model}'s memory claim was refused: ${reason}`, { cause: error }), "failed")
+    }
   }
 
   /** Ends `entry`'s worker, freeing its model and memory; what waits on it fails with `reason`. */

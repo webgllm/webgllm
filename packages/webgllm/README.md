@@ -109,6 +109,18 @@ await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```
 
+### Sharing memory with other runtimes
+
+An app that also runs models in other runtimes (Transformers.js, wllama) can count webgllm's GPU memory in its own budget with `onMemoryClaim`. Each time a model's worker claims memory (an estimate before loading, the measured textures after, and each time its attention cache grows), the hook gets the bytes the model will hold in all, replacing its previous claim. The worker allocates only after the hook's promise resolves, so the app can make room first, for example by unloading another runtime's model (or another webgllm model with `unloadModel`). Rejecting fails the load, or the reply whose cache grew, with an `out-of-memory` error. `signal` aborts if the model is unloaded meanwhile. The model's memory is free again at its `unload` event.
+
+```ts
+const webgllm = new WebGLLM({
+  memoryBudget: registry.limit, // the same limit: webgllm still orders and evicts its own models
+  onMemoryClaim: ({ model, bytes, signal }) => registry.claim(`webgllm:${model}`, bytes, { signal })
+})
+webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${model}`))
+```
+
 ### Other request fields
 
 `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, image or audio content) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.

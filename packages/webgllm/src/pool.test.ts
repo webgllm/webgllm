@@ -6,6 +6,7 @@ import type { FakeOptions } from "./fake-worker.test.js"
 import { MemoryBudget } from "./model-memory.js"
 import type { LoadProgress } from "./openai.js"
 import { downloadProgress, loadProgress, ModelPool, TaskQueue } from "./pool.js"
+import type { ModelEvent, PoolOptions } from "./pool.js"
 
 const A = "LiquidAI/LFM2.5-350M-GGUF"
 const B = "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"
@@ -13,20 +14,24 @@ const C = "LiquidAI/LFM3-1.7B-GGUF"
 
 const fields = { chat: [{ role: "user" as const, content: "hi" }], tools: [], sampling: { temperature: 0, top_k: 1, repetition_penalty: 1 } }
 
-function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string> } = {}) {
+function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>; onMemoryClaim?: PoolOptions["onMemoryClaim"] } = {}) {
   const workers = fakeWorkers({ bytes: () => 60, ...options })
   const progress: Array<LoadProgress> = []
   const logs: Array<string> = []
+  const events: Array<ModelEvent> = []
   const storage = fakeStorage(options.downloaded)
   const p = new ModelPool({
     createWorker: workers.create,
     memoryBudget: () => options.budget ?? 100,
     storage,
     onProgress: (event) => progress.push(event),
+    onModelEvent: (event) => events.push(event),
+    ...(options.onMemoryClaim && { onMemoryClaim: options.onMemoryClaim }),
     log: (_, text) => logs.push(text)
   })
-  return { pool: p, workers, progress, logs, storage }
+  return { pool: p, workers, progress, logs, storage, events }
 }
+const claimedCount = (worker: { sent: Array<{ type: string }> }) => worker.sent.filter((m) => m.type === "claimed").length
 
 test("the budget unloads the least recently used model, keeping models kept loaded", async () => {
   const unloaded: Array<string> = []
@@ -381,4 +386,76 @@ test("a resize queued behind a reply is sent when the reply ends", async () => {
   await resize
   assert.deepEqual(a.sent.filter((m) => m.type === "load").map((m) => m.type === "load" && m.contextLength), [8192, 4096])
   assert.equal(p.requestedContext(A), 4096)
+})
+
+test("onMemoryClaim gets each claim's total bytes, and the worker allocates only after it resolves", async () => {
+  const claims: Array<[string, number]> = []
+  let release = () => {}
+  const { pool: p, workers } = pool({
+    budget: 1000,
+    onMemoryClaim: ({ model, bytes }) => {
+      claims.push([model, bytes])
+      return new Promise<void>((resolve) => (release = resolve))
+    }
+  })
+  const loading = p.load(A)
+  await settle()
+  const worker = workers.of(A)!
+  assert.deepEqual(claims, [[A, 60]], "the measured bytes after load")
+  assert.equal(claimedCount(worker), 0, "not told while the host makes room")
+  release()
+  await loading
+  assert.equal(claimedCount(worker), 1)
+
+  // A cache growing during a reply claims its new total.
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const grown = worker.claim(90)
+  await settle()
+  assert.deepEqual(claims.at(-1), [A, 90])
+  assert.equal(claimedCount(worker), 1, "the growth waits for the host too")
+  release()
+  await grown
+  assert.equal(claimedCount(worker), 2)
+  assert.equal(p.memoryUsed, 90, "a total, not an increment")
+  worker.finish(worker.generations()[0]!.id)
+  await running
+})
+
+test("an onMemoryClaim that rejects fails the load and leaves webgllm's budget", async () => {
+  const { pool: p, workers, events } = pool({ budget: 1000, onMemoryClaim: () => Promise.reject(new Error("no room in the host")) })
+  await assert.rejects(p.load(A), (error: unknown) =>
+    error instanceof WebGLLMError && error.code === "out-of-memory" && /no room in the host/.test(error.message))
+  assert.equal(p.memoryUsed, 0)
+  assert.equal(p.isLoaded(A), false)
+  assert.equal(workers.workers[0]!.terminated, true)
+  assert.deepEqual(events.map((e) => e.type), ["loadstart", "error", "unload"])
+})
+
+test("unloading a model while onMemoryClaim is pending aborts its signal", async () => {
+  let seen: AbortSignal | undefined
+  const { pool: p, events } = pool({ budget: 1000, onMemoryClaim: ({ signal }) => { seen = signal; return new Promise<void>(() => {}) } })
+  const loading = p.load(A)
+  await settle()
+  assert.equal(seen?.aborted, false)
+  p.unload(A)
+  assert.equal(seen?.aborted, true)
+  await assert.rejects(loading, (error: unknown) => error instanceof WebGLLMError && error.code === "model-not-loaded")
+  assert.equal(p.memoryUsed, 0)
+  assert.deepEqual(events.at(-1), { type: "unload", model: A, reason: "unloaded" })
+})
+
+test("an onMemoryClaim that unloads another model to make room doesn't deadlock", async () => {
+  let pool_: ModelPool | undefined
+  const { pool: p } = pool({
+    budget: 1000,
+    onMemoryClaim: async ({ model }) => {
+      if (model === B) pool_!.unload(A)
+    }
+  })
+  pool_ = p
+  await p.load(A)
+  await p.load(B)
+  assert.deepEqual(p.loadedModels(), [B])
+  assert.equal(p.memoryUsed, 60)
 })
