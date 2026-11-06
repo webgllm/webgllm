@@ -26,7 +26,7 @@ import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
 import { createThinkingBudget } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
-import { createConstraint } from "@tanstack-ai-browser/structured-output"
+import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
 

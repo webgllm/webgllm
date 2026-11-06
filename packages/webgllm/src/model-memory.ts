@@ -31,7 +31,7 @@ type Registry = {
   budget?: number
 }
 
-const KEY = Symbol.for("@tanstack-ai-browser/model-memory")
+const KEY = Symbol.for("webgllm/model-memory")
 
 function registry(): Registry {
   const scope = globalThis as unknown as Record<symbol, Registry | undefined>

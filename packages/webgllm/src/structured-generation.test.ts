@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
-import { createConstraint, tokenAllowed } from "@tanstack-ai-browser/structured-output"
-import type { Constraint } from "@tanstack-ai-browser/structured-output"
+import { createConstraint, tokenAllowed } from "./constraint/index.js"
+import type { Constraint } from "./constraint/index.js"
 
 function fixture() {
   const accepted: number[] = []

@@ -32,7 +32,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     ${source.slice(start, end)}
     return generate;
   }
-` }, outfile, bundle: true, format: "esm", platform: "node", conditions: ["@tanstack-ai-browser/source"], logLevel: "error" })
+` }, outfile, bundle: true, format: "esm", platform: "node", conditions: ["webgllm/source"], logLevel: "error" })
 const { makeGenerate } = await import(pathToFileURL(outfile).href)
 function gate() {
   let release!: () => void

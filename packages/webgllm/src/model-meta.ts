@@ -5,8 +5,6 @@
  * q4f16 ONNX), each with its files (at their latest version) and the
  * sampling from its card.
  */
-import type { ModelReasoning } from "@tanstack/ai"
-import type { ModelReasoningCapability } from "@tanstack/ai/adapter-internals"
 
 import type { Sampling } from "./sampler.js"
 import type { ToolFormat } from "./tool-calls.js"
@@ -15,6 +13,12 @@ import type { ToolFormat } from "./tool-calls.js"
 export type ModelFile = {
   repo: string
   path: string
+}
+
+/** Whether thinking can be switched off (`off`) and capped by a token budget. */
+export type ModelReasoning = {
+  readonly levels: { readonly off?: "false"; readonly high: "true" }
+  readonly budget: boolean
 }
 
 export type WebGlModelMeta = {
@@ -41,7 +45,7 @@ export type WebGlModelMeta = {
     capabilities: ReadonlyArray<"tools" | "thinking">
   }
   size: string
-  /** Reasoning levels for `chat({ reasoning })`: the template's enable_thinking. */
+  /** Thinking levels: the chat template's enable_thinking values, and whether a budget applies. */
   reasoning?: ModelReasoning
   sampling: Sampling
   /** Recommended text sampling when the chat template enables thinking. */
@@ -120,38 +124,6 @@ const LFM3_1_7B_GGUF = {
   toolFormat: "lfm3"
 } as const satisfies WebGlModelMeta
 
-const LFM3_WEB_REPO = {
-  repo: "daveycodez/LFM3-1.7B-Web-ONNX"
-}
-
-/**
- * LFM3 1.7B for the web: GPTQ 4-bit with block size 32 and a 49k
- * vocabulary (900 MB), so writing each token costs less than with the GGUF's
- * 128k-row output head.
- */
-const LFM3_1_7B_WEB = {
-  name: "daveycodez/LFM3-1.7B-Web-ONNX",
-  format: "onnx",
-  files: {
-    kind: "onnx",
-    graph: { ...LFM3_WEB_REPO, path: "onnx/model_q4f16.onnx" },
-    data: {
-      ...LFM3_WEB_REPO,
-      path: "onnx/model_q4f16.onnx_data"
-    },
-    config: { ...LFM3_WEB_REPO, path: "config.json" }
-  },
-  tokenizer: {
-    tokenizer: { ...LFM3_WEB_REPO, path: "tokenizer.json" },
-    config: { ...LFM3_WEB_REPO, path: "tokenizer_config.json" },
-    chatTemplate: { ...LFM3_WEB_REPO, path: "chat_template.jinja" }
-  },
-  supports: TOOLS_AND_THINKING,
-  size: "1.7b",
-  reasoning: THINKING_SWITCH,
-  sampling: LFM3_SAMPLING,
-  toolFormat: "lfm3"
-} as const satisfies WebGlModelMeta
 
 const LFM3_ONNX_REPO = {
   repo: "onnx-community/LFM3-1.7B-ONNX"
@@ -226,19 +198,6 @@ const LFM2_5_1_2B = lfm2Onnx({
 
 const LFM2_5_1_2B_THINKING = lfm2Onnx({
   name: "LiquidAI/LFM2.5-1.2B-Thinking-ONNX",
-  size: "1.2b",
-  thinking: true
-})
-
-/** LFM2.5 1.2B re-exported to compute the prompt's last-token logits only (the WebGL engine does that anyway). */
-const LFM2_5_1_2B_WEB = lfm2Onnx({
-  name: "daveycodez/LFM2.5-1.2B-Web-ONNX",
-  size: "1.2b",
-  thinking: false
-})
-
-const LFM2_5_1_2B_THINKING_WEB = lfm2Onnx({
-  name: "daveycodez/LFM2.5-1.2B-Thinking-Web-ONNX",
   size: "1.2b",
   thinking: true
 })
@@ -360,12 +319,9 @@ const LFM2_5_350M = lfm2Onnx({
 
 export const WEBGL_TEXT_MODELS = [
   LFM3_1_7B_GGUF.name,
-  LFM3_1_7B_WEB.name,
   LFM3_1_7B_ONNX.name,
   LFM2_5_1_2B.name,
   LFM2_5_1_2B_THINKING.name,
-  LFM2_5_1_2B_WEB.name,
-  LFM2_5_1_2B_THINKING_WEB.name,
   LFM2_5_350M.name,
   LFM2_5_350M_GGUF.name,
   LFM2_5_1_2B_GGUF.name,
@@ -381,12 +337,9 @@ export const WEBGL_MODEL_META: Readonly<
   Record<WebGlTextModel, WebGlModelMeta>
 > = {
   [LFM3_1_7B_GGUF.name]: LFM3_1_7B_GGUF,
-  [LFM3_1_7B_WEB.name]: LFM3_1_7B_WEB,
   [LFM3_1_7B_ONNX.name]: LFM3_1_7B_ONNX,
   [LFM2_5_1_2B.name]: LFM2_5_1_2B,
   [LFM2_5_1_2B_THINKING.name]: LFM2_5_1_2B_THINKING,
-  [LFM2_5_1_2B_WEB.name]: LFM2_5_1_2B_WEB,
-  [LFM2_5_1_2B_THINKING_WEB.name]: LFM2_5_1_2B_THINKING_WEB,
   [LFM2_5_350M.name]: LFM2_5_350M,
   [LFM2_5_350M_GGUF.name]: LFM2_5_350M_GGUF,
   [LFM2_5_1_2B_GGUF.name]: LFM2_5_1_2B_GGUF,
@@ -394,28 +347,6 @@ export const WEBGL_MODEL_META: Readonly<
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
   [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX
 }
-
-const WEBGL_REASONING = {
-  [LFM3_1_7B_GGUF.name]: LFM3_1_7B_GGUF.reasoning,
-  [LFM3_1_7B_WEB.name]: LFM3_1_7B_WEB.reasoning,
-  [LFM3_1_7B_ONNX.name]: LFM3_1_7B_ONNX.reasoning,
-  [LFM2_5_1_2B_THINKING.name]: ALWAYS_THINKS,
-  [LFM2_5_1_2B_THINKING_GGUF.name]: ALWAYS_THINKS,
-  [LFM2_5_1_2B_THINKING_WEB.name]: ALWAYS_THINKS,
-  [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF.reasoning,
-  [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX.reasoning
-} as const
-
-/** The reasoning levels of each model. */
-export type WebGlModelReasoningByName = {
-  [K in keyof typeof WEBGL_REASONING]: ModelReasoningCapability<
-    (typeof WEBGL_REASONING)[K]
-  >
-}
-
-/** Reasoning data of each model, for `supportedReasoningLevels()`. */
-export const WEBGL_MODEL_REASONING: Readonly<Record<string, ModelReasoning>> =
-  WEBGL_REASONING
 
 export const modelMeta = (model: WebGlTextModel): WebGlModelMeta =>
   WEBGL_MODEL_META[model]

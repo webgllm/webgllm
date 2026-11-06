@@ -3,9 +3,7 @@ import test from "node:test"
 import { loadGguf } from "./load-gguf.js"
 import { GgmlType } from "./gguf.js"
 import type { GgufHeader, GgufTensorInfo, GgufValue } from "./gguf.js"
-import { modelMeta, WEBGL_TEXT_MODELS, WEBGL_MODEL_REASONING } from "./model-meta.js"
-import { WebGlTextAdapter } from "./adapter.js"
-import type { Sampling } from "./sampler.js"
+import { modelMeta, WEBGL_TEXT_MODELS } from "./model-meta.js"
 import type { WeightPiece } from "./weights.js"
 
 function fixture(arch = "lfm2", sliding = 0) {
@@ -68,19 +66,15 @@ test("unsupported architectures, untied LFM2 heads and incomplete LFM2 files fai
   const missing=fixture();missing.header.tensors.delete("token_embd_norm.weight")
   await assert.rejects(collect(missing),/missing tensor token_embd_norm/)
 })
-test("three official GGUF entries use recommended sampling with caller overrides and Thinking-only reasoning",()=>{
+test("three official GGUF entries use recommended sampling with Thinking-only reasoning",()=>{
   const names=["LiquidAI/LFM2.5-350M-GGUF","LiquidAI/LFM2.5-1.2B-Instruct-GGUF","LiquidAI/LFM2.5-1.2B-Thinking-GGUF"] as const
   for(const name of names){
     assert.ok(WEBGL_TEXT_MODELS.includes(name));const meta=modelMeta(name),thinking=name.includes("Thinking")
     assert.equal(meta.format,"gguf");assert.equal(meta.toolFormat,"lfm2");assert.equal(meta.files.kind,"gguf")
     assert.deepEqual(meta.sampling,{temperature:thinking?0.05:0.1,top_k:50,repetition_penalty:1.05})
-    const adapter=new WebGlTextAdapter(name)
-    const sample=Reflect.get(adapter,"sampling").bind(adapter) as (options:Partial<Sampling>|undefined,thinking:boolean)=>Sampling
-    assert.deepEqual(sample(undefined,thinking),meta.sampling)
-    assert.deepEqual(sample({temperature:0.3,top_k:9,top_p:0.8,min_p:0.1,repetition_penalty:1.2},thinking),{temperature:0.3,top_k:9,top_p:0.8,min_p:0.1,repetition_penalty:1.2})
     assert.equal(meta.sampling.top_p??1,1);assert.equal(meta.sampling.min_p??0,0)
-    if(thinking){assert.deepEqual(WEBGL_MODEL_REASONING[name],{levels:{high:"true"},budget:true});assert.ok(meta.supports.capabilities.includes("thinking"))}
-    else{assert.equal(WEBGL_MODEL_REASONING[name],undefined);assert.equal(meta.reasoning,undefined)}
+    if(thinking){assert.deepEqual(modelMeta(name).reasoning,{levels:{high:"true"},budget:true});assert.ok(meta.supports.capabilities.includes("thinking"))}
+    else{assert.equal(modelMeta(name).reasoning,undefined);assert.equal(meta.reasoning,undefined)}
     assert.equal(meta.files.kind==="gguf"&&meta.files.model.path.includes("QAD"),!thinking)
   }
 })

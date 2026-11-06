@@ -10,3 +10,4 @@ dist
 .nx/cache
 .nx/workspace-data
 .claude/settings.local.json
+out-tsc

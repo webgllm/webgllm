@@ -1,14 +1,7 @@
 /**
- * TanStack AI adapter for LFM3 on an LLM inference engine for WebGL 2, for
- * browsers without WebGPU (Firefox on Android, for one). Loads Liquid AI's
- * GGUF and the ONNX build for the web.
+ * WebGLLM: LLM inference in the browser on WebGL 2, for devices without
+ * WebGPU. The engine runs in a Web Worker on an OffscreenCanvas.
  */
-export { webglText, WebGlTextAdapter } from "./adapter.js"
-export type { WebGlTextConfig } from "./adapter.js"
-export type {
-  WebGlProviderUsageDetails,
-  WebGlTextProviderOptions
-} from "./adapter.js"
 export {
   hasWebGl2,
   loadModel,
@@ -19,29 +12,14 @@ export {
 export { setMemoryBudget } from "./model-memory.js"
 export type { ModelStatus } from "./client.js"
 export type { GenerationPhase } from "./protocol.js"
-export {
-  WEBGL_MODEL_META,
-  WEBGL_MODEL_REASONING,
-  WEBGL_TEXT_MODELS
-} from "./model-meta.js"
-export type {
-  ModelFile,
-  WebGlModelMeta,
-  WebGlModelReasoningByName,
-  WebGlTextModel
-} from "./model-meta.js"
+export { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+export type { ModelFile, ModelReasoning, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
 export type { ToolFormat } from "./tool-calls.js"
 export { Engine } from "./engine.js"
 export type { EngineOptions, LayerProbe } from "./engine.js"
 export type { Sampling } from "./sampler.js"
 export type { Store } from "./store.js"
-export type {
-  ByteSource,
-  ModelConfig,
-  ModelWeights,
-  QuantMatrix,
-  WeightPiece
-} from "./weights.js"
+export type { ByteSource, ModelConfig, ModelWeights, QuantMatrix, WeightPiece } from "./weights.js"
 export { loadTokenizer } from "./tokenizer.js"
 export type {
   ChatMessage,

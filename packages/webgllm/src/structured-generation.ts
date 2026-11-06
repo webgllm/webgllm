@@ -1,5 +1,5 @@
-import { tokenAllowed } from "@tanstack-ai-browser/structured-output"
-import type { Constraint } from "@tanstack-ai-browser/structured-output"
+import { tokenAllowed } from "./constraint/index.js"
+import type { Constraint } from "./constraint/index.js"
 
 /** Keep reasoning separate from the schema-constrained answer. */
 export class StructuredGeneration {
