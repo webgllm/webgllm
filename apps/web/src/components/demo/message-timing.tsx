@@ -114,7 +114,7 @@ export const MessageTiming: FC<{
             )}
             {stats?.cachedTokens !== undefined && (
             <div className="flex items-center justify-between gap-4">
-              <span className="text-fd-muted-foreground">Cached</span>
+              <span className="text-fd-muted-foreground">Cached tokens</span>
               <span className="font-mono tabular-nums">
                 {stats.cachedTokens}
               </span>
