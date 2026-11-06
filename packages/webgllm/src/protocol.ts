@@ -72,6 +72,8 @@ export type WorkerRequest =
        * loads the model again.
        */
       contextLength?: number
+      /** Echoed in the "ready" or "load-error" that answers this load. */
+      loadId?: number
     }
   | {
       type: "generate"
@@ -97,7 +99,8 @@ export type WorkerRequest =
       maxTokens?: number
       /**
        * End the reply where any of these strings first appears in its
-       * answer (not in its thinking); the stop string itself is not sent.
+       * answer (not in its thinking, nor in an answer constrained to a
+       * schema); the stop string itself is not sent.
        */
       stop?: Array<string>
       /** Seeds the sampler: the same seed, prompt and settings give the same reply. */
@@ -133,12 +136,14 @@ export type WorkerResponse =
   | {
       type: "ready"
       model: string
+      /** The load this answers (see "load"). */
+      loadId?: number
       /** Tokens the loaded model holds, prompt and reply together. */
       contextLength?: number
       /** Milliseconds each phase of the load took (a fresh load only). */
       timings?: Record<string, number>
     }
-  | { type: "load-error"; model: string; message: string; code?: WorkerErrorCode }
+  | { type: "load-error"; model: string; loadId?: number; message: string; code?: WorkerErrorCode }
   | { type: "downloaded"; model: string }
   | { type: "download-error"; model: string; message: string; code?: WorkerErrorCode }
   /**

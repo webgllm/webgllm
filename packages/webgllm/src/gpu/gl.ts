@@ -17,6 +17,9 @@ export type GpuLimits = {
   renderer: string
 }
 
+/** A read issued by readStart: call it to wait for the data, or cancel it. */
+export type PendingRead = (() => Promise<Float32Array>) & { cancel: () => void }
+
 export class GpuError extends Error {}
 
 /**
@@ -1055,7 +1058,8 @@ export class Gpu {
   /**
    * Issues a read like `read`'s, and returns a function that waits for it:
    * passes issued in between run after the read on the GPU, without the
-   * read waiting for them.
+   * read waiting for them. A read that won't be waited for (work issued in
+   * between threw) must be cancelled, which frees its buffer and fence.
    */
   readStart(
     texture: Texture,
@@ -1065,7 +1069,7 @@ export class Gpu {
       width: texture.width,
       height: texture.height
     }
-  ): () => Promise<Float32Array> {
+  ): PendingRead {
     const gl = this.gl
     const out = new Float32Array(rect.width * rect.height * 4)
     const buffer = gl.createBuffer()
@@ -1080,18 +1084,25 @@ export class Gpu {
     gl.flush()
     this.submitGpuWork()
     const budget = this.submissionBudget, at = performance.now()
-    return async () => {
+    let freed = false
+    const free = () => {
+      if (freed) return
+      freed = true
+      if (sync) gl.deleteSync(sync)
+      gl.deleteBuffer(buffer)
+    }
+    return Object.assign(async () => {
+      if (freed) throw new Error("This read was cancelled.")
       try {
         await this.wait(sync, budget, at)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
         gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
       } finally {
-        if (sync) gl.deleteSync(sync)
-        gl.deleteBuffer(buffer)
+        free()
       }
       return out
-    }
+    }, { cancel: free })
   }
 
   /**

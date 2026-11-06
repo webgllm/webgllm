@@ -75,12 +75,12 @@ export class FakeWorker {
       this.model = message.model
       this.emit({ type: "progress", model: message.model, progress: 0.5, cached: true })
       const error = this.options.loadError?.(message.model)
-      if (error) return this.emit({ type: "load-error", model: message.model, ...error })
+      if (error) return this.emit({ type: "load-error", model: message.model, loadId: message.loadId, ...error })
       await new Promise<void>((resolve) => {
         this.claimed.push(resolve)
         this.emit({ type: "claim", model: message.model, bytes: this.options.bytes?.(message.model) ?? 10 })
       })
-      this.emit({ type: "ready", model: message.model })
+      this.emit({ type: "ready", model: message.model, loadId: message.loadId })
     } else if (message.type === "download") {
       this.emit({ type: "progress", model: message.model, progress: 0.45, cached: false, loadedBytes: 50, totalBytes: 100 })
       this.emit({ type: "downloaded", model: message.model })

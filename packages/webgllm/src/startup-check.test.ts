@@ -13,6 +13,7 @@ function fake(linear = false) {
       ...(linear && { linear: {} })
     },
     layers: [{ type: "full_attention" }, { type: "full_attention" }],
+    contextLength: 8192,
     work: null,
     position: 0,
     forwards: 0,
@@ -114,4 +115,87 @@ test("dense startup checks retain every attention layout and restore layer index
   assert.equal(state.layers, layers)
   assert.equal(state.config, config)
   assert.equal(state.position, 0)
+})
+
+/**
+ * selfCheck's state with the real panelError, whose forwards fail past
+ * `contextLength` as the engine's do.
+ */
+function bounded(contextLength: number, linear = false) {
+  const state = fake(linear)
+  const panelError = Reflect.get(Engine.prototype, "panelError") as (...args: unknown[]) => Promise<number>
+  const forward = async (tokens: number[]) => {
+    assert.ok(tokens.length > 0, "a forward reads at least a token")
+    if (state.position + tokens.length > contextLength)
+      throw new Error(`The cache holds ${contextLength} tokens; this would need ${state.position + tokens.length}.`)
+    state.position += tokens.length
+    state.chunkErrors?.push(0.1)
+    Reflect.get(state, "panelErrors")?.push(0.2)
+    return new Float32Array(1)
+  }
+  return Object.assign(state, {
+    contextLength,
+    mrt: { chunks: true },
+    tuned: { flashDecode: null },
+    panelErrors: null,
+    forward,
+    forwardHidden: forward,
+    panelError,
+    gpu: { ...state.gpu, finish: async () => undefined }
+  })
+}
+
+for (const linear of [false, true]) {
+  test(`startup checks fit a small requested context${linear ? " (recurrent model)" : ""}`, async () => {
+    for (const contextLength of [3, 8, 40, 41, 64]) {
+      const state = bounded(contextLength, linear)
+      const error = await Engine.prototype.selfCheck.call(state as unknown as Engine)
+      assert.ok(Number.isFinite(error), `context ${contextLength}`)
+      assert.equal(state.position, 0)
+    }
+  })
+}
+
+test("the warm-up fits a small requested context", async () => {
+  for (const contextLength of [3, 9, 13, 64, 65, 8192]) {
+    let position = 0
+    const sizes: number[] = []
+    const state = {
+      contextLength,
+      get position() { return position },
+      capacity: 576,
+      canDraft: true,
+      quadMatmuls: false,
+      layers: [{ type: "full_attention", attention: {} }],
+      work: null,
+      warmCounts: {},
+      gpu: { compiled: { count: 0 } },
+      warmUpLayers: Reflect.get(Engine.prototype, "warmUpLayers"),
+      f16Trim() {},
+      reset() { position = 0 },
+      async forwardHidden(tokens: number[]) {
+        assert.ok(tokens.length > 0, "a forward reads at least a token")
+        if (position + tokens.length > contextLength)
+          throw new Error(`The cache holds ${contextLength} tokens; this would need ${position + tokens.length}.`)
+        position += tokens.length
+        sizes.push(tokens.length)
+        return tokens.length - 1
+      },
+      async candidates() { return { ids: new Int32Array(1), logits: new Float32Array(1) } },
+      async logits() { return new Float32Array(1) },
+      async argmax() { return new Int32Array(1) },
+      dropGuess() {},
+      accept(kept: number) { position -= 2 - kept },
+      snapshot() {}
+    }
+    await Engine.prototype.warmUp.call(state as unknown as Engine)
+    assert.equal(position, 0)
+    // A big enough context reads every batch shape the warm-up has.
+    if (contextLength === 8192) assert.deepEqual(sizes, [9, 64, 2, 1, 12, 1])
+  }
+})
+
+test("a context too small for the startup checks fails before the GPU is touched", () => {
+  for (const contextLength of [0, 2, 64.5])
+    assert.throws(() => new Engine({} as OffscreenCanvas, { contextLength }), /at least 3/)
 })

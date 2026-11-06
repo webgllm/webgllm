@@ -10,7 +10,7 @@ import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
-import type { Texture } from "./gpu/gl.js"
+import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
@@ -444,6 +444,7 @@ export type EngineOptions = {
   /**
    * Most tokens the cache may hold, prompt and reply together: the model's
    * own context length when left out. The cache grows to it as it fills.
+   * At least MIN_CONTEXT_LENGTH.
    */
   contextLength?: number
   /** Most tokens per forward batch. */
@@ -509,6 +510,12 @@ const HALF_INT = Uint16Array.from({ length: 256 }, (_, n) => {
 
 /** Batches this small split their matmuls along K (see TUNING). */
 const SPLIT_ROWS = 8
+
+/**
+ * The fewest tokens a cache may hold: the load's self-check reads a prompt
+ * of two tokens and one token after it.
+ */
+export const MIN_CONTEXT_LENGTH = 3
 
 export class Engine {
   /**
@@ -593,8 +600,11 @@ export class Engine {
     canvas: OffscreenCanvas | HTMLCanvasElement,
     options: EngineOptions = {}
   ) {
+    const cap = options.contextLength
+    if (cap !== undefined && !(Number.isInteger(cap) && cap >= MIN_CONTEXT_LENGTH))
+      throw new Error(`A context length is a whole number of tokens, at least ${MIN_CONTEXT_LENGTH}; got ${cap}.`)
     this.gpu = new Gpu(canvas)
-    this.contextCap = options.contextLength ?? Infinity
+    this.contextCap = cap ?? Infinity
     this.noMrt = new Set(options.noMrt ?? [])
     this.chunkedRecurrence = options.chunkedRecurrence ?? true
     this.kvBlockRows = options.kvBlockRows ?? Infinity
@@ -3084,7 +3094,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return keep
     })
     try {
-      if (options.shortOnly) await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
+      if (options.shortOnly) await this.forwardHidden(new Array(Math.min(SPLIT_ROWS + 1, this.contextLength)).fill(0))
       else await this.warmUpLayers()
     } finally {
       this.layers = all
@@ -3100,7 +3110,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.warmCounts[name] = this.gpu.compiled.count - seen
       seen = this.gpu.compiled.count
     }
-    const row = await this.forwardHidden(new Array(SPLIT_ROWS + 1).fill(0))
+    // Each probe fits the cache: none reads more tokens than it holds, and
+    // one that won't fit after the last starts from an empty cache.
+    const fit = (rows: number) => {
+      rows = Math.min(rows, this.contextLength)
+      if (this.position + rows > this.contextLength) this.reset()
+      return new Array<number>(rows).fill(0)
+    }
+    const row = await this.forwardHidden(fit(SPLIT_ROWS + 1))
     step("batch9")
     await this.candidates(row, 1, 1, true)
     step("pick")
@@ -3110,16 +3127,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     await this.argmax(row, 1, 1, [])
     step("argmax")
     // A batch past f16MinRows: the f16 matmul path full prompts take.
-    if (TUNING.f16MinRows <= this.capacity) {
-      await this.forwardHidden(new Array(Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1)).fill(0))
+    // (A cache too small for it never takes that path.)
+    const f16Rows = Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1)
+    if (TUNING.f16MinRows <= this.capacity && f16Rows <= this.contextLength) {
+      await this.forwardHidden(fit(f16Rows))
       step("batchF16")
     }
     if (this.canDraft) {
-      await this.forwardHidden([0, 0], { draft: true })
+      await this.forwardHidden(fit(2), { draft: true })
       step("draft")
       this.accept(1)
     }
-    await this.logits(await this.forwardHidden([0]))
+    await this.logits(await this.forwardHidden(fit(1)))
     step("token")
     this.snapshot()
     this.reset()
@@ -3134,8 +3153,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       TUNING.attendChunkTexelsDecode = 1
       TUNING.flashPast = 0
       try {
-        await this.forwardHidden(new Array(12).fill(0))
-        await this.logits(await this.forwardHidden([0]))
+        await this.forwardHidden(fit(Math.min(12, this.contextLength - 1)))
+        await this.logits(await this.forwardHidden(fit(1)))
         step("chunked")
       } finally {
         TUNING.attendChunkTexels = saved
@@ -3191,8 +3210,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    * where the GPU gets it right).
    */
   async selfCheck() {
+    // (The panel check reads one token after them: room for it too.)
     const tokens = Array.from(
-      { length: 40 },
+      { length: Math.min(40, this.contextLength - 1) },
       (_, i) => (i * 7919 + 13) % this.config.vocabSize
     )
     let worst = 0
@@ -5320,6 +5340,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.gpu.flush()
   }
 
+  /** forwardGuess while `read` goes back: a guess that throws frees the read. */
+  private async guessWhile(read: PendingRead) {
+    try {
+      await this.forwardGuess()
+    } catch (error) {
+      read.cancel()
+      throw error
+    }
+  }
+
   /** The guessed token was the one drawn: it stays in the cache. */
   keepGuess() {
     this.guessAt = null
@@ -5509,7 +5539,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     let data: Float32Array
     if (guess || TUNING.blockingReads <= 0) {
       const pending = this.gpu.readStart(this.greedyOut, rect)
-      if (guess) await this.forwardGuess()
+      if (guess) await this.guessWhile(pending)
       data = await pending()
     } else {
       data = this.gpu.readNow(this.greedyOut, rect)
@@ -5632,7 +5662,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (guess || TUNING.blockingReads <= 0) {
       const pending = this.gpu.readStart(b.candidates, rect)
       // Read it forward while the candidates go back to the CPU (see guess).
-      if (guess) await this.forwardGuess()
+      if (guess) await this.guessWhile(pending)
       data = await pending()
     } else {
       // Nothing to overlap: a blocking read returns as soon as the GPU is

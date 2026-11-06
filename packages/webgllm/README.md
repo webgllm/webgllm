@@ -97,7 +97,7 @@ const reply = await webgllm.chat.completions.create({
 const person = JSON.parse(reply.choices[0].message.content!)
 ```
 
-Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values. `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends rather than while it's written (a limitation of the constraint library, [llguidance-js#4](https://github.com/nico-martin/llguidance-js/issues/4)): an answer that can't satisfy them fails fast with `invalid-output`.
+Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. `stop` sequences don't apply inside it (the schema decides where it ends), as they don't to a forced tool call's arguments. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values. `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends rather than while it's written (a limitation of the constraint library, [llguidance-js#4](https://github.com/nico-martin/llguidance-js/issues/4)): an answer that can't satisfy them fails fast with `invalid-output`.
 
 ### Several models
 

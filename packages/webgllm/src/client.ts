@@ -54,7 +54,9 @@ export const defaultWorker = () =>
 
 export class ModelWorker {
   private readonly worker: Worker
-  private load: (Pending<void> & { contextLength: number | undefined }) | null = null
+  private load: (Pending<void> & { contextLength: number | undefined; id: number }) | null = null
+  /** The last load's id: the worker's "ready" or "load-error" names the load it answers. */
+  private loads = 0
   private downloading: Pending<void> | null = null
   private readonly generations = new Map<string, Generation>()
   /** Loaded and ready, for the context it was asked for (see contextLength). */
@@ -121,8 +123,8 @@ export class ModelWorker {
     this.load?.reject(new Error("The model was loaded again for another context length."))
     this.ready = false
     this.contextLength = contextLength
-    this.load = { ...pending<void>(), contextLength }
-    this.post({ type: "load", model: this.model, ...(contextLength !== undefined && { contextLength }) })
+    this.load = { ...pending<void>(), contextLength, id: ++this.loads }
+    this.post({ type: "load", model: this.model, loadId: this.load.id, ...(contextLength !== undefined && { contextLength }) })
     return this.load.promise
   }
 
@@ -193,14 +195,15 @@ export class ModelWorker {
           .then(() => this.post({ type: "claimed" }))
         break
       case "ready":
-        if (this.load) {
+        // (A late answer to a load this one replaced is ignored.)
+        if (this.load && data.loadId === this.load.id) {
           this.ready = true
           this.loadedContextLength = data.contextLength
           this.load.resolve()
         }
         break
       case "load-error":
-        if (this.load) {
+        if (this.load && data.loadId === this.load.id) {
           this.load.reject(workerError(data.message, data.code))
           this.load = null
           this.ready = false

@@ -455,7 +455,8 @@ async function load(
 
 /**
  * Loads `model` for chats of up to `contextLength` tokens unless it's loaded
- * (or loading) for them, replacing any other.
+ * (or loading) for them, replacing any other. Rejects with Superseded if
+ * another load replaces this one first.
  */
 function startLoad(
   model: string,
@@ -466,39 +467,49 @@ function startLoad(
     current.contextLength === contextLength &&
     !current.engine.gpu.isLost
   ) {
-    post({ type: "ready", model, contextLength: current.engine.contextLength })
     return Promise.resolve(current)
   }
   if (loading?.model === model && loading.contextLength === contextLength) {
     return loading.promise
   }
-  // Stop a load of another model, and free the loaded one.
+  // Stop a load of another model, and free the loaded one. The new load
+  // starts once the stopped one has ended: two never run at once (their
+  // startup probes set worker-wide tuning, and each holds GPU memory).
+  const previous = loading?.promise
   loading?.abort.abort()
   if (current) {
     release(current.engine)
     current = null
   }
   const abort = new AbortController()
-  const promise = load(model as WebGlTextModel, abort.signal, contextLength)
-  const entry = { model, contextLength, promise, abort }
-  loading = entry
-  promise.then(
-    (loaded) => {
-      if (loading !== entry) {
-        release(loaded.engine)
-        return
+  const run = async () => {
+    await previous?.catch(() => undefined)
+    if (abort.signal.aborted) throw new Superseded()
+    return load(model as WebGlTextModel, abort.signal, contextLength)
+  }
+  const entry: NonNullable<typeof loading> = {
+    model,
+    contextLength,
+    abort,
+    promise: run().then(
+      (loaded) => {
+        if (loading !== entry) {
+          release(loaded.engine)
+          throw new Superseded()
+        }
+        loading = null
+        current = loaded
+        return loaded
+      },
+      (error: unknown) => {
+        if (loading !== entry) throw new Superseded()
+        loading = null
+        throw error
       }
-      loading = null
-      current = loaded
-      post({ type: "ready", model, contextLength: loaded.engine.contextLength, timings: loaded.timings })
-    },
-    (error: unknown) => {
-      if (loading !== entry) return
-      loading = null
-      post({ type: "load-error", model, message: errorMessage(error), code: errorCode(error) })
-    }
-  )
-  return promise
+    )
+  }
+  loading = entry
+  return entry.promise
 }
 
 /**
@@ -823,13 +834,22 @@ async function generate(request: GenerateRequest) {
 
   // Stop sequences end the answer (see stop-sequences.ts); a forced call's
   // JSON isn't text: it's kept, and sent as the call (see "done").
+  // Neither applies inside a constrained answer: the schema ends it, and a
+  // stop string cut from it would leave JSON that fails the schema.
   const stopFilter = createStopFilter(request.stop)
   let stopHit = false
   let sawEos = false
   let callText = ""
+  let unfiltered = false
   /** Sends reply text; false once a stop sequence ended the reply. */
-  const send = (text: string) => {
-    if (!stopFilter) {
+  const send = (text: string, constrained = false) => {
+    if (constrained && stopFilter && !unfiltered) {
+      // What the filter holds back (whitespace after the thinking) first.
+      const held = stopFilter.flush()
+      if (held) post({ type: "token", id, text: held })
+      unfiltered = true
+    }
+    if (!stopFilter || unfiltered) {
       post({ type: "token", id, text })
       return true
     }
@@ -859,8 +879,9 @@ async function generate(request: GenerateRequest) {
   // Writes out a token of the reply; false once the reply is over.
   const emit = (t: number) => {
     stats.outputTokens++
-    // (Whether this token is the call's, before it may close the thinking.)
-    const calling = !!forced && structured!.answering
+    // (Whether this token is the answer's, before it may close the thinking.)
+    const constrained = !!structured?.answering
+    const calling = !!forced && constrained
     structured?.observe(t)
     if (t === eos) {
       sawEos = true
@@ -874,7 +895,7 @@ async function generate(request: GenerateRequest) {
     const text = decoder.push(t)
     if (text) {
       if (calling) callText += text
-      else if (!send(text)) return false
+      else if (!send(text, constrained)) return false
     }
     return stats.outputTokens < maxTokens
   }
@@ -996,9 +1017,9 @@ async function generate(request: GenerateRequest) {
   const rest = decoder.flush()
   if (rest && !stopHit) {
     if (forced && structured!.answering) callText += rest
-    else send(rest)
+    else send(rest, !!structured?.answering)
   }
-  const held = stopHit ? "" : stopFilter?.flush()
+  const held = stopHit || unfiltered ? "" : stopFilter?.flush()
   if (held) post({ type: "token", id, text: held })
   if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
@@ -1027,8 +1048,7 @@ async function generate(request: GenerateRequest) {
     model.claimed = engine.gpu.bytes
     void claimMemory(model.model, model.claimed)
   }
-  // (A stop sequence the caller asked for may end a JSON answer early.)
-  if (structured && !stopped.has(id) && !stopHit && !structured.complete) {
+  if (structured && !stopped.has(id) && !structured.complete) {
     throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
   }
   let toolCall: ToolCall | undefined
@@ -1075,7 +1095,26 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
-    void startLoad(data.model, data.contextLength).catch(() => undefined)
+    // After the generations asked for before it: another context length
+    // frees the engine they run on. Each answer names its load.
+    const { model, contextLength, loadId } = data
+    queue = queue.then(() => {
+      const before = current
+      startLoad(model, contextLength).then(
+        (loaded) =>
+          post({
+            type: "ready",
+            model,
+            loadId,
+            contextLength: loaded.engine.contextLength,
+            ...(loaded !== before && { timings: loaded.timings })
+          }),
+        (error: unknown) => {
+          if (!(error instanceof Superseded))
+            post({ type: "load-error", model, loadId, message: errorMessage(error), code: errorCode(error) })
+        }
+      )
+    })
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else if (data.type === "download") {

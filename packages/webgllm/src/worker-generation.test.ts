@@ -215,3 +215,19 @@ test("a session too long for the model fails with context-length-exceeded", asyn
     // (The extracted bundle has its own CodedError class: read the code.)
     (error as { code?: string }).code === "context-length-exceeded")
 })
+
+test("stop sequences don't apply inside a structured answer: it stays valid JSON", async () => {
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
+  for (const stop of [["{"], ["}"], ["Oslo"]]) {
+    const j = jsonConstraint(id("}"))
+    const s = scripted([...json], { constraint: () => j.constraint })
+    await s.generate(request({ outputSchema: schema, stop }))
+    assert.equal(text(s.messages), "{\"city\":\"Oslo\"}", `stop ${JSON.stringify(stop)}`)
+    assert.equal(done(s.messages).finishReason, "stop")
+  }
+  // Thinking before it is still sent as written.
+  const j = jsonConstraint(id("}"))
+  const t = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
+  await t.generate(request({ outputSchema: schema, stop: ["{"], thinking: true }))
+  assert.equal(text(t.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
+})
