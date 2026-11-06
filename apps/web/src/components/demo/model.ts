@@ -218,6 +218,12 @@ export function chatModel(getModel: () => ModelId): ChatModelAdapter {
         };
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return;
+        // assistant-ui keeps an error with a string code and message as is,
+        // and saves it with the chat. An Error's message doesn't survive
+        // JSON, so a reload would show "[object Object]": hand it a plain one.
+        if (error instanceof Error) {
+          throw { code: 'code' in error && typeof error.code === 'string' ? error.code : 'unknown', message: error.message };
+        }
         throw error;
       }
     },
