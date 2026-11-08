@@ -3,6 +3,8 @@ import { test } from "node:test"
 import { blobSource } from "./byte-source.js"
 import { browserStorage, ggufContextLength, modelFiles } from "./model-files.js"
 import { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+import { diskName } from "./storage.js"
+import { internals, WebGLLM } from "./webgllm.js"
 
 /** A GGUF header with these keys (strings, u32s and a string array). */
 function gguf(entries: Array<[string, string | number | Array<string>]>) {
@@ -105,4 +107,42 @@ test("a cold model listing asks the server for each GGUF's size once", async () 
   const heads = calls.filter((c) => c.startsWith("HEAD"))
   console.log(`fetch calls: ${calls.length}`)
   assert.equal(new Set(heads).size, heads.length, `duplicate size probes: ${heads.filter((c, i) => heads.indexOf(c) !== i).join(", ")}`)
+})
+
+test("models.downloaded reads OPFS only: whole, missing, or partly downloaded", async (t) => {
+  const model = "unsloth/Qwen3.5-2B-GGUF"
+  const names = new Set<string>()
+  const folder = {
+    async getFileHandle(name: string) {
+      if (!names.has(name)) throw new DOMException("missing", "NotFoundError")
+      return { getFile: async () => new File([new Uint8Array(4)], name) }
+    }
+  }
+  t.mock.getter(globalThis, "navigator", () => ({
+    storage: { getDirectory: async () => ({ getDirectoryHandle: async () => folder }) }
+  }))
+  const fetches = t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("no network")
+  })
+  const saved = internals.storage
+  internals.storage = browserStorage
+  try {
+    const llm = new WebGLLM({
+      memoryBudget: 1000,
+      worker: () => {
+        throw new Error("no load")
+      }
+    })
+    assert.equal(await llm.models.downloaded(model), false, "nothing stored")
+    const files = modelFiles(WEBGL_MODEL_META[model])
+    for (const file of files) names.add(diskName(file)).add(`${diskName(file)}.done`)
+    assert.equal(await llm.models.downloaded(model), true, "every file stored")
+    // The weights are on disk but their download didn't finish (no marker).
+    names.delete(`${diskName(files.at(-1)!)}.done`)
+    assert.equal(await llm.models.downloaded(model), false, "partly downloaded")
+    assert.equal(await llm.models.downloaded("LiquidAI/LFM2.5-350M-GGUF"), false, "another model")
+  } finally {
+    internals.storage = saved
+  }
+  assert.equal(fetches.mock.callCount(), 0, "no network request")
 })

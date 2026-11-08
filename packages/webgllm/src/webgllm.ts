@@ -421,6 +421,16 @@ class Models {
     return this.info(catalogModel(model))
   }
 
+  /**
+   * Whether `model` is ready to load without a download: every file it
+   * loads is in storage, or it's loaded. Reads storage only, with no network
+   * request (unlike retrieve, which also asks for sizes and context length).
+   */
+  async downloaded(model: string): Promise<boolean> {
+    const id = catalogModel(model)
+    return this.pool.isLoaded(id) || this.storage.downloaded(id)
+  }
+
   /** Removes `model`'s files from storage, unloading it first if it's loaded. */
   async delete(model: string): Promise<void> {
     const id = catalogModel(model)

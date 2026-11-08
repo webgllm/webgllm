@@ -24,7 +24,7 @@ export function modelFiles(meta: WebGlModelMeta): Array<ModelFile> {
 
 /** The storage questions the pool asks (a fake one in tests). */
 export type ModelStorage = {
-  /** Whether all the model's files are in storage. */
+  /** Whether all the model's files are in storage: storage only, no network request. */
   downloaded: (model: WebGlTextModel) => Promise<boolean>
   /** Bytes to download, all files together; 0 when unknown. */
   size: (model: WebGlTextModel) => Promise<number>
