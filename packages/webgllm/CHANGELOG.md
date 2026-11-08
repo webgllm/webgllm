@@ -1,3 +1,13 @@
+## 0.1.6 (2026-11-08)
+
+### 🚀 Features
+
+- **webgllm:** add models.downloaded to check storage without network requests ([296251f](https://github.com/webgllm/webgllm/commit/296251f))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.5 (2026-11-06)
 
 ### 🩹 Fixes
