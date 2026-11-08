@@ -105,6 +105,7 @@ Several models can be loaded at once, one worker each, up to a memory budget (`n
 
 ```ts
 await webgllm.models.list()      // the supported models, with downloaded / loaded
+await webgllm.models.downloaded(id) // whether it loads without a download (storage only, no network)
 await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```

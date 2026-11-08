@@ -208,6 +208,19 @@ test("models: the catalog with what's downloaded and loaded", async () => {
   assert.equal(lfm2.supports.thinking, false)
 })
 
+test("models.downloaded: stored or loaded, asking storage nothing else", async () => {
+  const { llm: client, storage } = llm({}, new Set([LFM2]))
+  let other = 0
+  storage.size = async () => (other++, 1234)
+  storage.contextLength = async () => (other++, 32768)
+  assert.equal(await client.models.downloaded(LFM2), true)
+  assert.equal(await client.models.downloaded(QWEN), false)
+  await client.loadModel(QWEN)
+  assert.equal(await client.models.downloaded(QWEN), true)
+  await assert.rejects(client.models.downloaded("gpt-4o"), { code: "model-not-supported" })
+  assert.equal(other, 0, "no size or context length lookups")
+})
+
 test("deleting a model unloads it and removes its files", async () => {
   const { llm: client, storage } = llm({}, new Set([QWEN]))
   await client.loadModel(QWEN)
