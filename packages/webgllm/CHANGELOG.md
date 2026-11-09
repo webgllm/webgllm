@@ -1,3 +1,13 @@
+## 0.1.8 (2026-11-09)
+
+### 🩹 Fixes
+
+- **webgllm:** load ONNX exports by graph structure, and float16 tied embeddings ([#4](https://github.com/webgllm/webgllm/pull/4))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.7 (2026-11-09)
 
 ### 🚀 Features
