@@ -703,10 +703,11 @@ async function generate(request: GenerateRequest) {
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
-  // The penalties count the reply's own tokens: the prompt's would push the
-  // model off values it copies from them (LFM3 wrote "Ada_Lovelace" for a
-  // name in the prompt). setSeen still bans the padding ids.
-  if (onGpu) engine.setSeen([], vocab)
+  // The repetition penalty counts the prompt's tokens and the reply's, as
+  // Transformers.js does: the model cards' values assume it. (The presence
+  // penalty counts only the reply's.) setSeen also bans the padding ids.
+  if (onGpu) engine.setSeen(prompt, vocab)
+  else sampler.see(prompt)
   // With a seed, the number each token is drawn with comes from the seed
   // and the token's place in the reply (see seeded-random.ts); else
   // Math.random, as before. Greedy picks don't depend on either.
