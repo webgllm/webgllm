@@ -30,7 +30,7 @@
  * MatMul over the same tensor transposed: it is quantized to 8 bits at
  * load, as the GGUF loader does a float embedding.
  */
-import { halvesToFloats } from "./half.js"
+import { halfTable, halvesToFloats } from "./half.js"
 import {
   OnnxDataType,
   onnxElementSize,
@@ -302,12 +302,10 @@ export async function* loadOnnx(
     const rows = Math.min(chunkRows, emb.N - r)
     if (emb.kind === "float") {
       // Floats: quantized to 8 bits (as the GGUF loader does a float embedding).
-      const values = await floats(
-        { ...emb.weight, name: `floats@${r}` },
-        rows * D
-      )
+      const bytes = await plan.take(`floats@${r}`)
       const m = newQuantMatrix(rows, D, 8, false)
-      quantizeQ8(m, 0, values, rows)
+      quantizeEmbeddingRows(m, bytes, emb.weight.dataType, rows)
+      plan.release(bytes)
       yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
       continue
     }
@@ -317,6 +315,36 @@ export async function* loadOnnx(
     const m = newQuantMatrix(rows, D, 4, emb.zp !== null)
     packMatMulNBits(m, 0, quant, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
+  }
+}
+
+/**
+ * Float16 or float32 rows quantized to 8 bits into `m` (rows from 0), one
+ * row at a time through one row of float32 scratch: the same values as
+ * converting the whole chunk first (quantizeQ8 works per block), without
+ * staging the chunk in float32.
+ */
+export function quantizeEmbeddingRows(
+  m: QuantMatrix,
+  bytes: Uint8Array,
+  dataType: number,
+  rows: number
+): void {
+  const K = m.K
+  const size = onnxElementSize(dataType)
+  if (dataType !== OnnxDataType.FLOAT16 && dataType !== OnnxDataType.FLOAT)
+    throw new Error(`ONNX: embedding data type ${dataType}, expected float16 or float`)
+  if (bytes.length < rows * K * size)
+    throw new Error(`ONNX: ${bytes.length} embedding bytes for ${rows} rows of ${K}`)
+  const row = new Float32Array(K)
+  const half = halfTable()
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  for (let i = 0; i < rows; i++) {
+    let p = i * K * size
+    if (size === 2)
+      for (let k = 0; k < K; k++, p += 2) row[k] = half[bytes[p] | (bytes[p + 1] << 8)]
+    else for (let k = 0; k < K; k++, p += 4) row[k] = view.getFloat32(p, true)
+    quantizeQ8(m, i, row, 1)
   }
 }
 

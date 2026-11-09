@@ -2,8 +2,9 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { test } from "node:test"
-import { halfTable } from "./half.js"
-import { checkOnnxGraph, checkOnnxModel, loadOnnx } from "./load-onnx.js"
+import { halfTable, halvesToFloats } from "./half.js"
+import { checkOnnxGraph, checkOnnxModel, loadOnnx, quantizeEmbeddingRows } from "./load-onnx.js"
+import { newQuantMatrix, quantizeQ8 } from "./repack.js"
 import { OnnxDataType, parseOnnxModel, type OnnxGraph } from "./onnx.js"
 import type { QuantMatrix } from "./weights.js"
 
@@ -70,8 +71,13 @@ test("a float16 tied embedding loads quantized to 8 bits, in chunks of rows", as
   }
   assert.equal(layers, config.num_hidden_layers)
   assert.equal(rows, vocab)
-  // 8-bit layout: rows in groups of 4, 32 values per block (repack.ts).
+  // The loader's chunk is bit for bit the whole chunk converted at once.
   const m = first as QuantMatrix
+  const reference = newQuantMatrix(chunkRows, D, 8, false)
+  quantizeQ8(reference, 0, halvesToFloats(await data.read(ext.offset, chunkRows * D * 2)), chunkRows)
+  assert.ok(Buffer.from(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength).equals(Buffer.from(reference.quants.buffer, reference.quants.byteOffset, reference.quants.byteLength)))
+  assert.deepEqual(m.scales, reference.scales)
+  // 8-bit layout: rows in groups of 4, 32 values per block (repack.ts).
   const q = new Int8Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength)
   const table = halfTable()
   const blocks = D / 32
@@ -135,4 +141,34 @@ test("an embedding whose rows aren't a multiple of 4 is refused before any read"
   const rows = emb.dims[0] - 1
   g.initializers.set(emb.name, { ...emb, dims: [rows, D], external: { ...emb.external, length: rows * D * 2 } })
   assert.throws(() => checkOnnxModel(g, { ...config, vocab_size: rows }), /65535 rows, not a multiple of 4/)
+})
+
+test("the 8-bit embedding is bit for bit the whole-chunk conversion's", async () => {
+  // A small float16 embedding, read through the loader's own path
+  // (quantizeEmbeddingRows), against converting the chunk to floats at once.
+  const rows = 64
+  const D = 256
+  const bytes = new Uint8Array(rows * D * 2)
+  let x = 12345
+  for (let i = 0; i < rows * D; i++) {
+    x = (x * 1103515245 + 12345) >>> 0
+    // Any finite half: sign, exponent 0..30, mantissa.
+    const h = (x >>> 16) & 0xffff
+    const e = (h >> 10) & 31
+    const finite = e === 31 ? h & ~(1 << 10) : h
+    bytes[2 * i] = finite & 255
+    bytes[2 * i + 1] = finite >> 8
+  }
+  const reference = newQuantMatrix(rows, D, 8, false)
+  quantizeQ8(reference, 0, halvesToFloats(bytes), rows)
+  const got = newQuantMatrix(rows, D, 8, false)
+  quantizeEmbeddingRows(got, bytes, OnnxDataType.FLOAT16, rows)
+  assert.deepEqual(got.quants, reference.quants)
+  assert.deepEqual(got.scales, reference.scales)
+  // float32 too.
+  const f32 = halvesToFloats(bytes)
+  const got32 = newQuantMatrix(rows, D, 8, false)
+  quantizeEmbeddingRows(got32, new Uint8Array(f32.buffer), OnnxDataType.FLOAT, rows)
+  assert.deepEqual(got32.quants, reference.quants)
+  assert.deepEqual(got32.scales, reference.scales)
 })
