@@ -1,3 +1,40 @@
+## 0.2.0 (2026-11-09)
+
+### 🚀 Features
+
+- ⚠️  **webgllm:** an OpenAI-shaped client, and reasoning levels as reasoning_effort values ([#6](https://github.com/webgllm/webgllm/pull/6))
+
+### ⚠️  Breaking Changes
+
+- **webgllm:** an OpenAI-shaped client, and reasoning levels as reasoning_effort values  ([#6](https://github.com/webgllm/webgllm/pull/6))
+  a model's reasoning levels hold the reasoning_effort value
+  to send for each, { off: "none", high: "high" }, instead of the chat
+  template's enable_thinking values ("false", "true"), which webgllm never
+  read. They now describe webgllm's own API.
+  * fix(webgllm): manifests stored before 0.2.0 read with today's reasoning levels; baseURL's comment says what it covers
+  * chore: update every dependency to its latest version
+  @huggingface/jinja 0.5.11, Nx 24.0.5, assistant-ui, fumadocs, TanStack
+  Start, Tailwind and the rest. fumadocs-mdx stays at 15.5.1: 15.5.2 hands
+  Vite its meta.json files as JavaScript, and the docs site's build fails.
+  * fix(webgllm): a manifest from before 0.2.0 is deleted and its model resolves again, instead of being converted"
+  M	apps/web/package.json
+  M	package.json
+  M	packages/webgllm/package.json
+  M	packages/webgllm/src/lfm2-gguf.test.ts
+  M	packages/webgllm/src/manifest.test.ts
+  M	packages/webgllm/src/model-meta-types.test.ts
+  M	packages/webgllm/src/model-meta.ts
+  M	packages/webgllm/src/resolve-model-files.test.ts
+  M	packages/webgllm/src/resolve-model.ts
+  M	packages/webgllm/src/storage.ts
+  M	packages/webgllm/src/webgllm.test.ts
+  M	packages/webgllm/src/webgllm.ts
+  M	pnpm-lock.yaml
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.9 (2026-11-09)
 
 ### 🩹 Fixes
