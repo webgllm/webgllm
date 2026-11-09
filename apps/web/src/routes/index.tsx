@@ -241,7 +241,7 @@ const features = [
     icon: <Brain />,
     title: 'Thinking',
     description:
-      'reasoning_effort turns thinking on or off, thinking_budget_tokens caps it, and reasoning streams separately from the answer.',
+      'reasoning.effort turns thinking on or off, reasoning.max_tokens caps it, and reasoning streams separately from the answer.',
   },
   {
     icon: <Wrench />,

@@ -39,7 +39,8 @@
       // model that thinks by default (LFM3) answers within short max_tokens.
       if (params.get("think") === "0") {
         const create = webgllm.chat.completions.create.bind(webgllm.chat.completions)
-        webgllm.chat.completions.create = (body, options) => create({ reasoning_effort: "none", ...body }, options)
+        webgllm.chat.completions.create = (body, options) =>
+          create(body.reasoning_effort != null || body.reasoning != null ? body : { reasoning_effort: "none", ...body }, options)
       }
 
       const list = await webgllm.models.list()
@@ -394,8 +395,7 @@
         const think = await webgllm.chat.completions.create({
           model: second,
           messages: [{ role: "user", content: "Is 391 prime? Answer yes or no." }],
-          reasoning_effort: "high",
-          thinking_budget_tokens: 256
+          reasoning: { effort: "high", max_tokens: 256 }
         })
         log("second thinking", { reasoning: (think.choices[0].message.reasoning_content ?? "").slice(0, 200), content: think.choices[0].message.content }, think.usage)
         check("thinking arrives in reasoning_content", (think.choices[0].message.reasoning_content ?? "").length > 0)
