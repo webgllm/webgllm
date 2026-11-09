@@ -116,6 +116,14 @@ export class WebGLLM {
     return hasWebGl2()
   }
 
+  /**
+   * Where requests go, as an OpenAI client reports it: in this page, not over
+   * the network. With `chat.completions.create`, it's what an OpenAI client
+   * offers that TanStack AI's Chat Completions adapters use for streaming and
+   * structured output; it isn't a whole OpenAI client (no `withOptions`, so no
+   * `wrapFetch`), and its type isn't theirs.
+   */
+  readonly baseURL = "webgllm:"
   readonly chat: { readonly completions: Completions }
   readonly models: Models
   private readonly pool: ModelPool

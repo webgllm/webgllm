@@ -276,9 +276,9 @@ export function opensThinking(template: string): boolean {
 
 /** The model's thinking, from its chat template and its names (see the rules above). */
 export function reasoningFrom(template: string, labels: Array<string>): ModelReasoning | undefined {
-  if (/\benable_thinking\b/.test(template)) return { levels: { off: "false", high: "true" }, budget: true }
+  if (/\benable_thinking\b/.test(template)) return { levels: { off: "none", high: "high" }, budget: true }
   if (opensThinking(template) || labels.some((l) => word("thinking|reasoning").test(l))) {
-    return { levels: { high: "true" }, budget: true }
+    return { levels: { high: "high" }, budget: true }
   }
   return undefined
 }

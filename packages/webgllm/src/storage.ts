@@ -99,12 +99,27 @@ function isMeta(value: unknown, model?: string): value is WebGlModelMeta {
   )
 }
 
+/**
+ * Whether a stored manifest is from before 0.2.0, whose reasoning levels held
+ * the chat template's values ("false", "true"): it's deleted, and the model
+ * resolves again (its downloaded files stay, and are reused).
+ */
+const isStale = (meta: WebGlModelMeta) => {
+  const levels = meta.reasoning?.levels as Record<string, string> | undefined
+  return !!levels && (levels.off === "false" || levels.high === "true")
+}
+
 /** `model`'s stored manifest, or undefined (none, unreadable, or no storage here). */
 export async function readManifest(model: string): Promise<WebGlModelMeta | undefined> {
   try {
     const text = await (await (await (await dir()).getFileHandle(manifestName(model))).getFile()).text()
     const meta: unknown = JSON.parse(text)
-    return isMeta(meta, model) ? meta : undefined
+    if (!isMeta(meta, model)) return undefined
+    if (isStale(meta)) {
+      await removeManifest(model)
+      return undefined
+    }
+    return meta
   } catch {
     return undefined
   }
@@ -119,7 +134,9 @@ export async function storedManifests(): Promise<Array<WebGlModelMeta>> {
       if (!name.startsWith(MANIFEST)) continue
       try {
         const meta: unknown = JSON.parse(await (await (await folder.getFileHandle(name)).getFile()).text())
-        if (isMeta(meta) && manifestName(meta.name) === name) metas.push(meta)
+        if (!isMeta(meta) || manifestName(meta.name) !== name) continue
+        if (isStale(meta)) await removeManifest(meta.name)
+        else metas.push(meta)
       } catch {
         // Unreadable: skipped.
       }

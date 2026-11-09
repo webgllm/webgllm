@@ -42,7 +42,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@huggingface/jinja": "0.5.10",
+    "@huggingface/jinja": "0.5.11",
     "@huggingface/tokenizers": "0.2.0",
     "llguidance": "0.2.1"
   },

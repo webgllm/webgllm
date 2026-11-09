@@ -5,7 +5,7 @@ import { browserStorage, modelFiles } from "./model-files.js"
 import { forgetResolvedModels } from "./model-meta.js"
 import type { WebGlModelMeta } from "./model-meta.js"
 import { hub, resolveModel } from "./resolve-model.js"
-import { diskName, saveManifest } from "./storage.js"
+import { diskName, saveManifest, storedManifests } from "./storage.js"
 import { internals, WebGLLM } from "./webgllm.js"
 
 /** A GGUF model outside the catalog whose tokenizer is LFM2 350M's (as LiquidAI/LFM2-350M-GGUF's is). */
@@ -94,4 +94,22 @@ test("models.downloaded for a model with no stored meta reads storage only", asy
     internals.storage = saved
   }
   assert.equal(asked, 0)
+})
+
+test("a manifest stored before 0.2.0 is deleted, and the model resolves again", async (t) => {
+  useFolder(t)
+  // 0.1.9 stored the chat template's enable_thinking values.
+  const old = { ...ggufModel("someone/Thinks-GGUF"), reasoning: { levels: { off: "false", high: "true" }, budget: true } }
+  await saveManifest(old as unknown as WebGlModelMeta)
+  assert.equal((await storedManifests()).some((m) => m.name === old.name), false, "not listed, and deleted")
+  await saveManifest(old as unknown as WebGlModelMeta)
+  forgetResolvedModels()
+  const asked: Array<string> = []
+  hub.fetch = async (url: string) => {
+    asked.push(url)
+    throw new TypeError("offline")
+  }
+  await assert.rejects(resolveModel(old.name))
+  assert.ok(asked.length > 0, "it resolves from the Hub again")
+  assert.equal((await storedManifests()).some((m) => m.name === old.name), false)
 })

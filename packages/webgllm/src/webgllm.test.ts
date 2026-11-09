@@ -27,6 +27,12 @@ async function collect(stream: AsyncIterable<ChatCompletionChunk>) {
   return chunks
 }
 
+test("the instance has a baseURL and chat.completions.create, as an OpenAI client does", () => {
+  const { llm: instance } = llm()
+  assert.equal(instance.baseURL, "webgllm:")
+  assert.equal(typeof instance.chat.completions.create, "function")
+})
+
 test("a completion loads its model, then answers with thinking split out", async () => {
   const { llm: client, progress, workers } = llm({ reply: () => ({ tokens: ["<think>", "Greet.", "</think>", "\n\nHello", "!"] }) })
   const mine: Array<LoadProgress> = []

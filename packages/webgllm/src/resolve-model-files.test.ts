@@ -86,7 +86,7 @@ test("named chat templates: the resolver reads the one the tokenizer renders", a
   })
   const meta = await resolveModel(name)
   assert.equal(meta.tokenizer.chatTemplate, undefined)
-  assert.deepEqual(meta.reasoning, { levels: { off: "false", high: "true" }, budget: true })
+  assert.deepEqual(meta.reasoning, { levels: { off: "none", high: "high" }, budget: true })
   assert.deepEqual(meta.supports.capabilities, ["tools", "thinking"])
   // The tokenizer renders the same template from the same tokenizer_config.json.
   const tokenizer = loadTokenizer({

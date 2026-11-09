@@ -7,10 +7,10 @@ import type { WebGlModelReasoning, WebGlTextModel } from "./model-meta.js"
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false
 const exact = <T extends true>(_: T) => undefined
 
-exact<Equal<WebGlModelReasoning<"LiquidAI/LFM3-1.7B-GGUF">, { readonly levels: { readonly off: "false"; readonly high: "true" }; readonly budget: true }>>(true)
-exact<Equal<WebGlModelReasoning<"unsloth/Qwen3.5-2B-GGUF">, { readonly levels: { readonly off: "false"; readonly high: "true" }; readonly budget: true }>>(true)
-exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-ONNX">, { readonly levels: { readonly high: "true" }; readonly budget: true }>>(true)
-exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-GGUF">, { readonly levels: { readonly high: "true" }; readonly budget: true }>>(true)
+exact<Equal<WebGlModelReasoning<"LiquidAI/LFM3-1.7B-GGUF">, { readonly levels: { readonly off: "none"; readonly high: "high" }; readonly budget: true }>>(true)
+exact<Equal<WebGlModelReasoning<"unsloth/Qwen3.5-2B-GGUF">, { readonly levels: { readonly off: "none"; readonly high: "high" }; readonly budget: true }>>(true)
+exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-ONNX">, { readonly levels: { readonly high: "high" }; readonly budget: true }>>(true)
+exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-GGUF">, { readonly levels: { readonly high: "high" }; readonly budget: true }>>(true)
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-350M-GGUF">, undefined>>(true)
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Instruct-ONNX">, undefined>>(true)
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2-1.2B-Tool-GGUF">, undefined>>(true)
@@ -20,8 +20,8 @@ exact<Equal<string extends WebGlTextModel ? true : false, false>>(true)
 test("the catalog's runtime reasoning matches its types", () => {
   for (const model of WEBGL_TEXT_MODELS) {
     const reasoning = WEBGL_MODEL_META[model].reasoning
-    if (model.includes("Thinking")) assert.deepEqual(reasoning, { levels: { high: "true" }, budget: true })
+    if (model.includes("Thinking")) assert.deepEqual(reasoning, { levels: { high: "high" }, budget: true })
     else if (/LFM2[.-]/.test(model)) assert.equal(reasoning, undefined)
-    else assert.deepEqual(reasoning, { levels: { off: "false", high: "true" }, budget: true })
+    else assert.deepEqual(reasoning, { levels: { off: "none", high: "high" }, budget: true })
   }
 })

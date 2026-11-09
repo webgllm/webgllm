@@ -73,7 +73,7 @@ test("three official GGUF entries use recommended sampling with Thinking-only re
     assert.equal(meta.format,"gguf");assert.equal(meta.toolFormat,"lfm2");assert.equal(meta.files.kind,"gguf")
     assert.deepEqual(meta.sampling,{temperature:thinking?0.05:0.1,top_k:50,repetition_penalty:1.05})
     assert.equal(meta.sampling.top_p??1,1);assert.equal(meta.sampling.min_p??0,0)
-    if(thinking){assert.deepEqual(modelMeta(name).reasoning,{levels:{high:"true"},budget:true});assert.ok(meta.supports.capabilities.includes("thinking"))}
+    if(thinking){assert.deepEqual(modelMeta(name).reasoning,{levels:{high:"high"},budget:true});assert.ok(meta.supports.capabilities.includes("thinking"))}
     else{assert.equal(modelMeta(name).reasoning,undefined);assert.equal(meta.reasoning,undefined)}
     assert.equal(meta.files.kind==="gguf"&&meta.files.model.path.includes("QAD"),!thinking)
   }
