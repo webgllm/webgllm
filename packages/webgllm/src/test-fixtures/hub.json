@@ -1,0 +1,2197 @@
+{
+ "https://huggingface.co/api/models/LiquidAI/LFM3-1.7B-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM3-1.7B-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM3-1.7B-BF16.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-F16.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-NVFP4.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LFM3-1.7B-QAD-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    }
+   ],
+   "tags": [
+    "gguf",
+    "liquid",
+    "lfm3",
+    "llama.cpp",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "it",
+    "ja",
+    "ko",
+    "pt",
+    "es",
+    "vi",
+    "th",
+    "id",
+    "hi",
+    "ru",
+    "pl",
+    "base_model:LiquidAI/LFM3-1.7B",
+    "base_model:quantized:LiquidAI/LFM3-1.7B",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM3-1.7B",
+     "LiquidAI/LFM3-1.7B-NVFP4"
+    ]
+   },
+   "gguf": {
+    "architecture": "lfm3",
+    "total": 1728801600
+   }
+  }
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM3-1.7B": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM3-1.7B",
+   "siblings": [
+    {
+     "rfilename": ".eval_results/LFM3-1.7B.yaml"
+    },
+    {
+     "rfilename": ".eval_results/ifbench.yaml"
+    },
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "assets/icons/api.svg"
+    },
+    {
+     "rfilename": "assets/icons/blog.svg"
+    },
+    {
+     "rfilename": "assets/icons/docs.svg"
+    },
+    {
+     "rfilename": "assets/icons/try.svg"
+    },
+    {
+     "rfilename": "assets/lfm3-edge-inference.webp"
+    },
+    {
+     "rfilename": "assets/lfm3-gpu-throughput-b300.png"
+    },
+    {
+     "rfilename": "assets/lfm3-post-training-recipe.webp"
+    },
+    {
+     "rfilename": "assets/lfm3-pre-training-recipe.webp"
+    },
+    {
+     "rfilename": "assets/liquid-ai-banner.webp"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "configuration_lfm3.py"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "lfm3_conv.py"
+    },
+    {
+     "rfilename": "model.safetensors"
+    },
+    {
+     "rfilename": "modeling_lfm3.py"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "safetensors",
+    "lfm3",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "custom_code",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "it",
+    "ja",
+    "ko",
+    "pt",
+    "es",
+    "vi",
+    "th",
+    "id",
+    "hi",
+    "ru",
+    "pl",
+    "base_model:LiquidAI/LFM3-1.7B-Base",
+    "base_model:finetune:LiquidAI/LFM3-1.7B-Base",
+    "license:other",
+    "eval-results",
+    "endpoints_compatible",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM3-1.7B-Base"
+   },
+   "config": {
+    "model_type": "lfm3"
+   },
+   "safetensors": {
+    "total": 1728801536
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM3-1.7B/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 124894,\n  \"do_sample\": true,\n  \"eos_token_id\": [\n    124900\n  ],\n  \"output_attentions\": false,\n  \"output_hidden_states\": false,\n  \"pad_token_id\": 124893,\n  \"repetition_penalty\": 1.1,\n  \"temperature\": 0.1,\n  \"top_k\": 50,\n  \"transformers_version\": \"5.12.1\",\n  \"use_cache\": true\n}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM3-1.7B/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set preserve_thinking = preserve_thinking | default(false) -%}\n{%- set enable_thinking = enable_thinking | default(true) -%}\n\n{%- macro render_value(v) -%}\n    {%- if v is string -%}\n        {{- v -}}\n    {%- elif v is boolean -%}\n        {{- \"true\" if v else \"false\" -}}\n    {%- elif v is none -%}\n        {{- \"null\" -}}\n    {%- elif v is mapping or (v is sequence and v is not string) -%}\n        {{- v | tojson -}}\n    {%- else -%}\n        {{- v -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro parse_content(content) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping and content.get(\"type\") == \"image\" -%}\n        {{- \"<|vision_start|><|image|><|vision_end|>\" -}}\n    {%- elif content is mapping and content.get(\"type\") == \"video\" -%}\n        {{- \"<|vision_start|><|video|><|vision_end|>\" -}}\n    {%- elif content is mapping and content.get(\"type\") == \"text\" -%}\n        {{- (content.get(\"text\") or \"\") | string -}}\n    {%- elif content is mapping -%}\n        {{- content | tojson -}}\n    {%- elif content is iterable -%}\n        {%- set _ns = namespace(result=\"\") -%}\n        {%- for item in content -%}\n            {%- if item is string -%}\n                {%- set _ns.result = _ns.result + item -%}\n            {%- elif item is mapping and item.get(\"type\") == \"image\" -%}\n                {%- set _ns.result = _ns.result + \"<|vision_start|><|image|><|vision_end|>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"video\" -%}\n                {%- set _ns.result = _ns.result + \"<|vision_start|><|video|><|vision_end|>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"text\" -%}\n                {%- set _ns.result = _ns.result + ((item.get(\"text\") or \"\") | string) -%}\n            {%- else -%}\n                {%- set _ns.result = _ns.result + (item | tojson) -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- _ns.result -}}\n    {%- elif content is not none -%}\n        {{- content | tojson -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_calls(tool_calls) -%}\n    {%- for tool_call in tool_calls -%}\n        {%- if not loop.first -%}{{- \"\\n\\n\" -}}{%- endif -%}\n        {%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n        {%- set func_args = func.get(\"arguments\") -%}\n        {%- if func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n            {{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n        {%- endif -%}\n        {{- \"<tool_call>\\n<function=\" + func[\"name\"] + \">\\n\" -}}\n        {%- if func_args is mapping -%}\n            {%- for arg_name, arg_value in func_args.items() -%}\n                {{- \"<parameter=\" + arg_name + \">\\n\" + render_value(arg_value) + \"\\n</parameter>\\n\" -}}\n            {%- endfor -%}\n        {%- endif -%}\n        {{- \"</function>\\n</tool_call>\" -}}\n    {%- endfor -%}\n{%- endmacro -%}\n\n{%- macro tool_to_json(tool) -%}\n    {%- set fn = tool.function if tool.function is defined else tool -%}\n    {%- set ns_t = namespace(first=true) -%}\n    {{- \"{\" -}}\n    {%- for k, v in fn.items() -%}\n        {%- if k != \"defer_loading\" -%}\n            {%- if not ns_t.first -%}{{- \", \" -}}{%- endif -%}\n            {%- set ns_t.first = false -%}\n            {{- k | tojson -}}{{- \": \" -}}{{- v | tojson -}}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- \"}\" -}}\n{%- endmacro -%}\n\n{%- macro is_tool_reference(item) -%}\n    {{- \"1\" if item is mapping and item.get(\"type\") == \"tool_reference\" else \"\" -}}\n{%- endmacro -%}\n\n{%- macro referenced_tool_to_json(name) -%}\n    {%- set _ns = namespace(found=none) -%}\n    {%- for tool in tools or [] -%}\n        {%- set fn = tool.function if tool.function is defined else tool -%}\n        {%- if fn.name == name -%}\n            {%- set _ns.found = fn -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- if _ns.found is none -%}\n        {{- raise_exception(\"Tool reference '\" + name | string + \"' not found in available tools. Every tool referenced by a tool_reference must be in `tools` on every request.\") -}}\n    {%- endif -%}\n    {{- tool_to_json(_ns.found) -}}\n{%- endmacro -%}\n\n{%- macro render_tool_response(content) -%}\n    {%- if content is string and \"<tool_response>\" in content -%}\n        {{- content -}}\n    {%- else -%}\n    {{- \"<tool_response>\\n\" -}}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping -%}\n        {{- parse_content(content) -}}\n    {%- elif content is iterable -%}\n        {%- for item in content -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {%- if is_tool_reference(item) -%}\n                {%- if loop.first or not is_tool_reference(loop.previtem) -%}\n                    {{- \"<additional_tools>\\n\" -}}\n                {%- endif -%}\n                {{- referenced_tool_to_json(item.name) -}}\n                {%- if loop.last or not is_tool_reference(loop.nextitem) -%}\n                    {{- \"\\n</additional_tools>\" -}}\n                {%- endif -%}\n            {%- elif item is mapping and item.result is defined and item.result is mapping and item.result.tools is defined -%}\n                {{- \"<additional_tools>\\n\" -}}\n                {%- set _tl = item.result.tools -%}\n                {%- if _tl is string -%}\n                    {{- _tl -}}\n                {%- elif _tl is mapping -%}\n                    {{- tool_to_json(_tl) -}}\n                {%- else -%}\n                    {%- for t in _tl -%}\n                        {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n                        {{- tool_to_json(t) -}}\n                    {%- endfor -%}\n                {%- endif -%}\n                {{- \"\\n</additional_tools>\" -}}\n            {%- else -%}\n                {{- parse_content(item) -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- elif content is not none -%}\n        {{- content | tojson -}}\n    {%- endif -%}\n    {{- \"\\n</tool_response>\" -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- set ns = namespace(system_prompt=\"\", last_user_index=-1) -%}\n{%- if messages and messages[0][\"role\"] == \"system\" -%}\n    {%- if messages[0].get(\"content\") -%}\n        {%- set ns.system_prompt = parse_content(messages[0][\"content\"]) -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set tools_ns = namespace(lines=[]) -%}\n    {%- for tool in tools -%}\n        {%- set fn = tool.function if tool.function is defined else tool -%}\n        {%- set _dyn = (fn.defer_loading is defined and fn.defer_loading) or (tool.defer_loading is defined and tool.defer_loading) -%}\n        {%- if not _dyn -%}\n            {%- set tools_ns.lines = tools_ns.lines + [tool_to_json(fn)] -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- if tools_ns.lines -%}\n        {%- set ns.system_prompt = ns.system_prompt + (\"\\n\\n\" if ns.system_prompt else \"\") + \"<tools>\\n\" + (tools_ns.lines | join(\"\\n\")) + \"\\n</tools>\" -%}\n    {%- endif -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"user\" -%}\n        {%- set ns.last_user_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- set carry = namespace(pending=[]) -%}\n{%- for message in messages -%}\n    {%- set _next = messages[loop.index0 + 1] if not loop.last else none -%}\n    {%- set _merge = message.role == \"tool\" and not message.get(\"additional_tools\")\n        and _next is not none and _next.role == \"tool\" and not _next.get(\"additional_tools\")\n        and message.get(\"tool_call_id\") and _next.get(\"tool_call_id\") == message.get(\"tool_call_id\") -%}\n    {%- set _items = [] -%}\n    {%- if message.role == \"tool\" and not message.get(\"additional_tools\") -%}\n        {%- set _c = message.get(\"content\") -%}\n        {%- if _c is string -%}\n            {%- set _items = [{\"type\": \"text\", \"text\": _c}] if _c else [] -%}\n        {%- elif _c is mapping -%}\n            {%- set _items = [_c] -%}\n        {%- elif _c is iterable -%}\n            {%- set _items = _c | list -%}\n        {%- elif _c is not none -%}\n            {%- set _items = [_c] -%}\n        {%- endif -%}\n    {%- endif -%}\n    {%- if _merge -%}\n        {%- set carry.pending = carry.pending + _items -%}\n    {%- else -%}\n    {{- \"<|im_start|>\" + message.role + \"\\n\" -}}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}\n        {%- set thinking = message.thinking if message.thinking is defined else message.reasoning if message.reasoning is defined else message.reasoning_content -%}\n        {%- set keep_thinking = preserve_thinking or loop.index0 > ns.last_user_index -%}\n        {%- if thinking is defined and keep_thinking -%}\n            {{- \"<think>\" + (thinking or \"\") + \"</think>\" -}}\n        {%- elif keep_thinking and \"</think>\" not in (message.get(\"content\") if message.get(\"content\") is string else \"\") -%}\n            {{- \"<think></think>\" -}}\n        {%- endif -%}\n        {%- set _cfm_tag = \"CONTINUE_FINAL_MESSAGE_TAG \" -%}\n        {%- set _has_cfm = false -%}\n        {%- set content = \"\" -%}\n        {%- if message.get(\"content\") -%}\n            {%- set content = parse_content(message.content) -%}\n        {%- endif -%}\n        {%- if not keep_thinking -%}\n            {%- if \"</think>\" in content -%}\n                {%- set content = content.split(\"</think>\")[-1] | trim -%}\n            {%- endif -%}\n            {%- set content = \"<think></think>\" + content -%}\n        {%- endif -%}\n        {%- if content.endswith(_cfm_tag) -%}\n            {%- set _has_cfm = true -%}\n            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}\n            {%- set content = content[:_trunc_len] -%}\n        {%- endif -%}\n        {{- content -}}\n        {%- if message.tool_calls -%}\n            {{- render_tool_calls(message.tool_calls) -}}\n        {%- endif -%}\n        {%- if _has_cfm -%}\n            {{- _cfm_tag -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n        {%- endgeneration -%}\n    {%- elif message.role == \"tool\" -%}\n        {%- if message.get(\"additional_tools\") -%}\n            {%- set _at = message[\"additional_tools\"] -%}\n            {%- if _at is mapping or (_at is sequence and _at is not string) -%}\n                {%- set _src = _at -%}\n            {%- else -%}\n                {%- set _src = message.get(\"content\") -%}\n            {%- endif -%}\n            {%- if _src is string and \"<tool_response>\" in _src -%}\n                {{- _src -}}\n            {%- elif _src is string and \"<additional_tools>\" in _src -%}\n                {{- \"<tool_response>\\n\" + _src + \"\\n</tool_response>\" -}}\n            {%- elif _src -%}\n                {{- \"<tool_response>\\n<additional_tools>\\n\" -}}\n                {%- if _src is string -%}\n                    {{- _src -}}\n                {%- elif _src is mapping -%}\n                    {{- tool_to_json(_src) -}}\n                {%- else -%}\n                    {%- for t in _src -%}\n                        {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n                        {{- tool_to_json(t) -}}\n                    {%- endfor -%}\n                {%- endif -%}\n                {{- \"\\n</additional_tools>\\n</tool_response>\" -}}\n            {%- endif -%}\n        {%- elif carry.pending -%}\n            {{- render_tool_response(carry.pending + _items) -}}\n            {%- set carry.pending = [] -%}\n        {%- else -%}\n            {{- render_tool_response(\"\" if message.get(\"content\") is none else message.get(\"content\")) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- else %}\n        {%- if message.get(\"content\") -%}\n            {{- parse_content(message[\"content\"]) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- endif %}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n    {%- if enable_thinking -%}\n        {{- \"<think>\" -}}\n    {%- else -%}\n        {{- \"<think></think>\" -}}\n    {%- endif -%}\n{%- endif -%}\n"
+ },
+ "https://huggingface.co/api/models/onnx-community/LFM3-1.7B-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "onnx-community/LFM3-1.7B-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data_1"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers.js",
+    "onnx",
+    "lfm3",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "it",
+    "ja",
+    "ko",
+    "pt",
+    "es",
+    "vi",
+    "th",
+    "id",
+    "hi",
+    "ru",
+    "pl",
+    "base_model:LiquidAI/LFM3-1.7B",
+    "base_model:quantized:LiquidAI/LFM3-1.7B",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM3-1.7B"
+   },
+   "config": {
+    "model_type": "lfm3"
+   }
+  }
+ },
+ "https://huggingface.co/onnx-community/LFM3-1.7B-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 124894,\n  \"eos_token_id\": [\n    124900\n  ],\n  \"output_attentions\": false,\n  \"output_hidden_states\": false,\n  \"pad_token_id\": 124893,\n  \"transformers_version\": \"5.12.1\",\n  \"use_cache\": true\n}\n"
+ },
+ "https://huggingface.co/onnx-community/LFM3-1.7B-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set preserve_thinking = preserve_thinking | default(false) -%}\n{%- set enable_thinking = enable_thinking | default(true) -%}\n\n{%- macro render_value(v) -%}\n    {%- if v is string -%}\n        {{- v -}}\n    {%- elif v is boolean -%}\n        {{- \"true\" if v else \"false\" -}}\n    {%- elif v is none -%}\n        {{- \"null\" -}}\n    {%- elif v is mapping or (v is sequence and v is not string) -%}\n        {{- v | tojson -}}\n    {%- else -%}\n        {{- v -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro parse_content(content) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping and content.get(\"type\") == \"image\" -%}\n        {{- \"<|vision_start|><|image|><|vision_end|>\" -}}\n    {%- elif content is mapping and content.get(\"type\") == \"video\" -%}\n        {{- \"<|vision_start|><|video|><|vision_end|>\" -}}\n    {%- elif content is mapping and content.get(\"type\") == \"text\" -%}\n        {{- (content.get(\"text\") or \"\") | string -}}\n    {%- elif content is mapping -%}\n        {{- content | tojson -}}\n    {%- elif content is iterable -%}\n        {%- set _ns = namespace(result=\"\") -%}\n        {%- for item in content -%}\n            {%- if item is string -%}\n                {%- set _ns.result = _ns.result + item -%}\n            {%- elif item is mapping and item.get(\"type\") == \"image\" -%}\n                {%- set _ns.result = _ns.result + \"<|vision_start|><|image|><|vision_end|>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"video\" -%}\n                {%- set _ns.result = _ns.result + \"<|vision_start|><|video|><|vision_end|>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"text\" -%}\n                {%- set _ns.result = _ns.result + ((item.get(\"text\") or \"\") | string) -%}\n            {%- else -%}\n                {%- set _ns.result = _ns.result + (item | tojson) -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- _ns.result -}}\n    {%- elif content is not none -%}\n        {{- content | tojson -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_calls(tool_calls) -%}\n    {%- for tool_call in tool_calls -%}\n        {%- if not loop.first -%}{{- \"\\n\\n\" -}}{%- endif -%}\n        {%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n        {%- set func_args = func.get(\"arguments\") -%}\n        {%- if func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n            {{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n        {%- endif -%}\n        {{- \"<tool_call>\\n<function=\" + func[\"name\"] + \">\\n\" -}}\n        {%- if func_args is mapping -%}\n            {%- for arg_name, arg_value in func_args.items() -%}\n                {{- \"<parameter=\" + arg_name + \">\\n\" + render_value(arg_value) + \"\\n</parameter>\\n\" -}}\n            {%- endfor -%}\n        {%- endif -%}\n        {{- \"</function>\\n</tool_call>\" -}}\n    {%- endfor -%}\n{%- endmacro -%}\n\n{%- macro tool_to_json(tool) -%}\n    {%- set fn = tool.function if tool.function is defined else tool -%}\n    {%- set ns_t = namespace(first=true) -%}\n    {{- \"{\" -}}\n    {%- for k, v in fn.items() -%}\n        {%- if k != \"defer_loading\" -%}\n            {%- if not ns_t.first -%}{{- \", \" -}}{%- endif -%}\n            {%- set ns_t.first = false -%}\n            {{- k | tojson -}}{{- \": \" -}}{{- v | tojson -}}\n        {%- endif -%}\n    {%- endfor -%}\n    {{- \"}\" -}}\n{%- endmacro -%}\n\n{%- macro is_tool_reference(item) -%}\n    {{- \"1\" if item is mapping and item.get(\"type\") == \"tool_reference\" else \"\" -}}\n{%- endmacro -%}\n\n{%- macro referenced_tool_to_json(name) -%}\n    {%- set _ns = namespace(found=none) -%}\n    {%- for tool in tools or [] -%}\n        {%- set fn = tool.function if tool.function is defined else tool -%}\n        {%- if fn.name == name -%}\n            {%- set _ns.found = fn -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- if _ns.found is none -%}\n        {{- raise_exception(\"Tool reference '\" + name | string + \"' not found in available tools. Every tool referenced by a tool_reference must be in `tools` on every request.\") -}}\n    {%- endif -%}\n    {{- tool_to_json(_ns.found) -}}\n{%- endmacro -%}\n\n{%- macro render_tool_response(content) -%}\n    {%- if content is string and \"<tool_response>\" in content -%}\n        {{- content -}}\n    {%- else -%}\n    {{- \"<tool_response>\\n\" -}}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping -%}\n        {{- parse_content(content) -}}\n    {%- elif content is iterable -%}\n        {%- for item in content -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {%- if is_tool_reference(item) -%}\n                {%- if loop.first or not is_tool_reference(loop.previtem) -%}\n                    {{- \"<additional_tools>\\n\" -}}\n                {%- endif -%}\n                {{- referenced_tool_to_json(item.name) -}}\n                {%- if loop.last or not is_tool_reference(loop.nextitem) -%}\n                    {{- \"\\n</additional_tools>\" -}}\n                {%- endif -%}\n            {%- elif item is mapping and item.result is defined and item.result is mapping and item.result.tools is defined -%}\n                {{- \"<additional_tools>\\n\" -}}\n                {%- set _tl = item.result.tools -%}\n                {%- if _tl is string -%}\n                    {{- _tl -}}\n                {%- elif _tl is mapping -%}\n                    {{- tool_to_json(_tl) -}}\n                {%- else -%}\n                    {%- for t in _tl -%}\n                        {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n                        {{- tool_to_json(t) -}}\n                    {%- endfor -%}\n                {%- endif -%}\n                {{- \"\\n</additional_tools>\" -}}\n            {%- else -%}\n                {{- parse_content(item) -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- elif content is not none -%}\n        {{- content | tojson -}}\n    {%- endif -%}\n    {{- \"\\n</tool_response>\" -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- set ns = namespace(system_prompt=\"\", last_user_index=-1) -%}\n{%- if messages and messages[0][\"role\"] == \"system\" -%}\n    {%- if messages[0].get(\"content\") -%}\n        {%- set ns.system_prompt = parse_content(messages[0][\"content\"]) -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set tools_ns = namespace(lines=[]) -%}\n    {%- for tool in tools -%}\n        {%- set fn = tool.function if tool.function is defined else tool -%}\n        {%- set _dyn = (fn.defer_loading is defined and fn.defer_loading) or (tool.defer_loading is defined and tool.defer_loading) -%}\n        {%- if not _dyn -%}\n            {%- set tools_ns.lines = tools_ns.lines + [tool_to_json(fn)] -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- if tools_ns.lines -%}\n        {%- set ns.system_prompt = ns.system_prompt + (\"\\n\\n\" if ns.system_prompt else \"\") + \"<tools>\\n\" + (tools_ns.lines | join(\"\\n\")) + \"\\n</tools>\" -%}\n    {%- endif -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"user\" -%}\n        {%- set ns.last_user_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- set carry = namespace(pending=[]) -%}\n{%- for message in messages -%}\n    {%- set _next = messages[loop.index0 + 1] if not loop.last else none -%}\n    {%- set _merge = message.role == \"tool\" and not message.get(\"additional_tools\")\n        and _next is not none and _next.role == \"tool\" and not _next.get(\"additional_tools\")\n        and message.get(\"tool_call_id\") and _next.get(\"tool_call_id\") == message.get(\"tool_call_id\") -%}\n    {%- set _items = [] -%}\n    {%- if message.role == \"tool\" and not message.get(\"additional_tools\") -%}\n        {%- set _c = message.get(\"content\") -%}\n        {%- if _c is string -%}\n            {%- set _items = [{\"type\": \"text\", \"text\": _c}] if _c else [] -%}\n        {%- elif _c is mapping -%}\n            {%- set _items = [_c] -%}\n        {%- elif _c is iterable -%}\n            {%- set _items = _c | list -%}\n        {%- elif _c is not none -%}\n            {%- set _items = [_c] -%}\n        {%- endif -%}\n    {%- endif -%}\n    {%- if _merge -%}\n        {%- set carry.pending = carry.pending + _items -%}\n    {%- else -%}\n    {{- \"<|im_start|>\" + message.role + \"\\n\" -}}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}\n        {%- set thinking = message.thinking if message.thinking is defined else message.reasoning if message.reasoning is defined else message.reasoning_content -%}\n        {%- set keep_thinking = preserve_thinking or loop.index0 > ns.last_user_index -%}\n        {%- if thinking is defined and keep_thinking -%}\n            {{- \"<think>\" + (thinking or \"\") + \"</think>\" -}}\n        {%- elif keep_thinking and \"</think>\" not in (message.get(\"content\") if message.get(\"content\") is string else \"\") -%}\n            {{- \"<think></think>\" -}}\n        {%- endif -%}\n        {%- set _cfm_tag = \"CONTINUE_FINAL_MESSAGE_TAG \" -%}\n        {%- set _has_cfm = false -%}\n        {%- set content = \"\" -%}\n        {%- if message.get(\"content\") -%}\n            {%- set content = parse_content(message.content) -%}\n        {%- endif -%}\n        {%- if not keep_thinking -%}\n            {%- if \"</think>\" in content -%}\n                {%- set content = content.split(\"</think>\")[-1] | trim -%}\n            {%- endif -%}\n            {%- set content = \"<think></think>\" + content -%}\n        {%- endif -%}\n        {%- if content.endswith(_cfm_tag) -%}\n            {%- set _has_cfm = true -%}\n            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}\n            {%- set content = content[:_trunc_len] -%}\n        {%- endif -%}\n        {{- content -}}\n        {%- if message.tool_calls -%}\n            {{- render_tool_calls(message.tool_calls) -}}\n        {%- endif -%}\n        {%- if _has_cfm -%}\n            {{- _cfm_tag -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n        {%- endgeneration -%}\n    {%- elif message.role == \"tool\" -%}\n        {%- if message.get(\"additional_tools\") -%}\n            {%- set _at = message[\"additional_tools\"] -%}\n            {%- if _at is mapping or (_at is sequence and _at is not string) -%}\n                {%- set _src = _at -%}\n            {%- else -%}\n                {%- set _src = message.get(\"content\") -%}\n            {%- endif -%}\n            {%- if _src is string and \"<tool_response>\" in _src -%}\n                {{- _src -}}\n            {%- elif _src is string and \"<additional_tools>\" in _src -%}\n                {{- \"<tool_response>\\n\" + _src + \"\\n</tool_response>\" -}}\n            {%- elif _src -%}\n                {{- \"<tool_response>\\n<additional_tools>\\n\" -}}\n                {%- if _src is string -%}\n                    {{- _src -}}\n                {%- elif _src is mapping -%}\n                    {{- tool_to_json(_src) -}}\n                {%- else -%}\n                    {%- for t in _src -%}\n                        {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n                        {{- tool_to_json(t) -}}\n                    {%- endfor -%}\n                {%- endif -%}\n                {{- \"\\n</additional_tools>\\n</tool_response>\" -}}\n            {%- endif -%}\n        {%- elif carry.pending -%}\n            {{- render_tool_response(carry.pending + _items) -}}\n            {%- set carry.pending = [] -%}\n        {%- else -%}\n            {{- render_tool_response(\"\" if message.get(\"content\") is none else message.get(\"content\")) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- else %}\n        {%- if message.get(\"content\") -%}\n            {{- parse_content(message[\"content\"]) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- endif %}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n    {%- if enable_thinking -%}\n        {{- \"<think>\" -}}\n    {%- else -%}\n        {{- \"<think></think>\" -}}\n    {%- endif -%}\n{%- endif -%}\n"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-1.2B-Instruct-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-1.2B-Instruct-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_2"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "onnx",
+    "lfm2",
+    "liquid",
+    "edge",
+    "lfm2.5",
+    "onnxruntime",
+    "webgpu",
+    "text-generation",
+    "conversational",
+    "en",
+    "ja",
+    "ko",
+    "fr",
+    "es",
+    "de",
+    "it",
+    "pt",
+    "ar",
+    "zh",
+    "base_model:LiquidAI/LFM2.5-1.2B-Instruct",
+    "base_model:quantized:LiquidAI/LFM2.5-1.2B-Instruct",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-1.2B-Instruct"
+    ]
+   },
+   "config": {
+    "model_type": "lfm2"
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"5.1.0\"\n}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set keep_past_thinking = keep_past_thinking | default(false) -%}\n{%- set ns = namespace(system_prompt=\"\") -%}\n{%- if messages[0][\"role\"] == \"system\" -%}\n    {%- set ns.system_prompt = messages[0][\"content\"] -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- set ns.last_assistant_index = -1 -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}}\n    {%- set content = message[\"content\"] -%}\n    {%- if content is not string -%}\n        {%- set content = content | tojson -%}\n    {%- endif -%}\n    {%- if message[\"role\"] == \"assistant\" and not keep_past_thinking and loop.index0 != ns.last_assistant_index -%}\n        {%- if \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n    {%- endif -%}\n    {{- content + \"<|im_end|>\\n\" -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-1.2B-Thinking-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-1.2B-Thinking-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_2"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "onnx",
+    "lfm2",
+    "liquid",
+    "edge",
+    "lfm2.5",
+    "thinking",
+    "reasoning",
+    "onnxruntime",
+    "webgpu",
+    "text-generation",
+    "conversational",
+    "en",
+    "ja",
+    "ko",
+    "fr",
+    "es",
+    "de",
+    "it",
+    "pt",
+    "ar",
+    "zh",
+    "base_model:LiquidAI/LFM2.5-1.2B-Thinking",
+    "base_model:quantized:LiquidAI/LFM2.5-1.2B-Thinking",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-1.2B-Thinking"
+    ]
+   },
+   "config": {
+    "model_type": "lfm2"
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"5.1.0\"\n}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set keep_past_thinking = keep_past_thinking | default(false) -%}\n{%- set ns = namespace(system_prompt=\"\") -%}\n{%- if messages[0][\"role\"] == \"system\" -%}\n    {%- set ns.system_prompt = messages[0][\"content\"] -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- set ns.last_assistant_index = -1 -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}}\n    {%- set content = message[\"content\"] -%}\n    {%- if content is not string -%}\n        {%- set content = content | tojson -%}\n    {%- endif -%}\n    {%- if message[\"role\"] == \"assistant\" and not keep_past_thinking and loop.index0 != ns.last_assistant_index -%}\n        {%- if \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n    {%- endif -%}\n    {{- content + \"<|im_end|>\\n\" -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-350M-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-350M-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f32.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f32.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q8.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "onnx",
+    "lfm2",
+    "liquid",
+    "edge",
+    "lfm2.5",
+    "onnxruntime",
+    "webgpu",
+    "text-generation",
+    "conversational",
+    "en",
+    "ja",
+    "ko",
+    "fr",
+    "es",
+    "de",
+    "it",
+    "pt",
+    "ar",
+    "zh",
+    "base_model:LiquidAI/LFM2.5-350M",
+    "base_model:quantized:LiquidAI/LFM2.5-350M",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-350M"
+    ]
+   },
+   "config": {
+    "model_type": "lfm2"
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-350M-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set keep_past_thinking = keep_past_thinking | default(false) -%}\n{%- set ns = namespace(system_prompt=\"\") -%}\n{%- if messages[0][\"role\"] == \"system\" -%}\n    {%- set sys_content = messages[0][\"content\"] -%}\n    {%- if sys_content is not string -%}\n        {%- for item in sys_content -%}\n            {%- if item[\"type\"] == \"text\" -%}\n                {%- set ns.system_prompt = ns.system_prompt + item[\"text\"] -%}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {%- set ns.system_prompt = sys_content -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- set ns.last_assistant_index = -1 -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}}\n    {%- set content = message[\"content\"] -%}\n    {%- if content is not string -%}\n        {%- set ns.content = \"\" -%}\n        {%- for item in content -%}\n            {%- if item[\"type\"] == \"image\" -%}\n                {%- set ns.content = ns.content + \"<image>\" -%}\n            {%- elif item[\"type\"] == \"text\" -%}\n                {%- set ns.content = ns.content + item[\"text\"] -%}\n            {%- else -%}\n                {%- set ns.content = ns.content + item | tojson -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {%- set content = ns.content -%}\n    {%- endif -%}\n    {%- if message[\"role\"] == \"assistant\" and not keep_past_thinking and loop.index0 != ns.last_assistant_index -%}\n        {%- if \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n    {%- endif -%}\n    {{- content + \"<|im_end|>\\n\" -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-350M-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"5.5.0.dev0\"\n}\n"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-350M-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-350M-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM2.5-350M-BF16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-F16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-350M-QAD-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    },
+    {
+     "rfilename": "qad/LICENSE"
+    },
+    {
+     "rfilename": "qad/README.md"
+    },
+    {
+     "rfilename": "qad/chat_template.jinja"
+    },
+    {
+     "rfilename": "qad/config.json"
+    },
+    {
+     "rfilename": "qad/generation_config.json"
+    },
+    {
+     "rfilename": "qad/model.safetensors"
+    },
+    {
+     "rfilename": "qad/provenance.json"
+    },
+    {
+     "rfilename": "qad/tokenizer.json"
+    },
+    {
+     "rfilename": "qad/tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "safetensors",
+    "gguf",
+    "liquid",
+    "lfm2",
+    "edge",
+    "llama.cpp",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2.5-350M",
+    "base_model:quantized:LiquidAI/LFM2.5-350M",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-350M"
+    ]
+   },
+   "gguf": {
+    "architecture": "lfm2",
+    "total": 354483968
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main/qad/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set preserve_thinking = preserve_thinking | default(keep_past_thinking | default(false)) -%}\n\n{%- macro format_arg_value(arg_value) -%}\n    {%- if arg_value is string -%}\n        {{- \"'\" + (arg_value | replace(\"\\\\\", \"\\\\\\\\\") | replace(\"'\", \"\\\\'\") | replace(\"\\n\", \"\\\\n\") | replace(\"\\r\", \"\\\\r\")) + \"'\" -}}\n    {%- elif arg_value is mapping or arg_value is iterable -%}\n        {{- arg_value | tojson -}}\n    {%- else -%}\n        {{- arg_value | string -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro parse_content(content) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping -%}\n        {{- content | tojson -}}\n    {%- elif content is iterable -%}\n        {%- set _ns = namespace(result=\"\") -%}\n        {%- for item in content -%}\n            {%- if item is string -%}\n                {%- set _ns.result = _ns.result + item -%}\n            {%- elif item is mapping and item.get(\"type\") == \"image\" -%}\n                {%- set _ns.result = _ns.result + \"<image>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"text\" -%}\n                {%- set _ns.result = _ns.result + ((item.get(\"text\") or \"\") | string) -%}\n            {%- else -%}\n                {%- set _ns.result = _ns.result + (item | tojson) -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- _ns.result -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_calls(tool_calls) -%}\n    {%- set tool_calls_ns = namespace(tool_calls=[]) -%}\n    {%- for tool_call in tool_calls -%}\n        {%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n        {%- set func_name = func[\"name\"] -%}\n        {%- set func_args = func.get(\"arguments\") -%}\n        {%- set args_ns = namespace(arg_strings=[]) -%}\n        {%- if func_args is mapping -%}\n            {%- for arg_name, arg_value in func_args.items() -%}\n                {%- set args_ns.arg_strings = args_ns.arg_strings + [arg_name + \"=\" + format_arg_value(arg_value)] -%}\n            {%- endfor -%}\n        {%- elif func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n            {{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n        {%- endif -%}\n        {%- set tool_calls_ns.tool_calls = tool_calls_ns.tool_calls + [func_name + \"(\" + (args_ns.arg_strings | join(\", \")) + \")\"] -%}\n    {%- endfor -%}\n    {{- \"<|tool_call_start|>[\" + (tool_calls_ns.tool_calls | join(\", \")) + \"]<|tool_call_end|>\" -}}\n{%- endmacro -%}\n\n{%- set ns = namespace(system_prompt=\"\", last_assistant_index=-1) -%}\n{%- if messages and messages[0][\"role\"] == \"system\" -%}\n    {%- if messages[0].get(\"content\") -%}\n        {%- set ns.system_prompt = parse_content(messages[0][\"content\"]) -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message.role + \"\\n\" -}}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}\n        {%- set keep_thinking = preserve_thinking or loop.index0 == ns.last_assistant_index -%}\n        {%- set thinking = message.thinking or message.reasoning or message.reasoning_content -%}\n        {%- set thinking = thinking if thinking is string else \"\" -%}\n        {%- if thinking and keep_thinking -%}\n            {{- \"<think>\" + thinking + \"</think>\" -}}\n        {%- endif -%}\n        {%- set _cfm_tag = \"CONTINUE_FINAL_MESSAGE_TAG \" -%}\n        {%- set _has_cfm = false -%}\n        {%- set content = \"\" -%}\n        {%- if message.get(\"content\") -%}\n            {%- set content = parse_content(message.content) -%}\n        {%- endif -%}\n        {%- if not keep_thinking and \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n        {%- if content.endswith(_cfm_tag) -%}\n            {%- set _has_cfm = true -%}\n            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}\n            {%- set content = content[:_trunc_len] -%}\n        {%- endif -%}\n        {{- content -}}\n        {%- if message.tool_calls -%}\n            {{- render_tool_calls(message.tool_calls) -}}\n        {%- endif -%}\n        {%- if _has_cfm -%}\n            {{- _cfm_tag -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n        {%- endgeneration -%}\n    {%- else %}\n        {%- if message.get(\"content\") -%}\n            {{- parse_content(message[\"content\"]) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- endif %}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main/qad/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"5.0.0rc1\"\n}\n"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-1.2B-Instruct-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-BF16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-F16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    },
+    {
+     "rfilename": "qad/LICENSE"
+    },
+    {
+     "rfilename": "qad/README.md"
+    },
+    {
+     "rfilename": "qad/chat_template.jinja"
+    },
+    {
+     "rfilename": "qad/config.json"
+    },
+    {
+     "rfilename": "qad/generation_config.json"
+    },
+    {
+     "rfilename": "qad/model.safetensors"
+    },
+    {
+     "rfilename": "qad/provenance.json"
+    },
+    {
+     "rfilename": "qad/tokenizer.json"
+    },
+    {
+     "rfilename": "qad/tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "safetensors",
+    "gguf",
+    "liquid",
+    "lfm2.5",
+    "edge",
+    "llama.cpp",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2.5-1.2B-Instruct",
+    "base_model:quantized:LiquidAI/LFM2.5-1.2B-Instruct",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-1.2B-Instruct"
+    ]
+   },
+   "gguf": {
+    "architecture": "lfm2",
+    "total": 1170340608
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/qad/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.57.2\"\n}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF/resolve/main/qad/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set preserve_thinking = preserve_thinking | default(keep_past_thinking | default(false)) -%}\n\n{%- macro format_arg_value(arg_value) -%}\n    {%- if arg_value is string -%}\n        {{- \"'\" + (arg_value | replace(\"\\\\\", \"\\\\\\\\\") | replace(\"'\", \"\\\\'\") | replace(\"\\n\", \"\\\\n\") | replace(\"\\r\", \"\\\\r\")) + \"'\" -}}\n    {%- elif arg_value is mapping or arg_value is iterable -%}\n        {{- arg_value | tojson -}}\n    {%- else -%}\n        {{- arg_value | string -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro parse_content(content) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping -%}\n        {{- content | tojson -}}\n    {%- elif content is iterable -%}\n        {%- set _ns = namespace(result=\"\") -%}\n        {%- for item in content -%}\n            {%- if item is string -%}\n                {%- set _ns.result = _ns.result + item -%}\n            {%- elif item is mapping and item.get(\"type\") == \"image\" -%}\n                {%- set _ns.result = _ns.result + \"<image>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"text\" -%}\n                {%- set _ns.result = _ns.result + ((item.get(\"text\") or \"\") | string) -%}\n            {%- else -%}\n                {%- set _ns.result = _ns.result + (item | tojson) -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- _ns.result -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_calls(tool_calls) -%}\n    {%- set tool_calls_ns = namespace(tool_calls=[]) -%}\n    {%- for tool_call in tool_calls -%}\n        {%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n        {%- set func_name = func[\"name\"] -%}\n        {%- set func_args = func.get(\"arguments\") -%}\n        {%- set args_ns = namespace(arg_strings=[]) -%}\n        {%- if func_args is mapping -%}\n            {%- for arg_name, arg_value in func_args.items() -%}\n                {%- set args_ns.arg_strings = args_ns.arg_strings + [arg_name + \"=\" + format_arg_value(arg_value)] -%}\n            {%- endfor -%}\n        {%- elif func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n            {{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n        {%- endif -%}\n        {%- set tool_calls_ns.tool_calls = tool_calls_ns.tool_calls + [func_name + \"(\" + (args_ns.arg_strings | join(\", \")) + \")\"] -%}\n    {%- endfor -%}\n    {{- \"<|tool_call_start|>[\" + (tool_calls_ns.tool_calls | join(\", \")) + \"]<|tool_call_end|>\" -}}\n{%- endmacro -%}\n\n{%- set ns = namespace(system_prompt=\"\", last_assistant_index=-1) -%}\n{%- if messages and messages[0][\"role\"] == \"system\" -%}\n    {%- if messages[0].get(\"content\") -%}\n        {%- set ns.system_prompt = parse_content(messages[0][\"content\"]) -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message.role + \"\\n\" -}}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}\n        {%- set keep_thinking = preserve_thinking or loop.index0 == ns.last_assistant_index -%}\n        {%- set thinking = message.thinking or message.reasoning or message.reasoning_content -%}\n        {%- set thinking = thinking if thinking is string else \"\" -%}\n        {%- if thinking and keep_thinking -%}\n            {{- \"<think>\" + thinking + \"</think>\" -}}\n        {%- endif -%}\n        {%- set _cfm_tag = \"CONTINUE_FINAL_MESSAGE_TAG \" -%}\n        {%- set _has_cfm = false -%}\n        {%- set content = \"\" -%}\n        {%- if message.get(\"content\") -%}\n            {%- set content = parse_content(message.content) -%}\n        {%- endif -%}\n        {%- if not keep_thinking and \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n        {%- if content.endswith(_cfm_tag) -%}\n            {%- set _has_cfm = true -%}\n            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}\n            {%- set content = content[:_trunc_len] -%}\n        {%- endif -%}\n        {{- content -}}\n        {%- if message.tool_calls -%}\n            {{- render_tool_calls(message.tool_calls) -}}\n        {%- endif -%}\n        {%- if _has_cfm -%}\n            {{- _cfm_tag -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n        {%- endgeneration -%}\n    {%- else %}\n        {%- if message.get(\"content\") -%}\n            {{- parse_content(message[\"content\"]) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- endif %}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}\n"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-1.2B-Thinking-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-1.2B-Thinking-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-BF16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-F16.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM2.5-1.2B-Thinking-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    }
+   ],
+   "tags": [
+    "gguf",
+    "liquid",
+    "lfm2.5",
+    "edge",
+    "llama.cpp",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2.5-1.2B-Thinking",
+    "base_model:quantized:LiquidAI/LFM2.5-1.2B-Thinking",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2.5-1.2B-Thinking"
+    ]
+   },
+   "gguf": {
+    "architecture": "lfm2",
+    "total": 1170340608
+   }
+  }
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2.5-1.2B-Thinking": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2.5-1.2B-Thinking",
+   "siblings": [
+    {
+     "rfilename": ".eval_results/gpqa.yaml"
+    },
+    {
+     "rfilename": ".eval_results/gsm8k.yaml"
+    },
+    {
+     "rfilename": ".eval_results/mmlu-pro.yaml"
+    },
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "model.safetensors"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "safetensors",
+    "lfm2",
+    "text-generation",
+    "liquid",
+    "lfm2.5",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "arxiv:2511.23404",
+    "base_model:LiquidAI/LFM2.5-1.2B-Base",
+    "base_model:finetune:LiquidAI/LFM2.5-1.2B-Base",
+    "license:other",
+    "eval-results",
+    "endpoints_compatible",
+    "deploy:azure",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM2.5-1.2B-Base"
+   },
+   "config": {
+    "model_type": "lfm2"
+   },
+   "safetensors": {
+    "total": 1170340608
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set preserve_thinking = preserve_thinking | default(keep_past_thinking | default(false)) -%}\n\n{%- macro format_arg_value(arg_value) -%}\n    {%- if arg_value is string -%}\n        {{- \"'\" + (arg_value | replace(\"\\\\\", \"\\\\\\\\\") | replace(\"'\", \"\\\\'\") | replace(\"\\n\", \"\\\\n\") | replace(\"\\r\", \"\\\\r\")) + \"'\" -}}\n    {%- elif arg_value is mapping or arg_value is iterable -%}\n        {{- arg_value | tojson -}}\n    {%- else -%}\n        {{- arg_value | string -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro parse_content(content) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is mapping -%}\n        {{- content | tojson -}}\n    {%- elif content is iterable -%}\n        {%- set _ns = namespace(result=\"\") -%}\n        {%- for item in content -%}\n            {%- if item is string -%}\n                {%- set _ns.result = _ns.result + item -%}\n            {%- elif item is mapping and item.get(\"type\") == \"image\" -%}\n                {%- set _ns.result = _ns.result + \"<image>\" -%}\n            {%- elif item is mapping and item.get(\"type\") == \"text\" -%}\n                {%- set _ns.result = _ns.result + ((item.get(\"text\") or \"\") | string) -%}\n            {%- else -%}\n                {%- set _ns.result = _ns.result + (item | tojson) -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- _ns.result -}}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_calls(tool_calls) -%}\n    {%- set tool_calls_ns = namespace(tool_calls=[]) -%}\n    {%- for tool_call in tool_calls -%}\n        {%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n        {%- set func_name = func[\"name\"] -%}\n        {%- set func_args = func.get(\"arguments\") -%}\n        {%- set args_ns = namespace(arg_strings=[]) -%}\n        {%- if func_args is mapping -%}\n            {%- for arg_name, arg_value in func_args.items() -%}\n                {%- set args_ns.arg_strings = args_ns.arg_strings + [arg_name + \"=\" + format_arg_value(arg_value)] -%}\n            {%- endfor -%}\n        {%- elif func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n            {{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n        {%- endif -%}\n        {%- set tool_calls_ns.tool_calls = tool_calls_ns.tool_calls + [func_name + \"(\" + (args_ns.arg_strings | join(\", \")) + \")\"] -%}\n    {%- endfor -%}\n    {{- \"<|tool_call_start|>[\" + (tool_calls_ns.tool_calls | join(\", \")) + \"]<|tool_call_end|>\" -}}\n{%- endmacro -%}\n\n{%- set ns = namespace(system_prompt=\"\", last_assistant_index=-1) -%}\n{%- if messages and messages[0][\"role\"] == \"system\" -%}\n    {%- if messages[0].get(\"content\") -%}\n        {%- set ns.system_prompt = parse_content(messages[0][\"content\"]) -%}\n    {%- endif -%}\n    {%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n    {%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: [\" -%}\n    {%- for tool in tools -%}\n        {%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n        {%- endif -%}\n        {%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n    {%- endfor -%}\n    {%- set ns.system_prompt = ns.system_prompt + \"]\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n    {{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if message[\"role\"] == \"assistant\" -%}\n        {%- set ns.last_assistant_index = loop.index0 -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {{- \"<|im_start|>\" + message.role + \"\\n\" -}}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}\n        {%- set keep_thinking = preserve_thinking or loop.index0 == ns.last_assistant_index -%}\n        {%- set thinking = message.thinking or message.reasoning or message.reasoning_content -%}\n        {%- set thinking = thinking if thinking is string else \"\" -%}\n        {%- if thinking and keep_thinking -%}\n            {{- \"<think>\" + thinking + \"</think>\" -}}\n        {%- endif -%}\n        {%- set _cfm_tag = \"CONTINUE_FINAL_MESSAGE_TAG \" -%}\n        {%- set _has_cfm = false -%}\n        {%- set content = \"\" -%}\n        {%- if message.get(\"content\") -%}\n            {%- set content = parse_content(message.content) -%}\n        {%- endif -%}\n        {%- if not keep_thinking and \"</think>\" in content -%}\n            {%- set content = content.split(\"</think>\")[-1] | trim -%}\n        {%- endif -%}\n        {%- if content.endswith(_cfm_tag) -%}\n            {%- set _has_cfm = true -%}\n            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}\n            {%- set content = content[:_trunc_len] -%}\n        {%- endif -%}\n        {{- content -}}\n        {%- if message.tool_calls -%}\n            {{- render_tool_calls(message.tool_calls) -}}\n        {%- endif -%}\n        {%- if _has_cfm -%}\n            {{- _cfm_tag -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n        {%- endgeneration -%}\n    {%- else %}\n        {%- if message.get(\"content\") -%}\n            {{- parse_content(message[\"content\"]) -}}\n        {%- endif -%}\n        {{- \"<|im_end|>\\n\" -}}\n    {%- endif %}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.57.2\"\n}\n"
+ },
+ "https://huggingface.co/api/models/unsloth/Qwen3.5-2B-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "unsloth/Qwen3.5-2B-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-BF16.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-IQ4_NL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-IQ4_XS.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q3_K_M.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q3_K_S.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q4_0.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q4_1.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q4_K_S.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q5_K_S.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q6_K.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-Q8_0.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-IQ2_M.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-IQ2_XXS.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-IQ3_XXS.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q2_K_XL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q3_K_XL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q4_K_XL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q5_K_XL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q6_K_XL.gguf"
+    },
+    {
+     "rfilename": "Qwen3.5-2B-UD-Q8_K_XL.gguf"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "imatrix_unsloth.gguf_file"
+    },
+    {
+     "rfilename": "mmproj-BF16.gguf"
+    },
+    {
+     "rfilename": "mmproj-F16.gguf"
+    },
+    {
+     "rfilename": "mmproj-F32.gguf"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "gguf",
+    "unsloth",
+    "image-text-to-text",
+    "base_model:Qwen/Qwen3.5-2B",
+    "base_model:quantized:Qwen/Qwen3.5-2B",
+    "license:apache-2.0",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "Qwen/Qwen3.5-2B"
+    ]
+   },
+   "gguf": {
+    "architecture": "qwen35",
+    "total": 1881825088
+   }
+  }
+ },
+ "https://huggingface.co/api/models/Qwen/Qwen3.5-2B": {
+  "status": 200,
+  "body": {
+   "id": "Qwen/Qwen3.5-2B",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "merges.txt"
+    },
+    {
+     "rfilename": "model.safetensors-00001-of-00001.safetensors"
+    },
+    {
+     "rfilename": "model.safetensors.index.json"
+    },
+    {
+     "rfilename": "preprocessor_config.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    },
+    {
+     "rfilename": "video_preprocessor_config.json"
+    },
+    {
+     "rfilename": "vocab.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "safetensors",
+    "qwen3_5",
+    "image-text-to-text",
+    "conversational",
+    "base_model:Qwen/Qwen3.5-2B-Base",
+    "base_model:finetune:Qwen/Qwen3.5-2B-Base",
+    "license:apache-2.0",
+    "eval-results",
+    "endpoints_compatible",
+    "deploy:sagemaker",
+    "deploy:azure",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "Qwen/Qwen3.5-2B-Base"
+    ]
+   },
+   "config": {
+    "model_type": "qwen3_5"
+   },
+   "safetensors": {
+    "total": 2274069824
+   }
+  }
+ },
+ "https://huggingface.co/Qwen/Qwen3.5-2B/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
+ },
+ "https://huggingface.co/api/models/onnx-community/Qwen3.5-2B-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "onnx-community/Qwen3.5-2B-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged.onnx"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged.onnx_data"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged.onnx_data_2"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged.onnx_data_3"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_quantized.onnx_data"
+    },
+    {
+     "rfilename": "onnx/decoder_model_merged_quantized.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/embed_tokens.onnx"
+    },
+    {
+     "rfilename": "onnx/embed_tokens.onnx_data"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/embed_tokens_quantized.onnx_data"
+    },
+    {
+     "rfilename": "onnx/vision_encoder.onnx"
+    },
+    {
+     "rfilename": "onnx/vision_encoder.onnx_data"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/vision_encoder_quantized.onnx_data"
+    },
+    {
+     "rfilename": "preprocessor_config.json"
+    },
+    {
+     "rfilename": "processor_config.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "onnx",
+    "qwen3_5",
+    "base_model:Qwen/Qwen3.5-2B",
+    "base_model:quantized:Qwen/Qwen3.5-2B",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "Qwen/Qwen3.5-2B"
+    ]
+   },
+   "config": {
+    "model_type": "qwen3_5"
+   }
+  }
+ },
+ "https://huggingface.co/onnx-community/Qwen3.5-2B-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"bos_token_id\": 248044,\n  \"do_sample\": true,\n  \"eos_token_id\": [\n    248046,\n    248044\n  ],\n  \"pad_token_id\": 248044,\n  \"temperature\": 0.6,\n  \"top_k\": 20,\n  \"top_p\": 0.95,\n  \"transformers_version\": \"5.3.0.dev0\",\n  \"trust_remote_code\": false\n}\n"
+ },
+ "https://huggingface.co/onnx-community/Qwen3.5-2B-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2-1.2B-Tool-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2-1.2B-Tool-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-F16.gguf"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM2-1.2B-Tool-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "gguf",
+    "liquid",
+    "lfm2",
+    "edge",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2-1.2B-Tool",
+    "base_model:quantized:LiquidAI/LFM2-1.2B-Tool",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM2-1.2B-Tool"
+   },
+   "gguf": {
+    "architecture": "lfm2",
+    "total": 1170340608
+   }
+  }
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2-1.2B-Tool": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2-1.2B-Tool",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "model.safetensors"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "safetensors",
+    "lfm2",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "arxiv:2511.23404",
+    "base_model:LiquidAI/LFM2-1.2B",
+    "base_model:finetune:LiquidAI/LFM2-1.2B",
+    "license:other",
+    "endpoints_compatible",
+    "deploy:azure",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM2-1.2B"
+   },
+   "config": {
+    "model_type": "lfm2"
+   },
+   "safetensors": {
+    "total": 1170340608
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2-1.2B-Tool/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.54.1\"\n}\n"
+ },
+ "https://huggingface.co/LiquidAI/LFM2-1.2B-Tool/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}{%- set system_prompt = \"\" -%}{%- set ns = namespace(system_prompt=\"\") -%}{%- if messages[0][\"role\"] == \"system\" -%} {%- set ns.system_prompt = messages[0][\"content\"] -%} {%- set messages = messages[1:] -%}{%- endif -%}{%- if tools -%} {%- set ns.system_prompt = ns.system_prompt + (\"\n\" if ns.system_prompt else \"\") + \"List of tools: <|tool_list_start|>[\" -%} {%- for tool in tools -%} {%- if tool is not string -%} {%- set tool = tool | tojson -%} {%- endif -%} {%- set ns.system_prompt = ns.system_prompt + tool -%} {%- if not loop.last -%} {%- set ns.system_prompt = ns.system_prompt + \", \" -%} {%- endif -%} {%- endfor -%} {%- set ns.system_prompt = ns.system_prompt + \"]<|tool_list_end|>\" -%}{%- endif -%}{%- if ns.system_prompt -%} {{- \"<|im_start|>system\n\" + ns.system_prompt + \"<|im_end|>\n\" -}}{%- endif -%}{%- for message in messages -%} {{- \"<|im_start|>\" + message[\"role\"] + \"\n\" -}} {%- set content = message[\"content\"] -%} {%- if content is not string -%} {%- set content = content | tojson -%} {%- endif -%} {%- if message[\"role\"] == \"tool\" -%} {%- set content = \"<|tool_response_start|>\" + content + \"<|tool_response_end|>\" -%} {%- endif -%} {{- content + \"<|im_end|>\n\" -}}{%- endfor -%}{%- if add_generation_prompt -%} {{- \"<|im_start|>assistant\n\" -}}{%- endif -%}"
+ },
+ "https://huggingface.co/api/models/onnx-community/LFM2-1.2B-Tool-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "onnx-community/LFM2-1.2B-Tool-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_2"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers.js",
+    "onnx",
+    "lfm2",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2-1.2B-Tool",
+    "base_model:quantized:LiquidAI/LFM2-1.2B-Tool",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "LiquidAI/LFM2-1.2B-Tool"
+   },
+   "config": {
+    "model_type": "lfm2"
+   }
+  }
+ },
+ "https://huggingface.co/onnx-community/LFM2-1.2B-Tool-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.57.0.dev0\"\n}\n"
+ },
+ "https://huggingface.co/onnx-community/LFM2-1.2B-Tool-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}{%- set system_prompt = \"\" -%}{%- set ns = namespace(system_prompt=\"\") -%}{%- if messages[0][\"role\"] == \"system\" -%} {%- set ns.system_prompt = messages[0][\"content\"] -%} {%- set messages = messages[1:] -%}{%- endif -%}{%- if tools -%} {%- set ns.system_prompt = ns.system_prompt + (\"\n\" if ns.system_prompt else \"\") + \"List of tools: <|tool_list_start|>[\" -%} {%- for tool in tools -%} {%- if tool is not string -%} {%- set tool = tool | tojson -%} {%- endif -%} {%- set ns.system_prompt = ns.system_prompt + tool -%} {%- if not loop.last -%} {%- set ns.system_prompt = ns.system_prompt + \", \" -%} {%- endif -%} {%- endfor -%} {%- set ns.system_prompt = ns.system_prompt + \"]<|tool_list_end|>\" -%}{%- endif -%}{%- if ns.system_prompt -%} {{- \"<|im_start|>system\n\" + ns.system_prompt + \"<|im_end|>\n\" -}}{%- endif -%}{%- for message in messages -%} {{- \"<|im_start|>\" + message[\"role\"] + \"\n\" -}} {%- set content = message[\"content\"] -%} {%- if content is not string -%} {%- set content = content | tojson -%} {%- endif -%} {%- if message[\"role\"] == \"tool\" -%} {%- set content = \"<|tool_response_start|>\" + content + \"<|tool_response_end|>\" -%} {%- endif -%} {{- content + \"<|im_end|>\n\" -}}{%- endfor -%}{%- if add_generation_prompt -%} {{- \"<|im_start|>assistant\n\" -}}{%- endif -%}"
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2-350M-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2-350M-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LFM2-350M-F16.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q4_0.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q4_K_M-hip-optimized.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q6_K.gguf"
+    },
+    {
+     "rfilename": "LFM2-350M-Q8_0.gguf"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "leap/Q4_0.json"
+    },
+    {
+     "rfilename": "leap/Q4_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q5_K_M.json"
+    },
+    {
+     "rfilename": "leap/Q8_0.json"
+    }
+   ],
+   "tags": [
+    "gguf",
+    "liquid",
+    "lfm2",
+    "edge",
+    "llama.cpp",
+    "text-generation",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2-350M",
+    "base_model:quantized:LiquidAI/LFM2-350M",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2-350M"
+    ]
+   },
+   "gguf": {
+    "architecture": "lfm2",
+    "total": 354483968
+   }
+  }
+ },
+ "https://huggingface.co/api/models/LiquidAI/LFM2-350M": {
+  "status": 200,
+  "body": {
+   "id": "LiquidAI/LFM2-350M",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "model.safetensors"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "safetensors",
+    "lfm2",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "arxiv:2511.23404",
+    "license:other",
+    "endpoints_compatible",
+    "deploy:azure",
+    "region:us"
+   ],
+   "config": {
+    "model_type": "lfm2"
+   },
+   "safetensors": {
+    "total": 354483968
+   }
+  }
+ },
+ "https://huggingface.co/LiquidAI/LFM2-350M/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- macro format_arg_value(arg_value) -%}\n\t{%- if arg_value is string -%}\n\t\t{{- \"'\" + (arg_value | replace(\"\\\\\", \"\\\\\\\\\") | replace(\"'\", \"\\\\'\") | replace(\"\\n\", \"\\\\n\") | replace(\"\\r\", \"\\\\r\")) + \"'\" -}}\n\t{%- elif arg_value is mapping or arg_value is iterable -%}\n\t\t{{- arg_value | tojson -}}\n\t{%- else -%}\n\t\t{{- arg_value | string -}}\n\t{%- endif -%}\n{%- endmacro -%}\n{%- macro render_tool_calls(tool_calls) -%}\n\t{%- set tool_calls_ns = namespace(tool_calls=[]) -%}\n\t{%- for tool_call in tool_calls -%}\n\t\t{%- set func = tool_call[\"function\"] if \"function\" in tool_call else tool_call -%}\n\t\t{%- set func_name = func[\"name\"] -%}\n\t\t{%- set func_args = func.get(\"arguments\") -%}\n\t\t{%- set args_ns = namespace(arg_strings=[]) -%}\n\t\t{%- if func_args is mapping -%}\n\t\t\t{%- for arg_name, arg_value in func_args.items() -%}\n\t\t\t\t{%- set args_ns.arg_strings = args_ns.arg_strings + [arg_name + \"=\" + format_arg_value(arg_value)] -%}\n\t\t\t{%- endfor -%}\n\t\t{%- elif func_args is string and (func_args | trim) not in [\"\", \"{}\", \"null\"] -%}\n\t\t\t{{- raise_exception(\"Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template\") -}}\n\t\t{%- endif -%}\n\t\t{%- set tool_calls_ns.tool_calls = tool_calls_ns.tool_calls + [func_name + \"(\" + (args_ns.arg_strings | join(\", \")) + \")\"] -%}\n\t{%- endfor -%}\n\t{{- \"<|tool_call_start|>[\" + (tool_calls_ns.tool_calls | join(\", \")) + \"]<|tool_call_end|>\" -}}\n{%- endmacro -%}\n{%- set system_prompt = \"\" -%}\n{%- set ns = namespace(system_prompt=\"\") -%}\n{%- if messages[0][\"role\"] == \"system\" -%}\n\t{%- set ns.system_prompt = messages[0][\"content\"] -%}\n\t{%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n\t{%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: <|tool_list_start|>[\" -%}\n\t{%- for tool in tools -%}\n\t\t{%- if tool is not string -%}\n            {%- set tool = tool | tojson -%}\n\t\t{%- endif -%}\n\t\t{%- set ns.system_prompt = ns.system_prompt + tool -%}\n        {%- if not loop.last -%}\n            {%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n        {%- endif -%}\n\t{%- endfor -%}\n\t{%- set ns.system_prompt = ns.system_prompt + \"]<|tool_list_end|>\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n\t{{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n\t{{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}}\n\t{%- set content = message.get(\"content\") -%}\n\t{%- if content is not string -%}\n\t\t{%- set content = content | tojson -%}\n\t{%- endif -%}\n\t{%- if message[\"role\"] == \"tool\" -%}\n\t\t{%- set content = \"<|tool_response_start|>\" + content + \"<|tool_response_end|>\" -%}\n\t{%- endif -%}\n\t{%- if message[\"role\"] == \"assistant\" and message.get(\"tool_calls\") -%}\n\t\t{%- if content and content != \"null\" -%}\n\t\t\t{{- content -}}\n\t\t{%- endif -%}\n\t\t{{- render_tool_calls(message[\"tool_calls\"]) -}}\n\t\t{{- \"<|im_end|>\\n\" -}}\n\t{%- else -%}\n\t\t{{- content + \"<|im_end|>\\n\" -}}\n\t{%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n\t{{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}"
+ },
+ "https://huggingface.co/LiquidAI/LFM2-350M/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.54.0.dev0\"\n}\n"
+ },
+ "https://huggingface.co/api/models/onnx-community/LFM2-350M-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "onnx-community/LFM2-350M-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx_data"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers.js",
+    "onnx",
+    "lfm2",
+    "text-generation",
+    "liquid",
+    "edge",
+    "conversational",
+    "en",
+    "ar",
+    "zh",
+    "fr",
+    "de",
+    "ja",
+    "ko",
+    "es",
+    "base_model:LiquidAI/LFM2-350M",
+    "base_model:quantized:LiquidAI/LFM2-350M",
+    "license:other",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": [
+     "LiquidAI/LFM2-350M"
+    ]
+   },
+   "config": {
+    "model_type": "lfm2"
+   }
+  }
+ },
+ "https://huggingface.co/onnx-community/LFM2-350M-ONNX/resolve/main/generation_config.json": {
+  "status": 200,
+  "body": "{\n  \"_from_model_config\": true,\n  \"bos_token_id\": 1,\n  \"eos_token_id\": 7,\n  \"pad_token_id\": 0,\n  \"transformers_version\": \"4.54.0.dev0\"\n}"
+ },
+ "https://huggingface.co/onnx-community/LFM2-350M-ONNX/resolve/main/chat_template.jinja": {
+  "status": 200,
+  "body": "{{- bos_token -}}\n{%- set system_prompt = \"\" -%}\n{%- set ns = namespace(system_prompt=\"\") -%}\n{%- if messages[0][\"role\"] == \"system\" -%}\n\t{%- set ns.system_prompt = messages[0][\"content\"] -%}\n\t{%- set messages = messages[1:] -%}\n{%- endif -%}\n{%- if tools -%}\n\t{%- set ns.system_prompt = ns.system_prompt + (\"\\n\" if ns.system_prompt else \"\") + \"List of tools: <|tool_list_start|>[\" -%}\n\t{%- for tool in tools -%}\n\t\t{%- if tool is not string -%}\n\t\t\t{%- set tool = tool | tojson -%}\n\t\t{%- endif -%}\n\t\t{%- set ns.system_prompt = ns.system_prompt + tool -%}\n\t\t{%- if not loop.last -%}\n\t\t\t{%- set ns.system_prompt = ns.system_prompt + \", \" -%}\n\t\t{%- endif -%}\n\t{%- endfor -%}\n\t{%- set ns.system_prompt = ns.system_prompt + \"]<|tool_list_end|>\" -%}\n{%- endif -%}\n{%- if ns.system_prompt -%}\n\t{{- \"<|im_start|>system\\n\" + ns.system_prompt + \"<|im_end|>\\n\" -}}\n{%- endif -%}\n{%- for message in messages -%}\n\t{{- \"<|im_start|>\" + message[\"role\"] + \"\\n\" -}}\n\t{%- set content = message[\"content\"] -%}\n\t{%- if content is not string -%}\n\t\t{%- set content = content | tojson -%}\n\t{%- endif -%}\n\t{%- if message[\"role\"] == \"tool\" -%}\n\t\t{%- set content = \"<|tool_response_start|>\" + content + \"<|tool_response_end|>\" -%}\n\t{%- endif -%}\n\t{{- content + \"<|im_end|>\\n\" -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n\t{{- \"<|im_start|>assistant\\n\" -}}\n{%- endif -%}"
+ },
+ "https://huggingface.co/api/models/unsloth/Llama-3.2-1B-Instruct-GGUF": {
+  "status": 200,
+  "body": {
+   "id": "unsloth/Llama-3.2-1B-Instruct-GGUF",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-BF16.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-F16.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-IQ4_NL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-IQ4_XS.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q2_K.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q2_K_L.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q3_K_M.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q3_K_S.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q4_0.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q4_1.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q4_K_S.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q5_K_M.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q5_K_S.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q6_K.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-Q8_0.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-IQ1_M.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-IQ1_S.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-IQ2_M.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-IQ2_XXS.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-IQ3_XXS.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q2_K_XL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q3_K_XL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q4_K_XL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q5_K_XL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q6_K_XL.gguf"
+    },
+    {
+     "rfilename": "Llama-3.2-1B-Instruct-UD-Q8_K_XL.gguf"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "imatrix_unsloth.dat"
+    }
+   ],
+   "tags": [
+    "transformers",
+    "gguf",
+    "llama",
+    "text-generation",
+    "llama-3",
+    "meta",
+    "facebook",
+    "unsloth",
+    "en",
+    "base_model:meta-llama/Llama-3.2-1B-Instruct",
+    "base_model:quantized:meta-llama/Llama-3.2-1B-Instruct",
+    "license:llama3.2",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+   ],
+   "cardData": {
+    "base_model": "meta-llama/Llama-3.2-1B-Instruct"
+   },
+   "gguf": {
+    "architecture": "llama",
+    "total": 1235814432
+   },
+   "config": {
+    "model_type": "llama"
+   }
+  }
+ },
+ "https://huggingface.co/api/models/onnx-community/Llama-3.2-1B-Instruct-ONNX": {
+  "status": 200,
+  "body": {
+   "id": "onnx-community/Llama-3.2-1B-Instruct-ONNX",
+   "siblings": [
+    {
+     "rfilename": ".gitattributes"
+    },
+    {
+     "rfilename": "LICENSE.txt"
+    },
+    {
+     "rfilename": "README.md"
+    },
+    {
+     "rfilename": "USE_POLICY.md"
+    },
+    {
+     "rfilename": "chat_template.jinja"
+    },
+    {
+     "rfilename": "config.json"
+    },
+    {
+     "rfilename": "generation_config.json"
+    },
+    {
+     "rfilename": "onnx/model.onnx"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model.onnx_data_2"
+    },
+    {
+     "rfilename": "onnx/model_bnb4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_fp16.onnx_data_1"
+    },
+    {
+     "rfilename": "onnx/model_int8.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx"
+    },
+    {
+     "rfilename": "onnx/model_q4f16.onnx_data"
+    },
+    {
+     "rfilename": "onnx/model_quantized.onnx"
+    },
+    {
+     "rfilename": "onnx/model_uint8.onnx"
+    },
+    {
+     "rfilename": "quantize_config.json"
+    },
+    {
+     "rfilename": "special_tokens_map.json"
+    },
+    {
+     "rfilename": "tokenizer.json"
+    },
+    {
+     "rfilename": "tokenizer_config.json"
+    }
+   ],
+   "tags": [
+    "transformers.js",
+    "onnx",
+    "llama",
+    "text-generation",
+    "conversational",
+    "base_model:meta-llama/Llama-3.2-1B-Instruct",
+    "base_model:quantized:meta-llama/Llama-3.2-1B-Instruct",
+    "license:llama3.2",
+    "region:us"
+   ],
+   "cardData": {
+    "base_model": "meta-llama/Llama-3.2-1B-Instruct"
+   },
+   "config": {
+    "model_type": "llama"
+   }
+  }
+ }
+}

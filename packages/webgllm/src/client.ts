@@ -5,6 +5,7 @@
  */
 import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
+import { isCatalogModel, knownModelMeta } from "./model-meta.js"
 import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 
 /** What a worker sends that the pool acts on. */
@@ -163,7 +164,7 @@ export class ModelWorker {
   private sendLoad(load: Load) {
     if (this.gone) return
     this.open.add(load.id)
-    this.post({ type: "load", model: this.model, loadId: load.id, ...(load.contextLength !== undefined && { contextLength: load.contextLength }) })
+    this.post({ type: "load", model: this.model, loadId: load.id, ...(load.contextLength !== undefined && { contextLength: load.contextLength }), ...this.meta() })
   }
 
   /**
@@ -180,12 +181,18 @@ export class ModelWorker {
     return true
   }
 
+  /** A model resolved from the Hub: its meta, so the worker needn't ask the Hub again. */
+  private meta() {
+    const meta = isCatalogModel(this.model) ? undefined : knownModelMeta(this.model)
+    return meta ? { meta } : {}
+  }
+
   /** Downloads the model's files to storage, without loading it. */
   download(): Promise<void> {
     if (this.gone) return Promise.reject(this.gone)
     if (!this.downloading) {
       this.downloading = pending<void>()
-      this.post({ type: "download", model: this.model })
+      this.post({ type: "download", model: this.model, ...this.meta() })
     }
     return this.downloading.promise
   }

@@ -104,8 +104,8 @@ Answer tokens are constrained to the schema while they're picked, so the answer 
 Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
 
 ```ts
-await webgllm.models.list()      // the supported models, with downloaded / loaded
-await webgllm.models.downloaded(id) // whether it loads without a download (storage only, no network)
+await webgllm.models.list()      // the catalog and models used on the page, with downloaded / loaded
+await webgllm.models.downloaded(id) // whether it loads without a download (storage only; a model outside the catalog asks the Hub for its files once)
 await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```
@@ -132,6 +132,23 @@ webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${mo
 
 ## Models
 
+Any Hugging Face model whose architecture webgllm runs loads by its repository name (`owner/name`): LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export.
+
+```ts
+await webgllm.chat.completions.create({ model: "LiquidAI/LFM2-350M-GGUF", messages })
+```
+
+webgllm reads the repository's file list from the Hub and picks, by one rule each:
+
+- **Weights:** a GGUF file (Q4_0 first, a quantization-aware "QAD" Q4_0 before a plain one, then Q8_0, then the fewest bits among Q4_1, Q5_K, Q6_K and F16), else an ONNX decoder under `onnx/` with one external data file (q4f16 first, then q4).
+- **Tokenizer and chat template:** the repository's own, else those in a folder named in the weights file's name (Liquid AI's `qad/`), else the base model's (the card's `base_model`).
+- **Thinking and tool calls:** from the chat template (`enable_thinking` makes thinking switchable; a template that opens `<think>`, or a model named "Thinking" or "Reasoning", always thinks). `<tool_call>` means the XML call format, otherwise LFM2's Pythonic calls.
+- **Sampling:** the repository's `generation_config.json` as Transformers reads it: its values when it sets `do_sample`, else greedy decoding.
+
+Another architecture, or a repository without weights it can load, fails with `model-not-supported` before anything downloads.
+
+The catalog holds known defaults for the models webgllm is tuned and tested on, such as the sampling from their model cards, which the Hub doesn't say. `models.list()` returns it, plus any other model used on the page:
+
 | Model                                | Weights                                                  |
 | ------------------------------------ | -------------------------------------------------------- |
 | `LiquidAI/LFM3-1.7B-GGUF`            | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)   |
@@ -142,6 +159,8 @@ webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${mo
 | `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` | official Q4_0; always thinks                             |
 | `LiquidAI/LFM2.5-350M-GGUF`          | official QAD Q4_0                                        |
 | `LiquidAI/LFM2.5-1.2B-Instruct-ONNX`, `LiquidAI/LFM2.5-1.2B-Thinking-ONNX`, `LiquidAI/LFM2.5-350M-ONNX` | Liquid AI's 4-bit ONNX exports |
+| `LiquidAI/LFM2-1.2B-Tool-GGUF`       | official Q4_0; tuned for tool calls, greedy decoding     |
+| `onnx-community/LFM2-1.2B-Tool-ONNX` | onnx-community's q4f16 export                            |
 
 LFM3 thinks by default and Qwen3.5 doesn't; `reasoning_effort` switches it through the chat template's `enable_thinking`. Sampling defaults come from each model card. See [LFM2.5 GGUF validation](bench/LFM2-GGUF.md).
 

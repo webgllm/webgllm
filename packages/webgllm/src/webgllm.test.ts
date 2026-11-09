@@ -5,6 +5,8 @@ import { fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
 import type { FakeOptions } from "./fake-worker.test.js"
 import type { ChatCompletionChunk, LoadProgress } from "./openai.js"
 import { internals, WebGLLM } from "./webgllm.js"
+import { hub } from "./resolve-model.js"
+import hubFixture from "./test-fixtures/hub.json"
 
 const QWEN = "unsloth/Qwen3.5-2B-GGUF"
 const LFM2 = "LiquidAI/LFM2.5-350M-GGUF"
@@ -393,4 +395,28 @@ test("onMemoryClaim forwards each model's claims, released at its unload event",
   assert.deepEqual([...host], [[QWEN, 700]])
   await instance.unloadModel(QWEN)
   assert.deepEqual([...host], [])
+})
+
+test("any Hugging Face model: resolved from the Hub, its meta sent to the worker, listed after", async () => {
+  const name = "LiquidAI/LFM2-350M-GGUF"
+  const answers = hubFixture as Record<string, { status: number; body: unknown }>
+  hub.fetch = async (url: string) => {
+    const answer = answers[url]
+    if (!answer) return new Response("Not found", { status: 404 })
+    return new Response(typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body), { status: answer.status })
+  }
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["Hello", "!"] }) })
+  const completion = await client.chat.completions.create({ model: name, messages: hi })
+  assert.equal(completion.choices[0]?.message.content, "Hello!")
+  const load = workers.of(name)!.sent.find((m) => m.type === "load")
+  assert.ok(load?.type === "load" && load.meta?.name === name)
+  assert.deepEqual(load.meta.files, { kind: "gguf", model: { repo: name, path: "LFM2-350M-Q4_0.gguf" } })
+  // Greedy, as its generation_config.json says nothing about sampling.
+  assert.equal(workers.of(name)!.generations()[0]!.sampling.temperature, 0)
+  const listed = (await client.models.list()).find((m) => m.id === name)
+  assert.equal(listed?.loaded, true)
+  assert.equal(listed?.format, "gguf")
+  // A catalog model's load carries no meta (the worker has the catalog).
+  await client.loadModel(LFM2)
+  assert.equal(workers.of(LFM2)!.sent.find((m) => m.type === "load" && "meta" in m), undefined)
 })

@@ -13,10 +13,11 @@ import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
-import { modelMeta } from "./model-meta.js"
+import { modelMeta, rememberModel } from "./model-meta.js"
+import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
-import type { ModelFile, WebGlTextModel } from "./model-meta.js"
+import type { ModelFile } from "./model-meta.js"
 import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, verify, verifyAt } from "./sampler.js"
@@ -144,8 +145,9 @@ const downloads = createSharedDownloads<File>()
  * `share` (a load's uploading takes the rest). Needs no GPU: a worker may
  * only download.
  */
-async function fetchFiles(model: WebGlTextModel, signal: AbortSignal, share = 0.9) {
-  const meta = modelMeta(model)
+async function fetchFiles(model: string, signal: AbortSignal, share = 0.9) {
+  // The page sends a resolved model's meta; a page that doesn't has it resolved here.
+  const meta = await resolveModel(model)
   const weights: Array<ModelFile> =
     meta.files.kind === "gguf"
       ? [meta.files.model]
@@ -211,7 +213,7 @@ async function fetchFiles(model: WebGlTextModel, signal: AbortSignal, share = 0.
 const SELF_CHECK_MAX = 1e-2
 
 async function load(
-  model: WebGlTextModel,
+  model: string,
   signal: AbortSignal,
   /** Most tokens a chat may hold: the model's own context length when undefined. */
   contextLength: number | undefined,
@@ -219,7 +221,7 @@ async function load(
   plain = false,
   reuseTuning = true
 ): Promise<Loaded> {
-  const meta = modelMeta(model)
+  const meta = await resolveModel(model)
   // The GPU first: a browser or GPU that can't run the model says so before
   // a gigabyte downloads. (The page's hasWebGl2 checks the page; this is
   // the worker, where the engine runs.)
@@ -487,7 +489,7 @@ function startLoad(
   const run = async () => {
     await previous?.catch(() => undefined)
     if (abort.signal.aborted) throw new Superseded()
-    return load(model as WebGlTextModel, abort.signal, contextLength)
+    return load(model, abort.signal, contextLength)
   }
   const entry: NonNullable<typeof loading> = {
     model,
@@ -520,8 +522,7 @@ function startLoad(
  */
 async function downloadModel(model: string) {
   try {
-    if (!modelMeta(model as WebGlTextModel)) throw new Error(`${model} isn't a model this engine runs.`)
-    const { cached } = await fetchFiles(model as WebGlTextModel, new AbortController().signal, 1)
+    const { cached } = await fetchFiles(model, new AbortController().signal, 1)
     post({ type: "progress", model, progress: 1, cached })
     post({ type: "downloaded", model })
   } catch (error) {
@@ -595,7 +596,7 @@ async function generate(request: GenerateRequest) {
   )
   // LFM2.5 Thinking writes its opening marker itself; its template ends at
   // assistant\n. Seed that expected marker so the answer grammar never suppresses reasoning.
-  const reasoning = modelMeta(request.model as WebGlTextModel).reasoning
+  const reasoning = modelMeta(request.model).reasoning
   const mandatoryThinking = !!reasoning && "levels" in reasoning && !("off" in reasoning.levels)
   const openThinking = answerSchema !== undefined && !startsInThinking && think !== null &&
     (request.thinking === true || (request.thinking === undefined && mandatoryThinking))
@@ -1119,6 +1120,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
     // After the generations asked for before it: another context length
     // frees the engine they run on. Each answer names its load.
     const { model, contextLength, loadId } = data
+    if (data.meta) rememberModel(data.meta)
     queue = queue.then(() => {
       const before = current
       startLoad(model, contextLength).then(
@@ -1139,6 +1141,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
   } else if (data.type === "stop") {
     stopped.add(data.id)
   } else if (data.type === "download") {
+    if (data.meta) rememberModel(data.meta)
     void downloadModel(data.model)
   } else {
     queue = queue

@@ -6,7 +6,6 @@ import {
   buildCompletion,
   createChunkWriter,
   createReplyReader,
-  isCatalogModel,
   planCompletion,
   planRepairs,
   randomId,
@@ -22,8 +21,9 @@ import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js
 import { browserStorage, fileKey, modelFiles } from "./model-files.js"
 import type { ModelStorage } from "./model-files.js"
 import { defaultMemoryBudget } from "./model-memory.js"
-import { modelMeta, WEBGL_TEXT_MODELS } from "./model-meta.js"
-import type { WebGlTextModel } from "./model-meta.js"
+import { knownModelMeta, knownModels, modelMeta } from "./model-meta.js"
+import type { WebGlModelId } from "./model-meta.js"
+import { resolveModel } from "./resolve-model.js"
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -91,11 +91,16 @@ export type RequestOptions = {
 
 const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3, silent: 4 }
 
-function catalogModel(model: unknown): WebGlTextModel {
-  if (!isCatalogModel(model)) {
+/**
+ * `model` resolved (the catalog's meta, or one built from the Hub) so its
+ * meta can be read synchronously from here on.
+ */
+async function resolved(model: unknown): Promise<string> {
+  if (typeof model === "string" && knownModelMeta(model)) return model
+  if (typeof model !== "string") {
     throw new WebGLLMError("model-not-supported", `${String(model)} isn't a model webgllm runs (see models.list()).`)
   }
-  return model
+  return (await resolveModel(model)).name
 }
 
 /** What the tests swap (storage); not exported from the package. */
@@ -173,8 +178,9 @@ export class WebGLLM {
    * `contextLength` tokens. Other models stay loaded while they fit the
    * memory budget; past it, the least recently used go (not ones kept loaded).
    */
-  async loadModel(model: string, options: LoadModelOptions = {}): Promise<void> {
-    const id = catalogModel(model)
+  async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
+    // (Without a wait for a known model: its load starts in this call.)
+    const id = typeof model === "string" && knownModelMeta(model) ? model : await resolved(model)
     this.checkSupport()
     await this.pool.load(id, {
       contextLength: options.contextLength ?? this.options.contextLength,
@@ -185,13 +191,13 @@ export class WebGLLM {
   }
 
   /** Unloads `model`, or every model, freeing its GPU memory; its running generation fails. */
-  async unloadModel(model?: string): Promise<void> {
-    this.pool.unload(model === undefined ? undefined : catalogModel(model))
+  async unloadModel(model?: WebGlModelId): Promise<void> {
+    this.pool.unload(model)
   }
 
   /** Downloads `model`'s files to the browser's storage, without loading it. */
-  async downloadModel(model: string, options: DownloadModelOptions = {}): Promise<void> {
-    await this.pool.download(catalogModel(model), options)
+  async downloadModel(model: WebGlModelId, options: DownloadModelOptions = {}): Promise<void> {
+    await this.pool.download(await resolved(model), options)
   }
 
   /**
@@ -229,6 +235,10 @@ class Completions {
   create(body: ChatCompletionCreateParamsNonStreaming, options?: RequestOptions): Promise<ChatCompletion>
   create(body: ChatCompletionCreateParams, options?: RequestOptions): Promise<ChatCompletion | AsyncIterable<ChatCompletionChunk>>
   async create(body: ChatCompletionCreateParams, options: RequestOptions = {}): Promise<ChatCompletion | AsyncIterable<ChatCompletionChunk>> {
+    // Any Hugging Face model: resolved before the request is checked against it.
+    if (body && typeof body === "object" && typeof body.model === "string" && body.model && !knownModelMeta(body.model)) {
+      await resolveModel(body.model)
+    }
     const plan = planCompletion(body)
     const { signal, onProgress } = options
     throwIfAborted(signal)
@@ -412,13 +422,17 @@ class Models {
     private readonly storage: ModelStorage
   ) {}
 
-  /** Every model webgllm runs, with whether it's downloaded and loaded. */
+  /**
+   * The catalog's models, and any other Hugging Face model used on this
+   * page, with whether each is downloaded and loaded.
+   */
   list(): Promise<Array<ModelInfo>> {
-    return Promise.all(WEBGL_TEXT_MODELS.map((model) => this.info(model)))
+    return Promise.all(knownModels().map((model) => this.info(model)))
   }
 
-  retrieve(model: string): Promise<ModelInfo> {
-    return this.info(catalogModel(model))
+  /** `model`'s info: any Hugging Face model with a supported architecture, resolved first. */
+  async retrieve(model: WebGlModelId): Promise<ModelInfo> {
+    return this.info(await resolved(model))
   }
 
   /**
@@ -426,19 +440,19 @@ class Models {
    * loads is in storage, or it's loaded. Reads storage only, with no network
    * request (unlike retrieve, which also asks for sizes and context length).
    */
-  async downloaded(model: string): Promise<boolean> {
-    const id = catalogModel(model)
+  async downloaded(model: WebGlModelId): Promise<boolean> {
+    const id = await resolved(model)
     return this.pool.isLoaded(id) || this.storage.downloaded(id)
   }
 
   /** Removes `model`'s files from storage, unloading it first if it's loaded. */
-  async delete(model: string): Promise<void> {
-    const id = catalogModel(model)
+  async delete(model: WebGlModelId): Promise<void> {
+    const id = await resolved(model)
     await this.llm.unloadModel(id)
     this.pool.cancelDownload(id)
     // Files another downloaded or loaded model also reads stay.
     const keep = new Set<string>()
-    for (const other of WEBGL_TEXT_MODELS) {
+    for (const other of knownModels()) {
       if (other === id) continue
       if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
         for (const file of modelFiles(modelMeta(other))) keep.add(fileKey(file))
@@ -447,7 +461,7 @@ class Models {
     await this.storage.remove(id, keep)
   }
 
-  private async info(model: WebGlTextModel): Promise<ModelInfo> {
+  private async info(model: string): Promise<ModelInfo> {
     const meta = modelMeta(model)
     const loaded = this.pool.isLoaded(model)
     const [contextLength, size, downloaded] = await Promise.all([

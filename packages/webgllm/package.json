@@ -32,7 +32,7 @@
       "default": "./dist/advanced.js"
     }
   },
-  "files": ["src", "dist", "!**/*.test.ts", "!**/*.tsbuildinfo"],
+  "files": ["src", "dist", "!**/*.test.ts", "!**/*.tsbuildinfo", "!src/test-fixtures"],
   "scripts": {
     "build": "tsc -b tsconfig.lib.json",
     "typecheck": "tsc -b tsconfig.json",

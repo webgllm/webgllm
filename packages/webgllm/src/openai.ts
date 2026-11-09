@@ -2,6 +2,7 @@
  * The public request and response types: OpenAI's Chat Completions shapes
  * (the fields webgllm takes), plus a few llama.cpp-style extensions.
  */
+import type { WebGlModelId } from "./model-meta.js"
 
 /** A text part of a message's content. Other part types (images, audio) are refused. */
 export type ChatCompletionContentPartText = { type: "text"; text: string }
@@ -84,8 +85,11 @@ export type ResponseFormat =
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
 
 export type ChatCompletionCreateParamsBase = {
-  /** A catalog id (see `models.list()`); loaded first if it isn't. */
-  model: string
+  /**
+   * A catalog model (see `models.list()`), or any Hugging Face repository
+   * (`owner/name`) with an architecture webgllm runs; loaded first if it isn't.
+   */
+  model: WebGlModelId
   messages: Array<ChatCompletionMessageParam>
   stream?: boolean | null
   stream_options?: { include_usage?: boolean } | null

@@ -8,6 +8,6 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"]
   },
-  "include": ["src/**/*.test.ts", "bench/memory-names.ts"],
+  "include": ["src/**/*.test.ts", "src/test-fixtures/*.json", "bench/memory-names.ts"],
   "references": [{ "path": "./tsconfig.lib.json" }]
 }

@@ -4,7 +4,6 @@
  * "done"), and lets a test hold generations open.
  */
 import type { ModelStorage } from "./model-files.js"
-import type { WebGlTextModel } from "./model-meta.js"
 import type { RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 
 export const STATS: RunTimings = {
@@ -141,7 +140,7 @@ export function fakeStorage(downloaded = new Set<string>()): ModelStorage & { re
   const removed: Array<[string, Set<string>]> = []
   return {
     removed,
-    downloaded: async (model: WebGlTextModel) => downloaded.has(model),
+    downloaded: async (model: string) => downloaded.has(model),
     size: async () => 1234,
     contextLength: async () => 32768,
     remove: async (model, keep) => {

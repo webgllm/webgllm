@@ -1,4 +1,5 @@
 /** Messages between the page and the WebGL 2 worker. */
+import type { WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
 
@@ -76,6 +77,8 @@ export type WorkerRequest =
        * Echoed in the "ready" or "load-error" that answers this load. A worker that leaves it out may answer only one load at a time.
        */
       loadId?: number
+      /** A model that isn't in the catalog: its meta, as the page resolved it from the Hub. */
+      meta?: WebGlModelMeta
     }
   | {
       type: "generate"
@@ -119,7 +122,7 @@ export type WorkerRequest =
     }
   | { type: "stop"; id: string }
   /** Download a model's files to storage without loading it ("progress", then "downloaded"). */
-  | { type: "download"; model: string }
+  | { type: "download"; model: string; meta?: WebGlModelMeta }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
   /** The page made room for the model (see "claim"): the worker loads it. */
   | { type: "claimed" }

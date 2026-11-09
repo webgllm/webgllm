@@ -3,7 +3,9 @@ title: Models
 description: The models webgllm runs.
 ---
 
-Pass a model's id as `model`. `webgllm.models.list()` returns the same list, with each model's size, context length, and whether it's downloaded or loaded.
+Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX decoder), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template) and sampling (its `generation_config.json`) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
+
+The catalog below holds known defaults for the models webgllm is tuned and tested on, such as sampling from their model cards. `webgllm.models.list()` returns it, plus any other model used on the page, with each model's size, context length, and whether it's downloaded or loaded.
 
 | Model | Weights | Thinks |
 | --- | --- | --- |
@@ -17,8 +19,10 @@ Pass a model's id as `model`. `webgllm.models.list()` returns the same list, wit
 | `LiquidAI/LFM2.5-1.2B-Instruct-ONNX` | Liquid AI's 4-bit ONNX export | No |
 | `LiquidAI/LFM2.5-1.2B-Thinking-ONNX` | Liquid AI's 4-bit ONNX export | Always |
 | `LiquidAI/LFM2.5-350M-ONNX` | Liquid AI's 4-bit ONNX export | No |
+| `LiquidAI/LFM2-1.2B-Tool-GGUF` | Official Q4_0, tuned for tool calls | No |
+| `onnx-community/LFM2-1.2B-Tool-ONNX` | onnx-community's q4f16 export | No |
 
-Other ids throw `model-not-supported`. Sampling defaults come from each model card. See [Thinking](/docs/guides/thinking) for switching reasoning on and off.
+Sampling defaults come from each model card. See [Thinking](/docs/guides/thinking) for switching reasoning on and off.
 
 ## Choosing one
 

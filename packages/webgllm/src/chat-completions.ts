@@ -6,8 +6,8 @@
  */
 import { validateStructuredValue } from "./constraint/index.js"
 import { WebGLLMError } from "./errors.js"
-import { modelMeta, WEBGL_MODEL_META } from "./model-meta.js"
-import type { WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
+import { knownModelMeta, modelMeta } from "./model-meta.js"
+import type { WebGlModelMeta } from "./model-meta.js"
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -37,7 +37,7 @@ export type GenerateFields = Omit<
 
 /** A checked request: what to send the worker and how to read its reply. */
 export type CompletionPlan = {
-  model: WebGlTextModel
+  model: string
   stream: boolean
   includeUsage: boolean
   generate: GenerateFields
@@ -48,9 +48,6 @@ export type CompletionPlan = {
   /** Check parsed tool calls against their tools, and regenerate bad ones (see planRepairs). */
   repairToolCalls: boolean
 }
-
-export const isCatalogModel = (model: unknown): model is WebGlTextModel =>
-  typeof model === "string" && Object.hasOwn(WEBGL_MODEL_META, model)
 
 const unsupported = (message: string) => new WebGLLMError("unsupported-parameter", message)
 
@@ -279,11 +276,10 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   if (!params || typeof params !== "object") throw new TypeError("The request must be an object.")
   const body = params as unknown as Record<string, unknown>
   if (typeof body.model !== "string" || !body.model) throw new TypeError("model is required.")
-  if (!isCatalogModel(body.model)) {
-    throw new WebGLLMError("model-not-supported", `${body.model} isn't a model webgllm runs (see models.list()).`)
-  }
   const model = body.model
-  const meta = modelMeta(model)
+  // Resolved first (resolveModel) when it isn't a catalog model.
+  const meta = knownModelMeta(model)
+  if (!meta) throw new WebGLLMError("model-not-supported", `${model} isn't a model webgllm runs (see models.list()).`)
 
   const n = numberField(body, "n", { min: 1, integer: true })
   if (n !== undefined && n > 1) throw unsupported("n > 1 isn't supported: one choice per request.")
