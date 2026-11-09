@@ -104,8 +104,8 @@ Answer tokens are constrained to the schema while they're picked, so the answer 
 Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
 
 ```ts
-await webgllm.models.list()      // the catalog and models used on the page, with downloaded / loaded
-await webgllm.models.downloaded(id) // whether it loads without a download (storage only; a model outside the catalog asks the Hub for its files once)
+await webgllm.models.list()      // the catalog, downloaded models and models used on the page
+await webgllm.models.downloaded(id) // whether it loads without a download (storage only, no network)
 await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```
@@ -140,14 +140,14 @@ await webgllm.chat.completions.create({ model: "LiquidAI/LFM2-350M-GGUF", messag
 
 webgllm reads the repository's file list from the Hub and picks, by one rule each:
 
-- **Weights:** a GGUF file (Q4_0 first, a quantization-aware "QAD" Q4_0 before a plain one, then Q8_0, then the fewest bits among Q4_1, Q5_K, Q6_K and F16), else an ONNX decoder under `onnx/` with one external data file (q4f16 first, then q4).
+- **Weights:** a GGUF file (Q4_0 first, a quantization-aware "QAD" Q4_0 before a plain one, then Q8_0, then the fewest bits among Q4_1, Q5_K, Q6_K and F16), else an ONNX graph under `onnx/` that the loader takes, checked by reading the graph before its weights download (4-bit `MatMulNBits` in blocks of 32, its weights in one external data file; q4f16 tried first, then q4).
 - **Tokenizer and chat template:** the repository's own, else those in a folder named in the weights file's name (Liquid AI's `qad/`), else the base model's (the card's `base_model`).
 - **Thinking and tool calls:** from the chat template (`enable_thinking` makes thinking switchable; a template that opens `<think>`, or a model named "Thinking" or "Reasoning", always thinks). `<tool_call>` means the XML call format, otherwise LFM2's Pythonic calls.
 - **Sampling:** the repository's `generation_config.json` as Transformers reads it: its values when it sets `do_sample`, else greedy decoding.
 
-Another architecture, or a repository without weights it can load, fails with `model-not-supported` before anything downloads.
+Another architecture, or a repository without weights it can load, fails with `model-not-supported` before anything downloads. A downloaded model keeps what was resolved beside its files, so after a reload it loads (and `models.downloaded` answers) with no request to the Hub, offline too.
 
-The catalog holds known defaults for the models webgllm is tuned and tested on, such as the sampling from their model cards, which the Hub doesn't say. `models.list()` returns it, plus any other model used on the page:
+The catalog holds known defaults for the models webgllm is tuned and tested on, such as the sampling from their model cards, which the Hub doesn't say. `models.list()` returns it, plus any other model downloaded or used on the page:
 
 | Model                                | Weights                                                  |
 | ------------------------------------ | -------------------------------------------------------- |

@@ -7,7 +7,7 @@
 import { blobSource } from "./byte-source.js"
 import { fileUrl, modelMeta } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
-import { diskName, isOldVersion, storedFile } from "./storage.js"
+import { diskName, isOldVersion, readManifest, removeManifest, storedFile, storedManifests } from "./storage.js"
 import type { ByteSource } from "./weights.js"
 
 /** Every file a model loads: tokenizer, chat template and weights (as the worker fetches them). */
@@ -30,7 +30,11 @@ export type ModelStorage = {
   size: (model: string) => Promise<number>
   /** The model's own context length; 0 when it can't be read. */
   contextLength: (model: string) => Promise<number>
-  /** Removes the model's files (not ones `keep` still uses). */
+  /** A downloaded model's stored meta (outside the catalog), if there is one. */
+  manifest: (model: string) => Promise<WebGlModelMeta | undefined>
+  /** Every stored meta: the downloaded models outside the catalog. */
+  manifests: () => Promise<Array<WebGlModelMeta>>
+  /** Removes the model's files (not ones `keep` still uses), and its stored meta. */
   remove: (model: string, keep: Set<string>) => Promise<void>
 }
 
@@ -225,7 +229,11 @@ export const browserStorage: ModelStorage = {
     }
     return length
   },
+  manifest: readManifest,
+  manifests: storedManifests,
   async remove(model, keep) {
+    // The meta first: a model without it isn't counted as downloaded by a later page.
+    await removeManifest(model)
     let dir: FileSystemDirectoryHandle
     try {
       dir = await folder()

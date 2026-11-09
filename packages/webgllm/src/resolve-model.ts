@@ -9,11 +9,15 @@
  *   a GGUF model: Q4_0 first (a quantization-aware "QAD" Q4_0 before a plain
  *   one), then Q8_0, then the fewest bits among the other types the loader
  *   takes (Q4_1, Q5_K, Q6_K, F16), then unlabeled files. Otherwise an ONNX
- *   decoder graph under `onnx/` (`model*.onnx` or `decoder_model_merged*.onnx`)
- *   with exactly one external data file (`<graph>_data`): q4f16 first, then
- *   q4, then the rest.
+ *   graph under `onnx/` that the ONNX loader takes, read before anything
+ *   else downloads: its own checks (4-bit MatMulNBits in blocks of 32, the
+ *   layer layout, config.json's shapes) pass, and its weights are in one
+ *   external data file, which the graph names. Graphs are tried q4f16 first,
+ *   then q4, then the rest (decoders before other graphs).
  * - Architecture: the Hub's GGUF architecture, or config.json's model_type,
  *   must be one the loaders run, else the model fails before any download.
+ * - A model whose files were downloaded resolves from its manifest in storage
+ *   (storage.ts), with no request to the Hub.
  * - Tokenizer and chat template: tokenizer.json and tokenizer_config.json
  *   (and chat_template.jinja when there is one) at the repository's root;
  *   else in a folder named in the chosen weights file's name (Liquid AI's
@@ -31,10 +35,13 @@
  *   defaults for the rest) when it sets do_sample, else greedy decoding.
  * - Size: the name's parameter count ("1.2B", "350M"), else the Hub's.
  */
-import { WebGLLMError } from "./errors.js"
+import { chatTemplateOf } from "./chat-template.js"
+import { abortable, throwIfAborted, WebGLLMError } from "./errors.js"
+import { checkOnnxGraph } from "./load-onnx.js"
 import { knownModelMeta, rememberModel } from "./model-meta.js"
 import type { ModelFile, ModelReasoning, WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
+import { readManifest } from "./storage.js"
 import type { ToolFormat } from "./tool-calls.js"
 
 const HUB = "https://huggingface.co"
@@ -44,8 +51,11 @@ export const GGUF_ARCHITECTURES = ["lfm2", "lfm3", "qwen35"] as const
 /** config.json model types the ONNX loader runs (load-onnx.ts). */
 export const ONNX_MODEL_TYPES = ["lfm2", "lfm3", "qwen3_5"] as const
 
-/** What the tests swap: the fetch the Hub is asked with. */
-export const hub = { fetch: (input: string, init?: RequestInit) => fetch(input, init) }
+/** What the tests swap: the fetch the Hub is asked with, and the ONNX loader's graph check. */
+export const hub = {
+  fetch: (input: string, init?: RequestInit) => fetch(input, init),
+  checkGraph: checkOnnxGraph
+}
 
 /** The fields of the Hub's `/api/models/{repo}` this reads. */
 type HubModel = {
@@ -65,13 +75,24 @@ const MODEL_ID = /^[\w.-]+\/[\w.-]+$/
 
 const pending = new Map<string, Promise<WebGlModelMeta>>()
 
+/** Whether `model` is a name the resolver can look up (a catalog model or `owner/name`). */
+export const isModelId = (model: unknown): model is string =>
+  typeof model === "string" && (!!knownModelMeta(model) || MODEL_ID.test(model))
+
 /**
- * `model`'s meta: the catalog's, one resolved before, or one built from the
- * Hub now (kept for modelMeta). Rejects with "model-not-supported" for a
- * name that isn't a Hugging Face repository webgllm can run, and
- * "download-failed" when the Hub can't be reached.
+ * `model`'s meta: the catalog's, one resolved before, a downloaded model's
+ * manifest, or one built from the Hub now (kept for modelMeta). Rejects
+ * with "model-not-supported" for a name that isn't a Hugging Face
+ * repository webgllm can run, and "download-failed" when the Hub can't be
+ * reached. Aborting `signal` stops this caller's wait (nothing is asked if
+ * it's aborted already); a resolution other callers wait for goes on.
  */
-export function resolveModel(model: unknown): Promise<WebGlModelMeta> {
+export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebGlModelMeta> {
+  try {
+    throwIfAborted(signal)
+  } catch (error) {
+    return Promise.reject(error)
+  }
   if (typeof model !== "string" || !model) return Promise.reject(new TypeError("model is required."))
   const known = knownModelMeta(model)
   if (known) return Promise.resolve(known)
@@ -80,7 +101,7 @@ export function resolveModel(model: unknown): Promise<WebGlModelMeta> {
   }
   let promise = pending.get(model)
   if (!promise) {
-    promise = hubModelMeta(model).then((meta) => {
+    promise = (async () => (await readManifest(model)) ?? (await hubModelMeta(model)))().then((meta) => {
       rememberModel(meta)
       return meta
     })
@@ -88,7 +109,7 @@ export function resolveModel(model: unknown): Promise<WebGlModelMeta> {
     // A failed resolution is tried again next time.
     promise.catch(() => pending.delete(model))
   }
-  return promise
+  return abortable(promise, signal)
 }
 
 async function hubGet(url: string, what: string): Promise<Response> {
@@ -110,13 +131,28 @@ async function apiModel(repo: string): Promise<HubModel> {
   return (await response.json()) as HubModel
 }
 
+/**
+ * A file from the Hub, or undefined when it isn't there (404, the Hub's
+ * "entry not found"). Any other failure (a 5xx, a network error, another
+ * status) throws "download-failed": not an answer, so it isn't kept and
+ * the next resolution asks again.
+ */
+async function fileResponse(file: ModelFile): Promise<Response | undefined> {
+  const what = `${file.repo}/${file.path}`
+  const response = await hubGet(`${HUB}/${file.repo}/resolve/main/${file.path}`, what)
+  if (response.ok) return response
+  await response.body?.cancel()
+  if (response.status === 404) return undefined
+  throw new WebGLLMError("download-failed", `Hugging Face answered ${response.status} for ${what}.`)
+}
+
 async function fileText(file: ModelFile): Promise<string | undefined> {
-  const response = await hubGet(`${HUB}/${file.repo}/resolve/main/${file.path}`, `${file.repo}/${file.path}`)
-  if (!response.ok) {
-    await response.body?.cancel()
-    return undefined
-  }
-  return response.text()
+  return (await fileResponse(file))?.text()
+}
+
+async function fileBytes(file: ModelFile): Promise<Uint8Array | undefined> {
+  const response = await fileResponse(file)
+  return response ? new Uint8Array(await response.arrayBuffer()) : undefined
 }
 
 async function fileJson(file: ModelFile): Promise<Record<string, unknown> | undefined> {
@@ -159,22 +195,44 @@ export function pickGguf(files: Iterable<string>): string | undefined {
 /** ONNX quantizations by preference; the graph name's suffix (`model_q4f16.onnx`). */
 const ONNX_QUANTS = ["q4f16", "q4"]
 
-/** The ONNX graph to load (with its one data file), or undefined. */
-export function pickOnnx(files: Set<string>): { graph: string; data: string } | undefined {
-  const graphs = [...files].filter(
-    (f) =>
-      /^onnx\/(model|decoder_model_merged)(_\w+)?\.onnx$/.test(f) &&
-      files.has(`${f}_data`) &&
-      !files.has(`${f}_data_1`)
-  )
-  const quant = (f: string) => /_(\w+)\.onnx$/.exec(f.replace(/^onnx\/decoder_model_merged/, "onnx/model"))?.[1] ?? ""
+/**
+ * The ONNX graphs to try, in order: q4f16, then q4, then the rest, and
+ * within each, decoders (`model*`, `decoder_model_merged*`) before other
+ * graphs. Which one loads is decided by reading it (onnxWeights).
+ */
+export function onnxCandidates(files: Iterable<string>): Array<string> {
+  const graphs = [...files].filter((f) => /^onnx\/.+\.onnx$/.test(f))
+  const quant = (f: string) => /_([a-z0-9]+)\.onnx$/.exec(f)?.[1] ?? ""
   const rank = (f: string) => {
-    const i = ONNX_QUANTS.indexOf(quant(f))
-    return i < 0 ? ONNX_QUANTS.length : i
+    const q = ONNX_QUANTS.indexOf(quant(f))
+    const decoder = /^onnx\/(model|decoder_model_merged)(_[a-z0-9]+)?\.onnx$/.test(f) ? 0 : 1
+    return (q < 0 ? ONNX_QUANTS.length : q) * 2 + decoder
   }
-  graphs.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
-  const graph = graphs[0]
-  return graph ? { graph, data: `${graph}_data` } : undefined
+  return graphs.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+}
+
+/**
+ * The first graph the ONNX loader takes, and its one external data file,
+ * reading only graphs (small) and config.json: never a data file.
+ */
+async function onnxWeights(repo: string, files: Set<string>, config: Record<string, unknown>): Promise<{ graph: string; data: string }> {
+  let reason = "none under onnx/"
+  for (const graph of onnxCandidates(files)) {
+    const bytes = await fileBytes({ repo, path: graph })
+    if (!bytes) continue
+    let dataFiles: Array<string>
+    try {
+      dataFiles = hub.checkGraph(bytes, config).dataFiles
+    } catch (error) {
+      reason = `${graph}: ${error instanceof Error ? error.message : String(error)}`
+      continue
+    }
+    const data = `${graph.slice(0, graph.lastIndexOf("/") + 1)}${dataFiles[0]}`
+    if (dataFiles.length !== 1) reason = `${graph} keeps its weights in ${dataFiles.length} files; webgllm reads one`
+    else if (!files.has(data)) reason = `${graph}'s weights are in ${data}, which the repository doesn't have`
+    else return { graph, data }
+  }
+  throw notSupported(`${repo} has no ONNX graph webgllm loads (${reason}).`)
 }
 
 /** Where the tokenizer files are: a repository and a folder in it ("" or "qad/"). */
@@ -258,20 +316,18 @@ export function sizeFrom(name: string, parameters: number | undefined): string {
   return `${Number((parameters / 1e9).toFixed(1))}b`
 }
 
-/** The chat template's text: chat_template.jinja's, else tokenizer_config.json's. */
-async function templateText(tokenizer: WebGlModelMeta["tokenizer"]): Promise<string | undefined> {
+/**
+ * The chat template the worker will render (chatTemplateOf, as the
+ * tokenizer picks it), and the tokenizer files without a listed
+ * chat_template.jinja that turned out not to be there.
+ */
+async function templateOf(tokenizer: WebGlModelMeta["tokenizer"]): Promise<{ template: string | undefined; tokenizer: WebGlModelMeta["tokenizer"] }> {
   if (tokenizer.chatTemplate) {
-    const text = await fileText(tokenizer.chatTemplate)
-    if (text !== undefined) return text
+    const file = await fileText(tokenizer.chatTemplate)
+    if (file !== undefined) return { template: file, tokenizer }
   }
-  const template = (await fileJson(tokenizer.config))?.chat_template
-  if (typeof template === "string") return template
-  // Several named templates: the default one, else the first.
-  if (Array.isArray(template)) {
-    const named = template as Array<{ name?: string; template?: string }>
-    return (named.find((t) => t.name === "default") ?? named[0])?.template
-  }
-  return undefined
+  const { chatTemplate: _, ...rest } = tokenizer
+  return { template: chatTemplateOf(await fileJson(tokenizer.config)), tokenizer: rest }
 }
 
 /**
@@ -292,16 +348,17 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
     weights = { kind: "gguf", model: { repo, path: gguf } }
     weightsFile = gguf
   } else {
-    const onnx = pickOnnx(files)
-    if (!onnx || !files.has("config.json")) {
+    const config = files.has("config.json") && onnxCandidates(files).length ? await fileJson({ repo, path: "config.json" }) : undefined
+    if (!config) {
       throw notSupported(
-        `${repo} has no weights webgllm loads: no GGUF file of a type it reads (Q4_0, Q8_0, Q4_1, Q5_K, Q6_K, F16), and no ONNX graph under onnx/ with one external data file and a config.json.`
+        `${repo} has no weights webgllm loads: no GGUF file of a type it reads (Q4_0, Q8_0, Q4_1, Q5_K, Q6_K, F16), and no ONNX graph under onnx/ with a config.json.`
       )
     }
-    const type = info.config?.model_type ?? (await fileJson({ repo, path: "config.json" }))?.model_type
+    const type = info.config?.model_type ?? config.model_type
     if (typeof type !== "string" || !(ONNX_MODEL_TYPES as ReadonlyArray<string>).includes(type)) {
       throw notSupported(`${repo} is a "${String(type)}" model; webgllm runs ${ONNX_MODEL_TYPES.join(", ")} ONNX models.`)
     }
+    const onnx = await onnxWeights(repo, files, config)
     weights = {
       kind: "onnx",
       graph: { repo, path: onnx.graph },
@@ -312,7 +369,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
   }
   const source = await tokenizerSource(repo, info, files, weightsFile)
   const at = (path: string): ModelFile => ({ repo: source.repo, path: `${source.prefix}${path}` })
-  const tokenizer: WebGlModelMeta["tokenizer"] = {
+  const listed: WebGlModelMeta["tokenizer"] = {
     tokenizer: at("tokenizer.json"),
     config: at("tokenizer_config.json"),
     ...(source.files.has(`${source.prefix}chat_template.jinja`) && { chatTemplate: at("chat_template.jinja") })
@@ -322,8 +379,8 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
     : source.files.has(`${source.prefix}generation_config.json`)
       ? at("generation_config.json")
       : undefined
-  const [template, generationConfig] = await Promise.all([
-    templateText(tokenizer),
+  const [{ template, tokenizer }, generationConfig] = await Promise.all([
+    templateOf(listed),
     generation ? fileJson(generation) : Promise.resolve(undefined)
   ])
   if (template === undefined) throw notSupported(`${repo} has no chat template (chat_template.jinja or tokenizer_config.json's).`)

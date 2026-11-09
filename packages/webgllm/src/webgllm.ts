@@ -21,9 +21,9 @@ import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js
 import { browserStorage, fileKey, modelFiles } from "./model-files.js"
 import type { ModelStorage } from "./model-files.js"
 import { defaultMemoryBudget } from "./model-memory.js"
-import { knownModelMeta, knownModels, modelMeta } from "./model-meta.js"
+import { knownModelMeta, knownModels, modelMeta, rememberModel } from "./model-meta.js"
 import type { WebGlModelId } from "./model-meta.js"
-import { resolveModel } from "./resolve-model.js"
+import { isModelId, resolveModel } from "./resolve-model.js"
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -95,13 +95,17 @@ const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3,
  * `model` resolved (the catalog's meta, or one built from the Hub) so its
  * meta can be read synchronously from here on.
  */
-async function resolved(model: unknown): Promise<string> {
+async function resolved(model: unknown, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal)
   if (typeof model === "string" && knownModelMeta(model)) return model
   if (typeof model !== "string") {
     throw new WebGLLMError("model-not-supported", `${String(model)} isn't a model webgllm runs (see models.list()).`)
   }
-  return (await resolveModel(model)).name
+  return (await resolveModel(model, signal)).name
 }
+
+const notSupported = (model: unknown) =>
+  new WebGLLMError("model-not-supported", `${String(model)} isn't a model webgllm runs (see models.list()).`)
 
 /** What the tests swap (storage); not exported from the package. */
 export const internals = { storage: browserStorage as ModelStorage }
@@ -179,10 +183,14 @@ export class WebGLLM {
    * memory budget; past it, the least recently used go (not ones kept loaded).
    */
   async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
+    throwIfAborted(options.signal)
+    // Before resolving: an unload asked for meanwhile stops this load.
+    const since = typeof model === "string" ? this.pool.unloadMark(model) : 0
     // (Without a wait for a known model: its load starts in this call.)
-    const id = typeof model === "string" && knownModelMeta(model) ? model : await resolved(model)
+    const id = typeof model === "string" && knownModelMeta(model) ? model : await resolved(model, options.signal)
     this.checkSupport()
     await this.pool.load(id, {
+      since,
       contextLength: options.contextLength ?? this.options.contextLength,
       ...(options.keepLoaded !== undefined && { keepLoaded: options.keepLoaded }),
       ...(options.onProgress && { onProgress: options.onProgress }),
@@ -197,7 +205,7 @@ export class WebGLLM {
 
   /** Downloads `model`'s files to the browser's storage, without loading it. */
   async downloadModel(model: WebGlModelId, options: DownloadModelOptions = {}): Promise<void> {
-    await this.pool.download(await resolved(model), options)
+    await this.pool.download(await resolved(model, options.signal), options)
   }
 
   /**
@@ -236,15 +244,16 @@ class Completions {
   create(body: ChatCompletionCreateParams, options?: RequestOptions): Promise<ChatCompletion | AsyncIterable<ChatCompletionChunk>>
   async create(body: ChatCompletionCreateParams, options: RequestOptions = {}): Promise<ChatCompletion | AsyncIterable<ChatCompletionChunk>> {
     // Any Hugging Face model: resolved before the request is checked against it.
-    if (body && typeof body === "object" && typeof body.model === "string" && body.model && !knownModelMeta(body.model)) {
-      await resolveModel(body.model)
-    }
-    const plan = planCompletion(body)
     const { signal, onProgress } = options
     throwIfAborted(signal)
+    const named = body && typeof body === "object" && typeof body.model === "string" && body.model ? body.model : undefined
+    // Before resolving: an unload asked for meanwhile stops this call.
+    const since = named === undefined ? undefined : this.pool.unloadMark(named)
+    if (named !== undefined && !knownModelMeta(named)) await resolveModel(named, signal)
+    const plan = planCompletion(body)
     if (!this.pool.isLoaded(plan.model)) this.llm.checkSupport()
     // Loaded before the call resolves, so load failures reject it.
-    await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal)
+    await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
     const meta = { id: randomId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
     return plan.stream ? this.stream(plan, meta, options) : this.complete(plan, meta, options)
   }
@@ -426,8 +435,14 @@ class Models {
    * The catalog's models, and any other Hugging Face model used on this
    * page, with whether each is downloaded and loaded.
    */
-  list(): Promise<Array<ModelInfo>> {
-    return Promise.all(knownModels().map((model) => this.info(model)))
+  async list(): Promise<Array<ModelInfo>> {
+    return Promise.all((await this.allModels()).map((model) => this.info(model)))
+  }
+
+  /** The catalog, models used on the page, and downloaded ones (from their stored meta). */
+  private async allModels(): Promise<Array<string>> {
+    for (const meta of await this.storage.manifests()) if (!knownModelMeta(meta.name)) rememberModel(meta)
+    return knownModels()
   }
 
   /** `model`'s info: any Hugging Face model with a supported architecture, resolved first. */
@@ -441,8 +456,15 @@ class Models {
    * request (unlike retrieve, which also asks for sizes and context length).
    */
   async downloaded(model: WebGlModelId): Promise<boolean> {
-    const id = await resolved(model)
-    return this.pool.isLoaded(id) || this.storage.downloaded(id)
+    if (!isModelId(model)) throw notSupported(model)
+    // A model outside the catalog is downloaded only with its stored meta: no Hub request.
+    let meta = knownModelMeta(model)
+    if (!meta) {
+      meta = await this.storage.manifest(model)
+      if (!meta) return false
+      rememberModel(meta)
+    }
+    return this.pool.isLoaded(model) || this.storage.downloaded(model)
   }
 
   /** Removes `model`'s files from storage, unloading it first if it's loaded. */
@@ -452,11 +474,15 @@ class Models {
     this.pool.cancelDownload(id)
     // Files another downloaded or loaded model also reads stay.
     const keep = new Set<string>()
-    for (const other of knownModels()) {
+    for (const other of await this.allModels()) {
       if (other === id) continue
       if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
         for (const file of modelFiles(modelMeta(other))) keep.add(fileKey(file))
       }
+    }
+    // A stored meta is a downloaded model, even partly: its files stay.
+    for (const meta of await this.storage.manifests()) {
+      if (meta.name !== id) for (const file of modelFiles(meta)) keep.add(fileKey(file))
     }
     await this.storage.remove(id, keep)
   }

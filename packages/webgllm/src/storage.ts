@@ -7,8 +7,8 @@
  * exists, so an interrupted download is never mistaken for a whole one.
  */
 import type { Tuned } from "./engine.js"
-import { fileUrl } from "./model-meta.js"
-import type { ModelFile } from "./model-meta.js"
+import { fileUrl, isCatalogModel, WEBGL_MODEL_META } from "./model-meta.js"
+import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
 
 const DIR = "webgl-models"
 const ATTEMPTS = 6
@@ -16,10 +16,38 @@ const ATTEMPTS = 6
 const safe = (name: string) => name.replace(/[^\w.@-]+/g, "_")
 
 /**
- * The file's name on disk: its repository and path, at main (files saved
- * by earlier versions of this package carry a pinned commit instead).
+ * Every character but letters, digits and "-" as `_` and its UTF-8 bytes in
+ * hex: reversible, so two strings never share a name (unlike `safe`, which
+ * makes "a/b" and "a_b" both "a_b").
  */
-export const diskName = (file: ModelFile) => safe(`${file.repo}@main/${file.path}`)
+export const escapeName = (text: string) =>
+  [...new TextEncoder().encode(text)]
+    .map((b) => (/[A-Za-z0-9-]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `_${b.toString(16).padStart(2, "0")}`))
+    .join("")
+
+/** The catalog's files, which keep the names earlier versions saved them under. */
+let catalogFiles: Set<string> | undefined
+const isCatalogFile = (file: ModelFile) => {
+  catalogFiles ??= new Set(
+    Object.values(WEBGL_MODEL_META).flatMap((meta) => {
+      const m = meta as WebGlModelMeta
+      const weights = m.files.kind === "gguf" ? [m.files.model] : [m.files.graph, m.files.data, m.files.config]
+      return [...weights, m.tokenizer.tokenizer, m.tokenizer.config, ...(m.tokenizer.chatTemplate ? [m.tokenizer.chatTemplate] : [])]
+    }).map((f) => `${f.repo}\n${f.path}`)
+  )
+  return catalogFiles.has(`${file.repo}\n${file.path}`)
+}
+
+/**
+ * The file's name on disk, at main. A catalog file keeps the name earlier
+ * versions gave it (its repository and path made safe), so what's
+ * downloaded is found again; the catalog's names don't collide. Any other
+ * file's name is its repository and path escaped (escapeName) around
+ * "@main~": no two paths share one, and none is a catalog name (those have
+ * no "~"), a marker (those end in ".done" or ".etag") or a manifest.
+ */
+export const diskName = (file: ModelFile) =>
+  isCatalogFile(file) ? safe(`${file.repo}@main/${file.path}`) : `${escapeName(file.repo)}@main~${escapeName(file.path)}`
 
 const marker = (file: ModelFile) => `${diskName(file)}.done`
 
@@ -48,6 +76,76 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
     return await (await folder.getFileHandle(diskName(file))).getFile()
   } catch {
     return null
+  }
+}
+
+/**
+ * Manifests: the meta of each model outside the catalog whose files were
+ * downloaded, as the page resolved it. After a reload the model resolves
+ * from it with no request to the Hub, and deleting another model keeps the
+ * files it still reads.
+ */
+const MANIFEST = "manifest~"
+const manifestName = (model: string) => `${MANIFEST}${escapeName(model)}.json`
+
+/** Whether `value` has a model meta's shape, for `model` (a manifest someone could have edited). */
+function isMeta(value: unknown, model?: string): value is WebGlModelMeta {
+  const m = value as WebGlModelMeta | null
+  const file = (f: unknown) => !!f && typeof (f as ModelFile).repo === "string" && typeof (f as ModelFile).path === "string"
+  return (
+    !!m && typeof m === "object" && typeof m.name === "string" && (model === undefined || m.name === model) &&
+    (m.files?.kind === "gguf" ? file(m.files.model) : m.files?.kind === "onnx" && file(m.files.graph) && file(m.files.data) && file(m.files.config)) &&
+    file(m.tokenizer?.tokenizer) && file(m.tokenizer?.config) && !!m.supports && !!m.sampling
+  )
+}
+
+/** `model`'s stored manifest, or undefined (none, unreadable, or no storage here). */
+export async function readManifest(model: string): Promise<WebGlModelMeta | undefined> {
+  try {
+    const text = await (await (await (await dir()).getFileHandle(manifestName(model))).getFile()).text()
+    const meta: unknown = JSON.parse(text)
+    return isMeta(meta, model) ? meta : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Every stored manifest. */
+export async function storedManifests(): Promise<Array<WebGlModelMeta>> {
+  const metas: Array<WebGlModelMeta> = []
+  try {
+    const folder = await dir()
+    for await (const name of (folder as unknown as { keys: () => AsyncIterable<string> }).keys()) {
+      if (!name.startsWith(MANIFEST)) continue
+      try {
+        const meta: unknown = JSON.parse(await (await (await folder.getFileHandle(name)).getFile()).text())
+        if (isMeta(meta) && manifestName(meta.name) === name) metas.push(meta)
+      } catch {
+        // Unreadable: skipped.
+      }
+    }
+  } catch {
+    // No storage here.
+  }
+  return metas
+}
+
+/** Saves a downloaded model's manifest (in the worker: sync access handles). Catalog models need none. */
+export async function saveManifest(meta: WebGlModelMeta): Promise<void> {
+  if (isCatalogModel(meta.name)) return
+  try {
+    await writeText(await dir(), manifestName(meta.name), JSON.stringify(meta))
+  } catch {
+    // Best effort: without it the model resolves from the Hub again.
+  }
+}
+
+/** Removes `model`'s manifest. */
+export async function removeManifest(model: string): Promise<void> {
+  try {
+    await (await dir()).removeEntry(manifestName(model))
+  } catch {
+    // None.
   }
 }
 

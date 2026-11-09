@@ -420,3 +420,82 @@ test("any Hugging Face model: resolved from the Hub, its meta sent to the worker
   await client.loadModel(LFM2)
   assert.equal(workers.of(LFM2)!.sent.find((m) => m.type === "load" && "meta" in m), undefined)
 })
+
+/**
+ * The Hub, holding every answer for a model outside the catalog until
+ * `release`: `alias` is answered as LFM2 350M's GGUF repository.
+ */
+function heldHub(alias: string) {
+  const answers = hubFixture as Record<string, { status: number; body: unknown }>
+  const source = "LiquidAI/LFM2-350M-GGUF"
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const calls: Array<string> = []
+  hub.fetch = async (url: string) => {
+    calls.push(url)
+    await held
+    const answer = answers[url.replace(alias, source)]
+    if (!answer) return new Response("Not found", { status: 404 })
+    return new Response(typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body), { status: answer.status })
+  }
+  return { calls, release }
+}
+
+const isAbort = (error: unknown) => error instanceof DOMException && error.name === "AbortError"
+
+test("aborting stops a call waiting on the Hub; the shared resolution goes on for others", async () => {
+  const name = "someone/held-abort-GGUF"
+  const { release } = heldHub(name)
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["ok"] }) })
+  const calls = [
+    (signal: AbortSignal) => client.loadModel(name, { signal }),
+    (signal: AbortSignal) => client.downloadModel(name, { signal }),
+    (signal: AbortSignal) => client.chat.completions.create({ model: name, messages: hi }, { signal })
+  ]
+  for (const call of calls) {
+    const controller = new AbortController()
+    const pending = call(controller.signal)
+    let settled = false
+    pending.then(
+      () => (settled = true),
+      () => (settled = true)
+    )
+    await settle()
+    controller.abort()
+    await settle()
+    assert.equal(settled, true, "settled while the Hub still holds its answer")
+    await assert.rejects(pending, isAbort)
+  }
+  // Another caller, not aborted, gets the model once the Hub answers.
+  const waiting = client.loadModel(name)
+  release()
+  await waiting
+  assert.ok(workers.of(name))
+})
+
+test("a load aborted before it starts asks the Hub nothing", async () => {
+  const name = "someone/pre-aborted-GGUF"
+  const { calls, release } = heldHub(name)
+  release()
+  const { llm: client } = llm()
+  await assert.rejects(client.loadModel(name, { signal: AbortSignal.abort() }), isAbort)
+  await assert.rejects(client.downloadModel(name, { signal: AbortSignal.abort() }), isAbort)
+  await assert.rejects(client.chat.completions.create({ model: name, messages: hi }, { signal: AbortSignal.abort() }), isAbort)
+  assert.equal(calls.length, 0)
+})
+
+test("unloading a model while it resolves stops its load", async () => {
+  const name = "someone/held-unload-GGUF"
+  const { release } = heldHub(name)
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["ok"] }) })
+  const load = client.loadModel(name)
+  const reply = client.chat.completions.create({ model: name, messages: hi })
+  await settle()
+  await client.unloadModel(name)
+  release()
+  await assert.rejects(load, { code: "model-not-loaded" })
+  await assert.rejects(reply, { code: "model-not-loaded" })
+  assert.equal(workers.of(name), undefined, "no worker started")
+})

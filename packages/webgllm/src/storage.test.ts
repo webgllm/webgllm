@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { diskName, download, isOldVersion, previousGpuTuning, readGpuNotes, writeGpuNote, type GpuNote } from "./storage.js"
+import { diskName, download, isOldVersion, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote, type GpuNote } from "./storage.js"
 
 const repo = "onnx-community/LFM3-1.7B-ONNX"
 const commit = "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7"
@@ -355,5 +355,35 @@ test("a note written by another worker during a write isn't lost", async (t) => 
   assert.deepEqual(await readGpuNotes(), {
     "gpu|browser|other-model|code": other,
     "gpu|browser|model|code": mine
+  })
+})
+
+describe("names on disk", () => {
+  test("two paths of one repository never share a stored file", async (t) => {
+    const { useFolder: folderFor } = await import("./fake-opfs.test.js")
+    const fake = folderFor(t)
+    const nested = { repo: "someone/Model-GGUF", path: "release/model-Q4_0.gguf" }
+    const flat = { repo: "someone/Model-GGUF", path: "release_model-Q4_0.gguf" }
+    assert.notEqual(diskName(nested), diskName(flat))
+    fake.put(diskName(nested), "old weights")
+    fake.put(`${diskName(nested)}.done`, "")
+    assert.equal(await (await storedFile(nested))?.text(), "old weights")
+    assert.equal(await storedFile(flat), null, "the other path isn't downloaded")
+  })
+
+  test("a catalog file keeps the name it was downloaded under", () => {
+    assert.equal(diskName({ repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" }), "unsloth_Qwen3.5-2B-GGUF@main_Qwen3.5-2B-Q4_0.gguf")
+    assert.equal(diskName(config), "onnx-community_LFM3-1.7B-ONNX@main_config.json")
+    assert.equal(
+      diskName({ repo: "LiquidAI/LFM2.5-350M-GGUF", path: "qad/tokenizer_config.json" }),
+      "LiquidAI_LFM2.5-350M-GGUF@main_qad_tokenizer_config.json"
+    )
+  })
+
+  test("no other file's name is a catalog name or a marker", () => {
+    const other = diskName({ repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q8_0.gguf" })
+    assert.ok(!other.includes("/"))
+    assert.ok(other.includes("~") && !other.endsWith(".done") && !other.endsWith(".etag"))
+    assert.notEqual(diskName({ repo: "a/b", path: "x.gguf.done" }), `${diskName({ repo: "a/b", path: "x.gguf" })}.done`)
   })
 })

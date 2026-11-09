@@ -3,9 +3,9 @@ title: Models
 description: The models webgllm runs.
 ---
 
-Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX decoder), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template) and sampling (its `generation_config.json`) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
+Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX graph, checked before its weights download), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template) and sampling (its `generation_config.json`) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
 
-The catalog below holds known defaults for the models webgllm is tuned and tested on, such as sampling from their model cards. `webgllm.models.list()` returns it, plus any other model used on the page, with each model's size, context length, and whether it's downloaded or loaded.
+The catalog below holds known defaults for the models webgllm is tuned and tested on, such as sampling from their model cards. `webgllm.models.list()` returns it, plus any other model downloaded or used on the page, with each model's size, context length, and whether it's downloaded or loaded.
 
 | Model | Weights | Thinks |
 | --- | --- | --- |

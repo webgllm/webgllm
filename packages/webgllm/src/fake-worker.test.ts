@@ -143,6 +143,8 @@ export function fakeStorage(downloaded = new Set<string>()): ModelStorage & { re
     downloaded: async (model: string) => downloaded.has(model),
     size: async () => 1234,
     contextLength: async () => 32768,
+    manifest: async () => undefined,
+    manifests: async () => [],
     remove: async (model, keep) => {
       removed.push([model, keep])
       downloaded.delete(model)

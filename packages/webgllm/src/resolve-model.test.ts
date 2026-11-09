@@ -1,38 +1,9 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
+import { api, code, fakeHub, recorded } from "./fake-hub.test.js"
 import { modelMeta, WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
-import { hub, hubModelMeta, pickGguf, pickOnnx, resolveModel, samplingFrom, sizeFrom } from "./resolve-model.js"
-import recorded from "./test-fixtures/hub.json"
-
-/**
- * The Hub as recorded (test-fixtures/hub.json: API answers trimmed to the
- * fields the resolver reads, and the chat templates and generation configs
- * it fetched), plus `extra` answers; anything else is a 404. Counts calls.
- */
-function fakeHub(extra: Record<string, { status: number; body: unknown }> = {}) {
-  const answers: Record<string, { status: number; body: unknown }> = { ...(recorded as Record<string, { status: number; body: unknown }>), ...extra }
-  const calls: Array<string> = []
-  hub.fetch = async (url: string) => {
-    calls.push(url)
-    const answer = answers[url]
-    if (!answer) return new Response("Not found", { status: 404 })
-    const body = typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body)
-    return new Response(body, { status: answer.status })
-  }
-  return calls
-}
-
-const api = (repo: string) => `https://huggingface.co/api/models/${repo}`
-
-const code = async (promise: Promise<unknown>) => {
-  try {
-    await promise
-  } catch (error) {
-    return error instanceof WebGLLMError ? error.code : (error as Error).name
-  }
-  return "resolved"
-}
+import { hub, hubModelMeta, onnxCandidates, pickGguf, resolveModel, samplingFrom, sizeFrom } from "./resolve-model.js"
 
 test("the resolver agrees with the catalog on every catalog model", async () => {
   fakeHub()
@@ -103,7 +74,7 @@ test("an uncataloged ONNX build: its q4f16 graph, one data file, the repository'
 test("concurrent resolutions of one model ask the Hub once", async () => {
   // A name that isn't in the catalog, answered as LFM2 1.2B Tool's GGUF repository is.
   const alias = "someone/LFM2-1.2B-Tool-GGUF"
-  const answers = recorded as Record<string, { status: number; body: unknown }>
+  const answers = recorded
   const calls = fakeHub({ [api(alias)]: answers[api("LiquidAI/LFM2-1.2B-Tool-GGUF")]! })
   const [a, b] = await Promise.all([resolveModel(alias), resolveModel(alias)])
   assert.equal(a, b)
@@ -135,14 +106,20 @@ test("a repository with no weights webgllm loads fails clearly", async () => {
       body: { siblings: ["config.json", "onnx/model.onnx", "onnx/model.onnx_data", "onnx/model.onnx_data_1"].map((rfilename) => ({ rfilename })), config: { model_type: "lfm2" } }
     }
   })
-  for (const name of ["someone/only-k-quants-GGUF", "someone/split-onnx"]) {
-    await assert.rejects(resolveModel(name), (error: unknown) => {
-      assert.ok(error instanceof WebGLLMError)
-      assert.equal(error.code, "model-not-supported")
-      assert.match(error.message, /no weights webgllm loads/)
-      return true
-    })
-  }
+  await assert.rejects(resolveModel("someone/only-k-quants-GGUF"), (error: unknown) => {
+    assert.ok(error instanceof WebGLLMError)
+    assert.equal(error.code, "model-not-supported")
+    assert.match(error.message, /no weights webgllm loads/)
+    return true
+  })
+  // A graph whose weights are in two files.
+  hub.checkGraph = () => ({ dataFiles: ["model.onnx_data", "model.onnx_data_1"] })
+  await assert.rejects(resolveModel("someone/split-onnx"), (error: unknown) => {
+    assert.ok(error instanceof WebGLLMError)
+    assert.equal(error.code, "model-not-supported")
+    assert.match(error.message, /in 2 files/)
+    return true
+  })
 })
 
 test("names that aren't Hub repositories, and an unreachable Hub", async () => {
@@ -177,22 +154,17 @@ test("GGUF files by preference: QAD Q4_0, Q4_0, Q8_0, then the fewest bits the l
   assert.equal(pickGguf(["m-Q4_0-00001-of-00002.gguf", "m-Q4_0-00002-of-00002.gguf"]), undefined)
 })
 
-test("ONNX graphs by preference: q4f16, then q4; only one with a single data file", () => {
-  const files = (list: Array<string>) => new Set(list)
+test("ONNX graphs to try: q4f16, then q4, then the rest; decoders first", () => {
   assert.deepEqual(
-    pickOnnx(files(["onnx/model.onnx", "onnx/model.onnx_data", "onnx/model.onnx_data_1", "onnx/model_q4.onnx", "onnx/model_q4.onnx_data", "onnx/model_q4f16.onnx", "onnx/model_q4f16.onnx_data"])),
-    { graph: "onnx/model_q4f16.onnx", data: "onnx/model_q4f16.onnx_data" }
+    onnxCandidates(["onnx/model.onnx", "onnx/model.onnx_data", "onnx/model_q4.onnx", "onnx/model_fp16.onnx", "onnx/model_q4f16.onnx", "config.json"]),
+    ["onnx/model_q4f16.onnx", "onnx/model_q4.onnx", "onnx/model_fp16.onnx", "onnx/model.onnx"]
   )
-  assert.deepEqual(pickOnnx(files(["onnx/model_q4.onnx", "onnx/model_q4.onnx_data", "onnx/model_fp16.onnx", "onnx/model_fp16.onnx_data"])), {
-    graph: "onnx/model_q4.onnx",
-    data: "onnx/model_q4.onnx_data"
-  })
-  // Qwen3.5's decoder, not its embedding or vision graphs.
-  assert.deepEqual(
-    pickOnnx(files(["onnx/embed_tokens_q4f16.onnx", "onnx/embed_tokens_q4f16.onnx_data", "onnx/decoder_model_merged_q4f16.onnx", "onnx/decoder_model_merged_q4f16.onnx_data"])),
-    { graph: "onnx/decoder_model_merged_q4f16.onnx", data: "onnx/decoder_model_merged_q4f16.onnx_data" }
-  )
-  assert.equal(pickOnnx(files(["onnx/model.onnx"])), undefined)
+  // Qwen3.5's decoder before its embedding and vision graphs.
+  assert.deepEqual(onnxCandidates(["onnx/embed_tokens_q4f16.onnx", "onnx/vision_encoder_q4f16.onnx", "onnx/decoder_model_merged_q4f16.onnx"]), [
+    "onnx/decoder_model_merged_q4f16.onnx",
+    "onnx/embed_tokens_q4f16.onnx",
+    "onnx/vision_encoder_q4f16.onnx"
+  ])
 })
 
 test("sampling as Transformers reads generation_config.json; size from the name, else the Hub", () => {

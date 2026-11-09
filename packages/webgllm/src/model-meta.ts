@@ -445,6 +445,9 @@ export function rememberModel(meta: WebGlModelMeta) {
   if (!isCatalogModel(meta.name)) resolved.set(meta.name, meta)
 }
 
+/** Forgets resolved models, as a page reload does (for tests). */
+export const forgetResolvedModels = () => resolved.clear()
+
 /** Every model this thread knows: the catalog's, then those resolved since. */
 export const knownModels = (): Array<string> => [...WEBGL_TEXT_MODELS, ...resolved.keys()]
 

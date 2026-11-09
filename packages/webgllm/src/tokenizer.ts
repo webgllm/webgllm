@@ -10,6 +10,7 @@
  */
 
 import { Template } from "@huggingface/jinja"
+import { chatTemplateOf } from "./chat-template.js"
 import { Tokenizer as HfTokenizer } from "@huggingface/tokenizers"
 
 /** A tool call in a past assistant turn; arguments as an object. */
@@ -144,10 +145,8 @@ type AddedTokenJson = { id: number; content: string; special?: boolean }
 
 export function loadTokenizer(files: TokenizerFiles): Tokenizer {
   const config = files.tokenizerConfig ?? {}
-  const chatTemplate =
-    files.chatTemplate ??
-    (typeof config.chat_template === "string" ? config.chat_template : null)
-  if (chatTemplate === null) throw new Error("No chat template.")
+  const chatTemplate = chatTemplateOf(config, files.chatTemplate)
+  if (chatTemplate === undefined) throw new Error("No chat template.")
 
   const hf = new HfTokenizer(files.tokenizerJson, {
     ...config,

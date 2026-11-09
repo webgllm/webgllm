@@ -21,7 +21,7 @@ import type { ModelFile } from "./model-meta.js"
 import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, verify, verifyAt } from "./sampler.js"
-import { download, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote } from "./storage.js"
+import { download, previousGpuTuning, readGpuNotes, saveManifest, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -196,6 +196,8 @@ async function fetchFiles(model: string, signal: AbortSignal, share = 0.9) {
   ).catch((error: unknown) => {
     throw downloadError(error, signal)
   })
+  // Every file is stored: a model outside the catalog keeps its meta beside them.
+  await saveManifest(meta)
   const [tokenizerFile, tokenizerConfigFile, ...rest] = files
   // tokenizer_config.json's template when the model has no file for it.
   const templateFile = template.length ? rest.shift() : undefined

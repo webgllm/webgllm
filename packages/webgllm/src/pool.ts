@@ -182,7 +182,7 @@ export class ModelPool {
   }
 
   /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
-  private unloadMark(model: string): number {
+  unloadMark(model: string): number {
     return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
   }
 
@@ -215,9 +215,10 @@ export class ModelPool {
     model: string,
     contextLength: number | undefined,
     onProgress: ProgressListener | undefined,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    /** unloadMark when the caller started waiting (before resolving the model, say). */
+    since = this.unloadMark(model)
   ): Promise<Entry> {
-    const since = this.unloadMark(model)
     for (;;) {
       const entry = this.entries.get(model)
       if (entry?.evicting) {
