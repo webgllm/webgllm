@@ -26,4 +26,12 @@ Without streaming, the reasoning is in `message.reasoning_content`.
 - `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` always thinks and ignores `"none"`.
 - `models.list()` says which models think (`supports.thinking`).
 
-`reasoning.max_tokens` caps the reasoning; the model then answers. A budget without an effort turns thinking on. The `reasoning` object is OpenRouter's. Reasoning tokens count in `max_completion_tokens` and in `usage.completion_tokens_details.reasoning_tokens`.
+`reasoning.max_tokens` caps the reasoning; the model then answers. A budget without an effort turns thinking on.
+
+## Which `reasoning` fields work
+
+The `reasoning` object is a subset of OpenRouter's:
+
+- `effort`: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"` or `"xhigh"`, the same values as OpenAI's `reasoning_effort`. Every value but `"none"` turns thinking on. OpenRouter's `"max"` is refused.
+- `max_tokens`: the thinking budget, a whole number of tokens. Unlike OpenRouter, it can be set together with `effort`.
+- `exclude` and `enabled` are refused with an `unsupported-parameter` error, as is the old `thinking_budget_tokens`. Reasoning tokens count in `max_completion_tokens` and in `usage.completion_tokens_details.reasoning_tokens`.

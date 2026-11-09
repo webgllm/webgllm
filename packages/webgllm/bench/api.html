@@ -39,7 +39,8 @@
       // model that thinks by default (LFM3) answers within short max_tokens.
       if (params.get("think") === "0") {
         const create = webgllm.chat.completions.create.bind(webgllm.chat.completions)
-        webgllm.chat.completions.create = (body, options) => create({ reasoning_effort: "none", ...body }, options)
+        webgllm.chat.completions.create = (body, options) =>
+          create(body.reasoning_effort != null || body.reasoning != null ? body : { reasoning_effort: "none", ...body }, options)
       }
 
       const list = await webgllm.models.list()

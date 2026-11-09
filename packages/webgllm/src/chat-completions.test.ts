@@ -115,6 +115,8 @@ test("a thinking budget (reasoning.max_tokens) needs a model that takes one, tur
     false
   )
   assert.equal(code(() => planCompletion({ model: LFM2, messages: hi, reasoning: { max_tokens: 64 } })), "unsupported-parameter")
+  // The old field is refused, never dropped: a cap the caller asked for isn't silently lost.
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", thinking_budget_tokens: 64 } as never)), "unsupported-parameter")
 })
 
 test("reasoning.effort works as reasoning_effort; the two must agree, and other reasoning fields are refused", () => {

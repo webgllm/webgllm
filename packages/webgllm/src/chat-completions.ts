@@ -226,6 +226,9 @@ function toToolChoice(choice: unknown, tools: Array<ChatTool>): ToolChoice {
  * budget without an effort turns thinking on.
  */
 function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: number | undefined } {
+  if (body.thinking_budget_tokens !== undefined && body.thinking_budget_tokens !== null) {
+    throw unsupported("thinking_budget_tokens is now reasoning.max_tokens.")
+  }
   const reasoning = body.reasoning
   if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, budget: undefined }
   if (typeof reasoning !== "object" || Array.isArray(reasoning)) throw new TypeError("reasoning must be an object.")
