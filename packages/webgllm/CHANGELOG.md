@@ -1,3 +1,13 @@
+## 0.1.7 (2026-11-09)
+
+### 🚀 Features
+
+- **webgllm:** load any Hugging Face model by name, the catalog as known defaults ([#3](https://github.com/webgllm/webgllm/pull/3))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.6 (2026-11-08)
 
 ### 🚀 Features
