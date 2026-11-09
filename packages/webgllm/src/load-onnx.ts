@@ -21,6 +21,14 @@
  * norms already hold 1 + w. Its lm_head is byte for byte the 4-bit
  * embedding (embed_tokens_q4f16), so the embedding is read from it and
  * the separate embedding file isn't needed.
+ *
+ * Weights are found by the graph's structure, not their initializer names,
+ * which differ between exporters: a projection is the MatMulNBits node
+ * under its module path (`/model/layers.0/mlp/gate_proj/`), its weights
+ * whatever that node reads. Some exports (onnx-community/LFM2-1.2B-Tool-ONNX)
+ * keep the embedding in float16, read by a plain Gather, with the LM head a
+ * MatMul over the same tensor transposed: it is quantized to 8 bits at
+ * load, as the GGUF loader does a float embedding.
  */
 import { halvesToFloats } from "./half.js"
 import {
@@ -36,7 +44,8 @@ import { ReadPlan } from "./read-plan.js"
 import {
   newQuantMatrix,
   packMatMulNBits,
-  packMatMulNBitsScales
+  packMatMulNBitsScales,
+  quantizeQ8
 } from "./repack.js"
 import type {
   AttentionWeights,
@@ -64,6 +73,7 @@ export type LoadOnnxOptions = {
 /** A MatMulNBits weight: its initializers and shape. */
 type NBits = {
   name: string
+  node: OnnxNode
   N: number
   K: number
   quant: OnnxTensor
@@ -290,6 +300,17 @@ export async function* loadOnnx(
   // In chunks of rows, so the embedding is never all in JavaScript memory.
   for (let r = 0; r < emb.N; r += chunkRows) {
     const rows = Math.min(chunkRows, emb.N - r)
+    if (emb.kind === "float") {
+      // Floats: quantized to 8 bits (as the GGUF loader does a float embedding).
+      const values = await floats(
+        { ...emb.weight, name: `floats@${r}` },
+        rows * D
+      )
+      const m = newQuantMatrix(rows, D, 8, false)
+      quantizeQ8(m, 0, values, rows)
+      yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
+      continue
+    }
     const quant = await plan.take(`quant@${r}`)
     const scales = await plan.take(`scales@${r}`)
     const zp = emb.zp ? await plan.take(`zp@${r}`) : null
@@ -384,6 +405,10 @@ function planOnnx(
         length: rows * rowBytes
       })
     }
+    if (emb.kind === "float") {
+      ext(emb.weight, D * onnxElementSize(emb.weight.dataType), "floats")
+      continue
+    }
     ext(emb.quant, blocks * 16, "quant")
     ext(emb.scales, blocks * 2, "scales")
     if (emb.zp) ext(emb.zp, zpStride, "zp")
@@ -456,6 +481,16 @@ class OnnxModel {
     return this.graph.initializers.has(name)
   }
 
+  /** A constant tensor: an initializer, or a Constant node's value. */
+  constant(name: string): OnnxTensor {
+    const t = this.graph.initializers.get(name)
+    if (t) return t
+    const node = this.producerOf(name)
+    const value = node?.opType === "Constant" ? node.attributes.get("value")?.t : undefined
+    if (!value) throw new Error(`ONNX: ${name} is not a constant`)
+    return value
+  }
+
   consumersOf(name: string): Array<OnnxNode> {
     return this.consumers.get(name) ?? []
   }
@@ -464,16 +499,33 @@ class OnnxModel {
     return this.producers.get(name)
   }
 
-  /** The MatMulNBits weight named `{prefix}_MatMul_weight_*`. */
-  nbits(prefix: string): NBits {
-    const quant = this.init(`${prefix}_MatMul_weight_quant`)
-    const scales = this.init(`${prefix}_MatMul_weight_scales`)
-    const zpName = `${prefix}_MatMul_weight_zp`
-    const zp = this.has(zpName) ? this.init(zpName) : null
-    const node = this.consumersOf(quant.name).find(
-      (n) => n.opType === "MatMulNBits"
+  /**
+   * The 4-bit MatMulNBits node under `path` (its node name's prefix, the
+   * module path every export keeps, e.g. `/model/layers.0/mlp/gate_proj/`),
+   * or undefined. Its weights are whatever the node reads: exports name
+   * them differently (`model_layers_0_mlp_gate_proj_MatMul_weight_quant`,
+   * `model.layers.0.mlp.gate_proj.MatMul.weight_Q4`).
+   */
+  private nbitsNode(path: string): OnnxNode | undefined {
+    const nodes = this.graph.nodes.filter(
+      (n) => n.opType === "MatMulNBits" && n.name.startsWith(path)
     )
-    if (!node) throw new Error(`ONNX: no MatMulNBits reads ${quant.name}`)
+    if (nodes.length > 1)
+      throw new Error(`ONNX: ${nodes.length} MatMulNBits nodes under ${path}`)
+    return nodes[0]
+  }
+
+  hasNBits(path: string): boolean {
+    return this.nbitsNode(path) !== undefined
+  }
+
+  /** The MatMulNBits weight under `path` (see nbitsNode). */
+  nbits(path: string): NBits {
+    const node = this.nbitsNode(path)
+    if (!node) throw new Error(`ONNX: no MatMulNBits node under ${path}`)
+    const quant = this.init(node.inputs[1])
+    const scales = this.init(node.inputs[2])
+    const zp = node.inputs[3] ? this.init(node.inputs[3]) : null
     const attr = (key: string) => node.attributes.get(key)?.i
     const N = attr("N")
     const K = attr("K")
@@ -485,21 +537,13 @@ class OnnxModel {
     ) {
       throw new Error(`ONNX: ${node.name} is not 4-bit with block size 32`)
     }
-    if (
-      node.inputs[2] !== scales.name ||
-      (node.inputs[3] ?? "") !== (zp?.name ?? "")
-    ) {
-      throw new Error(
-        `ONNX: ${node.name} doesn't use the expected scales / zero points`
-      )
-    }
     if (node.inputs[4] || node.inputs[5])
       throw new Error(`ONNX: ${node.name} has g_idx or bias inputs`)
     const blocks = K / 32
     checkShape(quant, OnnxDataType.UINT8, N * blocks * 16)
     checkShape(scales, OnnxDataType.FLOAT16, N * blocks)
     if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(blocks / 2))
-    return { name: prefix, N, K, quant, scales, zp }
+    return { name: path, node, N, K, quant, scales, zp }
   }
 
   /** What a layer needs, with the graph checked against the layout assumptions. */
@@ -516,11 +560,11 @@ class OnnxModel {
       norm("ffn_layernorm"),
       optional("post_ffn_layernorm")
     ]
-    const w = (name: string) => this.nbits(`model_layers_${i}_${name}`)
-    const mlp = [w("mlp_gate_proj"), w("mlp_up_proj"), w("mlp_down_proj")]
+    const w = (name: string) => this.nbits(`/model/layers.${i}/${name}/`)
+    const mlp = [w("mlp/gate_proj"), w("mlp/up_proj"), w("mlp/down_proj")]
     if (type === "conv") {
-      const inProj = w("conv_in_proj")
-      const outProj = w("conv_out_proj")
+      const inProj = w("conv/in_proj")
+      const outProj = w("conv/out_proj")
       if (
         inProj.N !== 3 * D ||
         inProj.K !== D ||
@@ -548,10 +592,10 @@ class OnnxModel {
         q: { start: 0, rows: 0 }
       }
     }
-    const q = w("attn_q_proj")
-    const k = w("attn_k_proj")
-    const v = w("attn_v_proj")
-    const o = w("attn_o_proj")
+    const q = w("attn/q_proj")
+    const k = w("attn/k_proj")
+    const v = w("attn/v_proj")
+    const o = w("attn/o_proj")
     const qRows = config.numHeads * config.headDim
     const extra = [
       this.init(`${p}attn.q_norm.layernorm.weight`),
@@ -569,7 +613,7 @@ class OnnxModel {
       }
     }
     if (q.N === qRows) {
-      const gateWeight = w("attn_gate_proj")
+      const gateWeight = w("attn/gate_proj")
       return {
         type,
         norms,
@@ -597,18 +641,18 @@ class OnnxModel {
       this.init(`${p}post_attention_layernorm.weight`),
       null
     ]
-    const w = (name: string) => this.nbits(`model_layers_${i}_${name}`)
-    const mlp = [w("mlp_gate_proj"), w("mlp_up_proj"), w("mlp_down_proj")]
+    const w = (name: string) => this.nbits(`/model/layers.${i}/${name}/`)
+    const mlp = [w("mlp/gate_proj"), w("mlp/up_proj"), w("mlp/down_proj")]
     const l = config.linear
     if (!l) throw new Error("ONNX: the config has no Gated DeltaNet shapes")
     if (type === "linear_attention") {
       const keyDim = l.numKeyHeads * l.keyHeadDim
       const valueDim = l.numValueHeads * l.valueHeadDim
-      const qkv = w("gdn_in_proj_qkv")
-      const z = w("gdn_in_proj_z")
-      const b = w("gdn_in_proj_b")
-      const a = w("gdn_in_proj_a")
-      const out = w("gdn_out_proj")
+      const qkv = w("gdn/in_proj_qkv")
+      const z = w("gdn/in_proj_z")
+      const b = w("gdn/in_proj_b")
+      const a = w("gdn/in_proj_a")
+      const out = w("gdn/out_proj")
       const H = l.numValueHeads
       if (
         qkv.N !== 2 * keyDim + valueDim ||
@@ -635,7 +679,7 @@ class OnnxModel {
         q: { start: 0, rows: 0 }
       }
     }
-    const q = w("attn_q_proj")
+    const q = w("attn/q_proj")
     if (q.N !== 2 * config.numHeads * config.headDim)
       throw new Error(`ONNX: layer ${i} q_proj has ${q.N} rows, expected q and gate`)
     // RoPE: non-interleaved over the first ropeDimsFull dims of each head.
@@ -654,7 +698,7 @@ class OnnxModel {
     return {
       type,
       norms,
-      matrices: [q, w("attn_k_proj"), w("attn_v_proj"), w("attn_o_proj"), ...mlp],
+      matrices: [q, w("attn/k_proj"), w("attn/v_proj"), w("attn/o_proj"), ...mlp],
       extra: [
         this.init(`${p}attn.q_norm.layernorm.weight`),
         this.init(`${p}attn.k_norm.layernorm.weight`)
@@ -665,11 +709,7 @@ class OnnxModel {
 
   /** The output of the MatMulNBits node reading `w`. */
   private outputOf(w: NBits): string {
-    const node = this.consumersOf(w.quant.name).find(
-      (n) => n.opType === "MatMulNBits"
-    )
-    if (!node) throw new Error(`ONNX: no MatMulNBits reads ${w.quant.name}`)
-    return node.outputs[0]
+    return w.node.outputs[0]
   }
 
   /** A Split's part sizes, from its input or attribute. */
@@ -679,7 +719,7 @@ class OnnxModel {
     if (axis !== -1 && axis !== 2 && axis !== 1)
       throw new Error(`ONNX: ${split.name} doesn't split the channels axis`)
     const input = split.inputs[1]
-    if (input) return onnxInt64s(this.init(input))
+    if (input) return onnxInt64s(this.constant(input))
     const attr = split.attributes.get("split")?.ints
     if (attr) return attr
     throw new Error(`ONNX: ${split.name} has no split sizes`)
@@ -808,12 +848,21 @@ class OnnxModel {
     }
   }
 
+  /** The LM head: the MatMulNBits or MatMul node under `/lm_head/`. */
+  private lmHead(): OnnxNode {
+    const heads = this.graph.nodes.filter(
+      (n) =>
+        n.name.startsWith("/lm_head/") &&
+        (n.opType === "MatMulNBits" || n.opType === "MatMul")
+    )
+    if (heads.length !== 1)
+      throw new Error(`ONNX: ${heads.length} LM head MatMul nodes`)
+    return heads[0]
+  }
+
   /** The final norm's weight: the norm feeding the LM head. */
   finalNorm(): OnnxTensor {
-    const head = this.graph.nodes.find(
-      (n) => n.name.startsWith("/lm_head/") && n.opType === "MatMulNBits"
-    )
-    let name = head?.inputs[0]
+    let name: string | undefined = this.lmHead().inputs[0]
     for (let hops = 0; name && hops < 8; hops++) {
       const node = this.producerOf(name)
       if (!node) break
@@ -826,46 +875,100 @@ class OnnxModel {
     throw new Error("ONNX: can't find the final norm")
   }
 
-  /** The 4-bit embedding read by GatherBlockQuantized (and the LM head). */
-  embedding(D: number): {
-    N: number
-    quant: OnnxTensor
-    scales: OnnxTensor
-    zp: OnnxTensor | null
-  } {
+  /**
+   * The embedding (also the output head):
+   * - 4-bit, read by GatherBlockQuantized;
+   * - floats read by a plain Gather, when the LM head is a MatMul over the
+   *   same tensor transposed (tied): the loader quantizes it to 8 bits, as
+   *   it does a GGUF's float embedding;
+   * - in a decoder-only graph (Qwen3.5's), the 4-bit tied head itself.
+   */
+  embedding(D: number): OnnxEmbedding {
     const gather = this.graph.nodes.find(
       (n) => n.opType === "GatherBlockQuantized"
     )
-    if (!gather && this.has("lm_head_MatMul_weight_quant")) {
-      // A decoder-only graph (Qwen3.5's): the tied head is the embedding.
-      const head = this.nbits("lm_head")
-      if (head.K !== D) throw new Error(`ONNX: lm_head has K ${head.K}`)
-      return { N: head.N, quant: head.quant, scales: head.scales, zp: head.zp }
+    if (gather) {
+      const attr = (key: string) => gather.attributes.get(key)?.i
+      if (
+        attr("bits") !== 4 ||
+        attr("block_size") !== 32 ||
+        attr("quantize_axis") !== 1 ||
+        (attr("gather_axis") ?? 0) !== 0
+      ) {
+        throw new Error(
+          `ONNX: ${gather.name} is not 4-bit, block 32, quantized along rows`
+        )
+      }
+      const quant = this.init(gather.inputs[0])
+      const scales = this.init(gather.inputs[2])
+      const zp = gather.inputs[3] ? this.init(gather.inputs[3]) : null
+      const N = quant.dims[0]
+      if (quant.dims[1] !== D / 2)
+        throw new Error(`ONNX: ${quant.name} is [${quant.dims}]`)
+      checkShape(quant, OnnxDataType.UINT8, (N * D) / 2)
+      checkShape(scales, OnnxDataType.FLOAT16, (N * D) / 32)
+      if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(D / 64))
+      return { kind: "q4", N, quant, scales, zp }
     }
-    if (!gather) throw new Error("ONNX: no GatherBlockQuantized embedding")
-    const attr = (key: string) => gather.attributes.get(key)?.i
-    if (
-      attr("bits") !== 4 ||
-      attr("block_size") !== 32 ||
-      attr("quantize_axis") !== 1 ||
-      (attr("gather_axis") ?? 0) !== 0
-    ) {
-      throw new Error(
-        `ONNX: ${gather.name} is not 4-bit, block 32, quantized along rows`
+    const floatGather = this.graph.nodes.find(
+      (n) =>
+        n.opType === "Gather" &&
+        n.inputs[1] === "input_ids" &&
+        this.has(n.inputs[0])
+    )
+    if (floatGather) {
+      const weight = this.init(floatGather.inputs[0])
+      if (
+        weight.dataType !== OnnxDataType.FLOAT16 &&
+        weight.dataType !== OnnxDataType.FLOAT
       )
+        throw new Error(
+          `ONNX: ${weight.name} has data type ${weight.dataType}, expected float16 or float`
+        )
+      const [N, K] = weight.dims
+      if (weight.dims.length !== 2 || K !== D)
+        throw new Error(`ONNX: ${weight.name} is [${weight.dims}]`)
+      // Tied: the head multiplies by this same tensor, transposed.
+      const head = this.lmHead()
+      const transpose = this.producerOf(head.inputs[1])
+      const perm = transpose?.attributes.get("perm")?.ints
+      if (
+        head.opType !== "MatMul" ||
+        transpose?.opType !== "Transpose" ||
+        transpose.inputs[0] !== weight.name ||
+        (perm && (perm[0] !== 1 || perm[1] !== 0))
+      )
+        throw new Error(
+          `ONNX: the LM head isn't ${weight.name} (only a tied head is supported)`
+        )
+      return { kind: "float", N, weight }
     }
-    const quant = this.init(gather.inputs[0])
-    const scales = this.init(gather.inputs[2])
-    const zp = gather.inputs[3] ? this.init(gather.inputs[3]) : null
-    const N = quant.dims[0]
-    if (quant.dims[1] !== D / 2)
-      throw new Error(`ONNX: ${quant.name} is [${quant.dims}]`)
-    checkShape(quant, OnnxDataType.UINT8, (N * D) / 2)
-    checkShape(scales, OnnxDataType.FLOAT16, (N * D) / 32)
-    if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(D / 64))
-    return { N, quant, scales, zp }
+    if (this.hasNBits("/lm_head/")) {
+      // A decoder-only graph (Qwen3.5's): the tied head is the embedding.
+      const head = this.nbits("/lm_head/")
+      if (head.K !== D) throw new Error(`ONNX: lm_head has K ${head.K}`)
+      return {
+        kind: "q4",
+        N: head.N,
+        quant: head.quant,
+        scales: head.scales,
+        zp: head.zp
+      }
+    }
+    throw new Error("ONNX: no embedding the loader reads")
   }
 }
+
+/** The embedding as the graph has it (OnnxModel.embedding). */
+type OnnxEmbedding =
+  | {
+      kind: "q4"
+      N: number
+      quant: OnnxTensor
+      scales: OnnxTensor
+      zp: OnnxTensor | null
+    }
+  | { kind: "float"; N: number; weight: OnnxTensor }
 
 function checkShape(t: OnnxTensor, dataType: number, elements: number): void {
   let n = 1
@@ -890,13 +993,9 @@ type HfRope = {
 function hasAttentionGate(model: OnnxModel, layerTypes: Array<LayerType>) {
   const i = layerTypes.findIndex((t) => t !== "conv")
   if (i < 0) return false
-  if (model.has(`model_layers_${i}_attn_gate_proj_MatMul_weight_quant`))
-    return true
-  const q = model.nbits(`model_layers_${i}_attn_q_proj`)
-  const node = model
-    .consumersOf(q.quant.name)
-    .find((n) => n.opType === "MatMulNBits")
-  return !!node && model.consumersOf(node.outputs[0]).some((n) => n.opType === "Split")
+  if (model.hasNBits(`/model/layers.${i}/attn/gate_proj/`)) return true
+  const q = model.nbits(`/model/layers.${i}/attn/q_proj/`)
+  return model.consumersOf(q.node.outputs[0]).some((n) => n.opType === "Split")
 }
 
 function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
@@ -953,7 +1052,7 @@ function onnxConfig(json: unknown, model: OnnxModel): ModelConfig {
     Math.round((r.partial_rotary_factor ?? 1) * headDim)
 
   // Shapes the weights have, over what the config says.
-  const gate0 = model.nbits("model_layers_0_mlp_gate_proj")
+  const gate0 = model.nbits("/model/layers.0/mlp/gate_proj/")
   const intermediateSize = gate0.N
   if (
     c.intermediate_size !== undefined &&

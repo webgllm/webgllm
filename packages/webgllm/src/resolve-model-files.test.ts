@@ -37,7 +37,7 @@ test("an FP16-only ONNX export fails before its weights download", async () => {
   await assert.rejects(resolveModel(name), (error: unknown) => {
     assert.ok(error instanceof WebGLLMError)
     assert.equal(error.code, "model-not-supported")
-    assert.match(error.message, /model_fp16\.onnx: ONNX: missing initializer .*_quant/)
+    assert.match(error.message, /model_fp16\.onnx: ONNX: no MatMulNBits node under \/model\/layers\.0\/mlp\/gate_proj\//)
     return true
   })
   assert.ok(!calls.some((url) => url.endsWith(".onnx_data")), "the weights weren't asked for")
