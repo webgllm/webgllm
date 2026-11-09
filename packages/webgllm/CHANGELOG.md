@@ -1,3 +1,17 @@
+## 0.2.1 (2026-11-09)
+
+### 🚀 Features
+
+- ⚠️  **webgllm:** OpenRouter's reasoning object for the effort and thinking budget ([#7](https://github.com/webgllm/webgllm/pull/7))
+
+### ⚠️  Breaking Changes
+
+- **webgllm:** OpenRouter's reasoning object for the effort and thinking budget  ([#7](https://github.com/webgllm/webgllm/pull/7))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.2.0 (2026-11-09)
 
 ### 🚀 Features
