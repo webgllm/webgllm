@@ -237,11 +237,11 @@ test("stop sequences don't apply inside a structured answer: it stays valid JSON
   assert.equal(text(t.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
 })
 
-test("the repetition penalty counts only the reply's tokens, not the prompt's", async () => {
+test("the repetition penalty counts the prompt's tokens, as Transformers.js does", async () => {
   const s = scripted([id("Oslo")])
   await s.generate(request({ sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 } }))
-  // A value copied from the prompt (a name to extract) mustn't be pushed away.
-  assert.deepEqual(s.seen, [[]])
+  assert.equal(s.seen.length, 1)
+  assert.ok(s.seen[0].length > 0, "the prompt's tokens are penalized")
 })
 
 test("no repetition or presence penalty inside a constrained answer", async () => {

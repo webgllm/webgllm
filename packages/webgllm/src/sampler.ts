@@ -15,10 +15,9 @@ export type Sampling = {
 
 /**
  * A sampler for one reply. It applies the repetition penalty to the tokens
- * it's told it has seen (the worker passes the reply's own: penalizing the
- * prompt's too, as Transformers.js does, pushes a model off values it copies
- * from it, such as a name to extract), keeps the top_k likeliest tokens, and
- * draws one at the temperature (greedy at 0).
+ * it's told it has seen (the prompt's and the reply's, as Transformers.js
+ * does), keeps the top_k likeliest tokens, and draws one at the temperature
+ * (greedy at 0).
  */
 export function createSampler({
   temperature,
@@ -31,7 +30,7 @@ export function createSampler({
   const seen = new Set<number>()
   const generated = new Set<number>()
   return {
-    /** Tokens to penalize from now on: each one drawn. */
+    /** Tokens to penalize from now on: the prompt, then each one drawn. */
     see(tokens: Iterable<number>, output = false) {
       for (const t of tokens) {
         seen.add(t)
