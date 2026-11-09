@@ -100,20 +100,13 @@ function isMeta(value: unknown, model?: string): value is WebGlModelMeta {
 }
 
 /**
- * A stored manifest with today's reasoning levels: before 0.2.0 they held the
- * chat template's enable_thinking values ("false", "true"), now the
- * reasoning_effort values ("none", "high").
+ * Whether a stored manifest is from before 0.2.0, whose reasoning levels held
+ * the chat template's values ("false", "true"): it's deleted, and the model
+ * resolves again (its downloaded files stay, and are reused).
  */
-function current(meta: WebGlModelMeta): WebGlModelMeta {
+const isStale = (meta: WebGlModelMeta) => {
   const levels = meta.reasoning?.levels as Record<string, string> | undefined
-  if (!levels || (levels.off !== "false" && levels.high !== "true")) return meta
-  return {
-    ...meta,
-    reasoning: {
-      ...meta.reasoning!,
-      levels: { ...("off" in levels && { off: "none" as const }), high: "high" as const }
-    }
-  }
+  return !!levels && (levels.off === "false" || levels.high === "true")
 }
 
 /** `model`'s stored manifest, or undefined (none, unreadable, or no storage here). */
@@ -121,7 +114,12 @@ export async function readManifest(model: string): Promise<WebGlModelMeta | unde
   try {
     const text = await (await (await (await dir()).getFileHandle(manifestName(model))).getFile()).text()
     const meta: unknown = JSON.parse(text)
-    return isMeta(meta, model) ? current(meta) : undefined
+    if (!isMeta(meta, model)) return undefined
+    if (isStale(meta)) {
+      await removeManifest(model)
+      return undefined
+    }
+    return meta
   } catch {
     return undefined
   }
@@ -136,7 +134,9 @@ export async function storedManifests(): Promise<Array<WebGlModelMeta>> {
       if (!name.startsWith(MANIFEST)) continue
       try {
         const meta: unknown = JSON.parse(await (await (await folder.getFileHandle(name)).getFile()).text())
-        if (isMeta(meta) && manifestName(meta.name) === name) metas.push(current(meta))
+        if (!isMeta(meta) || manifestName(meta.name) !== name) continue
+        if (isStale(meta)) await removeManifest(meta.name)
+        else metas.push(meta)
       } catch {
         // Unreadable: skipped.
       }

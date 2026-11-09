@@ -96,16 +96,20 @@ test("models.downloaded for a model with no stored meta reads storage only", asy
   assert.equal(asked, 0)
 })
 
-test("a manifest stored before 0.2.0 reads with today's reasoning levels", async (t) => {
+test("a manifest stored before 0.2.0 is deleted, and the model resolves again", async (t) => {
   useFolder(t)
   // 0.1.9 stored the chat template's enable_thinking values.
   const old = { ...ggufModel("someone/Thinks-GGUF"), reasoning: { levels: { off: "false", high: "true" }, budget: true } }
   await saveManifest(old as unknown as WebGlModelMeta)
+  assert.equal((await storedManifests()).some((m) => m.name === old.name), false, "not listed, and deleted")
+  await saveManifest(old as unknown as WebGlModelMeta)
   forgetResolvedModels()
-  hub.fetch = async () => {
+  const asked: Array<string> = []
+  hub.fetch = async (url: string) => {
+    asked.push(url)
     throw new TypeError("offline")
   }
-  const today = { levels: { off: "none", high: "high" }, budget: true }
-  assert.deepEqual((await resolveModel(old.name)).reasoning, today)
-  assert.deepEqual((await storedManifests()).find((m) => m.name === old.name)?.reasoning, today)
+  await assert.rejects(resolveModel(old.name))
+  assert.ok(asked.length > 0, "it resolves from the Hub again")
+  assert.equal((await storedManifests()).some((m) => m.name === old.name), false)
 })
