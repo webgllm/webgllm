@@ -27,7 +27,7 @@ async function collect(stream: AsyncIterable<ChatCompletionChunk>) {
   return chunks
 }
 
-test("the instance is an OpenAI-shaped client: a baseURL, and chat.completions.create", () => {
+test("the instance has a baseURL and chat.completions.create, as an OpenAI client does", () => {
   const { llm: instance } = llm()
   assert.equal(instance.baseURL, "webgllm:")
   assert.equal(typeof instance.chat.completions.create, "function")

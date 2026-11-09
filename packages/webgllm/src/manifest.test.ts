@@ -5,7 +5,7 @@ import { browserStorage, modelFiles } from "./model-files.js"
 import { forgetResolvedModels } from "./model-meta.js"
 import type { WebGlModelMeta } from "./model-meta.js"
 import { hub, resolveModel } from "./resolve-model.js"
-import { diskName, saveManifest } from "./storage.js"
+import { diskName, saveManifest, storedManifests } from "./storage.js"
 import { internals, WebGLLM } from "./webgllm.js"
 
 /** A GGUF model outside the catalog whose tokenizer is LFM2 350M's (as LiquidAI/LFM2-350M-GGUF's is). */
@@ -94,4 +94,18 @@ test("models.downloaded for a model with no stored meta reads storage only", asy
     internals.storage = saved
   }
   assert.equal(asked, 0)
+})
+
+test("a manifest stored before 0.2.0 reads with today's reasoning levels", async (t) => {
+  useFolder(t)
+  // 0.1.9 stored the chat template's enable_thinking values.
+  const old = { ...ggufModel("someone/Thinks-GGUF"), reasoning: { levels: { off: "false", high: "true" }, budget: true } }
+  await saveManifest(old as unknown as WebGlModelMeta)
+  forgetResolvedModels()
+  hub.fetch = async () => {
+    throw new TypeError("offline")
+  }
+  const today = { levels: { off: "none", high: "high" }, budget: true }
+  assert.deepEqual((await resolveModel(old.name)).reasoning, today)
+  assert.deepEqual((await storedManifests()).find((m) => m.name === old.name)?.reasoning, today)
 })
