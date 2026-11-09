@@ -329,12 +329,13 @@ type OnnxRead = { key: string; location: string; offset: number; length: number;
  * the load makes, in order, without reading the external data.
  */
 function planOnnx(
-  graphBytes: Uint8Array,
+  graphBytes: Uint8Array | OnnxGraph,
   configJson: unknown,
   chunkRows: number,
   add: (read: OnnxRead) => void
 ) {
-  const graph = parseOnnxModel(graphBytes)
+  const graph =
+    graphBytes instanceof Uint8Array ? parseOnnxModel(graphBytes) : graphBytes
   const model = new OnnxModel(graph)
   const config = onnxConfig(configJson, model)
   const D = config.hiddenSize
@@ -391,6 +392,13 @@ function planOnnx(
   want(finalNorm)
 
   const emb = model.embedding(D)
+  // Matrices hold rows in groups of 4 (QuantMatrix); padding would add
+  // tokens the head scores, so such a vocabulary is refused here, before
+  // the weights download.
+  if (emb.N % 4 !== 0)
+    throw new Error(`ONNX: the embedding has ${emb.N} rows, not a multiple of 4`)
+  if (chunkRows < emb.N && chunkRows % 4 !== 0)
+    throw new Error(`ONNX: embedding chunks of ${chunkRows} rows aren't a multiple of 4`)
   const blocks = D / 32
   const zpStride = Math.ceil(blocks / 2)
   for (let r = 0; r < emb.N; r += chunkRows) {
@@ -398,6 +406,11 @@ function planOnnx(
     const ext = (t: OnnxTensor, rowBytes: number, key: string) => {
       if (!t.external)
         throw new Error(`ONNX: ${t.name} is expected in the external data file`)
+      // The declared span must hold every row the reads take.
+      if (t.external.length !== tensorBytes(t) || rowBytes * emb.N !== tensorBytes(t))
+        throw new Error(
+          `ONNX: ${t.name} has ${t.external.length} bytes, expected ${rowBytes * emb.N}`
+        )
       add({
         key: `${key}@${r}`,
         location: t.external.location,
@@ -422,8 +435,13 @@ function planOnnx(
  * external data files its weights are in (their `location`s).
  */
 export function checkOnnxGraph(graphBytes: Uint8Array, configJson: unknown): { dataFiles: Array<string> } {
+  return checkOnnxModel(parseOnnxModel(graphBytes), configJson)
+}
+
+/** checkOnnxGraph on a graph already parsed. */
+export function checkOnnxModel(graph: OnnxGraph, configJson: unknown): { dataFiles: Array<string> } {
   const files = new Set<string>()
-  planOnnx(graphBytes, configJson, Number.MAX_SAFE_INTEGER, (read) => {
+  planOnnx(graph, configJson, Number.MAX_SAFE_INTEGER, (read) => {
     if (!read.bytes) files.add(read.location)
   })
   return { dataFiles: [...files] }
@@ -500,15 +518,22 @@ class OnnxModel {
   }
 
   /**
-   * The 4-bit MatMulNBits node under `path` (its node name's prefix, the
-   * module path every export keeps, e.g. `/model/layers.0/mlp/gate_proj/`),
-   * or undefined. Its weights are whatever the node reads: exports name
-   * them differently (`model_layers_0_mlp_gate_proj_MatMul_weight_quant`,
-   * `model.layers.0.mlp.gate_proj.MatMul.weight_Q4`).
+   * The MatMulNBits node of the module at `path` (e.g.
+   * `/model/layers.0/mlp/gate_proj/`), or undefined. Either of two signals
+   * names it: the node's own name (exporters prefix it with the module
+   * path), or the 4-bit weight it reads, whose name is the module path in
+   * any spelling (`model_layers_0_mlp_gate_proj_MatMul_weight_quant`,
+   * `model.layers.0.mlp.gate_proj.MatMul.weight_Q4`). Its weights are then
+   * whatever the node reads. Two nodes for one module is an error.
    */
   private nbitsNode(path: string): OnnxNode | undefined {
+    const spelled = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, "_")
+    const module = spelled(path).replace(/^_/, "")
     const nodes = this.graph.nodes.filter(
-      (n) => n.opType === "MatMulNBits" && n.name.startsWith(path)
+      (n) =>
+        n.opType === "MatMulNBits" &&
+        (n.name.startsWith(path) ||
+          (this.has(n.inputs[1]) && spelled(n.inputs[1]).startsWith(module)))
     )
     if (nodes.length > 1)
       throw new Error(`ONNX: ${nodes.length} MatMulNBits nodes under ${path}`)
@@ -908,6 +933,12 @@ class OnnxModel {
       checkShape(quant, OnnxDataType.UINT8, (N * D) / 2)
       checkShape(scales, OnnxDataType.FLOAT16, (N * D) / 32)
       if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(D / 64))
+      // The engine's head is the embedding: a 4-bit head is taken as
+      // tied (it is in these exports); a float one has its own weights.
+      if (this.lmHead().opType === "MatMul")
+        throw new Error(
+          "ONNX: the LM head is a float MatMul with its own weights, not the embedding (only a tied head is supported)"
+        )
       return { kind: "q4", N, quant, scales, zp }
     }
     const floatGather = this.graph.nodes.find(
