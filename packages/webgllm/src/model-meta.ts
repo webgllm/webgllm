@@ -20,9 +20,12 @@ export type ModelFile = {
   path: string
 }
 
-/** Whether thinking can be switched off (`off`) and capped by a token budget. */
+/**
+ * Whether thinking can be switched off (`off`) and capped by a token budget.
+ * Each level's value is what to send as `reasoning_effort` for it.
+ */
 export type ModelReasoning = {
-  readonly levels: { readonly off?: "false"; readonly high: "true" }
+  readonly levels: { readonly off?: "none"; readonly high: "high" }
   readonly budget: boolean
 }
 
@@ -50,7 +53,7 @@ export type WebGlModelMeta = {
     capabilities: ReadonlyArray<"tools" | "thinking">
   }
   size: string
-  /** Thinking levels: the chat template's enable_thinking values, and whether a budget applies. */
+  /** Thinking levels, each with its `reasoning_effort` value, and whether a budget applies. */
   reasoning?: ModelReasoning
   sampling: Sampling
   /** Recommended text sampling when the chat template enables thinking. */
@@ -60,7 +63,7 @@ export type WebGlModelMeta = {
 }
 
 const THINKING_SWITCH = {
-  levels: { off: "false", high: "true" },
+  levels: { off: "none", high: "high" },
   budget: true
 } as const
 
@@ -76,7 +79,7 @@ const TOOLS = {
 } as const
 
 /** LFM2.5 Thinking always thinks: its template takes no switch. */
-const ALWAYS_THINKS = { levels: { high: "true" }, budget: true } as const
+const ALWAYS_THINKS = { levels: { high: "high" }, budget: true } as const
 
 /** LFM2.5's card: temperature 0.1, top-k 50, repetition penalty 1.05. */
 const LFM2_5_SAMPLING = {

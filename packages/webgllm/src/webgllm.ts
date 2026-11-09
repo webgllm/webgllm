@@ -116,6 +116,13 @@ export class WebGLLM {
     return hasWebGl2()
   }
 
+  /**
+   * Where requests go, as an OpenAI client reports it: in this page, not over
+   * the network. With it the instance is an OpenAI-shaped client for libraries
+   * that take one (TanStack AI's Chat Completions adapters read `baseURL` and
+   * call `chat.completions.create`).
+   */
+  readonly baseURL = "webgllm:"
   readonly chat: { readonly completions: Completions }
   readonly models: Models
   private readonly pool: ModelPool
