@@ -73,8 +73,7 @@ Aborting rejects with a `DOMException` named `AbortError` and stops the generati
 const stream = await webgllm.chat.completions.create({
   model: "unsloth/Qwen3.5-2B-GGUF",
   messages,
-  reasoning_effort: "high",        // "none" turns it off
-  thinking_budget_tokens: 512,     // optional cap
+  reasoning: { effort: "high", max_tokens: 512 },  // "none" turns it off; max_tokens is an optional cap
   stream: true
 })
 for await (const chunk of stream) {
@@ -162,7 +161,7 @@ The catalog holds known defaults for the models webgllm is tuned and tested on, 
 | `LiquidAI/LFM2-1.2B-Tool-GGUF`       | official Q4_0; tuned for tool calls, greedy decoding     |
 | `onnx-community/LFM2-1.2B-Tool-ONNX` | onnx-community's q4f16 export                            |
 
-LFM3 thinks by default and Qwen3.5 doesn't; `reasoning_effort` switches it through the chat template's `enable_thinking`. Sampling defaults come from each model card. See [LFM2.5 GGUF validation](bench/LFM2-GGUF.md).
+LFM3 thinks by default and Qwen3.5 doesn't; `reasoning.effort` (or OpenAI's `reasoning_effort`) switches it through the chat template's `enable_thinking`. Sampling defaults come from each model card. See [LFM2.5 GGUF validation](bench/LFM2-GGUF.md).
 
 ## Advanced
 

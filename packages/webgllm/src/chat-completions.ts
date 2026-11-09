@@ -221,7 +221,28 @@ function toToolChoice(choice: unknown, tools: Array<ChatTool>): ToolChoice {
 }
 
 /**
- * The template's `enable_thinking` for `reasoning_effort`: "none" turns
+ * The reasoning effort and thinking budget, as OpenRouter takes them:
+ * `reasoning: { effort, max_tokens }`, or OpenAI's `reasoning_effort`. A
+ * budget without an effort turns thinking on.
+ */
+function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: number | undefined } {
+  const reasoning = body.reasoning
+  if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, budget: undefined }
+  if (typeof reasoning !== "object" || Array.isArray(reasoning)) throw new TypeError("reasoning must be an object.")
+  const fields = reasoning as Record<string, unknown>
+  const other = Object.keys(fields).find((key) => key !== "effort" && key !== "max_tokens")
+  if (other !== undefined) throw unsupported(`reasoning.${other} isn't supported.`)
+  const own = fields.effort ?? undefined
+  const openai = body.reasoning_effort ?? undefined
+  if (own !== undefined && openai !== undefined && own !== openai) {
+    throw new TypeError("reasoning.effort and reasoning_effort disagree.")
+  }
+  const budget = numberField({ "reasoning.max_tokens": fields.max_tokens }, "reasoning.max_tokens", { min: 0, integer: true })
+  return { effort: own ?? openai ?? (budget !== undefined ? "high" : undefined), budget }
+}
+
+/**
+ * The template's `enable_thinking` for the reasoning effort: "none" turns
  * thinking off where the model can switch it off (a model that always
  * thinks ignores it: OpenAI treats effort as a hint), any other level turns
  * it on where the model thinks at all; unset leaves the template's default.
@@ -229,7 +250,7 @@ function toToolChoice(choice: unknown, tools: Array<ChatTool>): ToolChoice {
 function thinkingFor(effort: unknown, meta: WebGlModelMeta): boolean | undefined {
   if (effort === undefined || effort === null) return undefined
   if (typeof effort !== "string" || !REASONING_EFFORTS.has(effort)) {
-    throw new TypeError(`reasoning_effort must be one of ${[...REASONING_EFFORTS].join(", ")}.`)
+    throw new TypeError(`The reasoning effort must be one of ${[...REASONING_EFFORTS].join(", ")}.`)
   }
   if (!meta.reasoning) return undefined
   if (effort === "none") return meta.reasoning.levels.off ? false : undefined
@@ -304,8 +325,8 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   // "none" offers no tools at all: the prompt doesn't list them.
   const tools = toolChoice === "none" ? [] : offered
 
-  const thinking = thinkingFor(body.reasoning_effort, meta)
-  const budget = numberField(body, "thinking_budget_tokens", { min: 0, integer: true })
+  const { effort, budget } = reasoningOf(body)
+  const thinking = thinkingFor(effort, meta)
   if (budget !== undefined && thinking !== false && !meta.reasoning?.budget) {
     throw unsupported(`${model} doesn't take a thinking budget.`)
   }

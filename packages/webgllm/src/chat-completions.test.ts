@@ -105,13 +105,24 @@ test("reasoning_effort switches thinking and its sampling", () => {
   assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning_effort: "max" as never })), "TypeError")
 })
 
-test("a thinking budget needs a model that takes one, and is dropped with thinking off", () => {
-  assert.equal(planCompletion({ model: QWEN, messages: hi, thinking_budget_tokens: 64 }).generate.thinkingBudgetTokens, 64)
+test("a thinking budget (reasoning.max_tokens) needs a model that takes one, turns thinking on, and is dropped with thinking off", () => {
+  const budgeted = planCompletion({ model: QWEN, messages: hi, reasoning: { max_tokens: 64 } }).generate
+  assert.equal(budgeted.thinkingBudgetTokens, 64)
+  assert.equal(budgeted.thinking, true)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning: { effort: "high", max_tokens: 64 } }).generate.thinkingBudgetTokens, 64)
   assert.equal(
-    "thinkingBudgetTokens" in planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none", thinking_budget_tokens: 64 }).generate,
+    "thinkingBudgetTokens" in planCompletion({ model: QWEN, messages: hi, reasoning: { effort: "none", max_tokens: 64 } }).generate,
     false
   )
-  assert.equal(code(() => planCompletion({ model: LFM2, messages: hi, thinking_budget_tokens: 64 })), "unsupported-parameter")
+  assert.equal(code(() => planCompletion({ model: LFM2, messages: hi, reasoning: { max_tokens: 64 } })), "unsupported-parameter")
+})
+
+test("reasoning.effort works as reasoning_effort; the two must agree, and other reasoning fields are refused", () => {
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning: { effort: "none" } }).generate.thinking, false)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", reasoning: { effort: "high" } }).generate.thinking, true)
+  assert.throws(() => planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none", reasoning: { effort: "high" } }), TypeError)
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning: { exclude: true } as never })), "unsupported-parameter")
+  assert.throws(() => planCompletion({ model: QWEN, messages: hi, reasoning: "high" as never }), TypeError)
 })
 
 test("unsupported OpenAI fields throw unsupported-parameter", () => {
@@ -426,7 +437,7 @@ test("planRepairs: valid calls pass; bad arguments, unknown tools and unparsed m
 })
 
 test("repairRequest appends the failed call and a note, drops stop strings and closes thinking", () => {
-  const qwen = planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, tools: [weatherTool], stop: ["END"], reasoning_effort: "high", thinking_budget_tokens: 300 })
+  const qwen = planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, tools: [weatherTool], stop: ["END"], reasoning: { effort: "high", max_tokens: 300 } })
   const draft = { name: "get_weather", args: { town: "Paris" } }
   const request = repairRequest(qwen, { index: 0, problem: "invalid-arguments", choice: { name: "get_weather" }, draft })
   // The prompt so far is kept as it was (the cache covers it).

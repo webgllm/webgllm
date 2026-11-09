@@ -111,6 +111,13 @@ export type ChatCompletionCreateParamsBase = {
   parallel_tool_calls?: boolean
   /** A hint: models that can't switch thinking off ignore "none". */
   reasoning_effort?: ReasoningEffort | null
+  /**
+   * OpenRouter's reasoning settings: `effort` as `reasoning_effort` (they
+   * must agree when both are set), and `max_tokens`, the thinking budget:
+   * thinking closes after that many tokens, then the model answers. A
+   * budget without an effort turns thinking on.
+   */
+  reasoning?: { effort?: ReasoningEffort | null; max_tokens?: number | null } | null
   /** Only 1 (or unset) is supported. */
   n?: number | null
   /** Unsupported when true. */
@@ -128,8 +135,6 @@ export type ChatCompletionCreateParamsBase = {
   top_k?: number | null
   min_p?: number | null
   repetition_penalty?: number | null
-  /** Close thinking after this many tokens, then answer. */
-  thinking_budget_tokens?: number | null
   /** False: don't reuse or keep the prompt's cache across calls. */
   cache_prompt?: boolean | null
   /**

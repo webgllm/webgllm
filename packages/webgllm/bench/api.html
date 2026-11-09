@@ -394,8 +394,7 @@
         const think = await webgllm.chat.completions.create({
           model: second,
           messages: [{ role: "user", content: "Is 391 prime? Answer yes or no." }],
-          reasoning_effort: "high",
-          thinking_budget_tokens: 256
+          reasoning: { effort: "high", max_tokens: 256 }
         })
         log("second thinking", { reasoning: (think.choices[0].message.reasoning_content ?? "").slice(0, 200), content: think.choices[0].message.content }, think.usage)
         check("thinking arrives in reasoning_content", (think.choices[0].message.reasoning_content ?? "").length > 0)
