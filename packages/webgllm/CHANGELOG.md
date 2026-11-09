@@ -1,3 +1,13 @@
+## 0.1.9 (2026-11-09)
+
+### 🩹 Fixes
+
+- **webgllm:** count the prompt's tokens in the repetition penalty, as Transformers.js does ([#5](https://github.com/webgllm/webgllm/pull/5))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.1.8 (2026-11-09)
 
 ### 🩹 Fixes
