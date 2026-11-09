@@ -1,5 +1,10 @@
 /**
- * The models this package runs: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
+ * The catalog: known defaults for models this package runs and is tuned
+ * for. Any other Hugging Face repository with a supported architecture
+ * loads too (resolve-model.ts builds its meta from the Hub); the catalog
+ * holds what the Hub can't say, such as the sampling on a model card.
+ *
+ * The models: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
  * 4-bit ONNX builds), official LFM2.5 GGUFs, the LFM2.5 / LFM2 ONNX builds
  * the Transformers.js package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
  * q4f16 ONNX), each with its files (at their latest version) and the
@@ -326,6 +331,56 @@ const LFM2_5_350M = lfm2Onnx({
   thinking: false
 })
 
+/** LFM2 1.2B Tool's card: greedy decoding (temperature 0). */
+const GREEDY = { temperature: 0, top_k: 1, repetition_penalty: 1 } as const satisfies Sampling
+
+const LFM2_1_2B_TOOL_REPO = { repo: "LiquidAI/LFM2-1.2B-Tool" }
+
+/**
+ * Liquid AI's LFM2 1.2B Tool, tuned for tool calls, in its official Q4_0
+ * GGUF; tokenizer and chat template from the original repository (the GGUF
+ * repository has none). It writes LFM2's Pythonic calls and doesn't think.
+ */
+const LFM2_1_2B_TOOL_GGUF = {
+  name: "LiquidAI/LFM2-1.2B-Tool-GGUF",
+  format: "gguf",
+  files: { kind: "gguf", model: { repo: "LiquidAI/LFM2-1.2B-Tool-GGUF", path: "LFM2-1.2B-Tool-Q4_0.gguf" } },
+  tokenizer: {
+    tokenizer: { ...LFM2_1_2B_TOOL_REPO, path: "tokenizer.json" },
+    config: { ...LFM2_1_2B_TOOL_REPO, path: "tokenizer_config.json" },
+    chatTemplate: { ...LFM2_1_2B_TOOL_REPO, path: "chat_template.jinja" }
+  },
+  supports: TOOLS,
+  size: "1.2b",
+  reasoning: undefined,
+  sampling: GREEDY,
+  toolFormat: "lfm2"
+} as const satisfies WebGlModelMeta
+
+const LFM2_1_2B_TOOL_ONNX_REPO = { repo: "onnx-community/LFM2-1.2B-Tool-ONNX" }
+
+/** The onnx-community export of LFM2 1.2B Tool (q4f16, one external data file). */
+const LFM2_1_2B_TOOL_ONNX = {
+  name: "onnx-community/LFM2-1.2B-Tool-ONNX",
+  format: "onnx",
+  files: {
+    kind: "onnx",
+    graph: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "onnx/model_q4f16.onnx" },
+    data: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "onnx/model_q4f16.onnx_data" },
+    config: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "config.json" }
+  },
+  tokenizer: {
+    tokenizer: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "tokenizer.json" },
+    config: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "tokenizer_config.json" },
+    chatTemplate: { ...LFM2_1_2B_TOOL_ONNX_REPO, path: "chat_template.jinja" }
+  },
+  supports: TOOLS,
+  size: "1.2b",
+  reasoning: undefined,
+  sampling: GREEDY,
+  toolFormat: "lfm2"
+} as const satisfies WebGlModelMeta
+
 export const WEBGL_TEXT_MODELS = [
   LFM3_1_7B_GGUF.name,
   LFM3_1_7B_ONNX.name,
@@ -336,7 +391,9 @@ export const WEBGL_TEXT_MODELS = [
   LFM2_5_1_2B_GGUF.name,
   LFM2_5_1_2B_THINKING_GGUF.name,
   QWEN_3_5_2B_GGUF.name,
-  QWEN_3_5_2B_ONNX.name
+  QWEN_3_5_2B_ONNX.name,
+  LFM2_1_2B_TOOL_GGUF.name,
+  LFM2_1_2B_TOOL_ONNX.name
 ] as const
 
 /** A model this package runs. */
@@ -357,14 +414,53 @@ export const WEBGL_MODEL_META = {
   [LFM2_5_1_2B_GGUF.name]: LFM2_5_1_2B_GGUF,
   [LFM2_5_1_2B_THINKING_GGUF.name]: LFM2_5_1_2B_THINKING_GGUF,
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
-  [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX
+  [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX,
+  [LFM2_1_2B_TOOL_GGUF.name]: LFM2_1_2B_TOOL_GGUF,
+  [LFM2_1_2B_TOOL_ONNX.name]: LFM2_1_2B_TOOL_ONNX
 } as const satisfies Readonly<Record<WebGlTextModel, WebGlModelMeta>>
 
 /** A model's reasoning, exactly: its levels, or undefined for a model that doesn't think. */
 export type WebGlModelReasoning<Model extends WebGlTextModel> = (typeof WEBGL_MODEL_META)[Model]["reasoning"]
 
-export const modelMeta = (model: WebGlTextModel): WebGlModelMeta =>
-  WEBGL_MODEL_META[model]
+/**
+ * A model id: a catalog model (autocompleted), or any Hugging Face repository
+ * (`owner/name`) with a supported architecture, resolved from the Hub.
+ */
+export type WebGlModelId = WebGlTextModel | (string & {})
+
+/** Models resolved from the Hub in this thread (see resolve-model.ts), by name. */
+const resolved = new Map<string, WebGlModelMeta>()
+
+/** Whether `model` is in the catalog. */
+export const isCatalogModel = (model: unknown): model is WebGlTextModel =>
+  typeof model === "string" && Object.hasOwn(WEBGL_MODEL_META, model)
+
+/** A model's meta: the catalog's, or one resolved earlier in this thread; undefined otherwise. */
+export function knownModelMeta(model: string): WebGlModelMeta | undefined {
+  return isCatalogModel(model) ? WEBGL_MODEL_META[model] : resolved.get(model)
+}
+
+/** Keeps a model's resolved meta for the sync lookups (modelMeta) of this thread. */
+export function rememberModel(meta: WebGlModelMeta) {
+  if (!isCatalogModel(meta.name)) resolved.set(meta.name, meta)
+}
+
+/** Forgets resolved models, as a page reload does (for tests). */
+export const forgetResolvedModels = () => resolved.clear()
+
+/** Every model this thread knows: the catalog's, then those resolved since. */
+export const knownModels = (): Array<string> => [...WEBGL_TEXT_MODELS, ...resolved.keys()]
+
+/**
+ * A model's meta, for code that runs after the model was resolved
+ * (resolveModel): the catalog's or the resolved one. Throws for a model
+ * that wasn't.
+ */
+export function modelMeta(model: string): WebGlModelMeta {
+  const meta = knownModelMeta(model)
+  if (!meta) throw new Error(`${model} wasn't resolved before its meta was read.`)
+  return meta
+}
 
 /** Where a file downloads from: its latest version (main) on Hugging Face. */
 export const fileUrl = (file: ModelFile) =>

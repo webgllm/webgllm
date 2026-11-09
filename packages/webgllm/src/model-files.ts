@@ -6,8 +6,8 @@
  */
 import { blobSource } from "./byte-source.js"
 import { fileUrl, modelMeta } from "./model-meta.js"
-import type { ModelFile, WebGlModelMeta, WebGlTextModel } from "./model-meta.js"
-import { diskName, isOldVersion, storedFile } from "./storage.js"
+import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
+import { diskName, isOldVersion, readManifest, removeManifest, storedFile, storedManifests } from "./storage.js"
 import type { ByteSource } from "./weights.js"
 
 /** Every file a model loads: tokenizer, chat template and weights (as the worker fetches them). */
@@ -25,13 +25,17 @@ export function modelFiles(meta: WebGlModelMeta): Array<ModelFile> {
 /** The storage questions the pool asks (a fake one in tests). */
 export type ModelStorage = {
   /** Whether all the model's files are in storage: storage only, no network request. */
-  downloaded: (model: WebGlTextModel) => Promise<boolean>
+  downloaded: (model: string) => Promise<boolean>
   /** Bytes to download, all files together; 0 when unknown. */
-  size: (model: WebGlTextModel) => Promise<number>
+  size: (model: string) => Promise<number>
   /** The model's own context length; 0 when it can't be read. */
-  contextLength: (model: WebGlTextModel) => Promise<number>
-  /** Removes the model's files (not ones `keep` still uses). */
-  remove: (model: WebGlTextModel, keep: Set<string>) => Promise<void>
+  contextLength: (model: string) => Promise<number>
+  /** A downloaded model's stored meta (outside the catalog), if there is one. */
+  manifest: (model: string) => Promise<WebGlModelMeta | undefined>
+  /** Every stored meta: the downloaded models outside the catalog. */
+  manifests: () => Promise<Array<WebGlModelMeta>>
+  /** Removes the model's files (not ones `keep` still uses), and its stored meta. */
+  remove: (model: string, keep: Set<string>) => Promise<void>
 }
 
 const fileKey = (file: ModelFile) => `${file.repo}/${file.path}`
@@ -225,7 +229,11 @@ export const browserStorage: ModelStorage = {
     }
     return length
   },
+  manifest: readManifest,
+  manifests: storedManifests,
   async remove(model, keep) {
+    // The meta first: a model without it isn't counted as downloaded by a later page.
+    await removeManifest(model)
     let dir: FileSystemDirectoryHandle
     try {
       dir = await folder()

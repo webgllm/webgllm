@@ -13,6 +13,7 @@ exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-ONNX">, { readonl
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Thinking-GGUF">, { readonly levels: { readonly high: "true" }; readonly budget: true }>>(true)
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-350M-GGUF">, undefined>>(true)
 exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2.5-1.2B-Instruct-ONNX">, undefined>>(true)
+exact<Equal<WebGlModelReasoning<"LiquidAI/LFM2-1.2B-Tool-GGUF">, undefined>>(true)
 // Model names stay a union of literals, not string.
 exact<Equal<string extends WebGlTextModel ? true : false, false>>(true)
 
@@ -20,7 +21,7 @@ test("the catalog's runtime reasoning matches its types", () => {
   for (const model of WEBGL_TEXT_MODELS) {
     const reasoning = WEBGL_MODEL_META[model].reasoning
     if (model.includes("Thinking")) assert.deepEqual(reasoning, { levels: { high: "true" }, budget: true })
-    else if (model.includes("LFM2.5")) assert.equal(reasoning, undefined)
+    else if (/LFM2[.-]/.test(model)) assert.equal(reasoning, undefined)
     else assert.deepEqual(reasoning, { levels: { off: "false", high: "true" }, budget: true })
   }
 })

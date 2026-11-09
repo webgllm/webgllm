@@ -86,9 +86,13 @@ export async function* loadOnnx(
     options.graph instanceof Uint8Array
       ? options.graph
       : await options.graph.read(0, options.graph.size)
-  const graph = parseOnnxModel(graphBytes)
-  const model = new OnnxModel(graph)
-  const config = onnxConfig(options.config, model)
+  const plan = new ReadPlan()
+  const { config, layers, finalNorm, emb, chunkRows } = planOnnx(
+    graphBytes,
+    options.config,
+    options.embeddingChunkRows ?? 2048,
+    (read) => plan.add({ ...read, source: data })
+  )
   yield { kind: "config", config }
 
   const {
@@ -99,67 +103,6 @@ export async function* loadOnnx(
     headDim,
     numLayers
   } = config
-
-  // Check the graph against what the layout assumes, and find the fused parts.
-  const layers = config.layerTypes.map((type, i) =>
-    model.layerPlan(i, type, config)
-  )
-
-  const plan = new ReadPlan()
-  const want = (t: OnnxTensor | null) => {
-    if (!t) return
-    const length = tensorBytes(t)
-    if (t.raw) {
-      if (t.raw.length !== length)
-        throw new Error(
-          `ONNX: ${t.name} has ${t.raw.length} bytes, expected ${length}`
-        )
-      plan.add({ key: t.name, source: data, offset: 0, length, bytes: t.raw })
-      return
-    }
-    if (!t.external) throw new Error(`ONNX: ${t.name} has no data`)
-    if (t.external.length !== length)
-      throw new Error(
-        `ONNX: ${t.name} has ${t.external.length} bytes, expected ${length}`
-      )
-    plan.add({ key: t.name, source: data, offset: t.external.offset, length })
-  }
-  const wantNBits = (w: NBits) => {
-    want(w.quant)
-    want(w.scales)
-    want(w.zp)
-  }
-  // In the order the layer code below takes them: norms, operator matrices,
-  // conv kernel or q/k norms, MLP matrices.
-  for (const l of layers) {
-    for (const t of l.norms) want(t)
-    for (const w of l.matrices.slice(0, -3)) wantNBits(w)
-    for (const t of l.extra) want(t)
-    for (const w of l.matrices.slice(-3)) wantNBits(w)
-  }
-  const finalNorm = model.finalNorm()
-  want(finalNorm)
-
-  const emb = model.embedding(D)
-  const chunkRows = options.embeddingChunkRows ?? 2048
-  const blocks = D / 32
-  const zpStride = Math.ceil(blocks / 2)
-  for (let r = 0; r < emb.N; r += chunkRows) {
-    const rows = Math.min(chunkRows, emb.N - r)
-    const ext = (t: OnnxTensor, rowBytes: number, key: string) => {
-      if (!t.external)
-        throw new Error(`ONNX: ${t.name} is expected in the external data file`)
-      plan.add({
-        key: `${key}@${r}`,
-        source: data,
-        offset: t.external.offset + r * rowBytes,
-        length: rows * rowBytes
-      })
-    }
-    ext(emb.quant, blocks * 16, "quant")
-    ext(emb.scales, blocks * 2, "scales")
-    if (emb.zp) ext(emb.zp, zpStride, "zp")
-  }
 
   const floats = async (
     t: OnnxTensor,
@@ -294,10 +237,6 @@ export async function* loadOnnx(
       const oW = l.matrices[l.gateWeight ? 4 : 3]
       const qRows = numHeads * headDim
       const kv = numKvHeads * headDim
-      if (kW.N !== kv || vW.N !== kv)
-        throw new Error(
-          `ONNX: layer ${i} k/v projections have ${kW.N}/${vW.N} rows`
-        )
       const gateTo = qRows + 2 * kv
       // Qwen3.5's q_proj: each head's q rows, then its gate rows.
       const perHead = config.gatePerDim
@@ -329,8 +268,6 @@ export async function* loadOnnx(
       attention = { qkvg, o, qNorm, kNorm }
     }
     const [gateW, upW, downW] = l.matrices.slice(-3) as [NBits, NBits, NBits]
-    if (gateW.N !== F || upW.N !== F || downW.K !== F)
-      throw new Error(`ONNX: layer ${i} MLP shapes don't match`)
     const gateUp = await matrix([whole(gateW), whole(upW, F)])
     const down = await matrix([whole(downW)])
     const value: LayerWeights = {
@@ -360,6 +297,111 @@ export async function* loadOnnx(
     packMatMulNBits(m, 0, quant, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
   }
+}
+
+/** A read the loader will make: from the external data file at `location`, or inline bytes. */
+type OnnxRead = { key: string; location: string; offset: number; length: number; bytes?: Uint8Array }
+
+/**
+ * Checks the graph against what the loader takes (4-bit MatMulNBits with
+ * blocks of 32, the layer layout, the config's shapes) and lists every read
+ * the load makes, in order, without reading the external data.
+ */
+function planOnnx(
+  graphBytes: Uint8Array,
+  configJson: unknown,
+  chunkRows: number,
+  add: (read: OnnxRead) => void
+) {
+  const graph = parseOnnxModel(graphBytes)
+  const model = new OnnxModel(graph)
+  const config = onnxConfig(configJson, model)
+  const D = config.hiddenSize
+  const F = config.intermediateSize
+  const kv = config.numKvHeads * config.headDim
+
+  // Check the graph against what the layout assumes, and find the fused parts.
+  const layers = config.layerTypes.map((type, i) =>
+    model.layerPlan(i, type, config)
+  )
+  layers.forEach((l, i) => {
+    if (l.type !== "conv" && l.type !== "linear_attention") {
+      const [, kW, vW] = l.matrices as [NBits, NBits, NBits]
+      if (kW.N !== kv || vW.N !== kv)
+        throw new Error(`ONNX: layer ${i} k/v projections have ${kW.N}/${vW.N} rows`)
+    }
+    const [gateW, upW, downW] = l.matrices.slice(-3) as [NBits, NBits, NBits]
+    if (gateW.N !== F || upW.N !== F || downW.K !== F)
+      throw new Error(`ONNX: layer ${i} MLP shapes don't match`)
+  })
+
+  const want = (t: OnnxTensor | null) => {
+    if (!t) return
+    const length = tensorBytes(t)
+    if (t.raw) {
+      if (t.raw.length !== length)
+        throw new Error(
+          `ONNX: ${t.name} has ${t.raw.length} bytes, expected ${length}`
+        )
+      add({ key: t.name, location: "", offset: 0, length, bytes: t.raw })
+      return
+    }
+    if (!t.external) throw new Error(`ONNX: ${t.name} has no data`)
+    if (t.external.length !== length)
+      throw new Error(
+        `ONNX: ${t.name} has ${t.external.length} bytes, expected ${length}`
+      )
+    add({ key: t.name, location: t.external.location, offset: t.external.offset, length })
+  }
+  const wantNBits = (w: NBits) => {
+    want(w.quant)
+    want(w.scales)
+    want(w.zp)
+  }
+  // In the order the layer code takes them: norms, operator matrices,
+  // conv kernel or q/k norms, MLP matrices.
+  for (const l of layers) {
+    for (const t of l.norms) want(t)
+    for (const w of l.matrices.slice(0, -3)) wantNBits(w)
+    for (const t of l.extra) want(t)
+    for (const w of l.matrices.slice(-3)) wantNBits(w)
+  }
+  const finalNorm = model.finalNorm()
+  want(finalNorm)
+
+  const emb = model.embedding(D)
+  const blocks = D / 32
+  const zpStride = Math.ceil(blocks / 2)
+  for (let r = 0; r < emb.N; r += chunkRows) {
+    const rows = Math.min(chunkRows, emb.N - r)
+    const ext = (t: OnnxTensor, rowBytes: number, key: string) => {
+      if (!t.external)
+        throw new Error(`ONNX: ${t.name} is expected in the external data file`)
+      add({
+        key: `${key}@${r}`,
+        location: t.external.location,
+        offset: t.external.offset + r * rowBytes,
+        length: rows * rowBytes
+      })
+    }
+    ext(emb.quant, blocks * 16, "quant")
+    ext(emb.scales, blocks * 2, "scales")
+    if (emb.zp) ext(emb.zp, zpStride, "zp")
+  }
+  return { config, layers, finalNorm, emb, chunkRows }
+}
+
+/**
+ * Whether the loader takes this graph (with this config.json), reading only
+ * the graph: throws the loader's own error if not, else returns the
+ * external data files its weights are in (their `location`s).
+ */
+export function checkOnnxGraph(graphBytes: Uint8Array, configJson: unknown): { dataFiles: Array<string> } {
+  const files = new Set<string>()
+  planOnnx(graphBytes, configJson, Number.MAX_SAFE_INTEGER, (read) => {
+    if (!read.bytes) files.add(read.location)
+  })
+  return { dataFiles: [...files] }
 }
 
 function tensorBytes(t: OnnxTensor): number {

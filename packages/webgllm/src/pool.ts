@@ -11,7 +11,6 @@ import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js
 import { monitorFrames } from "./frame-pacing.js"
 import type { ModelStorage } from "./model-files.js"
 import { MemoryBudget } from "./model-memory.js"
-import type { WebGlTextModel } from "./model-meta.js"
 import type { LoadProgress, ModelUnloadReason, WebGLLMEventMap } from "./openai.js"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 
@@ -42,7 +41,7 @@ export type ModelEvent = {
 }[Exclude<keyof WebGLLMEventMap, "progress">]
 
 type Entry = {
-  model: WebGlTextModel
+  model: string
   worker: ModelWorker
   keepLoaded: boolean
   /** Callers waiting on its load: the last to abort stops the load. */
@@ -142,7 +141,7 @@ export class ModelPool {
    * it loads again.
    */
   async load(
-    model: WebGlTextModel,
+    model: string,
     options: {
       contextLength?: number
       keepLoaded?: boolean
@@ -183,7 +182,7 @@ export class ModelPool {
   }
 
   /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
-  private unloadMark(model: string): number {
+  unloadMark(model: string): number {
     return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
   }
 
@@ -213,12 +212,13 @@ export class ModelPool {
    * for `contextLength`: a generation's load.
    */
   async ensureLoaded(
-    model: WebGlTextModel,
+    model: string,
     contextLength: number | undefined,
     onProgress: ProgressListener | undefined,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    /** unloadMark when the caller started waiting (before resolving the model, say). */
+    since = this.unloadMark(model)
   ): Promise<Entry> {
-    const since = this.unloadMark(model)
     for (;;) {
       const entry = this.entries.get(model)
       if (entry?.evicting) {
@@ -296,7 +296,7 @@ export class ModelPool {
    * they're there, whatever a load of it meanwhile does on the GPU.
    */
   async download(
-    model: WebGlTextModel,
+    model: string,
     options: { onProgress?: ProgressListener; signal?: AbortSignal } = {}
   ): Promise<void> {
     const { onProgress, signal } = options
@@ -341,7 +341,7 @@ export class ModelPool {
    * matter), else storage has them, else a worker of the download's own
    * fetches them.
    */
-  private async fetchFiles(model: WebGlTextModel, download: Download): Promise<void> {
+  private async fetchFiles(model: string, download: Download): Promise<void> {
     const { signal } = download.abort
     const entry = this.entries.get(model)
     const loading = entry?.worker.loadPromise
@@ -393,7 +393,7 @@ export class ModelPool {
    * when the worker ends it; aborting `signal` stops it.
    */
   async generate(
-    model: WebGlTextModel,
+    model: string,
     fields: GenerateFields,
     options: {
       contextLength?: number
@@ -422,7 +422,7 @@ export class ModelPool {
     }, signal)
   }
 
-  private spawn(model: WebGlTextModel): Entry {
+  private spawn(model: string): Entry {
     const entry: Entry = {
       model,
       keepLoaded: false,

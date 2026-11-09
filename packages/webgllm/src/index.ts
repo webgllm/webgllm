@@ -17,6 +17,7 @@
  */
 export { WebGLLM } from "./webgllm.js"
 export type { DownloadModelOptions, LoadModelOptions, LogLevel, RequestOptions, WebGLLMOptions } from "./webgllm.js"
+export type { WebGlModelId } from "./model-meta.js"
 export { WebGLLMError } from "./errors.js"
 export type { WebGLLMErrorCode } from "./errors.js"
 export type {
