@@ -102,8 +102,8 @@ index plus a delta (max(gh, gw) − gh · gw per image before it).
 - **Text speed and memory unchanged** (`webgl-perf.html?worker=`, the two
   builds alternated, each tuning from scratch, layout fixed): Qwen3.5 2B
   prompt 1904 / 1983 tok/s before, 1960 / 1998 after, writing 90.1 / 90.8
-  before, 90.3 / 90.6 after; 0.8B prompt 4045 before, 3896 / 4103 after,
-  writing 74.9 before, 76.8 / 76.7 after; painted frames the same.
+  before, 90.3 / 90.6 after; 0.8B prompt 4045 / 4180 before, 3896 / 4103 after,
+  writing 74.9 / 77.3 before, 76.8 / 76.7 after; painted frames the same.
   `mem.html` over an 8k chat: the same textures at every checkpoint (0.8B:
   866.0 MiB loaded to 1016.4 MiB at 8,120 tokens; nothing is allocated for
   images until a prompt has one).
