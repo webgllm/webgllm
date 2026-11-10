@@ -138,7 +138,7 @@ export type WorkerRequest =
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
   /** The page made room for the model (see "claim"): the worker loads it. */
   | { type: "claimed" }
-  /** Engine tuning knobs (see TUNING in engine.ts): for benchmarks, and setPromptBatch. */
+  /** Engine tuning knobs (see TUNING in engine.ts): for benchmarks. */
   | { type: "tune"; values: Record<string, number> }
 
 export type WorkerResponse =

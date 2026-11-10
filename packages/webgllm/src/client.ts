@@ -53,10 +53,6 @@ type Load = Pending<void> & {
   previous?: Load
 }
 
-/** Engine knobs every new worker starts with (see setPromptBatch). */
-const tuning: Record<string, number> = {}
-const live = new Set<ModelWorker>()
-
 /** The bundled worker. Written out here so bundlers see the `new URL(…, import.meta.url)`. */
 export const defaultWorker = () =>
   new Worker(new URL("./worker.js", import.meta.url), { type: "module", name: "webgllm" })
@@ -98,8 +94,6 @@ export class ModelWorker {
   ) {
     worker.addEventListener("message", this.onMessage)
     worker.addEventListener("error", this.onError)
-    live.add(this)
-    if (Object.keys(tuning).length) this.post({ type: "tune", values: { ...tuning } })
   }
 
   get loading(): boolean {
@@ -247,7 +241,6 @@ export class ModelWorker {
     }
     this.gone = reason
     this.ready = false
-    live.delete(this)
     this.load?.reject(reason)
     this.load = null
     this.downloading?.reject(reason)
@@ -359,19 +352,6 @@ export class ModelWorker {
         break
     }
   }
-}
-
-/**
- * Prompt tokens per forward batch from each model's next load on
- * (undefined: the default, 512 on every device). Smaller batches take less
- * memory and read prompts slower: 128 holds Qwen3.5 2B's 8k-token chats in
- * ~270 MiB less (an iPhone page has ~2 GB), at about half the prompt speed.
- * A loaded model keeps its batch until it loads again.
- */
-export function setPromptBatch(tokens: number | undefined) {
-  if (tokens === undefined) delete tuning.promptBatch
-  else tuning.promptBatch = tokens
-  for (const worker of live) worker.post({ type: "tune", values: { promptBatch: tokens ?? 0 } })
 }
 
 /**
