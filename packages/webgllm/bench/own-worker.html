@@ -19,7 +19,11 @@
       out.textContent += line + "\n"
       fetch("/log", { method: "POST", body: line }).catch(() => {})
     }
-    const check = (name, ok, detail) => log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    let failed = 0
+    const check = (name, ok, detail) => {
+      if (!ok) failed++
+      log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    }
     const params = new URLSearchParams(location.search)
     const model = params.get("model") ?? "LiquidAI/LFM2.5-350M-GGUF"
     const second = params.get("second")
@@ -46,7 +50,10 @@
     }
 
     try {
-      await run("webgllm's worker", new WebGLLM())
+      const own = new WebGLLM()
+      await run("webgllm's worker", own)
+      // Freed before the next phase loads the model again in another worker.
+      await own.unloadModel()
 
       const worker = new Worker("/bundle/bench/own-worker.js", { type: "module", name: "own" })
       // The page's own use of its worker goes on beside webgllm's: every message webgllm's handler sends reaches it too.
@@ -55,6 +62,12 @@
       const webgllm = new WebGLLM({ worker })
       const events = await run("own worker", webgllm)
       check("own worker: its messages reach the page's own listener too", seen > 0, seen)
+      // The page's own message to its worker and back, with the model loaded: webgllm takes neither for its own.
+      const pong = new Promise((resolve) => worker.addEventListener("message", (e) => e.data?.type === "pong" && resolve(e.data.model)))
+      worker.postMessage({ type: "ping", model })
+      const echoed = await Promise.race([pong, new Promise((resolve) => setTimeout(() => resolve("no answer"), 5000))])
+      const after = await ask(webgllm)
+      check("own worker: the page's own messages go round beside a loaded model", echoed === model && (await webgllm.models.retrieve(model)).loaded && /paris/i.test(after.choices[0].message.content ?? ""), echoed)
       if (second) {
         const other = await ask(webgllm, second)
         const loaded = (await webgllm.models.list()).filter((m) => m.loaded).map((m) => m.id)
@@ -65,7 +78,8 @@
       await webgllm.loadModel(model)
       check("own worker: still running after every model is unloaded", (await webgllm.models.retrieve(model)).loaded, events)
       await webgllm.unloadModel()
-      log("ALL DONE")
+      if (failed) log(`ERROR ${failed} check${failed === 1 ? "" : "s"} failed`)
+      else log("ALL DONE")
     } catch (error) {
       log("ERROR", String(error?.stack ?? error))
     }

@@ -71,21 +71,53 @@ const post = (message: WorkerResponse) => postMessage(message)
 export class WebGLLMWorkerHandler {
   /** A message from the page: `self.onmessage = (event) => handler.onmessage(event)`. */
   onmessage(event: { data: unknown }): void {
-    receive(event.data as WorkerRequest)
+    // The worker's own messages come this way too: only webgllm's are taken.
+    if (isRequest(event.data)) receive(event.data)
   }
 }
 
-/** Claims the page hasn't answered yet, oldest first (it answers in order). */
-const claims: Array<() => void> = []
+const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
+  "load", "generate", "stop", "unload", "download", "frames", "claimed", "tune"
+])
+
+/** Whether a message is one of the page's requests (by its type, and the fields every handler reads first). */
+function isRequest(data: unknown): data is WorkerRequest {
+  if (typeof data !== "object" || data === null) return false
+  const { type, model, id } = data as { type?: unknown; model?: unknown; id?: unknown }
+  if (typeof type !== "string" || !REQUESTS.has(type)) return false
+  if (type === "load" || type === "generate" || type === "unload" || type === "download") {
+    if (typeof model !== "string") return false
+  }
+  if (type === "generate" || type === "stop" || type === "download") return typeof id === "string"
+  if (type === "claimed" || type === "unload") return typeof id === "number"
+  return true
+}
+
+/** Claims the page hasn't answered yet, by id. */
+const claims = new Map<number, { model: string; resolve: () => void }>()
+let claimIds = 0
+/** Models asked to unload and not freed yet: they claim nothing more (the page has stopped listening). */
+const leaving = new Set<string>()
 
 /**
  * Asks the page to make room for the model's `bytes` (in place of what it
- * claimed before), and waits until it has.
+ * claimed before), and waits until it has. Resolves at once, asking
+ * nothing, if `signal` (its load's or generation's) has aborted or the
+ * model is being unloaded, and when either happens while it waits: the
+ * caller checks its signal after.
  */
-function claimMemory(model: string, bytes: number) {
+function claimMemory(model: string, bytes: number, signal?: AbortSignal) {
+  if (signal?.aborted || leaving.has(model)) return Promise.resolve()
   return new Promise<void>((resolve) => {
-    claims.push(resolve)
-    post({ type: "claim", model, bytes: Math.round(bytes) })
+    const id = ++claimIds
+    const settle = () => {
+      claims.delete(id)
+      signal?.removeEventListener("abort", settle)
+      resolve()
+    }
+    claims.set(id, { model, resolve: settle })
+    signal?.addEventListener("abort", settle, { once: true })
+    post({ type: "claim", id, model, bytes: Math.round(bytes) })
   })
 }
 
@@ -316,7 +348,9 @@ async function load(
     // memory budget. An estimate until it's loaded (then the textures it
     // took): the weights, the cache and the working textures.
     const weightBytes = weightFiles.reduce((sum, f) => sum + f.size, 0)
-    await claimMemory(model, weightBytes * TEXTURES_PER_FILE_BYTE)
+    if (signal.aborted) throw new Superseded()
+    await claimMemory(model, weightBytes * TEXTURES_PER_FILE_BYTE, signal)
+    if (signal.aborted) throw new Superseded()
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
       tokenizerConfig: JSON.parse(await tokenizerConfigFile.text()) as Record<
@@ -480,7 +514,7 @@ async function load(
       engine.gpu.primePresentation(window, Math.max(TUNING.submissionReads, Math.round(pacing.reads * scale)))
     }
     // What it took, in place of the estimate.
-    await claimMemory(model, engine.gpu.bytes)
+    await claimMemory(model, engine.gpu.bytes, signal)
     if (signal.aborted) throw new Superseded()
     if (measured && JSON.stringify(measured) !== JSON.stringify(checkedNote))
       void writeGpuNote(noteKey, measured)
@@ -569,7 +603,8 @@ function startLoad(
  * the page asks of a worker it didn't start (one it started, it ends). The
  * loaded model goes after the generations asked for before this.
  */
-function unload(model: string) {
+function unload(model: string, id: number) {
+  leaving.add(model)
   if (loading?.model === model) {
     const ended = loading.promise.catch(() => undefined)
     stopping = ended
@@ -581,11 +616,17 @@ function unload(model: string) {
     loading = null
   }
   // The page has stopped listening to this model: nothing answers its claims.
-  for (const resolve of claims.splice(0)) resolve()
-  queue = queue.then(() => {
-    if (current?.model !== model) return
-    release(current.engine)
-    current = null
+  for (const claim of [...claims.values()]) if (claim.model === model) claim.resolve()
+  const stopped = stopping
+  queue = queue.then(async () => {
+    if (current?.model === model) {
+      release(current.engine)
+      current = null
+    }
+    // A load of it that was stopped has freed its textures once it ends.
+    await stopped
+    leaving.delete(model)
+    post({ type: "unloaded", id })
   })
 }
 
@@ -593,13 +634,19 @@ function unload(model: string) {
  * Downloads `model`'s files to storage without loading it: no GL context,
  * so a worker spawned just for this works where WebGL 2 doesn't.
  */
-async function downloadModel(model: string) {
+async function downloadModel(model: string, id: string) {
+  // Its "stop" aborts it; a load or another download of the same files goes on (see shared-download.ts).
+  const signal = abortFor(id)
   try {
-    const { cached } = await fetchFiles(model, new AbortController().signal, 1)
+    const { cached } = await fetchFiles(model, signal, 1)
     post({ type: "progress", model, progress: 1, cached })
-    post({ type: "downloaded", model })
+    post({ type: "downloaded", model, id })
   } catch (error) {
-    post({ type: "download-error", model, message: errorMessage(error), code: errorCode(error) })
+    // (Stopped: sent once the files' writers have closed.)
+    post({ type: "download-error", model, id, message: errorMessage(error), code: errorCode(error) })
+  } finally {
+    stopped.delete(id)
+    aborts.delete(id)
   }
 }
 
@@ -725,7 +772,8 @@ async function encodeImages(model: Loaded, images: Array<{ start: number; image:
   )
   const encoder = new VisionEncoder(engine.gpu)
   try {
-    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config) + work)
+    signal.throwIfAborted()
+    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config) + work, signal)
     signal.throwIfAborted()
     await encoder.load(loadVision({ graph: graphBytes, data: blobSource(data) }), signal)
     if (encoder.config.outWidth !== engine.config.hiddenSize)
@@ -1348,7 +1396,7 @@ function receive(data: WorkerRequest) {
       data.meanMs
     )
   } else if (data.type === "claimed") {
-    claims.shift()?.()
+    claims.get(data.id)?.resolve()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
   } else if (data.type === "load") {
@@ -1377,11 +1425,11 @@ function receive(data: WorkerRequest) {
     stopped.add(data.id)
     aborts.get(data.id)?.abort()
   } else if (data.type === "unload") {
-    unload(data.model)
+    unload(data.model, data.id)
   } else if (data.type === "download") {
     if (data.meta) rememberModel(data.meta)
-    void downloadModel(data.model)
-  } else {
+    void downloadModel(data.model, data.id)
+  } else if (data.type === "generate") {
     queue = queue
       .then(() => generate(data))
       .catch((error: unknown) => {

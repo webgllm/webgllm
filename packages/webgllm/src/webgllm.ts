@@ -220,10 +220,11 @@ export class WebGLLM {
   /**
    * Unloads `model`, or every model, freeing its GPU memory; its running
    * generation fails. webgllm's own worker for the model ends; a worker of
-   * your own (`worker`) frees the model and stays running.
+   * your own (`worker`) frees the model and stays running. Resolves, after
+   * the model's "unload" event, once the memory is free.
    */
   async unloadModel(model?: WebGlModelId): Promise<void> {
-    this.pool.unload(model)
+    await this.pool.unload(model)
   }
 
   /**
@@ -277,10 +278,18 @@ class Completions {
     if (named !== undefined && !knownModelMeta(named)) await resolveModel(named, signal)
     const plan = planCompletion(body)
     if (!this.pool.isLoaded(plan.model)) this.llm.checkSupport()
-    // Loaded before the call resolves, so load failures reject it.
-    await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
-    const meta = { id: randomId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
-    return plan.stream ? this.stream(plan, meta, options) : this.complete(plan, meta, options)
+    // In a worker of the caller's (one model): its turn, from this load to its last token.
+    const end = await this.pool.turn(signal)
+    try {
+      // Loaded before the call resolves, so load failures reject it.
+      await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
+      const meta = { id: randomId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
+      if (plan.stream) return this.stream(plan, meta, options, end)
+      return await this.complete(plan, meta, options).finally(end)
+    } catch (error) {
+      end()
+      throw error
+    }
   }
 
   private async complete(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions): Promise<ChatCompletion> {
@@ -343,7 +352,7 @@ class Completions {
    * The chunks as the worker writes the reply. The generation starts at
    * once; chunks wait for the reader. Leaving the loop early stops it.
    */
-  private stream(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions): AsyncIterable<ChatCompletionChunk> {
+  private stream(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions, end: () => void): AsyncIterable<ChatCompletionChunk> {
     const reader = readerFor(plan)
     const writer = createChunkWriter(meta)
     const stop = new AbortController()
@@ -397,6 +406,7 @@ class Completions {
       )
       .finally(() => {
         finished = true
+        end()
         signal?.removeEventListener("abort", onAbort)
         notify()
       })
@@ -496,7 +506,8 @@ class Models {
   async delete(model: WebGlModelId): Promise<void> {
     const id = await resolved(model)
     await this.llm.unloadModel(id)
-    this.pool.cancelDownload(id)
+    // (Nothing writes its files any more once this resolves.)
+    await this.pool.cancelDownload(id)
     // Files another downloaded or loaded model also reads stay.
     const keep = new Set<string>()
     for (const other of await this.allModels()) {

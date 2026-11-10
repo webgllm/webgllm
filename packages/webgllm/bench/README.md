@@ -64,7 +64,7 @@ For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html
 
 ## own-worker.html: webgllm's worker and a worker of the page's own
 
-The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`.
+The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded, and must leave the page's own messages to that worker alone. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`, or `ERROR` if a check failed.
 
 ## q4-matmul.html: the first kernel
 

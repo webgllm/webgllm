@@ -109,6 +109,12 @@ export class ModelPool {
   /** Unloads asked for, by model and for every model: a load waiting meanwhile stops (see unloadMark). */
   private readonly unloads = new Map<string, number>()
   private unloadsOfAll = 0
+  /** Models dropped from the caller's worker that it hasn't freed yet: their memory is held, and no load starts, until it has. */
+  private readonly freeing = new Set<Promise<void>>()
+  /** Downloads stopped in the caller's worker whose files aren't closed yet, by model. */
+  private readonly closing = new Map<string, Promise<void>>()
+  /** The caller's worker's completions, one at a time from load to last token (see turn). */
+  private turns: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: PoolOptions) {
     this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
@@ -173,8 +179,10 @@ export class ModelPool {
     this.throwIfUnloaded(model, since)
     // The caller's worker holds one model: the one there leaves first, as one
     // evicted for room does (kept loaded or not), and the last load asked for wins.
-    while (!entry && this.options.worker && this.entries.size) {
+    while (!entry && this.options.worker && (this.entries.size || this.freeing.size)) {
       for (const other of [...this.entries.values()]) await abortable(this.evict(other.model, signal), signal)
+      // (Evicted or unloaded: until the worker has freed it.)
+      await abortable(Promise.all(this.freeing), signal)
       throwIfAborted(signal)
       this.throwIfUnloaded(model, since)
       entry = this.entries.get(model)
@@ -292,8 +300,13 @@ export class ModelPool {
     this.options.onModelEvent?.({ type: "load", model: entry.model, contextLength })
   }
 
-  /** Unloads `model`, or every model; their running generations fail with "model-not-loaded". */
-  unload(model?: string) {
+  /**
+   * Unloads `model`, or every model; their running generations fail with
+   * "model-not-loaded" at once. Resolves once their GPU memory is free: at
+   * once for webgllm's own workers (they're ended), and for the caller's
+   * worker when it says it has freed the model.
+   */
+  async unload(model?: string): Promise<void> {
     // Loads still waiting (for a download or an eviction of it) have no
     // entry to drop: they see this and stop.
     if (model === undefined) this.unloadsOfAll++
@@ -301,6 +314,29 @@ export class ModelPool {
     for (const entry of [...this.entries.values()]) {
       if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }
+    // (One being freed already, by an earlier unload or an eviction, too.)
+    await Promise.all(this.freeing)
+  }
+
+  /**
+   * A completion's turn in the caller's worker, which holds one model: from
+   * before its load to its last token, so a completion for another model
+   * can't replace this one's between its load and its generation. Resolves
+   * to what ends the turn. With webgllm's own workers (a model each) there
+   * are no turns.
+   */
+  async turn(signal?: AbortSignal): Promise<() => void> {
+    if (!this.options.worker) return () => undefined
+    const before = this.turns
+    let end!: () => void
+    this.turns = new Promise<void>((resolve) => (end = resolve))
+    try {
+      await abortable(before, signal)
+    } catch (error) {
+      void before.then(end)
+      throw error
+    }
+    return end
   }
 
   /**
@@ -326,8 +362,7 @@ export class ModelPool {
         listeners: new Set()
       }
       created.promise = this.fetchFiles(model, created).finally(() => {
-        created.worker?.terminate(new Error("The download ended."))
-        if (this.downloads.get(model) === created) this.downloads.delete(model)
+        this.endDownload(model, created, new Error("The download ended."))
       })
       created.promise.catch(() => undefined)
       download = created
@@ -355,6 +390,8 @@ export class ModelPool {
    */
   private async fetchFiles(model: string, download: Download): Promise<void> {
     const { signal } = download.abort
+    // (One stopped just before, in the caller's worker: once its files are closed.)
+    await abortable(this.closing.get(model) ?? Promise.resolve(), signal)
     const entry = this.entries.get(model)
     const loading = entry?.worker.loadPromise
     if (entry && loading) {
@@ -389,14 +426,29 @@ export class ModelPool {
 
   private stopDownload(model: string, download: Download, reason: Error) {
     download.abort.abort(reason)
-    download.worker?.terminate(reason)
-    if (this.downloads.get(model) === download) this.downloads.delete(model)
+    this.endDownload(model, download, reason)
   }
 
-  /** Stops a download of `model` in progress, if there is one. */
-  cancelDownload(model: string) {
+  /** Frees a download's worker (the caller's: stops the download there, and waits for its files to close). */
+  private endDownload(model: string, download: Download, reason: Error) {
+    if (this.downloads.get(model) === download) this.downloads.delete(model)
+    const closed = download.worker?.terminate(reason)
+    if (!closed) return
+    const both = Promise.all([this.closing.get(model), closed]).then(() => {
+      if (this.closing.get(model) === both) this.closing.delete(model)
+    })
+    this.closing.set(model, both)
+  }
+
+  /**
+   * Stops a download of `model` in progress, if there is one. Resolves once
+   * nothing writes its files any more (at once with webgllm's own workers,
+   * which are ended).
+   */
+  async cancelDownload(model: string): Promise<void> {
     const download = this.downloads.get(model)
     if (download) this.stopDownload(model, download, abortError() as Error)
+    await this.closing.get(model)
   }
 
   /**
@@ -498,13 +550,24 @@ export class ModelPool {
 
   /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
-    entry.worker.terminate(reason)
+    const freed = entry.worker.terminate(reason)
     entry.gone.abort(reason)
     if (this.entries.get(entry.model) !== entry) return
     this.entries.delete(entry.model)
-    this.budget.release(entry.model)
     if (why === "failed" || why === "crashed") this.options.onModelEvent?.({ type: "error", model: entry.model, error: reason })
-    this.options.onModelEvent?.({ type: "unload", model: entry.model, reason: why })
+    // Its memory is free, and "unload" says so, once it is: the caller's
+    // worker frees the model after the generation running there has stopped.
+    const release = () => {
+      this.budget.release(entry.model)
+      this.options.onModelEvent?.({ type: "unload", model: entry.model, reason: why })
+    }
+    if (freed) {
+      const done = freed.then(() => {
+        this.freeing.delete(done)
+        release()
+      })
+      this.freeing.add(done)
+    } else release()
     if (this.entries.size === 0) {
       this.stopFrames?.()
       this.stopFrames = undefined

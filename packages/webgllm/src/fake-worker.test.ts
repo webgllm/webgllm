@@ -35,6 +35,8 @@ export type FakeOptions = {
   hold?: (model: string) => Promise<void>
   /** Holds a download until this resolves. */
   holdDownload?: (model: string) => Promise<void>
+  /** Holds an "unload" (the model still in memory) until this resolves. */
+  holdUnload?: (model: string) => Promise<void>
 }
 
 export class FakeWorker {
@@ -44,7 +46,10 @@ export class FakeWorker {
   terminated = false
   readonly sent: Array<WorkerRequest> = []
   model: string | undefined
-  private claimed: Array<() => void> = []
+  private claimed = new Map<number, () => void>()
+  private claims = 0
+  /** Downloads stopped ("stop" with their id). */
+  readonly stoppedDownloads: Array<string> = []
   readonly open = new Map<string, Generate>()
   private idlers: Array<() => void> = []
 
@@ -84,9 +89,14 @@ export class FakeWorker {
 
   /** Claims memory again (a cache growing during a reply); resolves once "claimed". */
   claim(bytes: number) {
+    return this.claimFor(this.model!, bytes)
+  }
+
+  private claimFor(model: string, bytes: number) {
     return new Promise<void>((resolve) => {
-      this.claimed.push(resolve)
-      this.emit({ type: "claim", model: this.model!, bytes })
+      const id = ++this.claims
+      this.claimed.set(id, resolve)
+      this.emit({ type: "claim", id, model, bytes })
     })
   }
 
@@ -104,7 +114,10 @@ export class FakeWorker {
 
   private async handle(message: WorkerRequest) {
     await Promise.resolve()
-    if (message.type === "claimed") this.claimed.shift()?.()
+    if (message.type === "claimed") {
+      this.claimed.get(message.id)?.()
+      this.claimed.delete(message.id)
+    }
     else if (message.type === "load") {
       // Like handler.ts: after the generations running.
       if (this.open.size) await new Promise<void>((resolve) => this.idlers.push(resolve))
@@ -117,16 +130,15 @@ export class FakeWorker {
       await this.options.hold?.(message.model)
       const error = this.options.loadError?.(message.model)
       if (error) return this.emit({ type: "load-error", model: message.model, loadId: message.loadId, ...error })
-      await new Promise<void>((resolve) => {
-        this.claimed.push(resolve)
-        this.emit({ type: "claim", model: message.model, bytes: this.options.bytes?.(message.model) ?? 10 })
-      })
+      await this.claimFor(message.model, this.options.bytes?.(message.model) ?? 10)
       this.emit({ type: "ready", model: message.model, loadId: message.loadId })
     } else if (message.type === "download") {
       this.model = message.model
       await this.options.holdDownload?.(message.model)
+      if (this.stoppedDownloads.includes(message.id))
+        return this.emit({ type: "download-error", model: message.model, id: message.id, message: "The download was stopped." })
       this.emit({ type: "progress", model: message.model, progress: 0.45, cached: false, loadedBytes: 50, totalBytes: 100 })
-      this.emit({ type: "downloaded", model: message.model })
+      this.emit({ type: "downloaded", model: message.model, id: message.id })
     } else if (message.type === "generate") {
       const reply = this.options.reply?.(message)
       if (!reply) {
@@ -136,9 +148,12 @@ export class FakeWorker {
       this.finish(message.id, reply.tokens, reply.done)
     } else if (message.type === "stop") {
       if (this.open.has(message.id)) this.finish(message.id)
+      else if (message.id.startsWith("dl_")) this.stoppedDownloads.push(message.id)
     } else if (message.type === "unload") {
+      await this.options.holdUnload?.(message.model)
       this.unloaded.push(message.model)
       if (this.model === message.model) this.model = undefined
+      this.emit({ type: "unloaded", id: message.id })
     }
   }
 }

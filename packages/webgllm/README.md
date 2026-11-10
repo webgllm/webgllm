@@ -147,7 +147,7 @@ const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "modu
 const webgllm = new WebGLLM({ worker })
 ```
 
-The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. Downloads run in the same worker, beside the loaded model. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
+The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory. Completions take turns there, each from its load to its last token, so two for different models don't replace each other midway. Downloads run in the same worker, beside the loaded model, and the handler ignores the worker's other messages, so your own can share it. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
 
 ### Sharing memory with other runtimes
 

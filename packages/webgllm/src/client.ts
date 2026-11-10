@@ -57,13 +57,25 @@ type Load = Pending<void> & {
 export const defaultWorker = () =>
   new Worker(new URL("./worker.js", import.meta.url), { type: "module", name: "webgllm" })
 
+/**
+ * Ids of loads, unloads and downloads: one sequence for the page, so no
+ * two attachments to a worker (a model unloaded and loaded again in the
+ * caller's worker) ever share one, and a late answer can't pass for a new
+ * request's.
+ */
+let ids = 0
+
+const isResponse = (data: unknown): data is WorkerResponse =>
+  typeof data === "object" && data !== null && typeof (data as { type?: unknown }).type === "string"
+
 export class ModelWorker {
   private load: Load | null = null
-  /** The last load's id: the worker's "ready" or "load-error" names the load it answers. */
-  private loads = 0
   /** Loads sent and not answered yet. */
   private readonly open = new Set<number>()
-  private downloading: Pending<void> | null = null
+  private downloading: (Pending<void> & { id: string }) | null = null
+  /** What a worker of the caller's still owes once this is gone ("unloaded", a stopped download's end), by id. */
+  private readonly owed = new Map<number | string, () => void>()
+  private freed: Promise<void> | undefined
   private readonly stored = pending<void>()
   private readonly generations = new Map<string, Generation>()
   /** Loaded and ready, for the context it was asked for (see contextLength). */
@@ -74,10 +86,16 @@ export class ModelWorker {
   contextLength: number | undefined
   private gone: Error | null = null
 
-  private readonly onMessage = (event: MessageEvent<WorkerResponse>) => this.handle(event.data)
+  private readonly onMessage = (event: MessageEvent<unknown>) => this.handle(event.data)
   private readonly onError = (event: ErrorEvent) => {
+    // (Gone already: a worker that fails owes nothing more.)
+    if (this.gone) {
+      for (const settle of [...this.owed.values()]) settle()
+      return
+    }
     const error = new Error(event.message || "The model's worker stopped.")
     this.terminate(error)
+    for (const settle of [...this.owed.values()]) settle()
     this.events.onCrash(error)
   }
 
@@ -148,7 +166,7 @@ export class ModelWorker {
     this.load?.reject(replaced)
     this.ready = false
     this.contextLength = contextLength
-    const load: Load = { ...pending<void>(), contextLength, id: ++this.loads }
+    const load: Load = { ...pending<void>(), contextLength, id: ++ids }
     this.load = load
     if (previous && this.busy) {
       // The worker resizes after the reply running anyway: send it then, and
@@ -193,8 +211,9 @@ export class ModelWorker {
   download(): Promise<void> {
     if (this.gone) return Promise.reject(this.gone)
     if (!this.downloading) {
-      this.downloading = pending<void>()
-      this.post({ type: "download", model: this.model, ...this.meta() })
+      const id = `dl_${(++ids).toString(36)}`
+      this.downloading = { ...pending<void>(), id }
+      this.post({ type: "download", id, model: this.model, ...this.meta() })
     }
     return this.downloading.promise
   }
@@ -226,18 +245,38 @@ export class ModelWorker {
 
   /**
    * Frees the model and all its GPU memory: by ending the worker, or in a
-   * worker of the caller's by stopping its generations and asking the
-   * worker to free the model, which leaves it running.
+   * worker of the caller's by stopping its generations and its download
+   * and asking the worker to free the model, which leaves it running.
+   * What waits on it fails with `reason` at once. Returns a promise for
+   * the caller's worker having freed the model and closed the download's
+   * files; undefined when that's done already (its own worker is ended).
    */
-  terminate(reason: Error) {
-    if (this.gone) return
-    this.worker.removeEventListener("message", this.onMessage)
-    this.worker.removeEventListener("error", this.onError)
-    if (this.owned) this.worker.terminate()
-    else {
+  terminate(reason: Error): Promise<void> | undefined {
+    if (this.gone) return this.freed
+    const detach = () => {
+      this.worker.removeEventListener("message", this.onMessage)
+      this.worker.removeEventListener("error", this.onError)
+    }
+    if (this.owned) {
+      detach()
+      this.worker.terminate()
+    } else {
+      const waits: Array<Promise<void>> = []
+      const owe = (id: number | string) =>
+        waits.push(new Promise<void>((resolve) => this.owed.set(id, () => (this.owed.delete(id), resolve()))))
       for (const id of this.generations.keys()) this.post({ type: "stop", id })
       // (Only if it was asked to load: a download leaves the worker's model alone.)
-      if (this.load) this.post({ type: "unload", model: this.model })
+      if (this.load) {
+        const id = ++ids
+        this.post({ type: "unload", model: this.model, id })
+        owe(id)
+      }
+      if (this.downloading) {
+        this.post({ type: "stop", id: this.downloading.id })
+        owe(this.downloading.id)
+      }
+      if (waits.length) this.freed = Promise.all(waits).then(detach)
+      else detach()
     }
     this.gone = reason
     this.ready = false
@@ -248,6 +287,7 @@ export class ModelWorker {
     for (const generation of this.generations.values()) generation.reject(reason)
     this.generations.clear()
     this.settled()
+    return this.freed
   }
 
   get terminated(): boolean {
@@ -284,8 +324,13 @@ export class ModelWorker {
     return null
   }
 
-  private handle(data: WorkerResponse) {
-    // A worker of the caller's also carries the messages of a download of another model.
+  private handle(data: unknown) {
+    // A worker of the caller's carries its own messages too, and those of a download of another model.
+    if (!isResponse(data)) return
+    if (this.gone) {
+      if (data.type === "unloaded" || data.type === "downloaded" || data.type === "download-error") this.owed.get(data.id)?.()
+      return
+    }
     if (!this.owned && "model" in data && data.model !== this.model) return
     switch (data.type) {
       case "progress":
@@ -295,7 +340,7 @@ export class ModelWorker {
         void this.events
           .onClaim(data.bytes)
           .catch(() => undefined)
-          .then(() => this.post({ type: "claimed" }))
+          .then(() => this.post({ type: "claimed", id: data.id }))
         break
       case "stored":
         this.stored.resolve()
@@ -316,11 +361,13 @@ export class ModelWorker {
         break
       }
       case "downloaded":
-        this.downloading?.resolve()
+        if (data.id !== this.downloading?.id) break
+        this.downloading.resolve()
         this.downloading = null
         break
       case "download-error":
-        this.downloading?.reject(workerError(data.message, data.code))
+        if (data.id !== this.downloading?.id) break
+        this.downloading.reject(workerError(data.message, data.code))
         this.downloading = null
         break
       case "token":
@@ -349,6 +396,7 @@ export class ModelWorker {
         this.events.onLog(data.text)
         break
       case "phase":
+      case "unloaded":
         break
     }
   }

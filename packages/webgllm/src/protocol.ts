@@ -81,7 +81,9 @@ export type WorkerRequest =
        */
       contextLength?: number
       /**
-       * Echoed in the "ready" or "load-error" that answers this load. A worker that leaves it out may answer only one load at a time.
+       * Echoed in the "ready" or "load-error" that answers this load: never
+       * used twice in one worker, so a late answer to an earlier load of the
+       * same model can't pass for this one's.
        */
       loadId?: number
       /** A model that isn't in the catalog: its meta, as the page resolved it from the Hub. */
@@ -127,17 +129,19 @@ export type WorkerRequest =
        */
       pipeline?: boolean
     }
+  /** Stops generation `id`, or download `id`. */
   | { type: "stop"; id: string }
   /**
    * Free `model` (stopping a load of it) and stay running: sent to a worker
    * the caller started, where the page's own worker would be ended.
+   * Answered with "unloaded" once its GPU memory is free.
    */
-  | { type: "unload"; model: string }
+  | { type: "unload"; model: string; id: number }
   /** Download a model's files to storage without loading it ("progress", then "downloaded"). */
-  | { type: "download"; model: string; meta?: WebGlModelMeta }
+  | { type: "download"; id: string; model: string; meta?: WebGlModelMeta }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
-  /** The page made room for the model (see "claim"): the worker loads it. */
-  | { type: "claimed" }
+  /** The page made room for claim `id` (see "claim"): the worker goes on. */
+  | { type: "claimed"; id: number }
   /** Engine tuning knobs (see TUNING in engine.ts): for benchmarks. */
   | { type: "tune"; values: Record<string, number> }
 
@@ -163,14 +167,17 @@ export type WorkerResponse =
   | { type: "load-error"; model: string; loadId?: number; message: string; code?: WorkerErrorCode }
   /** A load has the model's files in storage, before the GPU reads them (downloads waiting on it settle). */
   | { type: "stored"; model: string }
-  | { type: "downloaded"; model: string }
-  | { type: "download-error"; model: string; message: string; code?: WorkerErrorCode }
+  | { type: "downloaded"; model: string; id: string }
+  /** A download failed, or was stopped (sent once its files' writers have closed). */
+  | { type: "download-error"; model: string; id: string; message: string; code?: WorkerErrorCode }
+  /** The model of "unload" `id` is freed, with its GPU memory. */
+  | { type: "unloaded"; id: number }
   /**
    * The model takes about `bytes` once loaded: the page makes room for it
    * (unloading other runtimes' models past the memory budget, see
    * model-memory.ts) and answers "claimed".
    */
-  | { type: "claim"; model: string; bytes: number }
+  | { type: "claim"; id: number; model: string; bytes: number }
   | { type: "phase"; id: string; phase: GenerationPhase }
   | { type: "token"; id: string; text: string }
   | {

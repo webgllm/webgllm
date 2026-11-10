@@ -226,7 +226,7 @@ test("downloads run in a worker of their own, ended after", async () => {
   await p.download(A, { onProgress: (event) => events.push(event) })
   assert.equal(workers.workers.length, 1)
   assert.equal(workers.workers[0]?.terminated, true)
-  assert.deepEqual(workers.workers[0]?.sent, [{ type: "download", model: A }])
+  assert.deepEqual(workers.workers[0]?.sent.map(({ type, model }: { type: string; model?: string }) => ({ type, model })), [{ type: "download", model: A }])
   assert.deepEqual(events, [{ model: A, phase: "download", progress: 0.5, cached: false, loadedBytes: 50, totalBytes: 100 }])
   assert.equal(p.isLoaded(A), false)
 })
@@ -578,6 +578,12 @@ test("a running generation's claim (its vision encoder) isn't stuck behind a loa
   assert.equal(p.memoryUsed, 60, "only B's bytes are held once A is unloaded")
 })
 
+function gate() {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => { release = resolve })
+  return { promise, release }
+}
+
 /** A pool given one worker of the caller's (a fake), which it must never end. */
 function given(options: FakeOptions & { budget?: number } = {}) {
   const worker = new FakeWorker({ bytes: () => 60, ...options })
@@ -589,10 +595,9 @@ test("a worker of the caller's: unloading frees the model there and leaves the w
   await p.load(A)
   await p.generate(A, fields, { onToken: () => undefined })
   assert.equal(workers.workers.length, 0, "the pool started a worker of its own")
-  p.unload(A)
+  await p.unload(A)
   assert.equal(p.isLoaded(A), false)
   assert.equal(p.memoryUsed, 0)
-  await settle()
   assert.deepEqual(worker.unloaded, [A])
   assert.equal(worker.terminated, false)
   assert.equal(worker.listening, 0, "the pool's listeners stay on the worker")
@@ -635,10 +640,10 @@ test("a worker of the caller's: unloading stops the running generation", async (
   const running = p.generate(A, fields, { onToken: () => undefined })
   await settle()
   const id = worker.generations()[0]!.id
-  p.unload()
+  const unloading = p.unload()
   await assert.rejects(running, { code: "model-not-loaded" })
   assert.ok(worker.sent.some((m) => m.type === "stop" && m.id === id))
-  await settle()
+  await unloading
   assert.deepEqual(worker.unloaded, [A])
 })
 
@@ -651,4 +656,104 @@ test("a worker of the caller's: a download runs in it beside the loaded model", 
   assert.equal(worker.terminated, false)
   assert.deepEqual(worker.unloaded, [], "a download freed the loaded model")
   assert.equal(p.isLoaded(A), true)
+})
+
+test("a worker of the caller's: unload resolves, frees the budget and says \"unload\" only once the worker has freed the model", async () => {
+  const freed = gate()
+  const { pool: p, worker, events } = given({ holdUnload: () => freed.promise })
+  await p.load(A)
+  let done = false
+  const unloading = p.unload(A).then(() => { done = true })
+  await settle()
+  // Still in the worker's memory: nothing says it's free.
+  assert.equal(p.isLoaded(A), false)
+  assert.equal(done, false)
+  assert.equal(p.memoryUsed, 60)
+  assert.equal(events.some((e) => e.type === "unload"), false)
+  assert.equal(worker.listening > 0, true, "the pool stopped listening for the worker's answer")
+  // A load meanwhile waits for it too.
+  const loading = p.load(B)
+  await settle()
+  assert.equal(worker.sent.some((m) => m.type === "load" && m.model === B), false)
+  freed.release()
+  await unloading
+  assert.deepEqual(events.find((e) => e.type === "unload"), { type: "unload", model: A, reason: "unloaded" })
+  await loading
+  assert.equal(p.memoryUsed, 60, "only B's bytes are held")
+  assert.deepEqual(p.loadedModels(), [B])
+})
+
+test("a worker of the caller's: aborting a download stops it there, and canceling resolves once its files are closed", async () => {
+  const held = gate()
+  const { pool: p, worker } = given({ holdDownload: () => held.promise })
+  const abort = new AbortController()
+  const downloading = p.download(A, { signal: abort.signal })
+  await settle()
+  const id = worker.sent.find((m) => m.type === "download")!.id
+  abort.abort()
+  await assert.rejects(downloading, { name: "AbortError" })
+  assert.deepEqual(worker.stoppedDownloads, [id])
+  let canceled = false
+  const canceling = p.cancelDownload(A).then(() => { canceled = true })
+  await settle()
+  assert.equal(canceled, false, "resolved while the worker still had the files open")
+  held.release()
+  await canceling
+  assert.equal(worker.listening, 0)
+  assert.equal(worker.terminated, false)
+})
+
+test("a worker of the caller's: a late answer to an earlier load of the same model doesn't settle the new one", async () => {
+  const { pool: p, worker } = given()
+  await p.load(A, { contextLength: 8192 })
+  const first = worker.sent.find((m) => m.type === "load")!
+  await p.unload(A)
+  const held = gate()
+  const again = given({ hold: () => held.promise })
+  // The same model again, in a worker that hasn't answered: the old load's answer arrives late.
+  let loaded = false
+  const loading = again.pool.load(A, { contextLength: 2048 }).then(() => { loaded = true })
+  await settle()
+  const second = again.worker.sent.find((m) => m.type === "load")!
+  assert.notEqual(second.loadId, first.loadId)
+  again.worker.emit({ type: "ready", model: A, loadId: first.loadId, contextLength: 8192 })
+  again.worker.emit({ type: "load-error", model: A, loadId: first.loadId, message: "late" })
+  await settle()
+  assert.equal(loaded, false)
+  held.release()
+  await loading
+  assert.equal(again.pool.isLoaded(A), true)
+})
+
+test("a worker of the caller's: its own messages pass through the pool's listeners untouched", async () => {
+  const { pool: p, worker } = given({ reply: () => ({ tokens: ["ok"] }) })
+  await p.load(A)
+  for (const data of ["ping", 7, null, undefined, { type: "pong", model: A }, { kind: "mine" }]) worker.emit(data as never)
+  await settle()
+  assert.equal(p.isLoaded(A), true)
+  await p.generate(A, fields, { onToken: () => undefined })
+  assert.deepEqual(worker.unloaded, [])
+})
+
+test("a worker of the caller's: completions take turns, so a second model's doesn't replace the first before it has generated", async () => {
+  const held = gate()
+  const { pool: p, worker } = given({ budget: 1000, hold: (model) => (model === A ? held.promise : Promise.resolve()), reply: () => ({ tokens: ["ok"] }) })
+  // What a completion does: its turn, its load, its generation.
+  const complete = async (model: string) => {
+    const end = await p.turn()
+    try {
+      await p.ensureLoaded(model, undefined, undefined, undefined)
+      return await p.generate(model, fields, { onToken: () => undefined })
+    } finally {
+      end()
+    }
+  }
+  const a = complete(A)
+  await settle()
+  const b = complete(B)
+  await settle()
+  held.release()
+  await Promise.all([a, b])
+  assert.deepEqual(worker.generations().map((g) => g.model), [A, B])
+  assert.deepEqual(worker.sent.filter((m) => m.type === "load").map((m) => m.model), [A, B])
 })

@@ -38,7 +38,9 @@ const webgllm = new WebGLLM({ worker })
 ```
 
 - The worker holds one model. Loading another replaces the one there once its running generation ends, whatever `keepLoaded` says; the replaced model's `unload` event has the reason `"evicted"`.
-- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start.
+- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory.
+- Completions take turns, each from its load to its last token, so two for different models don't replace each other midway.
+- The handler ignores messages that aren't webgllm's, so your own code can share the worker.
 - For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
 - Downloads (`downloadModel`) run in the same worker, beside the loaded model.
 
