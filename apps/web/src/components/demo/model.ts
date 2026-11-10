@@ -20,7 +20,7 @@ import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 const MODEL_NAMES = [
   ['LiquidAI/LFM3-1.7B-GGUF', 'LFM3 1.7B'],
   ['unsloth/Qwen3.5-2B-GGUF', 'Qwen3.5 2B'],
-  ['onnx-community/Qwen3.5-2B-ONNX', 'Qwen3.5 2B (images)'],
+  ['onnx-community/Qwen3.5-2B-ONNX', 'Qwen3.5 2B ONNX'],
   ['LiquidAI/LFM2.5-1.2B-Instruct-GGUF', 'LFM2.5 1.2B Instruct'],
   ['LiquidAI/LFM2.5-1.2B-Thinking-GGUF', 'LFM2.5 1.2B Thinking'],
   ['LiquidAI/LFM2.5-350M-GGUF', 'LFM2.5 350M'],
