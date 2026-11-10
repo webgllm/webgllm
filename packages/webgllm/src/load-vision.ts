@@ -168,6 +168,8 @@ export function planVision(graphBytes: Uint8Array) {
   const heads = mha ? attr(mha, "num_heads") : attr(rope, "num_heads")
   if (!heads) throw new Error("ONNX: the encoder's attention has no head count")
   const headDim = width / heads
+  // The shaders lay a head out as 16 texels (gpu/vision-kernels.ts).
+  if (headDim !== 64) throw new Error(`ONNX: the encoder's heads are ${headDim} wide; webgllm's encoder runs 64-wide heads`)
   const rotary = attr(rope, "rotary_embedding_dim") ?? headDim
   if (rotary !== headDim || invFreqT.dims[1] * 4 !== headDim)
     throw new Error(`ONNX: the encoder's RoPE rotates ${rotary} of ${headDim} dims`)

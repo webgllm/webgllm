@@ -24,7 +24,11 @@
     const model = params.get("model") ?? "onnx-community/Qwen3.5-0.8B-ONNX"
     const contextLength = Number(params.get("ctx") ?? 8192)
     const detail = params.get("detail") ?? "auto"
-    const check = (name, ok, detail) => log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    let failed = 0
+    const check = (name, ok, detail) => {
+      if (!ok) failed++
+      log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    }
     /** A width × height PNG data URL drawn by `draw`. */
     const picture = (width, height, draw) => {
       const canvas = document.createElement("canvas")
@@ -103,6 +107,7 @@
       check("two images: red then blue", /red[\s\S]*blue/i.test(a4.text), a4.text)
       const a5 = await ask([{ role: "user", content: "What is the capital of France? Answer in one short sentence." }], "text only")
       check("text-only after images: Paris", /paris/i.test(a5.text), a5.text)
+      if (failed) throw new Error(`${failed} check${failed === 1 ? "" : "s"} failed`)
       log("ALL DONE")
     } catch (error) {
       if (error !== "done") log("ERROR:", error instanceof Error ? `${error.message}\n${error.stack}` : String(error))

@@ -46,7 +46,8 @@ export function imageProcessorConfig(json: unknown): ImageProcessorConfig {
 /**
  * The size an image is resized to: each side a multiple of `factor`,
  * nearest to the original, then scaled (keeping the aspect ratio) into
- * [minPixels, maxPixels] (Qwen2-VL's smart_resize).
+ * [minPixels, maxPixels] (Qwen2-VL's smart_resize), never past maxPixels
+ * (see the end).
  */
 export function smartResize(
   height: number,
@@ -72,6 +73,14 @@ export function smartResize(
     const beta = Math.sqrt(minPixels / (height * width))
     h = Math.ceil((height * beta) / factor) * factor
     w = Math.ceil((width * beta) / factor) * factor
+  }
+  // Rounding to whole blocks can overshoot the maximum (both sides rounded
+  // up past the minimum; a thin strip's short side held at one block): the
+  // maximum wins, the longer side giving a block at a time, then the aspect
+  // ratio and the minimum as they may. One block is the least there is.
+  while (h * w > maxPixels && (h > factor || w > factor)) {
+    if (h >= w && h > factor) h -= factor
+    else w -= factor
   }
   return { height: h, width: w }
 }

@@ -75,6 +75,12 @@ export type WebGlModelMeta = {
   thinkingSampling?: Sampling
   /** How the model writes tool calls: LFM3's when left out. */
   toolFormat?: ToolFormat
+  /**
+   * Whether the resolver looked for a vision encoder (an ONNX model's
+   * `files.vision`): a stored meta from before it did, or whose look
+   * failed, is looked at again when the Hub can be reached.
+   */
+  visionChecked?: boolean
 }
 
 const THINKING_SWITCH = {

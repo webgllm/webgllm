@@ -16,6 +16,50 @@ type GpuBlock = { norm1: GpuNorm; qkv: GpuLinear; proj: GpuLinear; norm2: GpuNor
 /** Score bytes a chunk of query rows may take (see attend). */
 const SCORE_BYTES = 32 << 20
 
+/** Query rows per attention chunk: as many as fit SCORE_BYTES and a texture's height. */
+function chunkRows(config: VisionConfig, count: number, maxTextureSize: number) {
+  const keyTexels = Math.ceil(count / 4)
+  return Math.max(1, Math.min(count, Math.floor(maxTextureSize / config.heads), Math.floor(SCORE_BYTES / (keyTexels * 16 * config.heads))))
+}
+
+/** Bytes of an f32 tensor of `dims` features by `rows` (RGBA32F, 4 a texel). */
+const f32Bytes = (dims: number, rows: number) => (dims / 4) * rows * 16
+
+/**
+ * The encoder's weight textures, in bytes: each projection's quants
+ * (RGBA32UI, a texel per row and block), scales (RGBA16F) and zero points
+ * (RGBA8UI, a texel per 4 rows and block) and bias, and the norms, as
+ * VisionEncoder.load allocates them.
+ */
+export function visionWeightBytes(c: VisionConfig): number {
+  const linear = (N: number, K: number) => (K / 32) * (N * 16 + (N / 4) * 8 + (N / 4) * 4) + f32Bytes(N, 1)
+  const norm = 2 * f32Bytes(c.width, 1)
+  const W = c.width
+  const per = c.merge * c.merge
+  const block = 2 * norm + linear(3 * W, W) + linear(W, W) + linear(c.ffn, W) + linear(W, c.ffn)
+  return linear(W, c.patchValues) + c.depth * block + norm + linear(per * W, per * W) + linear(c.outWidth, per * W)
+}
+
+/**
+ * The most bytes of work textures encoding a gridH × gridW image takes at
+ * once, as VisionEncoder.encode allocates them: the patch projection's
+ * inputs (freed after it), then the blocks' tensors, attention's scores and
+ * the merger's outputs.
+ */
+export function visionWorkBytes(c: VisionConfig, gridH: number, gridW: number, maxTextureSize: number): number {
+  const count = gridH * gridW
+  const tokens = count / (c.merge * c.merge)
+  const W = c.width
+  const kept = f32Bytes(64, count) + 2 * f32Bytes(W, count)
+  const projection = f32Bytes(c.patchValues, count) + f32Bytes(W, count)
+  const rows = chunkRows(c, count, maxTextureSize)
+  const attention = Math.ceil(count / 4) * rows * c.heads * 16 + rows * c.heads * 16
+  const blocks =
+    f32Bytes(W, count) + f32Bytes(3 * W, count) + f32Bytes(2 * W, count) + f32Bytes(W, count) + f32Bytes(c.ffn, count)
+  const merger = f32Bytes(c.merge * c.merge * W, tokens) + f32Bytes(c.outWidth, tokens)
+  return kept + Math.max(projection, blocks + Math.max(attention, merger))
+}
+
 /**
  * The patch's position embedding: the 48 × 48 table bilinearly
  * interpolated to the grid (corners to corners), as the encoder's graph
@@ -169,7 +213,11 @@ export class VisionEncoder {
     this.blocks = []
   }
 
+  /** The running encode's abort (see encode). */
+  private signal: AbortSignal | undefined
+
   private async run(pass: Pass) {
+    this.signal?.throwIfAborted()
     await this.gpu.runAsync({ name: "vision", ...pass })
   }
 
@@ -222,7 +270,7 @@ export class VisionEncoder {
     const { heads, width } = this.config
     const keyTexels = Math.ceil(count / 4)
     const max = this.gpu.limits.maxTextureSize
-    const rows = Math.max(1, Math.min(count, Math.floor(max / heads), Math.floor(SCORE_BYTES / (keyTexels * 16 * heads))))
+    const rows = chunkRows(this.config, count, max)
     const scores = this.gpu.texture(GL.RGBA32F, keyTexels, rows * heads)
     const stats = this.gpu.texture(GL.RGBA32F, 1, rows * heads)
     try {
@@ -273,6 +321,15 @@ export class VisionEncoder {
    * outWidth floats, merged tokens in row-major order.
    */
   async encode(image: ImagePatches, signal?: AbortSignal): Promise<Float32Array> {
+    this.signal = signal
+    try {
+      return await this.encodeImage(image, signal)
+    } finally {
+      this.signal = undefined
+    }
+  }
+
+  private async encodeImage(image: ImagePatches, signal?: AbortSignal): Promise<Float32Array> {
     const c = this.config
     const { gridH, gridW } = image
     const count = gridH * gridW
@@ -293,17 +350,24 @@ export class VisionEncoder {
       return t
     }
     try {
-      const pixels = f32(c.patchValues, count, image.pixels)
-      const pos = f32(W, count, positionEmbeddings(this.positions, c.grid, W, gridH, gridW, c.merge))
       const cs = f32(16 * 4, count, ropeTable(this.invFreq, gridH, gridW, c.merge))
       let x = f32(W, count)
       let next = f32(W, count)
+      {
+        // The patch projection's inputs, freed once it has read them.
+        const pixels = f32(c.patchValues, count, image.pixels)
+        const pos = f32(W, count, positionEmbeddings(this.positions, c.grid, W, gridH, gridW, c.merge))
+        await this.matmul(pixels, this.patch, x, count, { residual: pos })
+        for (const t of [pixels, pos]) {
+          this.gpu.delete(t)
+          made.splice(made.indexOf(t), 1)
+        }
+      }
       const normed = f32(W, count)
       const qkv = f32(3 * W, count)
       const qk = f32(2 * W, count)
       const attn = f32(W, count)
       const inner = f32(c.ffn, count)
-      await this.matmul(pixels, this.patch, x, count, { residual: pos })
       for (const b of this.blocks) {
         signal?.throwIfAborted()
         await this.layerNorm(x, b.norm1, normed, count)

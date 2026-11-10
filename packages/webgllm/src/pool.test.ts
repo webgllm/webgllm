@@ -554,3 +554,25 @@ test("a load that waited for a download, with no unload, still loads", async () 
   await loading
   assert.equal(p.isLoaded(A), true)
 })
+
+test("a running generation's claim (its vision encoder) isn't stuck behind a load waiting to evict its model", async () => {
+  // A generates; B's load claims memory and waits for A's generation to end
+  // so it can unload A. A's generation then claims more (the vision
+  // encoder's textures): that claim must settle, not queue behind B's.
+  const { pool: p, workers } = pool()
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const a = workers.of(A)!
+  const loadB = p.load(B)
+  await settle()
+  const grown = a.claim(90)
+  const settled = await Promise.race([grown.then(() => "claimed"), new Promise((r) => setTimeout(() => r("stuck"), 200))])
+  assert.equal(settled, "claimed", "A's claim settles while B waits for A")
+  a.finish(a.generations()[0]!.id, ["done"])
+  await running
+  await loadB
+  assert.equal(a.terminated, true)
+  assert.equal(p.isLoaded(B), true)
+  assert.equal(p.memoryUsed, 60, "only B's bytes are held once A is unloaded")
+})

@@ -5,9 +5,12 @@ import { Engine, type EngineImage } from "./engine.js"
 import { asRepo, fakeHub } from "./fake-hub.test.js"
 import { imageProcessorConfig, patchPlace, pixelBudget, smartResize, toPatches } from "./image.js"
 import { dequantizeTable } from "./load-vision.js"
-import { chatImages, expandImageTokens, ImageCache, imageKey, type PreparedImage } from "./prompt-images.js"
+import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, type PreparedImage } from "./prompt-images.js"
 import { hubModelMeta } from "./resolve-model.js"
-import { positionEmbeddings, ropeTable } from "./vision.js"
+import { positionEmbeddings, ropeTable, VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
+import type { VisionConfig, VisionLinear, VisionPiece } from "./load-vision.js"
+import type { Gpu, Texture } from "./gpu/gl.js"
+import { storedModelFiles } from "./model-files.js"
 
 /** Qwen3.5's preprocessor_config.json. */
 const QWEN = imageProcessorConfig({
@@ -94,8 +97,8 @@ test("the engine's rotary positions are Qwen2-VL's: images in 3D, the text after
     { key: -1, height: 3, width: 5 },
     { key: -2, height: 4, width: 2 }
   ]
-  const prompt = [1, 2, IMG, 3, 4, 5, IMG, 6, 7]
-  const { tokens, starts } = expandImageTokens(prompt, IMG, images)
+  const prompt = [1, 2, 7, IMG, 8, 4, 5, 7, IMG, 8, 6]
+  const { tokens, starts } = expandImageTokens(prompt, { start: 7, pad: IMG, end: 8 }, images)
   const engine = Object.create(Engine.prototype) as Engine
   Object.assign(engine, { config: { hiddenSize: 4 }, images: [] })
   engine.setImages(
@@ -123,16 +126,22 @@ test("image tokens expand to their images' tokens, and image rows key by content
     { key: imageKey(new Uint8Array([1, 2, 3]), 32, 32), height: 1, width: 2 },
     { key: imageKey(new Uint8Array([1, 2, 4]), 32, 32), height: 2, width: 1 }
   ]
-  const { tokens, keys, starts } = expandImageTokens([5, 9, 6, 9], 9, images)
-  assert.deepEqual(tokens, [5, 9, 9, 6, 9, 9])
-  assert.deepEqual(starts, [1, 4])
-  assert.deepEqual(keys, [5, images[0].key, images[0].key, 6, images[1].key, images[1].key])
+  const slot = { start: 7, pad: 9, end: 8 }
+  const { tokens, keys, starts } = expandImageTokens([5, 7, 9, 8, 6, 7, 9, 8], slot, images)
+  assert.deepEqual(tokens, [5, 7, 9, 9, 8, 6, 7, 9, 9, 8])
+  assert.deepEqual(starts, [2, 7])
+  assert.deepEqual(keys, [5, 7, images[0].key, images[0].key, 8, 6, 7, images[1].key, images[1].key, 8])
   for (const { key } of images) assert.ok(Number.isSafeInteger(key) && key < 0)
   assert.notEqual(images[0].key, images[1].key)
   // The same pixels at another size are another image.
   assert.notEqual(imageKey(new Uint8Array([1, 2, 3]), 32, 64), images[0].key)
-  assert.throws(() => expandImageTokens([9, 9], 9, images.slice(0, 1)))
-  assert.throws(() => expandImageTokens([9], 9, images))
+  assert.throws(() => expandImageTokens([7, 9, 8, 7, 9, 8], slot, images.slice(0, 1)))
+  assert.throws(() => expandImageTokens([7, 9, 8], slot, images))
+  // The pad token written in a message's text (the literal "<|image_pad|>")
+  // isn't a slot: it stays one token, and the image still finds its own.
+  const literal = [5, 9, 6, 7, 9, 8]
+  assert.equal(countImageSlots(literal, slot), 1)
+  assert.deepEqual(expandImageTokens(literal, slot, images.slice(0, 1)).tokens, [5, 9, 6, 7, 9, 9, 8])
 })
 
 test("a chat's images in template order, and the cache of prepared ones", () => {
@@ -164,14 +173,18 @@ test("a chat's images in template order, and the cache of prepared ones", () => 
     { url: "https://example.com/a.png", detail: "low" },
     { url: "https://example.com/b.png" }
   ])
+  // By content; data URLs (whose bytes never change) by URL too, http URLs never.
   const cache = new ImageCache(2)
-  const made = (key: number): PreparedImage => ({ key, height: 1, width: 1, patches: null, features: null })
-  cache.set({ url: "a" }, made(-1))
-  cache.set({ url: "b" }, made(-2))
-  assert.equal(cache.get({ url: "a" })?.key, -1)
-  cache.set({ url: "c" }, made(-3))
-  assert.equal(cache.get({ url: "b" }), undefined, "the least recent goes")
-  assert.equal(cache.get({ url: "a", detail: "low" }), undefined, "another detail is another image")
+  const made = (key: number): PreparedImage => ({ key, height: 1, width: 1, pixels: null, features: null })
+  cache.set({ url: "data:image/png;base64,AA" }, "auto|1", made(-1))
+  cache.set({ url: "https://example.com/b.png" }, "auto|2", made(-2))
+  assert.equal(cache.getUrl({ url: "data:image/png;base64,AA" })?.key, -1)
+  assert.equal(cache.getUrl({ url: "https://example.com/b.png" }), undefined, "an http URL is fetched again")
+  assert.equal(cache.get("auto|2")?.key, -2)
+  cache.set({ url: "https://example.com/c.png" }, "auto|3", made(-3))
+  assert.equal(cache.get("auto|1"), undefined, "the least recent goes")
+  assert.equal(cache.getUrl({ url: "data:image/png;base64,AA" }), undefined, "and its URL with it")
+  assert.equal(cache.getUrl({ url: "data:image/png;base64,AA", detail: "low" }), undefined)
 })
 
 test("image parts only for models that read images; text parts still join", () => {
@@ -232,4 +245,123 @@ test("position embeddings: the table itself at its own size; RoPE angles by row,
   const row = cs.subarray(3 * 8, 4 * 8)
   assert.deepEqual(Array.from(row.subarray(0, 4)), [1, 0.5, 1, 0.5].map(Math.cos).map((v) => Math.fround(v)))
   assert.deepEqual(Array.from(row.subarray(4, 8)), [1, 0.5, 1, 0.5].map(Math.sin).map((v) => Math.fround(v)))
+})
+
+test("the pixel cap holds after rounding to whole blocks: portrait, landscape, strips and the GPU's limit", () => {
+  const low = 256 * 256
+  for (const [h, w] of [[100, 150], [150, 100], [32, 4800], [4800, 32], [33, 33], [1, 1], [255, 257]]) {
+    const size = smartResize(h, w, 32, low, low)
+    assert.ok(size.height * size.width <= low, `${h}×${w} → ${size.height}×${size.width}`)
+    assert.ok(size.height % 32 === 0 && size.width % 32 === 0 && size.height >= 32 && size.width >= 32)
+  }
+  // A GPU whose textures hold 1,024 patches: at most 1,024 · 256 pixels.
+  for (const [h, w] of [[1000, 1000], [600, 2000], [40, 7000]]) {
+    const size = smartResize(h, w, 32, 65536, 1024 * 256)
+    assert.ok(size.height * size.width <= 1024 * 256, `${h}×${w} → ${size.height}×${size.width}`)
+  }
+  // Inside the budget nothing changes.
+  assert.deepEqual(smartResize(400, 400, 32, 65536, 640 * 640), { height: 416, width: 416 })
+})
+
+test("deleting a model removes its vision encoder's files too", () => {
+  fakeHub()
+  return hubModelMeta("onnx-community/Qwen3.5-2B-ONNX").then((meta) => {
+    const paths = storedModelFiles(meta).map((f) => f.path)
+    for (const path of ["onnx/vision_encoder_q4f16.onnx", "onnx/vision_encoder_q4f16.onnx_data", "preprocessor_config.json"])
+      assert.ok(paths.includes(path), path)
+  })
+})
+
+test("a stopped image fetch rejects with the stop, not a fetch error", async (t) => {
+  t.mock.method(globalThis, "fetch", (_url: string, init?: RequestInit) =>
+    new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))))
+  )
+  const stop = new AbortController()
+  const fetching = fetchImage("https://example.com/slow.png", stop.signal)
+  stop.abort(new DOMException("stopped", "AbortError"))
+  await assert.rejects(fetching, (error: Error) => error.name === "AbortError" && error.message === "stopped")
+})
+
+/** A GPU that only counts texture bytes (live and peak), for the encoder's allocations. */
+function countingGpu() {
+  let live = 0
+  let peak = 0
+  let id = 0
+  const bytesPer: Record<number, number> = { 0x8d70: 16, 0x8814: 16, 0x881a: 8, 0x8d7c: 4 }
+  const textures = new Set<Texture>()
+  const gpu = {
+    limits: { maxTextureSize: 16384 },
+    texture(internal: number, width: number, height: number) {
+      const t = { id: id++, internal, width, height, bytes: width * height * bytesPer[internal]! } as Texture
+      textures.add(t)
+      live += t.bytes
+      peak = Math.max(peak, live)
+      return t
+    },
+    delete(t: Texture) {
+      if (textures.delete(t)) live -= t.bytes
+    },
+    program: (source: string) => ({ source }),
+    run: () => undefined,
+    runAsync: async () => undefined,
+    pace: async () => undefined,
+    read: async (t: Texture) => new Float32Array(t.width * t.height * 4)
+  }
+  return { gpu: gpu as unknown as Gpu, live: () => live, peak: () => peak, resetPeak: () => (peak = live) }
+}
+
+/** A tiny encoder's pieces (64-wide, one head, one block). */
+function tinyEncoder(): Array<VisionPiece> {
+  const config: VisionConfig = {
+    width: 64, heads: 1, headDim: 64, ffn: 128, depth: 1, outWidth: 128, patchSize: 16, temporal: 2, merge: 2,
+    patchValues: 1536, grid: 4, eps: 1e-6, act: "tanh", mergerAct: "erf"
+  }
+  const linear = (N: number, K: number): VisionLinear => ({
+    m: { N, K, bits: 4, quants: new Uint32Array(0), scales: new Uint16Array(N * (K / 32)), zeros: null, raw: new Uint8Array(N * (K / 32) * 16) },
+    bias: new Float32Array(N)
+  })
+  const norm = { weight: new Float32Array(64), bias: new Float32Array(64) }
+  return [
+    { kind: "config", config },
+    { kind: "patch", patch: linear(64, 1536), positions: new Float32Array(16 * 64), invFreq: new Float32Array(16) },
+    { kind: "block", index: 0, value: { norm1: norm, qkv: linear(192, 64), proj: linear(64, 64), norm2: norm, fc1: linear(128, 64), fc2: linear(64, 128) } },
+    { kind: "merger", norm, linear1: linear(256, 256), linear2: linear(128, 256) }
+  ]
+}
+
+async function* piecesOf(pieces: Array<VisionPiece>) {
+  yield* pieces
+}
+
+test("the vision claim is what the encoder allocates: its weights, and its largest image's work at once", async () => {
+  const counter = countingGpu()
+  const encoder = new VisionEncoder(counter.gpu)
+  const pieces = tinyEncoder()
+  await encoder.load(piecesOf(pieces))
+  const config = (pieces[0] as { config: VisionConfig }).config
+  assert.equal(counter.live(), visionWeightBytes(config))
+  for (const [gridH, gridW] of [[4, 4], [8, 12], [40, 40]]) {
+    counter.resetPeak()
+    const weights = counter.live()
+    await encoder.encode({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
+    assert.equal(counter.peak() - weights, visionWorkBytes(config, gridH, gridW, 16384), `${gridH}×${gridW}`)
+    assert.equal(counter.live(), weights, "its work textures are freed")
+  }
+  encoder.dispose()
+  assert.equal(counter.live(), 0)
+})
+
+test("a stopped encode rejects, freeing its work textures", async () => {
+  const counter = countingGpu()
+  const encoder = new VisionEncoder(counter.gpu)
+  await encoder.load(piecesOf(tinyEncoder()))
+  const weights = counter.live()
+  const stop = new AbortController()
+  let passes = 0
+  ;(counter.gpu as unknown as { runAsync: () => Promise<void> }).runAsync = async () => {
+    if (++passes === 5) stop.abort(new DOMException("stopped", "AbortError"))
+  }
+  await assert.rejects(encoder.encode({ pixels: new Float32Array(16 * 1536), gridH: 4, gridW: 4 }, stop.signal), { name: "AbortError" })
+  assert.equal(counter.live(), weights)
+  assert.ok(passes < 10, "it stops at the next pass")
 })

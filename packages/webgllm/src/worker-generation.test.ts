@@ -38,7 +38,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
   const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16, RECLAIM_BYTES = Infinity;
   // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
-  const promptImages = async (_model, prompt) => ({ prompt, keys: prompt, images: [] }), encodeImages = async () => undefined;
+  const promptImages = async (_model, prompt) => ({ prompt, keys: prompt, images: [] }), encodeImages = async () => 0;
+  const abortFor = () => new AbortController().signal;
   const claimMemory = () => undefined, writeGpuNote = () => undefined;
   export function makeGenerate(state) {
     const stopped = state.stopped, post = m => state.messages.push(m);

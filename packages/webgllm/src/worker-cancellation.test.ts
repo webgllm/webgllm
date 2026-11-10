@@ -34,7 +34,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     const stopped=state.stopped,post=m=>state.messages.push(m);
     const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();
     // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
-    const promptImages=async(_model,prompt)=>({prompt,keys:prompt,images:[]}),encodeImages=async()=>undefined;
+    const promptImages=(...a)=>(state.promptImages??(async(_model,prompt)=>({prompt,keys:prompt,images:[]})))(...a),encodeImages=(...a)=>(state.encodeImages??(async()=>0))(...a);
+    const abortFor=(id)=>{const a=new AbortController();if(stopped.has(id))a.abort();state.signals?.set(id,a);return a.signal};
     ${source.slice(start, end)}
     return generate;
   }
@@ -144,3 +145,31 @@ test("stop during pacing calibration performs zero forwards", async () => {
   assert.deepEqual(state.model.cached, [9, 9])
   assert.ok(state.messages.some(message => message.type === "done"))
 })
+
+for (const step of ["promptImages", "encodeImages"] as const)
+  test(`a stop while the images are ${step === "promptImages" ? "fetched" : "encoded"} ends the request, and the next one runs`, async () => {
+    const state = probe() as ReturnType<typeof probe> & Record<string, unknown>
+    const entered = gate()
+    const signals = new Map<string, AbortController>()
+    state.signals = signals
+    // The image step waits on its request's signal, as a stalled fetch, download or encode does.
+    state[step] = async (...args: Array<unknown>) => {
+      const signal = args.find((a): a is AbortSignal => a instanceof AbortSignal)!
+      entered.release()
+      await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason)))
+    }
+    const generate = makeGenerate(state)
+    const job = generate({ ...request("stalled", true), maxTokens: 0, outputSchema: undefined })
+    await entered.promise
+    state.stopped.add("stalled")
+    signals.get("stalled")!.abort(new DOMException("stopped", "AbortError"))
+    await job
+    assert.ok(state.messages.some((m) => m.type === "done" && m.id === "stalled" && m.finishReason === "stop"))
+    assert.equal(state.messages.some((m) => m.type === "error"), false)
+    // The next request (text) runs.
+    delete state[step]
+    const before = state.calls.forwards
+    await generate({ ...request("next", true), maxTokens: 0, outputSchema: undefined })
+    assert.ok(state.calls.forwards > before)
+    assert.ok(state.messages.some((m) => m.type === "done" && m.id === "next"))
+  })

@@ -82,3 +82,22 @@ export const ComposerAddAttachment: FC = () => {
 export function useTakesDrops(): boolean {
   return useMediaInputs().length > 0;
 }
+
+/**
+ * Whether the draft has attachments the selected model can't read (picked
+ * under another model): sending waits until the user switches back or
+ * removes them, rather than sending the text without them.
+ */
+export function useAttachmentsBlocked(): boolean {
+  const inputs = useMediaInputs();
+  const attached = useAuiState((s) => s.composer.attachments.length);
+  return attached > 0 && !inputs.includes("image");
+}
+
+/** Says why the draft can't be sent, while it can't. */
+export const AttachmentsBlockedNote: FC = () =>
+  useAttachmentsBlocked() ? (
+    <p className="aui-composer-attachments-note text-fd-muted-foreground px-2.5 text-xs">
+      This model doesn&apos;t read images. Switch to one that does, or remove the image to send.
+    </p>
+  ) : null;

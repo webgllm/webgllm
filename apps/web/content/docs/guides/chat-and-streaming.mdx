@@ -48,8 +48,29 @@ Send the whole chat each time, as with OpenAI. webgllm keeps the model's cache b
 | `stop`, `seed` | |
 | `cache_prompt` | webgllm's own |
 
-Unset sampling fields take the model card's values. Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, image or audio content) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
+Unset sampling fields take the model card's values. Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
+
+## Images
+
+Models with a vision encoder (Qwen3.5's ONNX builds, such as `onnx-community/Qwen3.5-2B-ONNX`; `supports.images` in `models.list()`) read OpenAI `image_url` parts in user messages, as http(s) or base64 data URLs:
+
+```ts
+await webgllm.chat.completions.create({
+  model: "onnx-community/Qwen3.5-2B-ONNX",
+  messages: [
+    {
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,..." } },
+        { type: "text", text: "What's in this picture?" },
+      ],
+    },
+  ],
+})
+```
+
+`detail` sets the image's pixel budget: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image. The vision encoder downloads with the first request that has an image and is loaded only while a request's new images are read, so text chats don't pay for it. A follow-up about an image already in the chat doesn't read it again.
 
 ## Usage and timings
 
-Every response has OpenAI's `usage`, with cached prompt tokens and reasoning tokens, and a `timings` object: time to first token, prompt speed and writing speed.
+Every response has OpenAI's `usage`, with cached prompt tokens and reasoning tokens, and a `timings` object: time to first token, prompt speed and writing speed, and with images `images_ms` (fetching, resizing and encoding them).

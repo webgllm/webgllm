@@ -38,6 +38,11 @@ try {
   log(`loaded in ${Math.round(performance.now() - t)} ms: ${(encoder.bytes / 2 ** 20).toFixed(1)} MiB of textures; ${JSON.stringify(encoder.config)}`)
   const pixels = new Float32Array((await bytes(`/models/${image}.pixels`)).buffer)
   const ref = new Float32Array((await bytes(`/models/${image}.features`)).buffer)
+  const tokens = (gridH * gridW) / (encoder.config.merge * encoder.config.merge)
+  if (pixels.length !== gridH * gridW * encoder.config.patchValues)
+    throw new Error(`${image}.pixels has ${pixels.length} values; a ${gridH}×${gridW} grid needs ${gridH * gridW * encoder.config.patchValues}`)
+  if (ref.length !== tokens * encoder.config.outWidth)
+    throw new Error(`${image}.features has ${ref.length} values; ${tokens} tokens need ${tokens * encoder.config.outWidth}`)
   for (let r = 0; r < rounds; r++) {
     t = performance.now()
     const got = await encoder.encode({ pixels, gridH, gridW })
@@ -59,6 +64,8 @@ try {
       worstCos = Math.min(worstCos, dot / Math.sqrt(a2 * b2))
       cosines.push([row, dot / Math.sqrt(a2 * b2)])
     }
+    if (!(Number.isFinite(maxAbs) && Number.isFinite(num) && Number.isFinite(worstCos)))
+      throw new Error(`round ${r}: the features aren't finite (max abs ${maxAbs}, worst cosine ${worstCos})`)
     log(`round ${r}: ${got.length / W} tokens in ${ms.toFixed(0)} ms; max abs ${maxAbs.toFixed(4)}, relative L2 ${Math.sqrt(num / den).toFixed(5)}, worst row cosine ${worstCos.toFixed(6)}; first ${Array.from(got.slice(0, 4), (v) => v.toFixed(4)).join(" ")} vs ${Array.from(ref.slice(0, 4), (v) => v.toFixed(4)).join(" ")}; worst rows ${cosines.sort((a, b) => a[1] - b[1]).slice(0, 6).map(([r, c]) => `${r}:${c.toFixed(5)}`).join(" ")}`)
   }
   encoder.dispose()

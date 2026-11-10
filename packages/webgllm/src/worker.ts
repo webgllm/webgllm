@@ -37,9 +37,20 @@ import { seededUniforms } from "./seeded-random.js"
 import { CodedError, downloadError, errorCode } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
 import { imageProcessorConfig, type ImageProcessorConfig } from "./image.js"
-import { loadVision } from "./load-vision.js"
-import { chatImages, decodeImage, expandImageTokens, ImageCache, type PreparedImage } from "./prompt-images.js"
-import { VisionEncoder } from "./vision.js"
+import { loadVision, planVision } from "./load-vision.js"
+import {
+  chatImages,
+  contentId,
+  countImageSlots,
+  decodeImage,
+  expandImageTokens,
+  fetchImage,
+  ImageCache,
+  patchesOf,
+  type ImageSlot,
+  type PreparedImage
+} from "./prompt-images.js"
+import { VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -545,6 +556,18 @@ async function downloadModel(model: string) {
 }
 
 const stopped = new Set<string>()
+/** Each generation's abort, signalled by its "stop" (image fetches, downloads and encoding take it). */
+const aborts = new Map<string, AbortController>()
+/** Generation `id`'s abort signal (aborted already if it was stopped). */
+function abortFor(id: string): AbortSignal {
+  let abort = aborts.get(id)
+  if (!abort) {
+    abort = new AbortController()
+    aborts.set(id, abort)
+  }
+  if (stopped.has(id)) abort.abort()
+  return abort.signal
+}
 
 const errorMessage = (error: unknown) =>
   error instanceof GpuError
@@ -566,30 +589,65 @@ async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
 }
 
 /**
- * The prompt's images, prepared (fetched, resized, cut into patches) or
- * found among recent ones, and the prompt with each image token expanded
- * to its image's tokens, with the cache's keys (see prompt-images.ts).
+ * The prompt's images, prepared (fetched and resized) or found among
+ * recent ones, and the prompt with each image slot expanded to its image's
+ * tokens, with the cache's keys (see prompt-images.ts). Images are taken
+ * one at a time, each checked against the context before its pixels are
+ * made, so a prompt that can't fit fails before it holds them all. With
+ * `reuse` false (cache_prompt: false), images are shared within the request
+ * only, and none is kept for later ones.
  */
-async function promptImages(model: Loaded, prompt: Array<number>, chat: GenerateRequest["chat"]) {
+async function promptImages(model: Loaded, prompt: Array<number>, chat: GenerateRequest["chat"], reuse: boolean, signal: AbortSignal) {
   const wanted = chatImages(chat)
   if (!wanted.length) return { prompt, keys: prompt, images: [] as Array<{ start: number; image: PreparedImage }> }
-  const vision = (await resolveModel(model.model)).files
-  if (vision.kind !== "onnx" || !vision.vision) throw new Error(`${model.model} doesn't read images.`)
-  model.imageConfig ??= imageProcessorConfig(JSON.parse(await (await modelFile(vision.vision.preprocessor)).text()))
+  const files = (await resolveModel(model.model, signal)).files
+  if (files.kind !== "onnx" || !files.vision) throw new Error(`${model.model} doesn't read images.`)
+  const { tokenizer, engine } = model
+  const slot = {
+    start: tokenizer.tokenToId("<|vision_start|>"),
+    pad: tokenizer.tokenToId("<|image_pad|>"),
+    end: tokenizer.tokenToId("<|vision_end|>")
+  }
+  if (slot.start == null || slot.pad == null || slot.end == null) throw new Error("The tokenizer has no image tokens.")
+  const imageSlot = slot as ImageSlot
+  const slots = countImageSlots(prompt, imageSlot)
+  if (slots !== wanted.length) throw new Error(`The prompt has ${slots} image slots for ${wanted.length} images.`)
+  model.imageConfig ??= imageProcessorConfig(JSON.parse(await (await modelFile(files.vision.preprocessor, signal)).text()))
   const config = model.imageConfig
-  const maxPatches = model.engine.gpu.limits.maxTextureSize
-  const prepared = await Promise.all(
-    wanted.map(async (image) => {
-      const known = model.images.get(image)
-      if (known) return known
-      const made = await decodeImage(image, config, maxPatches)
-      model.images.set(image, made)
-      return made
-    })
-  )
-  const imageToken = model.tokenizer.tokenToId("<|image_pad|>")
-  if (imageToken === undefined || imageToken === null) throw new Error("The tokenizer has no <|image_pad|> token.")
-  const expanded = expandImageTokens(prompt, imageToken, prepared)
+  const maxPatches = engine.gpu.limits.maxTextureSize
+  // Tokens so far: the text, and each image's (its slot's pad stands in until it's sized).
+  let tokens = prompt.length - slots
+  const fits = (more: number) => {
+    tokens += more
+    if (tokens >= engine.contextLength)
+      throw new CodedError(
+        `This session is too long for the model: its images alone take it past ${engine.contextLength} tokens, the most it can read, reply included. Send fewer or smaller images (detail: "low"), or start a new session.`,
+        "context-length-exceeded"
+      )
+  }
+  const local = new Map<string, PreparedImage>()
+  const prepared: Array<PreparedImage> = []
+  for (const image of wanted) {
+    signal.throwIfAborted()
+    const urlId = `${image.detail ?? "auto"}|${image.url}`
+    let found = local.get(urlId) ?? (reuse && image.url.startsWith("data:") ? model.images.getUrl(image) : undefined)
+    let content: string | undefined
+    let blob: Blob | undefined
+    if (!found) {
+      blob = await fetchImage(image.url, signal)
+      content = await contentId(blob, image.detail)
+      found = local.get(content) ?? (reuse ? model.images.get(content) : undefined)
+    }
+    if (found) fits(found.height * found.width)
+    else {
+      found = await decodeImage(blob!, image.detail, config, maxPatches, fits, signal)
+      if (reuse) model.images.set(image, content!, found)
+    }
+    local.set(urlId, found)
+    if (content) local.set(content, found)
+    prepared.push(found)
+  }
+  const expanded = expandImageTokens(prompt, imageSlot, prepared)
   return { prompt: expanded.tokens, keys: expanded.keys, images: expanded.starts.map((start, i) => ({ start, image: prepared[i] })) }
 }
 
@@ -599,7 +657,7 @@ async function promptImages(model: Loaded, prompt: Array<number>, chat: Generate
  * it after: text-only prompts never load it. Returns the ms the load took
  * (its download included; 0 without one).
  */
-async function encodeImages(model: Loaded, images: Array<{ start: number; image: PreparedImage }>, start: number, stop: () => boolean) {
+async function encodeImages(model: Loaded, images: Array<{ start: number; image: PreparedImage }>, start: number, signal: AbortSignal) {
   const needed = images.filter(
     ({ start: at, image }) => at + image.height * image.width > start && !image.features
   )
@@ -607,21 +665,28 @@ async function encodeImages(model: Loaded, images: Array<{ start: number; image:
   const loadAt = performance.now()
   const meta = (await resolveModel(model.model)).files
   if (meta.kind !== "onnx" || !meta.vision) throw new Error(`${model.model} doesn't read images.`)
-  const [graph, data] = await Promise.all([modelFile(meta.vision.graph), modelFile(meta.vision.data)])
+  const [graph, data] = await Promise.all([modelFile(meta.vision.graph, signal), modelFile(meta.vision.data, signal)])
   const { engine } = model
-  // Room for the encoder's weights and work while it's loaded.
-  await claimMemory(model.model, engine.gpu.bytes + data.size * TEXTURES_PER_FILE_BYTE)
+  // Room for the encoder's weights and its largest image's work while it's
+  // loaded, sized from the graph as the encoder allocates them.
+  const graphBytes = new Uint8Array(await graph.arrayBuffer())
+  const { config } = planVision(graphBytes)
+  const maxTexture = engine.gpu.limits.maxTextureSize
+  const work = Math.max(
+    ...needed.map(({ image }) => visionWorkBytes(config, image.height * config.merge, image.width * config.merge, maxTexture))
+  )
   const encoder = new VisionEncoder(engine.gpu)
   try {
-    await encoder.load(loadVision({ graph: blobSource(graph), data: blobSource(data) }))
+    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config) + work)
+    signal.throwIfAborted()
+    await encoder.load(loadVision({ graph: graphBytes, data: blobSource(data) }), signal)
     if (encoder.config.outWidth !== engine.config.hiddenSize)
       throw new Error(`The vision encoder writes ${encoder.config.outWidth}-wide rows; the model reads ${engine.config.hiddenSize}.`)
     const loadMs = performance.now() - loadAt
     for (const { image } of needed) {
-      if (stop()) return loadMs
-      if (!image.patches) throw new Error("An image's patches were dropped before it was encoded.")
-      image.features = await encoder.encode(image.patches)
-      image.patches = null
+      signal.throwIfAborted()
+      image.features = await encoder.encode(patchesOf(image, model.imageConfig!), signal)
+      image.pixels = null
     }
     return loadMs
   } finally {
@@ -671,7 +736,16 @@ async function generate(request: GenerateRequest) {
   // Each image's token expanded to its tokens (the image fetched and
   // resized here); `keys` is what the cache compares.
   const imagesAt = performance.now()
-  const { prompt, keys, images } = await promptImages(model, encoded, request.chat)
+  const signal = abortFor(id)
+  let prepared: Awaited<ReturnType<typeof promptImages>>
+  try {
+    prepared = await promptImages(model, encoded, request.chat, request.cachePrompt !== false, signal)
+  } catch (error) {
+    // Stopped while its images were fetched or resized: the cache is as it was.
+    if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
+    throw error
+  }
+  const { prompt, keys, images } = prepared
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
   const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
@@ -752,7 +826,15 @@ async function generate(request: GenerateRequest) {
   // First the images' embedding rows where the prompt reads them (the
   // vision encoder loaded for that only), and where every image is.
   const encodeAt = performance.now()
-  const visionLoadMs = await encodeImages(model, images, start, () => stopped.has(id))
+  let visionLoadMs: number
+  try {
+    visionLoadMs = await encodeImages(model, images, start, signal)
+  } catch (error) {
+    // Stopped while the encoder downloaded, loaded or ran: its textures and
+    // claim are freed, and the cache holds the prompt up to `start`.
+    if (stopped.has(id)) return post({ type: "done", id, stats: { ...empty, inputTokens: prompt.length, cachedTokens: start }, finishReason: "stop" })
+    throw error
+  }
   engine.setImages(images.map(({ start: at, image }) => ({ start: at, height: image.height, width: image.width, features: image.features })))
   const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
@@ -1245,6 +1327,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
     })
   } else if (data.type === "stop") {
     stopped.add(data.id)
+    aborts.get(data.id)?.abort()
   } else if (data.type === "download") {
     if (data.meta) rememberModel(data.meta)
     void downloadModel(data.model)
@@ -1269,6 +1352,7 @@ onmessage = ({ data }: MessageEvent<WorkerRequest>) => {
       })
       .finally(() => {
         stopped.delete(data.id)
+        aborts.delete(data.id)
       })
   }
 }

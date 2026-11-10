@@ -22,6 +22,16 @@ export function modelFiles(meta: WebGlModelMeta): Array<ModelFile> {
   ]
 }
 
+/**
+ * Every file of a model webgllm may store: modelFiles, plus the vision
+ * encoder's (downloaded with the first request that has an image). What
+ * deleting a model removes, and what another model's files keep.
+ */
+export function storedModelFiles(meta: WebGlModelMeta): Array<ModelFile> {
+  const vision = meta.files.kind === "onnx" ? meta.files.vision : undefined
+  return [...modelFiles(meta), ...(vision ? [vision.graph, vision.data, vision.preprocessor] : [])]
+}
+
 /** The storage questions the pool asks (a fake one in tests). */
 export type ModelStorage = {
   /** Whether all the model's files are in storage: storage only, no network request. */
@@ -240,7 +250,7 @@ export const browserStorage: ModelStorage = {
     } catch {
       return
     }
-    const files = modelFiles(modelMeta(model)).filter((f) => !keep.has(fileKey(f)))
+    const files = storedModelFiles(modelMeta(model)).filter((f) => !keep.has(fileKey(f)))
     const names = new Set<string>()
     for (const file of files) {
       const name = diskName(file)

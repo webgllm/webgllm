@@ -48,7 +48,7 @@ import { planVision } from "./load-vision.js"
 import { fileUrl, inputsOf, knownModelMeta, rememberModel } from "./model-meta.js"
 import type { ModelFile, ModelReasoning, VisionFiles, WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
-import { readManifest } from "./storage.js"
+import { readManifest, saveManifest } from "./storage.js"
 import type { ToolFormat } from "./tool-calls.js"
 
 const HUB = "https://huggingface.co"
@@ -87,6 +87,28 @@ export async function visionFilesFor(
 ): Promise<VisionFiles | undefined> {
   const type = (config.vision_config as { model_type?: unknown } | undefined)?.model_type
   if (typeof type !== "string" || !(VISION_MODEL_TYPES as ReadonlyArray<string>).includes(type)) return undefined
+  return findVision(at, graph, has)
+}
+
+/**
+ * visionFilesFor as an optional look: the text model resolves whatever it
+ * finds (a server that refuses HEAD, a failed request), and `checked` says
+ * whether the look got an answer, to look again later if it didn't.
+ */
+async function lookForVision(...args: Parameters<typeof visionFilesFor>): Promise<{ vision?: VisionFiles; checked: boolean }> {
+  try {
+    const vision = await visionFilesFor(...args)
+    return { ...(vision && { vision }), checked: true }
+  } catch {
+    return { checked: false }
+  }
+}
+
+async function findVision(
+  at: (path: string) => ModelFile,
+  graph: string,
+  has: (path: string) => boolean | Promise<boolean>
+): Promise<VisionFiles | undefined> {
   const slash = graph.lastIndexOf("/") + 1
   const suffix = /(_[a-z0-9]+)?\.onnx$/.exec(graph.slice(slash))?.[1] ?? ""
   const visionGraph = `${graph.slice(0, slash)}vision_encoder${suffix}.onnx`
@@ -154,7 +176,18 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
   }
   let promise = pending.get(model)
   if (!promise) {
-    promise = (async () => (await readManifest(model)) ?? (await (url ? urlModelMeta(model) : hubModelMeta(model))))().then((meta) => {
+    promise = (async () => {
+      const resolve = () => (url ? urlModelMeta(model) : hubModelMeta(model))
+      const stored = await readManifest(model)
+      if (!stored) return resolve()
+      // A stored ONNX meta whose look for a vision encoder never got an
+      // answer (saved before there was one, or the look failed) is looked
+      // at again; offline, it loads text as it did.
+      if (stored.files.kind !== "onnx" || stored.files.vision || stored.visionChecked) return stored
+      const fresh = await resolve().catch(() => stored)
+      if (fresh !== stored) await saveManifest(fresh)
+      return fresh
+    })().then((meta) => {
       rememberModel(meta)
       return meta
     })
@@ -392,6 +425,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
   const files = filesOf(info)
   const gguf = pickGguf(files)
   let weights: WebGlModelMeta["files"]
+  let visionChecked = true
   let weightsFile: string
   if (gguf) {
     const arch = info.gguf?.architecture
@@ -412,13 +446,14 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
       throw notSupported(`${repo} is a "${String(type)}" model; webgllm runs ${ONNX_MODEL_TYPES.join(", ")} ONNX models.`)
     }
     const onnx = await onnxWeights(repo, files, config)
-    const vision = await visionFilesFor((path) => ({ repo, path }), onnx.graph, config, (path) => files.has(path))
+    const look = await lookForVision((path) => ({ repo, path }), onnx.graph, config, (path) => files.has(path))
+    visionChecked = look.checked
     weights = {
       kind: "onnx",
       graph: { repo, path: onnx.graph },
       data: { repo, path: onnx.data },
       config: { repo, path: "config.json" },
-      ...(vision && { vision })
+      ...(look.vision && { vision: look.vision })
     }
     weightsFile = onnx.graph
   }
@@ -436,6 +471,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
       : undefined
   const base = info.cardData?.base_model
   return metaFrom({
+    visionChecked,
     name: repo,
     weights,
     listed,
@@ -454,6 +490,7 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
   const file = url.slice(slash + 1)
   const here = (path: string): ModelFile => ({ repo: url.slice(0, slash), path })
   let weights: WebGlModelMeta["files"]
+  let visionChecked = true
   if (/\.gguf$/i.test(file)) {
     weights = { kind: "gguf", model: here(file) }
   } else {
@@ -472,10 +509,12 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
       throw notSupported(`${url} isn't a graph webgllm loads: ${error instanceof Error ? error.message : String(error)}`)
     }
     if (dataFiles.length !== 1) throw notSupported(`${url} keeps its weights in ${dataFiles.length} files; webgllm reads one.`)
-    const vision = await visionFilesFor(here, file, config, async (path) => (await fileResponse(here(path), "HEAD")) !== undefined)
-    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json"), ...(vision && { vision }) }
+    const look = await lookForVision(here, file, config, async (path) => (await fileResponse(here(path), "HEAD")) !== undefined)
+    visionChecked = look.checked
+    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json"), ...(look.vision && { vision: look.vision }) }
   }
   return metaFrom({
+    visionChecked,
     name: url,
     weights,
     listed: { tokenizer: here("tokenizer.json"), config: here("tokenizer_config.json"), chatTemplate: here("chat_template.jinja") },
@@ -487,6 +526,8 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
 
 /** A model's meta from its weights and tokenizer files: its template, thinking, tools and sampling. */
 async function metaFrom(model: {
+  /** Whether the look for a vision encoder got an answer (see lookForVision). */
+  visionChecked: boolean
   name: string
   weights: WebGlModelMeta["files"]
   listed: WebGlModelMeta["tokenizer"]
@@ -511,6 +552,7 @@ async function metaFrom(model: {
     size: sizeFrom(model.name, model.parameters),
     ...(reasoning && { reasoning }),
     sampling: samplingFrom(generationConfig),
-    toolFormat: toolFormatFrom(template)
+    toolFormat: toolFormatFrom(template),
+    visionChecked: model.visionChecked
   }
 }

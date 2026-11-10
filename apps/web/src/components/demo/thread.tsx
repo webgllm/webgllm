@@ -67,9 +67,11 @@ import {
   type PropsWithChildren,
 } from "react";
 import {
+  AttachmentsBlockedNote,
   ComposerAddAttachment,
   ComposerAttachments,
   UserMessageAttachments,
+  useAttachmentsBlocked,
   useTakesDrops,
 } from "./attachments";
 
@@ -537,6 +539,7 @@ const ThreadSuggestionItem: FC = () => {
 
 const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
   const takesDrops = useTakesDrops();
+  const blocked = useAttachmentsBlocked();
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
       <ComposerPrimitive.AttachmentDropzone
@@ -545,7 +548,9 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
           className="border-fd-foreground/10 focus-within:border-fd-foreground/25 data-[dragging=true]:border-fd-ring flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-fd-accent)_50%,var(--color-fd-background))]"
         >
           <ComposerAttachments />
+          <AttachmentsBlockedNote />
           <ComposerPrimitive.Input
+            submitMode={blocked ? "none" : "enter"}
             placeholder="Send a message..."
             className="aui-composer-input caret-fd-primary placeholder:text-fd-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
             rows={1}
@@ -562,6 +567,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 const ComposerAction: FC = () => {
   const { ComposerExtra } = useContext(ThreadComponentsContext);
   // The stop control only cancels the send while no run it could stop is going.
+  const blocked = useAttachmentsBlocked();
   const isSending = useAuiState(
     (s) =>
       s.composer.submission !== undefined &&
@@ -615,19 +621,34 @@ const ComposerAction: FC = () => {
             !shouldShowComposerResume(s)
           }
         >
-          <ComposerPrimitive.Send asChild>
+          {blocked ? (
             <TooltipIconButton
-              tooltip="Send message"
+              tooltip="This model doesn't read images"
               side="bottom"
               type="button"
               variant="default"
               size="icon"
+              disabled
               className="aui-composer-send size-7 rounded-full"
               aria-label="Send message"
             >
               <ArrowUpIcon className="aui-composer-send-icon size-4" />
             </TooltipIconButton>
-          </ComposerPrimitive.Send>
+          ) : (
+            <ComposerPrimitive.Send asChild>
+              <TooltipIconButton
+                tooltip="Send message"
+                side="bottom"
+                type="button"
+                variant="default"
+                size="icon"
+                className="aui-composer-send size-7 rounded-full"
+                aria-label="Send message"
+              >
+                <ArrowUpIcon className="aui-composer-send-icon size-4" />
+              </TooltipIconButton>
+            </ComposerPrimitive.Send>
+          )}
         </AuiIf>
         <AuiIf condition={shouldShowComposerResume}>
           <ComposerPrimitive.Resume asChild>
