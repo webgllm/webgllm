@@ -33,6 +33,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   export function makeGenerate(state) {
     const stopped=state.stopped,post=m=>state.messages.push(m);
     const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();
+    // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
+    const promptImages=async(_model,prompt)=>({prompt,keys:prompt,images:[]}),encodeImages=async()=>undefined;
     ${source.slice(start, end)}
     return generate;
   }
@@ -55,6 +57,7 @@ function probe() {
     snapshot() { calls.snapshots++; return undefined },
     batchSizes(count: number) { const sizes = []; for (; count; count -= Math.min(256, count)) sizes.push(Math.min(256, count)); return sizes },
     preparePrompt: async () => undefined,
+    setImages() {},
     async forwardHidden() { calls.forwards++; return 0 }
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,

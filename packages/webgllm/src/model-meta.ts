@@ -20,6 +20,9 @@ export type ModelFile = {
   path: string
 }
 
+/** A model's vision encoder files (see WebGlModelMeta.files). */
+export type VisionFiles = { graph: ModelFile; data: ModelFile; preprocessor: ModelFile }
+
 /**
  * Whether thinking can be switched off (`off`) and capped by a token budget.
  * Each level's value is what to send as `reasoning_effort` for it.
@@ -39,7 +42,18 @@ export type WebGlModelMeta = {
    */
   files:
     | { kind: "gguf"; model: ModelFile }
-    | { kind: "onnx"; graph: ModelFile; data: ModelFile; config: ModelFile }
+    | {
+        kind: "onnx"
+        graph: ModelFile
+        data: ModelFile
+        config: ModelFile
+        /**
+         * The vision encoder (`onnx/vision_encoder<the decoder's suffix>.onnx`,
+         * its data, and preprocessor_config.json), for models that read
+         * images: loaded only for a request with images (see vision.ts).
+         */
+        vision?: VisionFiles
+      }
   /** The tokenizer and chat template. */
   /** The tokenizer and chat template (tokenizer_config.json's when there's no file for it). */
   tokenizer: {
@@ -48,7 +62,8 @@ export type WebGlModelMeta = {
     chatTemplate?: ModelFile
   }
   supports: {
-    input: ReadonlyArray<"text">
+    /** "image" for models with a vision encoder webgllm runs (see `files.vision`). */
+    input: ReadonlyArray<"text" | "image">
     output: ReadonlyArray<"text">
     capabilities: ReadonlyArray<"tools" | "thinking">
   }
@@ -66,6 +81,11 @@ const THINKING_SWITCH = {
   levels: { off: "none", high: "high" },
   budget: true
 } as const
+
+/** What a model reads, from its files: images where it has a vision encoder (`files.vision`). */
+export function inputsOf(files: WebGlModelMeta["files"]): ReadonlyArray<"text" | "image"> {
+  return files.kind === "onnx" && files.vision ? ["text", "image"] : ["text"]
+}
 
 const TOOLS_AND_THINKING = {
   input: ["text"],
@@ -302,24 +322,31 @@ const QWEN_3_5_2B_ONNX_REPO = { repo: "onnx-community/Qwen3.5-2B-ONNX" }
  * package runs: only its decoder (1.09 GB), whose 4-bit lm_head is the
  * embedding too (the separate embed_tokens file holds the same bytes).
  */
+const QWEN_3_5_2B_ONNX_FILES = {
+  kind: "onnx",
+  graph: { ...QWEN_3_5_2B_ONNX_REPO, path: "onnx/decoder_model_merged_q4f16.onnx" },
+  data: {
+    ...QWEN_3_5_2B_ONNX_REPO,
+    path: "onnx/decoder_model_merged_q4f16.onnx_data"
+  },
+  config: { ...QWEN_3_5_2B_ONNX_REPO, path: "config.json" },
+  vision: {
+    graph: { ...QWEN_3_5_2B_ONNX_REPO, path: "onnx/vision_encoder_q4f16.onnx" },
+    data: { ...QWEN_3_5_2B_ONNX_REPO, path: "onnx/vision_encoder_q4f16.onnx_data" },
+    preprocessor: { ...QWEN_3_5_2B_ONNX_REPO, path: "preprocessor_config.json" }
+  }
+} as const
+
 const QWEN_3_5_2B_ONNX = {
   name: "onnx-community/Qwen3.5-2B-ONNX",
   format: "onnx",
-  files: {
-    kind: "onnx",
-    graph: { ...QWEN_3_5_2B_ONNX_REPO, path: "onnx/decoder_model_merged_q4f16.onnx" },
-    data: {
-      ...QWEN_3_5_2B_ONNX_REPO,
-      path: "onnx/decoder_model_merged_q4f16.onnx_data"
-    },
-    config: { ...QWEN_3_5_2B_ONNX_REPO, path: "config.json" }
-  },
+  files: QWEN_3_5_2B_ONNX_FILES,
   tokenizer: {
     tokenizer: { ...QWEN_3_5_2B_ONNX_REPO, path: "tokenizer.json" },
     config: { ...QWEN_3_5_2B_ONNX_REPO, path: "tokenizer_config.json" },
     chatTemplate: { ...QWEN_3_5_2B_ONNX_REPO, path: "chat_template.jinja" }
   },
-  supports: TOOLS_AND_THINKING,
+  supports: { ...TOOLS_AND_THINKING, input: inputsOf(QWEN_3_5_2B_ONNX_FILES) },
   size: "2b",
   reasoning: THINKING_SWITCH,
   sampling: QWEN_3_5_SAMPLING,

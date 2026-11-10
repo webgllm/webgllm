@@ -518,7 +518,8 @@ class Models {
       }),
       supports: {
         tools: meta.supports.capabilities.includes("tools"),
-        thinking: meta.supports.capabilities.includes("thinking")
+        thinking: meta.supports.capabilities.includes("thinking"),
+        images: meta.supports.input.includes("image")
       }
     }
   }

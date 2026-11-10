@@ -37,6 +37,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
   const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16, RECLAIM_BYTES = Infinity;
+  // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
+  const promptImages = async (_model, prompt) => ({ prompt, keys: prompt, images: [] }), encodeImages = async () => undefined;
   const claimMemory = () => undefined, writeGpuNote = () => undefined;
   export function makeGenerate(state) {
     const stopped = state.stopped, post = m => state.messages.push(m);
@@ -76,6 +78,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     rewind() { position = 0; return 0 }, snapshotPosition() { return undefined }, snapshot() { return undefined },
     batchSizes(count: number) { return [count] },
     preparePrompt: async () => undefined,
+    setImages() {},
     async forwardHidden(batch: number[]) { position += batch.length; return batch.length - 1 },
     setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {},
     async argmax(_row: number, _rows: number, penalty: number, _drafts: number[], _guess: boolean, presence = 0) {

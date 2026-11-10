@@ -11,13 +11,14 @@ export type Answer = { status: number; body: unknown }
  * it fetched), plus `extra` answers; anything else is a 404. Counts calls.
  * ONNX graphs weren't recorded (they're 0.2 to 1 MB each): unless `extra`
  * has one, a graph answers with its own name, a config.json with {}, and
- * the graph check says the graph's weights are in `<graph>_data`, as the
- * exports' are. Tests of the real check set it back.
+ * the graph checks (decoder and vision encoder) say the graph's weights
+ * are in `<graph>_data`, as the exports' are. Tests of the real check set it back.
  */
 export function fakeHub(extra: Record<string, Answer | (() => Answer)> = {}) {
   const answers: Record<string, Answer | (() => Answer)> = { ...recorded, ...extra }
   const calls: Array<string> = []
   hub.checkGraph = (bytes: Uint8Array) => ({ dataFiles: [`${new TextDecoder().decode(bytes)}_data`] })
+  hub.checkVisionGraph = (bytes: Uint8Array) => [`${new TextDecoder().decode(bytes)}_data`]
   hub.fetch = async (url: string) => {
     calls.push(url)
     const found = answers[url]

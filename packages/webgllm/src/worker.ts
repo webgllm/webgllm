@@ -36,6 +36,10 @@ import { createStopFilter } from "./stop-sequences.js"
 import { seededUniforms } from "./seeded-random.js"
 import { CodedError, downloadError, errorCode } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
+import { imageProcessorConfig, type ImageProcessorConfig } from "./image.js"
+import { loadVision } from "./load-vision.js"
+import { chatImages, decodeImage, expandImageTokens, ImageCache, type PreparedImage } from "./prompt-images.js"
+import { VisionEncoder } from "./vision.js"
 
 const post = (message: WorkerResponse) => postMessage(message)
 
@@ -69,8 +73,15 @@ type Loaded = {
   contextLength: number | undefined
   engine: Engine
   tokenizer: Tokenizer
-  /** Token ids in the engine's cache, in order. */
+  /**
+   * What the engine's cache holds, in order: token ids, and for an image's
+   * rows its key (see prompt-images.ts), so another image doesn't match.
+   */
   cached: Array<number>
+  /** Images of recent prompts, with their embedding rows once encoded. */
+  images: ImageCache
+  /** The image processor's settings, read the first time a prompt has images. */
+  imageConfig?: ImageProcessorConfig
   /** Recent verified common content, for conservative short-prefix promotion. */
   previousShared?: number
   /** Milliseconds each phase of the load took. */
@@ -445,6 +456,7 @@ async function load(
       engine,
       tokenizer,
       cached: [],
+      images: new ImageCache(),
       claimed: engine.gpu.bytes,
       noteKey,
       note: measured ?? note,
@@ -541,6 +553,83 @@ const errorMessage = (error: unknown) =>
       ? error.message
       : String(error)
 
+/** One of a model's files: stored, or downloaded now. */
+async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
+  return (
+    (await storedFile(file)) ??
+    downloads(`${file.repo}/${file.path}`, (onProgress, shared) => download(file, onProgress, shared), () => undefined, signal).catch(
+      (error: unknown) => {
+        throw downloadError(error, signal ?? new AbortController().signal)
+      }
+    )
+  )
+}
+
+/**
+ * The prompt's images, prepared (fetched, resized, cut into patches) or
+ * found among recent ones, and the prompt with each image token expanded
+ * to its image's tokens, with the cache's keys (see prompt-images.ts).
+ */
+async function promptImages(model: Loaded, prompt: Array<number>, chat: GenerateRequest["chat"]) {
+  const wanted = chatImages(chat)
+  if (!wanted.length) return { prompt, keys: prompt, images: [] as Array<{ start: number; image: PreparedImage }> }
+  const vision = (await resolveModel(model.model)).files
+  if (vision.kind !== "onnx" || !vision.vision) throw new Error(`${model.model} doesn't read images.`)
+  model.imageConfig ??= imageProcessorConfig(JSON.parse(await (await modelFile(vision.vision.preprocessor)).text()))
+  const config = model.imageConfig
+  const maxPatches = model.engine.gpu.limits.maxTextureSize
+  const prepared = await Promise.all(
+    wanted.map(async (image) => {
+      const known = model.images.get(image)
+      if (known) return known
+      const made = await decodeImage(image, config, maxPatches)
+      model.images.set(image, made)
+      return made
+    })
+  )
+  const imageToken = model.tokenizer.tokenToId("<|image_pad|>")
+  if (imageToken === undefined || imageToken === null) throw new Error("The tokenizer has no <|image_pad|> token.")
+  const expanded = expandImageTokens(prompt, imageToken, prepared)
+  return { prompt: expanded.tokens, keys: expanded.keys, images: expanded.starts.map((start, i) => ({ start, image: prepared[i] })) }
+}
+
+/**
+ * Encodes the images whose rows the prompt reads from `start` on (the
+ * cache holds the rest), loading the vision encoder for them and freeing
+ * it after: text-only prompts never load it. Returns the ms the load took
+ * (its download included; 0 without one).
+ */
+async function encodeImages(model: Loaded, images: Array<{ start: number; image: PreparedImage }>, start: number, stop: () => boolean) {
+  const needed = images.filter(
+    ({ start: at, image }) => at + image.height * image.width > start && !image.features
+  )
+  if (!needed.length) return 0
+  const loadAt = performance.now()
+  const meta = (await resolveModel(model.model)).files
+  if (meta.kind !== "onnx" || !meta.vision) throw new Error(`${model.model} doesn't read images.`)
+  const [graph, data] = await Promise.all([modelFile(meta.vision.graph), modelFile(meta.vision.data)])
+  const { engine } = model
+  // Room for the encoder's weights and work while it's loaded.
+  await claimMemory(model.model, engine.gpu.bytes + data.size * TEXTURES_PER_FILE_BYTE)
+  const encoder = new VisionEncoder(engine.gpu)
+  try {
+    await encoder.load(loadVision({ graph: blobSource(graph), data: blobSource(data) }))
+    if (encoder.config.outWidth !== engine.config.hiddenSize)
+      throw new Error(`The vision encoder writes ${encoder.config.outWidth}-wide rows; the model reads ${engine.config.hiddenSize}.`)
+    const loadMs = performance.now() - loadAt
+    for (const { image } of needed) {
+      if (stop()) return loadMs
+      if (!image.patches) throw new Error("An image's patches were dropped before it was encoded.")
+      image.features = await encoder.encode(image.patches)
+      image.patches = null
+    }
+    return loadMs
+  } finally {
+    encoder.dispose()
+    void claimMemory(model.model, model.claimed)
+  }
+}
+
 type GenerateRequest = Extract<WorkerRequest, { type: "generate" }>
 
 async function generate(request: GenerateRequest) {
@@ -574,15 +663,20 @@ async function generate(request: GenerateRequest) {
   // A forced call is the reply: its arguments' schema takes the answer's place.
   const answerSchema = forced ? forced.schema : request.outputSchema
   const tokenizeAt = performance.now()
-  const prompt = tokenizer.encodeChat(request.chat, {
+  const encoded = tokenizer.encodeChat(request.chat, {
     tools,
     ...(request.thinking !== undefined && { enableThinking: request.thinking }),
     addGenerationPrompt: true
   })
+  // Each image's token expanded to its tokens (the image fetched and
+  // resized here); `keys` is what the cache compares.
+  const imagesAt = performance.now()
+  const { prompt, keys, images } = await promptImages(model, encoded, request.chat)
+  const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
   const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
   const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
-  const tokenizeMs = performance.now() - tokenizeAt
+  const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
   const startsInThinking = think !== null &&
@@ -633,7 +727,7 @@ async function generate(request: GenerateRequest) {
   while (
     common < model.cached.length &&
     common < prompt.length &&
-    model.cached[common] === prompt[common]
+    model.cached[common] === keys[common]
   ) {
     common++
   }
@@ -655,10 +749,17 @@ async function generate(request: GenerateRequest) {
 
   // Read the rest of the prompt (see readPrompt), with the anchor snapshot
   // where the next question's prompt will stop sharing it (see anchorFor).
+  // First the images' embedding rows where the prompt reads them (the
+  // vision encoder loaded for that only), and where every image is.
+  const encodeAt = performance.now()
+  const visionLoadMs = await encodeImages(model, images, start, () => stopped.has(id))
+  engine.setImages(images.map(({ start: at, image }) => ({ start: at, height: image.height, width: image.width, features: image.features })))
+  const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix
   if (!stopped.has(id)) await engine.preparePrompt(prompt.length)
   let row = await readPrompt(engine, prompt, start, model.cached, {
+    keys,
     stop: () => stopped.has(id),
     // After a changed request reveals a shorter common boundary, retain it
     // during this ordinary forward. One-off cold calls incur no extra work.
@@ -675,6 +776,7 @@ async function generate(request: GenerateRequest) {
     promptMs: performance.now() - promptStart,
     tokenizeMs,
     schemaMs,
+    ...(images.length && { imagesMs: prepareImagesMs + encodeMs, visionLoadMs }),
     cacheRestoreMs,
     cacheMatchedTokens: common,
     cachePrefixTokens: engine.snapshotPosition("prefix") ?? 0,

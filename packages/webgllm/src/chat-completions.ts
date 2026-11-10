@@ -14,6 +14,7 @@ import type {
   ChatCompletionChunkDelta,
   ChatCompletionContent,
   ChatCompletionCreateParams,
+  ChatCompletionUserContent,
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
@@ -24,7 +25,7 @@ import type {
 import type { FinishReason as WorkerFinishReason, RunTimings, ToolChoice, WorkerRequest } from "./protocol.js"
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
-import type { ChatMessage, ChatTool } from "./tokenizer.js"
+import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
 import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
@@ -72,6 +73,34 @@ function numberField(
   }
   if (range.positive && !(value > 0)) throw new RangeError(`${key} must be greater than 0.`)
   return value
+}
+
+/**
+ * A user message's content as the chat template takes it: its text, or,
+ * with images, text and image parts. Images only where the model reads
+ * them (`images`); audio is refused.
+ */
+export function userContent(content: ChatCompletionUserContent | null | undefined, images: boolean): ChatMessage["content"] {
+  if (!Array.isArray(content) || !content.some((part) => (part as { type?: unknown })?.type === "image_url"))
+    return contentText(content as ChatCompletionContent | null | undefined)
+  if (!images) throw unsupported("This model doesn't read images: pick one whose models.list() entry has supports.images.")
+  const parts: Array<ChatContentPart> = []
+  for (const part of content as Array<{ type?: unknown; text?: unknown; image_url?: { url?: unknown; detail?: unknown } }>) {
+    if (part?.type === "image_url") {
+      const url = part.image_url?.url
+      if (typeof url !== "string" || !/^(https?:|data:)/i.test(url))
+        throw new TypeError("An image_url part's url must be an http(s) URL or a base64 data URL.")
+      const detail = part.image_url?.detail
+      if (detail !== undefined && detail !== "auto" && detail !== "low" && detail !== "high")
+        throw new TypeError('image_url.detail must be "auto", "low" or "high".')
+      parts.push({ type: "image", image: url, ...(detail && detail !== "auto" && { detail }) })
+    } else if (part?.type === "text" && typeof part.text === "string") {
+      const last = parts[parts.length - 1]
+      if (last?.type === "text") last.text += part.text
+      else parts.push({ type: "text", text: part.text })
+    } else throw unsupported(`Content parts of type "${String(part?.type)}" aren't supported: text and image_url are.`)
+  }
+  return parts
 }
 
 /** A message's text: a string, or its text parts joined. Images and audio are refused. */
@@ -126,7 +155,12 @@ function withThinking(turn: ChatMessage, thinking: string, format: ToolFormat): 
  * results. The current turn's calls and results stay, with its thinking
  * (Liquid's guidance for tool use), since the model answers from them.
  */
-export function toChatMessages(messages: Array<ChatCompletionMessageParam>, format: ToolFormat): Array<ChatMessage> {
+export function toChatMessages(
+  messages: Array<ChatCompletionMessageParam>,
+  format: ToolFormat,
+  /** Whether the model reads images (user messages' image_url parts). */
+  images = false
+): Array<ChatMessage> {
   if (!Array.isArray(messages) || messages.length === 0) throw new TypeError("messages must be a non-empty array.")
   const system: Array<string> = []
   const chat: Array<ChatMessage> = []
@@ -148,8 +182,8 @@ export function toChatMessages(messages: Array<ChatCompletionMessageParam>, form
         break
       }
       case "user": {
-        const text = contentText(m.content)
-        if (text) chat.push({ role: "user", content: text })
+        const content = userContent(m.content, images)
+        if (content.length) chat.push({ role: "user", content })
         break
       }
       case "tool": {
@@ -319,7 +353,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   if (body.prediction) throw unsupported("Predicted outputs aren't supported.")
 
   const format = meta.toolFormat ?? "lfm3"
-  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, format)
+  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, format, meta.supports.input.includes("image"))
 
   if (body.tools !== undefined && body.tools !== null && !Array.isArray(body.tools)) throw new TypeError("tools must be an array.")
   const offered = toTools((body.tools as Array<ChatCompletionTool> | null | undefined) ?? [])
@@ -560,7 +594,8 @@ export function timingsOf(stats: RunTimings): CompletionTimings {
     decode_ms: stats.decodeMs,
     prompt_tokens_per_second: perSecond(stats.inputTokens - stats.cachedTokens, stats.promptMs),
     // The first token comes from reading the prompt; decoding makes the rest.
-    decode_tokens_per_second: perSecond(stats.outputTokens - 1, stats.decodeMs)
+    decode_tokens_per_second: perSecond(stats.outputTokens - 1, stats.decodeMs),
+    ...(stats.imagesMs !== undefined && { images_ms: stats.imagesMs })
   }
 }
 

@@ -98,6 +98,27 @@ const person = JSON.parse(reply.choices[0].message.content!)
 
 Answer tokens are constrained to the schema while they're picked, so the answer is always valid against it. Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode and as tools' are: a free-form key is slow to constrain ([llguidance-js#5](https://github.com/nico-martin/llguidance-js/issues/5)) and lets a model invent keys; set `additionalProperties: true` for an open object. Objects composed with `not`, `if`, `oneOf`, `contains`, `allOf`, `const`, `enum` or a `$ref` beside their own keywords stay as written. `json_object` (OpenAI's JSON mode) still takes any object. `stop` sequences don't apply inside it (the schema decides where it ends), as they don't to a forced tool call's arguments. Say in the prompt that you want JSON: small models constrained to a schema they weren't asked for write poor values. `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends rather than while it's written (a limitation of the constraint library, [llguidance-js#4](https://github.com/nico-martin/llguidance-js/issues/4)): an answer that can't satisfy them fails fast with `invalid-output`.
 
+### Images
+
+Models with a vision encoder (Qwen3.5's ONNX builds, such as `onnx-community/Qwen3.5-2B-ONNX` and `onnx-community/Qwen3.5-0.8B-ONNX`; `models.list()` marks them with `supports.images`) read OpenAI `image_url` parts in user messages, as http(s) or base64 data URLs:
+
+```ts
+const reply = await webgllm.chat.completions.create({
+  model: "onnx-community/Qwen3.5-2B-ONNX",
+  messages: [
+    {
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,..." } },
+        { type: "text", text: "What's in this picture?" }
+      ]
+    }
+  ]
+})
+```
+
+The image is resized the way the model's processor does it (to whole 32-pixel blocks) within a pixel budget set by `detail`: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image. The vision encoder (62 MB for Qwen3.5 0.8B, 197 MB for 2B) downloads the first time a request has an image, loads on the GPU for the request's new images and is freed after them, so text chats never pay for it in memory or speed. Each image's embedding rows are kept for a few recent images, and the prompt cache tells images apart by content, so a follow-up about an image in the history reads only the new turn. `timings.images_ms` says how long a request's images took (fetching, resizing and encoding, the encoder's load included), before `prompt_ms`. On a GPU whose textures are shorter than an image's count of 16-pixel patches (4,096 at `"high"`), the image is made smaller to fit.
+
 ### Several models
 
 Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
@@ -123,7 +144,7 @@ webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${mo
 
 ### Other request fields
 
-`max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, image or audio content) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.
+`max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.
 
 ### Errors
 
@@ -143,6 +164,7 @@ webgllm reads the repository's file list from the Hub and picks, by one rule eac
 - **Tokenizer and chat template:** the repository's own, else those in a folder named in the weights file's name (Liquid AI's `qad/`), else the base model's (the card's `base_model`).
 - **Thinking and tool calls:** from the chat template (`enable_thinking` makes thinking switchable; a template that opens `<think>`, or a model named "Thinking" or "Reasoning", always thinks). `<tool_call>` means the XML call format, otherwise LFM2's Pythonic calls.
 - **Sampling:** the repository's `generation_config.json` as Transformers reads it: its values when it sets `do_sample`, else greedy decoding.
+- **Images:** an ONNX build reads images when its `config.json` has a `vision_config` of a type the vision encoder runs (Qwen3.5's), and beside the decoder graph is `vision_encoder<the same suffix>.onnx` (`vision_encoder_q4f16.onnx` for `decoder_model_merged_q4f16.onnx`), a graph the encoder loads, with its data file and a `preprocessor_config.json`. GGUF vision projectors (`mmproj`) aren't read yet.
 
 Another architecture, or a repository without weights it can load, fails with `model-not-supported` before anything downloads. A downloaded model keeps what was resolved beside its files, so after a reload it loads (and `models.downloaded` answers) with no request to the Hub, offline too.
 
@@ -153,7 +175,7 @@ The catalog holds known defaults for the models webgllm is tuned and tested on, 
 | `LiquidAI/LFM3-1.7B-GGUF`            | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained)   |
 | `onnx-community/LFM3-1.7B-ONNX`      | onnx-community's q4f16 export                            |
 | `unsloth/Qwen3.5-2B-GGUF`            | unsloth's Q4_0 GGUF                                      |
-| `onnx-community/Qwen3.5-2B-ONNX`     | onnx-community's q4f16 decoder                           |
+| `onnx-community/Qwen3.5-2B-ONNX`     | onnx-community's q4f16 decoder and vision encoder (reads images) |
 | `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` | official QAD Q4_0                                        |
 | `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` | official Q4_0; always thinks                             |
 | `LiquidAI/LFM2.5-350M-GGUF`          | official QAD Q4_0                                        |

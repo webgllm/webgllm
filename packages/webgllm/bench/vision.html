@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Image input</title>
+  <style>
+    body { background: #fff; color: #111; font: 13px/1.4 ui-monospace, monospace; margin: 12px; }
+    pre { white-space: pre-wrap; }
+    img { width: 96px; height: 96px; border: 1px solid #ccc; margin-right: 6px; }
+  </style>
+  <h1>Image input</h1>
+  <p>Synthetic images through <code>chat.completions.create</code>: <code>?model=onnx-community/Qwen3.5-0.8B-ONNX&amp;ctx=8192&amp;detail=auto</code>.</p>
+  <div id="images"></div>
+  <pre id="out"></pre>
+  <script type="module">
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "onnx-community/Qwen3.5-0.8B-ONNX"
+    const contextLength = Number(params.get("ctx") ?? 8192)
+    const detail = params.get("detail") ?? "auto"
+    const check = (name, ok, detail) => log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    /** A width × height PNG data URL drawn by `draw`. */
+    const picture = (width, height, draw) => {
+      const canvas = document.createElement("canvas")
+      canvas.width = width
+      canvas.height = height
+      const c = canvas.getContext("2d")
+      c.fillStyle = "#fff"
+      c.fillRect(0, 0, width, height)
+      draw(c)
+      const url = canvas.toDataURL("image/png")
+      const img = document.createElement("img")
+      img.src = url
+      document.getElementById("images").append(img)
+      return url
+    }
+    const redCircle = picture(400, 400, (c) => {
+      c.fillStyle = "#e00"
+      c.beginPath()
+      c.arc(200, 200, 120, 0, 2 * Math.PI)
+      c.fill()
+    })
+    const blueSquare = picture(512, 320, (c) => {
+      c.fillStyle = "#0033dd"
+      c.fillRect(176, 80, 160, 160)
+    })
+    const image = (url) => ({ type: "image_url", image_url: { url, detail } })
+    /** `?prompts=/models/images/prompts.json`: these prompts on these PNGs (beside it) instead, as tools/compare scripts run them. */
+    const promptsUrl = params.get("prompts")
+    const fileUrl = async (path) => {
+      const blob = await (await fetch(path)).blob()
+      return await new Promise((resolve) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result)
+        reader.readAsDataURL(blob)
+      })
+    }
+    try {
+      const webgllm = new WebGLLM()
+      let t = performance.now()
+      await webgllm.loadModel(model, { contextLength })
+      log("loaded", model, `${Math.round(performance.now() - t)} ms`)
+      const info = await webgllm.models.retrieve(model)
+      log("info", info)
+      check("models.retrieve says it reads images", info.supports.images === true)
+      const ask = async (messages, label) => {
+        t = performance.now()
+        const r = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 64, reasoning_effort: "none" })
+        const text = r.choices[0].message.content ?? ""
+        log(label, JSON.stringify(text), `${Math.round(performance.now() - t)} ms`, r.usage, r.timings)
+        return { text, r }
+      }
+      if (promptsUrl) {
+        const base = promptsUrl.slice(0, promptsUrl.lastIndexOf("/") + 1)
+        for (const p of await (await fetch(promptsUrl)).json()) {
+          const urls = await Promise.all(p.images.map((n) => fileUrl(`${base}${n}.png`)))
+          const messages = [{ role: "user", content: [...urls.map(image), { type: "text", text: p.text }] }]
+          t = performance.now()
+          const r = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 64, reasoning_effort: "none" })
+          log(JSON.stringify({ label: p.label, prompt_tokens: r.usage.prompt_tokens, reply: r.choices[0].message.content, ms: Math.round(performance.now() - t) }))
+        }
+        log("ALL DONE")
+        throw "done"
+      }
+      const q1 = [{ role: "user", content: [image(redCircle), { type: "text", text: "What shape is in this image, and what color is it? Answer in a few words." }] }]
+      const a1 = await ask(q1, "red circle")
+      check("red circle: says red and circle", /red/i.test(a1.text) && /circle|round|disk|dot/i.test(a1.text), a1.text)
+      const a1again = await ask(q1, "red circle again")
+      check("same request again: same answer", a1again.text === a1.text)
+      const q2 = [{ role: "user", content: [image(blueSquare), { type: "text", text: "What shape is in this image, and what color is it? Answer in a few words." }] }]
+      const a2 = await ask(q2, "blue square")
+      check("blue square: says blue and square", /blue/i.test(a2.text) && /square|rectangle/i.test(a2.text), a2.text)
+      // A follow-up with the image in the history: the cache holds it.
+      const a3 = await ask([...q1, { role: "assistant", content: a1.text }, { role: "user", content: "Is the background white or black? One word." }], "follow-up")
+      check("follow-up: white background", /white/i.test(a3.text), a3.text)
+      const a4 = await ask([{ role: "user", content: [image(redCircle), image(blueSquare), { type: "text", text: "Two images. Name the color of the shape in the first image, then in the second. Answer like: first X, second Y." }] }], "two images")
+      check("two images: red then blue", /red[\s\S]*blue/i.test(a4.text), a4.text)
+      const a5 = await ask([{ role: "user", content: "What is the capital of France? Answer in one short sentence." }], "text only")
+      check("text-only after images: Paris", /paris/i.test(a5.text), a5.text)
+      log("ALL DONE")
+    } catch (error) {
+      if (error !== "done") log("ERROR:", error instanceof Error ? `${error.message}\n${error.stack}` : String(error))
+    }
+  </script>
+</html>

@@ -286,12 +286,19 @@ async function run() {
   begin("idle")
   await new Promise((r) => setTimeout(r, Number(params.get("idleMs") ?? 2500)))
   await end()
+  // `?worker=<file>`: a worker bundle in bench/dist (build-workers.mjs),
+  // run as the production one (frames reported to it): two builds compared
+  // alike, unlike `baseline=1`, whose worker gets no frame reports.
+  const named = params.get("worker")
+  if (named && !/^[\w.-]+\.js$/.test(named)) throw new Error("worker must name a bench/dist file")
   const worker = new Worker(
-    params.get("baseline") === "1"
-      ? "/dist/baseline-worker.js"
-      : params.get("production") === "1"
-        ? "/dist/current-worker.js"
-        : "/bundle/bench/webgl-perf-worker.js",
+    named
+      ? `/dist/${named}`
+      : params.get("baseline") === "1"
+        ? "/dist/baseline-worker.js"
+        : params.get("production") === "1"
+          ? "/dist/current-worker.js"
+          : "/bundle/bench/webgl-perf-worker.js",
     { type: "module" }
   )
   Object.assign(globalThis, { __benchWorker: worker })
@@ -461,7 +468,8 @@ async function run() {
     worker.postMessage({ type: "tune", values: tune })
   if (params.get("profile") === "1" || params.get("notune") === "1")
     worker.postMessage({ type: "bench-profile-config" })
-  const model = "LiquidAI/LFM3-1.7B-GGUF"
+  // `?model=`: a catalog model (LFM3 1.7B GGUF when left out).
+  const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
   stageEvents = []
   begin("load")
   await new Promise<void>((r, j) => {

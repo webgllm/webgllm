@@ -4,11 +4,26 @@
  */
 import type { WebGlModelId } from "./model-meta.js"
 
-/** A text part of a message's content. Other part types (images, audio) are refused. */
+/** A text part of a message's content. */
 export type ChatCompletionContentPartText = { type: "text"; text: string }
+
+/**
+ * An image part of a user message, for models that read images
+ * (`models.list()`: `supports.images`): an http(s) URL or a base64 data
+ * URL. `detail` sets its pixel budget: "low" 256², "auto" 640², "high"
+ * 1024² (Qwen3.5: 64, 400 and 1,024 tokens for a square image). Audio parts
+ * are refused.
+ */
+export type ChatCompletionContentPartImage = {
+  type: "image_url"
+  image_url: { url: string; detail?: "auto" | "low" | "high" }
+}
 
 /** A message's content: text, or text parts. */
 export type ChatCompletionContent = string | Array<ChatCompletionContentPartText>
+
+/** A user message's content: text, or text and image parts. */
+export type ChatCompletionUserContent = string | Array<ChatCompletionContentPartText | ChatCompletionContentPartImage>
 
 export type ChatCompletionMessageToolCall = {
   id: string
@@ -25,7 +40,7 @@ export type ChatCompletionSystemMessageParam = {
 
 export type ChatCompletionUserMessageParam = {
   role: "user"
-  content: ChatCompletionContent
+  content: ChatCompletionUserContent
   name?: string
 }
 
@@ -176,6 +191,11 @@ export type CompletionTimings = {
   decode_ms: number
   prompt_tokens_per_second: number
   decode_tokens_per_second: number
+  /**
+   * With images: preparing them (fetching, resizing, and encoding those not
+   * encoded before, loading the vision encoder for them), before prompt_ms.
+   */
+  images_ms?: number
 }
 
 export type ChatCompletionMessage = {
@@ -265,7 +285,7 @@ export type ModelInfo = {
   loaded: boolean
   /** The context the loaded model holds, when loaded. */
   loadedContextLength?: number
-  supports: { tools: boolean; thinking: boolean }
+  supports: { tools: boolean; thinking: boolean; images: boolean }
 }
 
 /** Why a model left memory: unloadModel, room for another model, nobody waiting for its load, a failed load, or its worker stopped. */

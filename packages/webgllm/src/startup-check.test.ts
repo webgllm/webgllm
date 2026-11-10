@@ -258,6 +258,7 @@ async function probedQkvg(rows: number) {
     debug: null,
     kvDebug: null,
     prefixSaving: null,
+    images: [],
     async reserve() {},
     async charge() {},
     normInput: () => buffers.normed,
