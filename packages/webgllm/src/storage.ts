@@ -168,7 +168,7 @@ export async function removeManifest(model: string): Promise<void> {
 
 /**
  * What a load learned about this GPU and model that the next load needn't
- * measure again (see worker.ts), keyed by GPU, browser, model and engine
+ * measure again (see handler.ts), keyed by GPU, browser, model and engine
  * code. Best effort: no storage means measuring each time.
  */
 export type GpuNote = {

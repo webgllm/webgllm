@@ -48,8 +48,13 @@ export type WebGLLMOptions = {
   memoryBudget?: number
   /** Which worker and engine messages reach the console ("warn" by default). */
   logLevel?: LogLevel
-  /** Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))` themselves. */
-  worker?: () => Worker
+  /**
+   * A Web Worker of your own to run models in, in place of the ones webgllm
+   * starts: one running `WebGLLMWorkerHandler`. It holds one model, so
+   * loading another replaces the one there (whatever `keepLoaded` says), and
+   * unloading frees the model and leaves the worker running.
+   */
+  worker?: Worker
   /**
    * Called each time a model's worker claims memory, with the bytes the
    * model will hold in all (replacing its previous claim). The worker
@@ -107,13 +112,17 @@ async function resolved(model: unknown, signal?: AbortSignal): Promise<string> {
 const notSupported = (model: unknown) =>
   new WebGLLMError("model-not-supported", `${String(model)} isn't a model webgllm runs (see models.list()).`)
 
-/** What the tests swap (storage); not exported from the package. */
-export const internals = { storage: browserStorage as ModelStorage }
+/** What the tests swap (storage, the workers webgllm starts, the support check); not exported from the package. */
+export const internals = {
+  storage: browserStorage as ModelStorage,
+  createWorker: defaultWorker as () => Worker,
+  hasWebGl2
+}
 
 export class WebGLLM {
   /** Whether this browser can run the engine (WebGL 2 with float render targets, in a worker). */
   static isSupported(): boolean {
-    return hasWebGl2()
+    return internals.hasWebGl2()
   }
 
   /**
@@ -136,7 +145,8 @@ export class WebGLLM {
     const level = LEVELS[options.logLevel ?? "warn"]
     this.storage = internals.storage
     this.pool = new ModelPool({
-      createWorker: options.worker ?? defaultWorker,
+      createWorker: internals.createWorker,
+      ...(options.worker && { worker: options.worker }),
       memoryBudget: () => options.memoryBudget ?? defaultMemoryBudget(),
       storage: this.storage,
       onProgress: (progress) => {
@@ -189,6 +199,7 @@ export class WebGLLM {
    * Loads `model` (downloading it the first time) for chats of up to
    * `contextLength` tokens. Other models stay loaded while they fit the
    * memory budget; past it, the least recently used go (not ones kept loaded).
+   * In a worker of your own (`worker`), it replaces the model loaded there.
    */
   async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
     throwIfAborted(options.signal)
@@ -206,7 +217,11 @@ export class WebGLLM {
     })
   }
 
-  /** Unloads `model`, or every model, freeing its GPU memory; its running generation fails. */
+  /**
+   * Unloads `model`, or every model, freeing its GPU memory; its running
+   * generation fails. webgllm's own worker for the model ends; a worker of
+   * your own (`worker`) frees the model and stays running.
+   */
   async unloadModel(model?: WebGlModelId): Promise<void> {
     this.pool.unload(model)
   }
@@ -221,13 +236,10 @@ export class WebGLLM {
     await this.pool.download(await resolved(model, options.signal), options)
   }
 
-  /**
-   * The page can't run the engine: say so before starting a worker that
-   * would fail (skipped with a custom worker, which may know better).
-   */
+  /** The page can't run the engine: say so before a worker fails at it. */
   private checkSupport() {
-    if (this.checked || this.options.worker) return
-    if (!hasWebGl2()) {
+    if (this.checked) return
+    if (!internals.hasWebGl2()) {
       throw new WebGLLMError("webgl2-unavailable", "This browser can't run webgllm: it needs WebGL 2 with float render targets in a worker.")
     }
     this.checked = true

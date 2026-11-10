@@ -1,13 +1,13 @@
 ---
-title: webgllm/advanced
+title: The engine
 description: The engine underneath, for experiments.
 ---
 
 ```ts
-import { Engine, loadGguf, loadOnnx, loadTokenizer } from "webgllm/advanced"
+import { Engine, loadGguf, loadOnnx, loadTokenizer } from "webgllm"
 ```
 
-`webgllm/advanced` exports the engine that `WebGLLM` runs in its workers, for code that runs a model without them: a worker of its own, or benchmarks.
+`webgllm` also exports the engine that `WebGLLM` runs in its workers, for code that runs a model itself: benchmarks and experiments. To run `WebGLLM`'s models in a worker you start, use [`WebGLLMWorkerHandler`](/docs/reference/webgllm#a-worker-of-your-own) instead.
 
 <Callout type="warn">
   Not covered by semver while the package is 0.x.
@@ -19,8 +19,8 @@ import { Engine, loadGguf, loadOnnx, loadTokenizer } from "webgllm/advanced"
 | `loadGguf`, `loadOnnx` | Read GGUF or ONNX files into the engine's weights |
 | `loadTokenizer` | The tokenizer and chat template |
 | `httpSource`, `blobSource` | Byte sources the loaders read from |
+| `loadVision`, `VisionEncoder` | A vision encoder's weights, and the encoder that runs them |
+| `imageProcessorConfig`, `smartResize`, `toPatches` | An image as the patches the encoder reads |
 | `setPromptBatch` | How many prompt tokens are read at a time (512 by default) |
 | `defaultMemoryBudget` | The memory budget `WebGLLM` picks for the device |
 | `WEBGL_TEXT_MODELS`, `WEBGL_MODEL_META` | The model catalog |
-| `splitThinking`, `createThinkingSplitter` | Split reasoning from an answer |
-| `parseToolCalls`, `createToolCallSplitter` | Parse tool-call markup |

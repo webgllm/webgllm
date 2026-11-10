@@ -1,5 +1,5 @@
 /**
- * A scripted stand-in for worker.ts, for the page-side tests: it answers
+ * A scripted stand-in for handler.ts, for the page-side tests: it answers
  * the protocol the way the worker does (claims before "ready", tokens then
  * "done"), and lets a test hold generations open.
  */
@@ -38,8 +38,9 @@ export type FakeOptions = {
 }
 
 export class FakeWorker {
-  onmessage: ((event: { data: WorkerResponse }) => void) | null = null
-  onerror: ((event: { message: string }) => void) | null = null
+  private readonly listeners = { message: new Set<(event: never) => void>(), error: new Set<(event: never) => void>() }
+  /** Models it was asked to free ("unload": a worker the caller owns). */
+  readonly unloaded: Array<string> = []
   terminated = false
   readonly sent: Array<WorkerRequest> = []
   model: string | undefined
@@ -59,8 +60,26 @@ export class FakeWorker {
     this.terminated = true
   }
 
+  addEventListener(type: "message" | "error", listener: (event: never) => void) {
+    this.listeners[type].add(listener)
+  }
+
+  removeEventListener(type: "message" | "error", listener: (event: never) => void) {
+    this.listeners[type].delete(listener)
+  }
+
+  /** How many listeners the page has on it. */
+  get listening(): number {
+    return this.listeners.message.size + this.listeners.error.size
+  }
+
   emit(data: WorkerResponse) {
-    if (!this.terminated) this.onmessage?.({ data })
+    if (!this.terminated) for (const listener of [...this.listeners.message]) listener({ data } as never)
+  }
+
+  /** The worker fails, as an uncaught error in it does. */
+  fail(message: string) {
+    for (const listener of [...this.listeners.error]) listener({ message } as never)
   }
 
   /** Claims memory again (a cache growing during a reply); resolves once "claimed". */
@@ -87,7 +106,7 @@ export class FakeWorker {
     await Promise.resolve()
     if (message.type === "claimed") this.claimed.shift()?.()
     else if (message.type === "load") {
-      // Like worker.ts: after the generations running.
+      // Like handler.ts: after the generations running.
       if (this.open.size) await new Promise<void>((resolve) => this.idlers.push(resolve))
       this.model = message.model
       this.emit({ type: "progress", model: message.model, progress: 0.5, cached: true })
@@ -117,6 +136,9 @@ export class FakeWorker {
       this.finish(message.id, reply.tokens, reply.done)
     } else if (message.type === "stop") {
       if (this.open.has(message.id)) this.finish(message.id)
+    } else if (message.type === "unload") {
+      this.unloaded.push(message.model)
+      if (this.model === message.model) this.model = undefined
     }
   }
 }

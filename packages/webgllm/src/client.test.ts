@@ -7,14 +7,17 @@ import { settle } from "./fake-worker.test.js"
 
 function manual() {
   const sent: WorkerRequest[] = []
+  let listener: ((event: { data: WorkerResponse }) => void) | undefined
   const fake = {
-    onmessage: null as ((event: { data: WorkerResponse }) => void) | null,
-    onerror: null,
+    addEventListener: (type: string, added: (event: { data: WorkerResponse }) => void) => {
+      if (type === "message") listener = added
+    },
+    removeEventListener() {},
     postMessage: (message: WorkerRequest) => void sent.push(message),
     terminate() {}
   }
-  const emit = (data: WorkerResponse) => fake.onmessage?.({ data })
-  const worker = new ModelWorker("LiquidAI/LFM3-1.7B-GGUF", () => fake as unknown as Worker, {
+  const emit = (data: WorkerResponse) => listener?.({ data })
+  const worker = new ModelWorker("LiquidAI/LFM3-1.7B-GGUF", fake as unknown as Worker, true, {
     onProgress() {}, onClaim: async () => undefined, onLog() {}, onCrash() {}
   })
   const loads = () => sent.filter((m): m is Extract<WorkerRequest, { type: "load" }> => m.type === "load")

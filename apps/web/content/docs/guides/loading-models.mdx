@@ -34,7 +34,7 @@ Aborting keeps what came; the next download resumes.
 
 ## Several models
 
-Several models can be loaded at once, one worker each, up to a memory budget. The budget is picked from the device; set your own with `new WebGLLM({ memoryBudget })`. Loading past it unloads the least recently used model, unless that model was loaded with `keepLoaded: true`.
+Several models can be loaded at once, one worker each, up to a memory budget (a [worker of your own](/docs/reference/webgllm#a-worker-of-your-own) holds one model). The budget is picked from the device; set your own with `new WebGLLM({ memoryBudget })`. Loading past it unloads the least recently used model, unless that model was loaded with `keepLoaded: true`.
 
 ```ts
 await webgllm.models.list()      // supported models, with downloaded / loaded

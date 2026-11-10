@@ -128,6 +128,11 @@ export type WorkerRequest =
       pipeline?: boolean
     }
   | { type: "stop"; id: string }
+  /**
+   * Free `model` (stopping a load of it) and stay running: sent to a worker
+   * the caller started, where the page's own worker would be ended.
+   */
+  | { type: "unload"; model: string }
   /** Download a model's files to storage without loading it ("progress", then "downloaded"). */
   | { type: "download"; model: string; meta?: WebGlModelMeta }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }

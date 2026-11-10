@@ -5,7 +5,7 @@ description: Workers, weights, kernels and caching.
 
 ## Workers
 
-Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `chat.completions.create` call is one generation there. The page's main thread stays free.
+Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `chat.completions.create` call is one generation there. The page's main thread stays free. webgllm starts the workers, and ends one to free its model; given a [worker of your own](/docs/reference/webgllm#a-worker-of-your-own), it runs one model in that worker and never ends it.
 
 The worker downloads the files to the Origin Private File System, resuming a dropped download. It then streams the weights from there into textures one layer at a time, so a model is never all in JavaScript memory.
 

@@ -1,7 +1,8 @@
 /**
- * The page's side of one WebGL 2 worker (worker.ts), which runs a model off
- * the main thread on an OffscreenCanvas. One worker holds one model; the
- * pool (pool.ts) keeps a worker per loaded model.
+ * The page's side of one model in a WebGL 2 worker (handler.ts), which runs
+ * it off the main thread on an OffscreenCanvas. One worker holds one model;
+ * the pool (pool.ts) starts a worker per loaded model, or keeps its one
+ * model in the worker the caller gave it.
  */
 import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
@@ -61,7 +62,6 @@ export const defaultWorker = () =>
   new Worker(new URL("./worker.js", import.meta.url), { type: "module", name: "webgllm" })
 
 export class ModelWorker {
-  private readonly worker: Worker
   private load: Load | null = null
   /** The last load's id: the worker's "ready" or "load-error" names the load it answers. */
   private loads = 0
@@ -78,18 +78,26 @@ export class ModelWorker {
   contextLength: number | undefined
   private gone: Error | null = null
 
+  private readonly onMessage = (event: MessageEvent<WorkerResponse>) => this.handle(event.data)
+  private readonly onError = (event: ErrorEvent) => {
+    const error = new Error(event.message || "The model's worker stopped.")
+    this.terminate(error)
+    this.events.onCrash(error)
+  }
+
+  /**
+   * `owned`: a worker started for this model, ended with it. Otherwise it's
+   * the caller's: it's left running (asked to free the model), its other
+   * listeners alone, and it may carry another model's messages too.
+   */
   constructor(
     readonly model: string,
-    create: () => Worker,
+    private readonly worker: Worker,
+    private readonly owned: boolean,
     private readonly events: WorkerEvents
   ) {
-    this.worker = create()
-    this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.handle(event.data)
-    this.worker.onerror = (event: ErrorEvent) => {
-      const error = new Error(event.message || "The model's worker stopped.")
-      this.terminate(error)
-      this.events.onCrash(error)
-    }
+    worker.addEventListener("message", this.onMessage)
+    worker.addEventListener("error", this.onError)
     live.add(this)
     if (Object.keys(tuning).length) this.post({ type: "tune", values: { ...tuning } })
   }
@@ -222,13 +230,24 @@ export class ModelWorker {
     this.post({ type: "stop", id })
   }
 
-  /** Ends the worker, and with it the model and all its GPU memory. */
+  /**
+   * Frees the model and all its GPU memory: by ending the worker, or in a
+   * worker of the caller's by stopping its generations and asking the
+   * worker to free the model, which leaves it running.
+   */
   terminate(reason: Error) {
     if (this.gone) return
+    this.worker.removeEventListener("message", this.onMessage)
+    this.worker.removeEventListener("error", this.onError)
+    if (this.owned) this.worker.terminate()
+    else {
+      for (const id of this.generations.keys()) this.post({ type: "stop", id })
+      // (Only if it was asked to load: a download leaves the worker's model alone.)
+      if (this.load) this.post({ type: "unload", model: this.model })
+    }
     this.gone = reason
     this.ready = false
     live.delete(this)
-    this.worker.terminate()
     this.load?.reject(reason)
     this.load = null
     this.downloading?.reject(reason)
@@ -273,6 +292,8 @@ export class ModelWorker {
   }
 
   private handle(data: WorkerResponse) {
+    // A worker of the caller's also carries the messages of a download of another model.
+    if (!this.owned && "model" in data && data.model !== this.model) return
     switch (data.type) {
       case "progress":
         this.events.onProgress(data)

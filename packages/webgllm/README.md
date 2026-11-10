@@ -121,7 +121,7 @@ The image is resized the way the model's processor does it (to whole 32-pixel bl
 
 ### Several models
 
-Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
+Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default; a [worker of your own](#a-worker-of-your-own) holds one model). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
 
 ```ts
 await webgllm.models.list()      // the catalog, downloaded models and models used on the page
@@ -129,6 +129,25 @@ await webgllm.models.downloaded(id) // whether it loads without a download (stor
 await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```
+
+### A worker of your own
+
+webgllm starts a Web Worker for each model it loads, with `new Worker(new URL("./worker.js", import.meta.url))`, which Vite and webpack 5 bundle for you. To run models in a worker you start (bundled your way, or shared with your own code), write the worker with the package's handler and give it to `WebGLLM`:
+
+```ts
+// worker.ts
+import { WebGLLMWorkerHandler } from "webgllm"
+
+const handler = new WebGLLMWorkerHandler()
+self.onmessage = (event) => handler.onmessage(event)
+```
+
+```ts
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const webgllm = new WebGLLM({ worker })
+```
+
+The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. Downloads run in the same worker, beside the loaded model. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
 
 ### Sharing memory with other runtimes
 
@@ -185,9 +204,9 @@ The catalog holds known defaults for the models webgllm is tuned and tested on, 
 
 LFM3 thinks by default and Qwen3.5 doesn't; `reasoning.effort` (or OpenAI's `reasoning_effort`) switches it through the chat template's `enable_thinking`. Sampling defaults come from each model card. See [LFM2.5 GGUF validation](bench/LFM2-GGUF.md).
 
-## Advanced
+## The engine
 
-`webgllm/advanced` exports the engine underneath (`Engine`, `loadGguf`, `loadOnnx`, `loadTokenizer`, byte sources, `setPromptBatch`) for experiments. It's not covered by semver while the package is 0.x.
+`webgllm` also exports the engine underneath (`Engine`, `loadGguf`, `loadOnnx`, `loadVision`, `VisionEncoder`, `loadTokenizer`, byte sources), `setPromptBatch`, `defaultMemoryBudget` and the model catalog (`WEBGL_TEXT_MODELS`, `WEBGL_MODEL_META`), for experiments. The engine isn't covered by semver while the package is 0.x.
 
 ## How it runs
 
@@ -195,7 +214,7 @@ Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `ch
 
 - **Loaders:** `loadGguf` and `loadOnnx` read either format into the same weights (`weights.ts`): 4-bit blocks of 32 in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is kept as it is and read natively in the shader, so its weights are exactly llama.cpp's. The embedding goes to the GPU in chunks of rows, so it's never all in JavaScript memory. Only tensors are read from the ONNX graph; its ops aren't run.
 - **Kernels:** fragment shaders, one output texel per fragment (`gpu/kernels.ts`). Matmuls read weights from byte textures and activations as packed halves, eight per texel. A one-token matmul splits its rows' blocks across fragments, so the GPU has enough work. Every op of LFM3's graph is a pass: RMSNorm, the gated short convolution with its state, QK-norm and RoPE, attention over a half-precision KV cache (sliding-window layers see their last 256 tokens), the sigmoid output gate, SwiGLU, and the sandwich norms.
-- **Prompts** are read 512 tokens at a time on every device (`setPromptBatch` in `webgllm/advanced` for fewer); big passes are split into bands of rows, under mobile GPUs' watchdogs.
+- **Prompts** are read 512 tokens at a time on every device (`setPromptBatch` for fewer); big passes are split into bands of rows, under mobile GPUs' watchdogs.
 - **Sampling:** with top-k (LFM3's 50), the GPU applies the repetition penalty and picks the 50 chunks of 256 logits with the largest logits, which hold the top 50 tokens for sure, so writing a token reads back ~50 KB rather than every logit. Readbacks go through a pixel buffer and a fence.
 - **Qwen3.5's Gated DeltaNet** (18 of its 24 layers) is a pass each for the gates (beta, decay), the causal convolution with its state, and q and k's L2 norms, then the recurrence over each head's 128×128 fp32 state, and the gated RMSNorm. Writing runs the recurrence as two passes a token (the delta and output, then the update). Prompt batches run it in chunks of 32 tokens, as llama.cpp and flash-linear-attention do (`delta-rule.ts` has the math): the decays summed within a chunk, the chunk's Gram matrices, a triangular solve and the products that don't read the state, for every chunk at once, then two passes a chunk that do (its deltas and outputs, then the state after it). Its full-attention layers gate their output per dim.
 - **Cache reuse:** a follow-up reads only what's new. The full-attention cache rewinds to any position; the convolutions' state, Qwen3.5's recurrent state and the sliding-window layers' last window are saved (snapshots) to resume from: LFM3's after each prompt batch and reply (the latest 8, ~3 MB each), Qwen3.5's (~20 MB each) after the reply and at the anchor, where the next question's prompt stops sharing the chat, 2 in all. Qwen3.5's template writes a past reply back without the `<think>` tags its generation prompt opened, so a follow-up differs from `<|im_start|>assistant` on; the anchor is saved there, from inside the prompt's last batch (its recurrence chunks laid out so one ends there), and a follow-up reads only the reply and the new message. `src/prompt.ts` finds where a template's follow-ups stop sharing, once per template (LFM3's write the reply back as it was: the anchor is the prompt's end). A tool's result keeps the last question's anchor, the reply before it being written back as it was. Qwen3.5 writes without speculative drafts (keeping only part of a draft batch would need the recurrent state after each of its tokens).

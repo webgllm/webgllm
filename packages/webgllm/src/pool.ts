@@ -1,12 +1,13 @@
 /**
  * The loaded models of one WebGLLM: a worker per model, as many as fit the
  * memory budget (the least recently used unloaded to make room, unless kept
- * loaded), and one queue for their generations. Only one generation runs
+ * loaded), and one queue for their generations. Given a worker of the
+ * caller's, it keeps one model, in that worker: loading another replaces it. Only one generation runs
  * at a time across all models: they'd contend for the GPU, and frame
  * pacing assumes one.
  */
 import { ModelWorker } from "./client.js"
-import type { WorkerGenerationEnd } from "./client.js"
+import type { WorkerEvents, WorkerGenerationEnd } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
 import { monitorFrames } from "./frame-pacing.js"
 import type { ModelStorage } from "./model-files.js"
@@ -17,7 +18,10 @@ import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 export type LogLevel = "debug" | "info" | "warn" | "error" | "silent"
 
 export type PoolOptions = {
+  /** Starts a worker for a model (not used with `worker`). */
   createWorker: () => Worker
+  /** The caller's worker (WebGLLMOptions.worker): every model runs in it, one at a time, and it's never ended. */
+  worker?: Worker
   /** Bytes all loaded models may take together. */
   memoryBudget: () => number
   storage: ModelStorage
@@ -167,6 +171,14 @@ export class ModelPool {
       entry = this.entries.get(model)
     }
     this.throwIfUnloaded(model, since)
+    // The caller's worker holds one model: the one there leaves first, as one
+    // evicted for room does (kept loaded or not), and the last load asked for wins.
+    while (!entry && this.options.worker && this.entries.size) {
+      for (const other of [...this.entries.values()]) await abortable(this.evict(other.model, signal), signal)
+      throwIfAborted(signal)
+      this.throwIfUnloaded(model, since)
+      entry = this.entries.get(model)
+    }
     entry ??= this.spawn(model)
     if (options.keepLoaded !== undefined) {
       entry.keepLoaded = options.keepLoaded
@@ -363,7 +375,7 @@ export class ModelPool {
     if (await abortable(this.options.storage.downloaded(model), signal)) return
     // Canceled as the check came back: there was no worker to stop yet.
     throwIfAborted(signal)
-    const worker = new ModelWorker(model, this.options.createWorker, {
+    const worker = this.modelWorker(model, {
       onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
       onClaim: () => Promise.resolve(),
       onLog: (text) => this.options.log("info", text),
@@ -422,6 +434,12 @@ export class ModelPool {
     }, signal)
   }
 
+  /** `model`'s side of a worker: the caller's, else one started for it. */
+  private modelWorker(model: string, events: WorkerEvents): ModelWorker {
+    const given = this.options.worker
+    return new ModelWorker(model, given ?? this.options.createWorker(), !given, events)
+  }
+
   private spawn(model: string): Entry {
     const entry: Entry = {
       model,
@@ -431,7 +449,7 @@ export class ModelPool {
       evicting: null,
       watched: null,
       gone: new AbortController(),
-      worker: new ModelWorker(model, this.options.createWorker, {
+      worker: this.modelWorker(model, {
         onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
         onClaim: async (bytes) => {
           if (this.entries.get(model) !== entry) return
@@ -478,7 +496,7 @@ export class ModelPool {
     }
   }
 
-  /** Ends `entry`'s worker, freeing its model and memory; what waits on it fails with `reason`. */
+  /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
     entry.worker.terminate(reason)
     entry.gone.abort(reason)

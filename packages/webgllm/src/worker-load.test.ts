@@ -15,7 +15,7 @@ const require = createRequire(join(process.cwd(), "package.json"))
 const { build } = await import(pathToFileURL(require.resolve("esbuild")).href) as typeof import("esbuild")
 const temporary = await mkdtemp(join(tmpdir(), "webgl-worker-load-"))
 after(() => rm(temporary, { recursive: true, force: true }))
-const source = await readFile(join(process.cwd(), "src/worker.ts"), "utf8")
+const source = await readFile(join(process.cwd(), "src/handler.ts"), "utf8")
 const loadStart = source.indexOf("function startLoad(")
 const loadEnd = source.indexOf("\n/**\n * Downloads `model`'s files", loadStart)
 const loopStart = source.indexOf("let queue: Promise<void>")
@@ -23,7 +23,7 @@ assert.ok(loadStart >= 0 && loadEnd > loadStart && loopStart > loadEnd)
 const outfile = join(temporary, "loads.mjs")
 await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), contents: `
   export function makeWorker(state) {
-    let current = null, loading = null, pacingEngine = null
+    let current = null, loading = null, stopping, pacingEngine = null
     const post = (m) => state.messages.push(m)
     const load = (model, signal, contextLength) => state.load(model, signal, contextLength)
     const release = (engine) => { engine.released = true }
@@ -37,7 +37,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
       await state.generate(model, request)
     }
     ${source.slice(loadStart, loadEnd)}
-    ${source.slice(loopStart).replace("onmessage = (", "state.onmessage = (")}
+    ${source.slice(loopStart)}
+    state.onmessage = ({ data }) => receive(data)
   }
 ` }, outfile, bundle: true, format: "esm", platform: "node", logLevel: "error" })
 const { makeWorker } = await import(pathToFileURL(outfile).href)
@@ -143,4 +144,59 @@ test("a load of what's loaded answers ready with its own id", async () => {
   await settle()
   assert.equal(w.loads.length, 1)
   assert.deepEqual(readies(w.messages).map((m) => m.type === "ready" && m.loadId), [1, 2])
+})
+
+test("unload frees the loaded model after the generation running, and the worker loads again", async () => {
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  w.send(generate("g"))
+  await settle()
+  w.send({ type: "unload", model: MODEL })
+  await settle()
+  assert.equal(w.loads[0].engine.released, false, "freed under the reply running")
+  w.generations[0].finish()
+  await settle()
+  assert.equal(w.loads[0].engine.released, true)
+  // Still running: the next load starts afresh.
+  w.send({ type: "load", model: MODEL, loadId: 2 })
+  await settle()
+  assert.equal(w.loads.length, 2)
+  w.loads[1].finish()
+  await settle()
+  assert.deepEqual(readies(w.messages).map((m) => m.type === "ready" && m.loadId), [1, 2])
+  assert.equal(w.loads[1].engine.released, false)
+})
+
+test("unload stops a load in progress, without an answer; the next load waits for it to end", async () => {
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  w.send({ type: "unload", model: MODEL })
+  await settle()
+  assert.equal(w.loads[0].signal.aborted, true)
+  w.send({ type: "load", model: "unsloth/Qwen3.5-2B-GGUF", loadId: 2 })
+  await settle()
+  assert.equal(w.loads.length, 1, "two loads ran at once")
+  w.loads[0].finish()
+  await settle()
+  assert.equal(w.loads[0].engine.released, true)
+  assert.equal(w.loads.length, 2)
+  w.loads[1].finish()
+  await settle()
+  assert.equal(w.most(), 1)
+  assert.deepEqual(w.messages.filter((m) => m.type === "ready" || m.type === "load-error").map((m) => m.type === "ready" && m.loadId), [2])
+})
+
+test("unload of another model leaves the loaded one", async () => {
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  w.send({ type: "unload", model: "unsloth/Qwen3.5-2B-GGUF" })
+  await settle()
+  assert.equal(w.loads[0].engine.released, false)
 })

@@ -9,8 +9,7 @@ import type {
   CompletionUsage,
   ReasoningEffort,
 } from 'webgllm';
-import { WebGLLM } from 'webgllm';
-import { WEBGL_MODEL_META, type WebGlModelMeta } from 'webgllm/advanced';
+import { WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 
 /**

@@ -12,12 +12,16 @@ const QWEN = "unsloth/Qwen3.5-2B-GGUF"
 const LFM2 = "LiquidAI/LFM2.5-350M-GGUF"
 const hi = [{ role: "user" as const, content: "hi" }]
 
+// (Node has no WebGL 2: the fake workers stand in for the engine.)
+internals.hasWebGl2 = () => true
+
 function llm(options: FakeOptions = {}, downloaded = new Set<string>()) {
   const workers = fakeWorkers(options)
   const storage = fakeStorage(downloaded)
   internals.storage = storage
+  internals.createWorker = workers.create
   const progress: Array<LoadProgress> = []
-  const instance = new WebGLLM({ worker: workers.create, onProgress: (p) => progress.push(p), memoryBudget: 1000 })
+  const instance = new WebGLLM({ onProgress: (p) => progress.push(p), memoryBudget: 1000 })
   return { llm: instance, workers, progress, storage }
 }
 
@@ -368,7 +372,7 @@ test("lifecycle events: a model evicted for room, a failed load, an aborted load
   const crashing = llm()
   const crashes = recordEvents(crashing.llm)
   await crashing.llm.loadModel(LFM2)
-  crashing.workers.of(LFM2)!.onerror?.({ message: "boom" })
+  crashing.workers.of(LFM2)!.fail("boom")
   await settle()
   assert.equal(crashes[2]?.startsWith(`error ${LFM2}:`), true, crashes.join(", "))
   assert.equal(crashes[3], `unload ${LFM2} crashed`)
@@ -392,9 +396,9 @@ test("a throwing listener doesn't break loading", async () => {
 test("onMemoryClaim forwards each model's claims, released at its unload event", async () => {
   const workers = fakeWorkers({ bytes: () => 700 })
   internals.storage = fakeStorage(new Set([QWEN]))
+  internals.createWorker = workers.create
   const host = new Map<string, number>()
   const instance = new WebGLLM({
-    worker: workers.create,
     memoryBudget: 1000,
     onMemoryClaim: ({ model, bytes }) => void host.set(model, bytes)
   })

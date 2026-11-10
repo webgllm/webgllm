@@ -47,7 +47,7 @@ Pages:
 
 ## mem.html: memory and speed over a chat (and the iPhone page)
 
-Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
+Runs a chat in a worker the way `handler.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
 
 - `model=qwen-onnx|qwen-gguf|lfm-onnx|lfm-gguf` (or a model's full name, a Hugging Face repository such as `onnx-community/Qwen3.5-0.8B-ONNX`).
 - `len=512`: the first message's length in tokens; `follow=0`: what each follow-up adds (0: a short question); `reply=128`: tokens per reply; `turns=3`, or `target=8192`: turns until the cache holds that many tokens; `ctx`: the context length (the model's own when left out); `think=1`: thinking on.
@@ -61,6 +61,10 @@ On an iPhone: start the server on the Mac (`node packages/webgllm/bench/server.m
 - serve the network (`HOST=0.0.0.0 node packages/webgllm/bench/server.mjs 8787`) and open `http://<the Mac's address>:8787/mem.html?…` on the same Wi-Fi: no storage there, so each load streams the model from Hugging Face again.
 
 For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html?model=qwen-gguf&len=2048&follow=1024&reply=128&target=8192&ctx=8192` (`&batch=128` for the smallest batch's memory). The timings a phone's defaults would need: `mem.html?model=qwen-gguf&mode=ab&len=535&reply=64&rounds=3&variants=default|f16Matmul:2|packZeros:0|batch:512|batch:256|batch:128|batch:128,quadMinBatch:128` (`packZeros` only matters for the ONNX builds; run it on each build). A tab that reloads by itself ran out of memory.
+
+## own-worker.html: webgllm's worker and a worker of the page's own
+
+The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`.
 
 ## q4-matmul.html: the first kernel
 

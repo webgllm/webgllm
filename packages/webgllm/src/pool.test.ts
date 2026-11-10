@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
-import { fakeStorage, fakeWorkers, settle } from "./fake-worker.test.js"
+import { FakeWorker, fakeStorage, fakeWorkers, settle } from "./fake-worker.test.js"
 import type { FakeOptions } from "./fake-worker.test.js"
 import { MemoryBudget } from "./model-memory.js"
 import type { LoadProgress } from "./openai.js"
@@ -14,7 +14,7 @@ const C = "LiquidAI/LFM3-1.7B-GGUF"
 
 const fields = { chat: [{ role: "user" as const, content: "hi" }], tools: [], sampling: { temperature: 0, top_k: 1, repetition_penalty: 1 } }
 
-function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>; onMemoryClaim?: PoolOptions["onMemoryClaim"] } = {}) {
+function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>; onMemoryClaim?: PoolOptions["onMemoryClaim"]; worker?: Worker } = {}) {
   const workers = fakeWorkers({ bytes: () => 60, ...options })
   const progress: Array<LoadProgress> = []
   const logs: Array<string> = []
@@ -27,6 +27,7 @@ function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>
     onProgress: (event) => progress.push(event),
     onModelEvent: (event) => events.push(event),
     ...(options.onMemoryClaim && { onMemoryClaim: options.onMemoryClaim }),
+    ...(options.worker && { worker: options.worker }),
     log: (_, text) => logs.push(text)
   })
   return { pool: p, workers, progress, logs, storage, events }
@@ -575,4 +576,79 @@ test("a running generation's claim (its vision encoder) isn't stuck behind a loa
   assert.equal(a.terminated, true)
   assert.equal(p.isLoaded(B), true)
   assert.equal(p.memoryUsed, 60, "only B's bytes are held once A is unloaded")
+})
+
+/** A pool given one worker of the caller's (a fake), which it must never end. */
+function given(options: FakeOptions & { budget?: number } = {}) {
+  const worker = new FakeWorker({ bytes: () => 60, ...options })
+  return { ...pool({ ...options, worker: worker as unknown as Worker }), worker }
+}
+
+test("a worker of the caller's: unloading frees the model there and leaves the worker running", async () => {
+  const { pool: p, worker, workers, events } = given({ reply: () => ({ tokens: ["ok"] }) })
+  await p.load(A)
+  await p.generate(A, fields, { onToken: () => undefined })
+  assert.equal(workers.workers.length, 0, "the pool started a worker of its own")
+  p.unload(A)
+  assert.equal(p.isLoaded(A), false)
+  assert.equal(p.memoryUsed, 0)
+  await settle()
+  assert.deepEqual(worker.unloaded, [A])
+  assert.equal(worker.terminated, false)
+  assert.equal(worker.listening, 0, "the pool's listeners stay on the worker")
+  assert.deepEqual(events.at(-1), { type: "unload", model: A, reason: "unloaded" })
+  // The same worker loads again.
+  await p.load(A)
+  assert.equal(p.isLoaded(A), true)
+  assert.equal(worker.sent.filter((m) => m.type === "load").length, 2)
+})
+
+test("a worker of the caller's holds one model: loading another replaces it, kept loaded or not", async () => {
+  const { pool: p, worker, events } = given({ budget: 1000 })
+  await p.load(A, { keepLoaded: true })
+  await p.load(B)
+  assert.deepEqual(p.loadedModels(), [B])
+  assert.deepEqual(worker.unloaded, [A])
+  assert.equal(worker.terminated, false)
+  assert.ok(events.some((e) => e.type === "unload" && e.model === A && e.reason === "evicted"))
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("a worker of the caller's: the model there finishes its running generation before another replaces it", async () => {
+  const { pool: p, worker } = given({ budget: 1000 })
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const loadB = p.load(B)
+  await settle()
+  assert.equal(p.isLoaded(B), false)
+  assert.deepEqual(worker.unloaded, [])
+  worker.finish(worker.generations()[0]!.id, ["done"])
+  await running
+  await loadB
+  assert.deepEqual(p.loadedModels(), [B])
+})
+
+test("a worker of the caller's: unloading stops the running generation", async () => {
+  const { pool: p, worker } = given()
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  const id = worker.generations()[0]!.id
+  p.unload()
+  await assert.rejects(running, { code: "model-not-loaded" })
+  assert.ok(worker.sent.some((m) => m.type === "stop" && m.id === id))
+  await settle()
+  assert.deepEqual(worker.unloaded, [A])
+})
+
+test("a worker of the caller's: a download runs in it beside the loaded model", async () => {
+  const { pool: p, worker, workers } = given({ budget: 1000 })
+  await p.load(A)
+  await p.download(B)
+  assert.equal(workers.workers.length, 0)
+  assert.ok(worker.sent.some((m) => m.type === "download" && m.model === B))
+  assert.equal(worker.terminated, false)
+  assert.deepEqual(worker.unloaded, [], "a download freed the loaded model")
+  assert.equal(p.isLoaded(A), true)
 })

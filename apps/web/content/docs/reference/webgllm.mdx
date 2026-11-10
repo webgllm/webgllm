@@ -4,7 +4,7 @@ description: The WebGLLM class, its options and methods.
 ---
 
 ```ts
-import { WebGLLM, WebGLLMError } from "webgllm"
+import { WebGLLM, WebGLLMError, WebGLLMWorkerHandler } from "webgllm"
 ```
 
 The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) and its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`).
@@ -18,7 +18,29 @@ The package also exports the OpenAI request and response types (`ChatCompletion`
 | `onProgress` | `(progress: LoadProgress) => void` | Every load's and download's progress. |
 | `onMemoryClaim` | `({ model, bytes, signal }) => Promise<void> \| void` | See [Sharing memory](/docs/guides/sharing-memory). |
 | `logLevel` | `"debug" \| "info" \| "warn" \| "error" \| "silent"` | Which worker messages reach the console. Default `"warn"`. |
-| `worker` | `() => Worker` | Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))`. |
+| `worker` | `Worker` | A Web Worker of your own to run models in. See [A worker of your own](#a-worker-of-your-own). |
+
+## A worker of your own
+
+webgllm starts a Web Worker for each model it loads. To run models in a worker you start (bundled your way, or shared with your own code), write the worker with `WebGLLMWorkerHandler` and give it to `WebGLLM`:
+
+```ts
+// worker.ts
+import { WebGLLMWorkerHandler } from "webgllm"
+
+const handler = new WebGLLMWorkerHandler()
+self.onmessage = (event) => handler.onmessage(event)
+```
+
+```ts
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const webgllm = new WebGLLM({ worker })
+```
+
+- The worker holds one model. Loading another replaces the one there once its running generation ends, whatever `keepLoaded` says; the replaced model's `unload` event has the reason `"evicted"`.
+- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start.
+- For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
+- Downloads (`downloadModel`) run in the same worker, beside the loaded model.
 
 ## `WebGLLM.isSupported()`
 
@@ -50,7 +72,7 @@ Downloads a model's files into storage without loading them. Takes `onProgress` 
 
 ## `unloadModel(model?)`
 
-Frees a model's GPU memory, or every model's with no argument.
+Frees a model's GPU memory, or every model's with no argument. webgllm's own worker for the model ends; a worker of your own frees the model and stays running.
 
 ## `models`
 

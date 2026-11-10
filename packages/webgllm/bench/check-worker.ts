@@ -1864,7 +1864,7 @@ async function smoke(params: {
   // The same reply with speculative decoding, as the worker writes:
   // drafts by prompt lookup checked in one batch, greedy, so the tokens
   // must match the plain loop's exactly.
-  // The worker's policy (src/worker.ts: DRAFT_MATCH, DRAFTS).
+  // The worker's policy (src/handler.ts: DRAFT_MATCH, DRAFTS).
   for (const [minMatch, maxDrafts] of [[2, 7]]) {
     engine.reset()
     engine.setSeen(prompt, tokenizer.vocabSize)
