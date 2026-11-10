@@ -215,7 +215,15 @@ export async function readPrompt(
   prompt: Array<number>,
   start: number,
   cached: Array<number>,
-  options: { stop?: () => boolean; anchor?: number; prefix?: number; observedPrefix?: number; checkpoints?: boolean } = {}
+  options: {
+    stop?: () => boolean
+    anchor?: number
+    prefix?: number
+    observedPrefix?: number
+    checkpoints?: boolean
+    /** What `cached` gets for each token read: the prompt's tokens when left out (see worker.ts: image rows' keys). */
+    keys?: Array<number>
+  } = {}
 ): Promise<number> {
   if (options.stop?.()) return 0
   const few = engine.snapshotLimit < 4
@@ -238,7 +246,7 @@ export async function readPrompt(
       ...(saveAt !== undefined && { saveAt }),
       ...(prefixAt !== undefined && { prefixAt })
     })
-    cached.push(...batch)
+    cached.push(...(options.keys ? options.keys.slice(i - size, i) : batch))
     const end = i === prompt.length ? row : undefined
     if (snapshot === "prefix") engine.snapshot(end, "prefix")
     else if (snapshot === "anchor") engine.snapshot(end, true)

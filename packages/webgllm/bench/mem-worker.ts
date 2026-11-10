@@ -16,6 +16,7 @@ import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
 import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
+import { resolveModel } from "../src/resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
 import { checkPrefixCache } from "./prefix-cache-check.js"
@@ -167,6 +168,8 @@ async function checkpoint(engine: Engine, params: Params, label: string) {
 
 /** The model's files, from the Origin Private File System (downloaded the first time). */
 async function files(model: WebGlTextModel) {
+  // (Any Hugging Face repository, not just the catalog: resolved first.)
+  await resolveModel(model)
   const meta = modelMeta(model)
   const t = meta.tokenizer
   const weights =

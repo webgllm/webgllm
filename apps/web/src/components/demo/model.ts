@@ -1,5 +1,8 @@
-import type { ChatModelAdapter, ThreadMessage, ToolCallMessagePart } from '@assistant-ui/react';
+import type { AttachmentAdapter, ChatModelAdapter, PendingAttachment, ThreadMessage, ToolCallMessagePart } from '@assistant-ui/react';
+import { useSyncExternalStore } from 'react';
 import type {
+  ChatCompletionContentPartImage,
+  ChatCompletionContentPartText,
   ChatCompletionMessageParam,
   ChatCompletionTool,
   CompletionTimings,
@@ -7,13 +10,17 @@ import type {
   ReasoningEffort,
 } from 'webgllm';
 import { WebGLLM } from 'webgllm';
-import { WEBGL_MODEL_META } from 'webgllm/advanced';
+import { WEBGL_MODEL_META, type WebGlModelMeta } from 'webgllm/advanced';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 
-/** The models the demo offers: regular GGUF builds, each with tools. */
+/**
+ * The models the demo offers: regular builds, each with tools. Qwen3.5 2B's
+ * ONNX build has a vision encoder, so it also reads images.
+ */
 const MODEL_NAMES = [
   ['LiquidAI/LFM3-1.7B-GGUF', 'LFM3 1.7B'],
   ['unsloth/Qwen3.5-2B-GGUF', 'Qwen3.5 2B'],
+  ['onnx-community/Qwen3.5-2B-ONNX', 'Qwen3.5 2B ONNX'],
   ['LiquidAI/LFM2.5-1.2B-Instruct-GGUF', 'LFM2.5 1.2B Instruct'],
   ['LiquidAI/LFM2.5-1.2B-Thinking-GGUF', 'LFM2.5 1.2B Thinking'],
   ['LiquidAI/LFM2.5-350M-GGUF', 'LFM2.5 350M'],
@@ -36,6 +43,86 @@ export const MODELS: ModelOption[] = MODEL_NAMES.map(([id, name]) => {
 });
 
 export type ModelId = (typeof MODEL_NAMES)[number][0];
+
+/** What a model reads besides text, from webgllm's meta (its files decide it). */
+export type MediaInput = Exclude<WebGlModelMeta['supports']['input'][number], 'text'>;
+export const mediaInputs = (model: string): MediaInput[] =>
+  ((WEBGL_MODEL_META[model as ModelId]?.supports.input ?? []) as WebGlModelMeta['supports']['input']).filter(
+    (input): input is MediaInput => input !== 'text',
+  );
+
+/** The model picked in the composer (set by its model selector). */
+let selected: string = MODELS[0]!.id;
+const selectedListeners = new Set<() => void>();
+export const selectedModel = {
+  get: () => selected,
+  set: (model: string) => {
+    selected = model;
+    for (const listener of selectedListeners) listener();
+  },
+  subscribe: (listener: () => void) => {
+    selectedListeners.add(listener);
+    return () => selectedListeners.delete(listener);
+  },
+};
+
+/** What the selected model reads besides text: the composer offers attachments for these. */
+export function useMediaInputs(): MediaInput[] {
+  const model = useSyncExternalStore(selectedModel.subscribe, selectedModel.get, () => MODELS[0]!.id);
+  return mediaInputs(model);
+}
+
+/** The longest side images are sent at: webgllm's largest pixel budget ("high", 1024²) reads no more. */
+const MAX_IMAGE_SIDE = 1024;
+
+/** An image file as a data URL, scaled down to MAX_IMAGE_SIDE (saved chats keep it, in localStorage). */
+async function imageDataUrl(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d')!;
+  context.fillStyle = '#fff';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas.toDataURL('image/jpeg', 0.9);
+}
+
+/**
+ * assistant-ui's attachments for what the selected model reads: images for
+ * a model with a vision encoder; nothing for the others (their composer
+ * shows no attach button, and a pasted or dropped file is refused).
+ */
+export class MediaAttachmentAdapter implements AttachmentAdapter {
+  get accept() {
+    return mediaInputs(selectedModel.get()).includes('image') ? 'image/*' : '';
+  }
+
+  async add({ file }: { file: File }): Promise<PendingAttachment> {
+    if (!file.type.startsWith('image/') || !mediaInputs(selectedModel.get()).includes('image'))
+      throw new Error(`${selectedModel.get()} doesn't read this kind of file.`);
+    return {
+      id: crypto.randomUUID(),
+      type: 'image',
+      name: file.name,
+      contentType: file.type,
+      file,
+      status: { type: 'requires-action', reason: 'composer-send' },
+    };
+  }
+
+  async send(attachment: PendingAttachment) {
+    return {
+      ...attachment,
+      status: { type: 'complete' as const },
+      content: [{ type: 'image' as const, image: await imageDataUrl(attachment.file) }],
+    };
+  }
+
+  async remove() {}
+}
 
 /** Where the selected model is: loading it shows here, as the chat waits for it. */
 export type ModelStatus =
@@ -86,10 +173,29 @@ const text = (message: ThreadMessage) =>
     .map((part) => (part as { text: string }).text)
     .join('\n\n');
 
-/** The thread as OpenAI chat messages, tool calls and their results included. */
-function toOpenAI(messages: readonly ThreadMessage[]): ChatCompletionMessageParam[] {
+/** A message's images (its own and its attachments'), as data URLs. */
+const images = (message: ThreadMessage): string[] =>
+  [...message.content, ...(message.attachments ?? []).flatMap((a) => a.content ?? [])].flatMap((part) =>
+    part.type === 'image' ? [(part as { image: string }).image] : [],
+  );
+
+/**
+ * The thread as OpenAI chat messages, tool calls and their results
+ * included; user messages' images as image_url parts where the model reads
+ * them (a model that doesn't gets their text only).
+ */
+function toOpenAI(messages: readonly ThreadMessage[], readsImages: boolean): ChatCompletionMessageParam[] {
   const out: ChatCompletionMessageParam[] = [];
   for (const message of messages) {
+    if (message.role === 'user' && readsImages && images(message).length > 0) {
+      const parts: Array<ChatCompletionContentPartImage | ChatCompletionContentPartText> = images(message).map((url) => ({
+        type: 'image_url',
+        image_url: { url },
+      }));
+      if (text(message)) parts.push({ type: 'text', text: text(message) });
+      out.push({ role: 'user', content: parts });
+      continue;
+    }
     if (message.role !== 'assistant') {
       out.push({ role: message.role, content: text(message) });
       continue;
@@ -197,16 +303,17 @@ export function chatModel(): ChatModelAdapter {
         })),
       ];
       try {
+        // Set by assistant-ui's model selector through the model context.
+        const model = context.config?.modelName ?? MODELS[0]!.id;
         const stream = await webgllm().chat.completions.create(
           {
-            // Set by assistant-ui's model selector through the model context.
-            model: context.config?.modelName ?? MODELS[0]!.id,
+            model,
             ...(context.config?.reasoningEffort && {
               reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
             }),
             messages: [
               ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
-              ...toOpenAI(thread),
+              ...toOpenAI(thread, mediaInputs(model).includes('image')),
             ],
             ...(tools.length > 0 && { tools }),
             stream: true,

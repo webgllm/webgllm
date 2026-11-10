@@ -2193,5 +2193,14 @@
     "model_type": "llama"
    }
   }
+ },
+ "https://huggingface.co/onnx-community/Qwen3.5-2B-ONNX/resolve/main/config.json": {
+  "status": 200,
+  "body": {
+   "model_type": "qwen3_5",
+   "vision_config": {
+    "model_type": "qwen3_5"
+   }
+  }
  }
 }

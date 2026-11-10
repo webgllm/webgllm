@@ -20,10 +20,20 @@ export type ChatToolCall = {
   function: { name: string; arguments: Record<string, unknown> }
 }
 
+/**
+ * A part of a message's content as chat templates read it (transformers'
+ * shape): text, or an image (its URL; templates that take images write
+ * their image tokens for it).
+ */
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; image: string; detail?: "low" | "high" | "auto" }
+
 /** A chat message as the chat template reads it (transformers' shape). */
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool"
-  content: string
+  /** Text, or parts (a user message with images). */
+  content: string | Array<ChatContentPart>
   /** The reply's thinking; LFM3's template keeps it for the current turn. */
   thinking?: string
   /** Another name for the thinking (LFM3's template reads either). */

@@ -30,7 +30,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     class Superseded extends Error { constructor() { super("Switched to another model.") } }
     const errorMessage = (e) => e instanceof Error ? e.message : String(e)
     const errorCode = () => undefined
-    const stopped = new Set(), claims = [], TUNING = {}
+    const stopped = new Set(), aborts = new Map(), claims = [], TUNING = {}
     const downloadModel = () => undefined
     async function generate(request) {
       const model = await startLoad(request.model, request.contextLength)

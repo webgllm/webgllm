@@ -480,6 +480,23 @@ export type LayerProbe = (
   }>
 ) => void | Promise<void>
 
+/**
+ * An image's rows in the cache (see Engine.setImages): its merged-token grid
+ * in row-major order from cache position `start`.
+ */
+export type EngineImage = {
+  start: number
+  /** Rows and columns of tokens: height · width rows in the cache. */
+  height: number
+  width: number
+  /**
+   * Its embedding rows (height · width rows of the model's hidden size),
+   * read in place of the image tokens' own; null where the cache already
+   * holds them (a read of those rows then fails).
+   */
+  features: Float32Array | null
+}
+
 const OUT_WIDTH = 1024
 /** Resume points kept (see `snapshot`): ~3 MB each for LFM3 (Qwen3.5: TUNING.linearSnapshots). */
 const MAX_SNAPSHOTS = 8
@@ -594,6 +611,15 @@ export class Engine {
   private ropeSliding!: Texture
   /** Tokens in the cache. */
   position = 0
+  /** The prompt's images, by cache position (see setImages). */
+  private images: Array<EngineImage> = []
+  /**
+   * The batch being read's rotary positions: from `pos0` on (text), or per
+   * row in `positions` (rows t, h, w; a batch with image rows).
+   */
+  private batchRope: { pos0: number } | { positions: Texture } = { pos0: 0 }
+  /** Rows' t, h, w positions for batches with image rows, made when first needed. */
+  private ropePositions: Texture | null = null
   private buffers!: ReturnType<Engine["allocate"]>
 
   constructor(
@@ -3015,8 +3041,51 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return this.debug
   }
 
-  /** Forgets the cache: the next forward starts a new sequence. */
+  /**
+   * The prompt's images (Qwen3.5: in place of its `<|image_pad|>` tokens),
+   * in order, not overlapping. Their rows read their features instead of the
+   * tokens' embeddings, with Qwen2-VL's 3D positions (see ropeAt); the text
+   * after an image continues from its largest position. Set before reading
+   * a prompt that has images, and again (empty) for one that has none.
+   */
+  setImages(images: Array<EngineImage>) {
+    let end = 0
+    for (const image of images) {
+      const rows = image.height * image.width
+      if (!(image.start >= end && rows > 0)) throw new RangeError("Images must be in order and not overlap.")
+      if (image.features && image.features.length !== rows * this.config.hiddenSize)
+        throw new RangeError(`An image of ${rows} tokens needs ${rows * this.config.hiddenSize} feature values.`)
+      end = image.start + rows
+    }
+    this.images = images
+  }
+
+  /**
+   * The rotary position of cache position `pos`: itself, less what the
+   * images before it saved (an image of h × w tokens advances positions by
+   * max(h, w), not h · w). For an image's row, its t, h and w positions.
+   */
+  ropeAt(pos: number): [number, number, number] {
+    let shift = 0
+    for (const image of this.images) {
+      const rows = image.height * image.width
+      if (pos >= image.start + rows) {
+        shift += Math.max(image.height, image.width) - rows
+        continue
+      }
+      if (pos >= image.start) {
+        const t = image.start + shift
+        const r = pos - image.start
+        return [t, t + Math.floor(r / image.width), t + (r % image.width)]
+      }
+      break
+    }
+    return [pos + shift, pos + shift, pos + shift]
+  }
+
+  /** Forgets the cache (and the images): the next forward starts a new sequence. */
   reset() {
+    this.images = []
     this.draft = null
     this.guessAt = null
     this.position = 0
@@ -4213,7 +4282,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const c = this.config
     const b = this.buffers
     const sliding = type === "sliding_attention"
-    const rope = sliding ? this.ropeSliding : this.ropeFull
+    const ropeTable = sliding ? this.ropeSliding : this.ropeFull
+    // Rotary positions: from the batch's first (text), or each row's own
+    // (a batch with image rows: the 3D variant of the head pass).
+    const br = this.batchRope
+    const mrope = "positions" in br
+    const rope: { uniforms: { uPos0: { int: number } }; inputs: Record<string, Texture> } = "positions" in br
+      ? { uniforms: { uPos0: { int: 0 } }, inputs: { uPositions: br.positions } }
+      : { uniforms: { uPos0: { int: br.pos0 } }, inputs: {} }
     const pairTexels = (sliding ? c.ropeDimsSliding : c.ropeDimsFull) / 8
     const qDims = c.numHeads * c.headDim
     const kvDims = c.numKvHeads * c.headDim
@@ -4261,16 +4337,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
               rope: true,
               norm: true,
               headDim: c.headDim,
-              cache: cacheShape
+              cache: cacheShape,
+              ...(mrope && { mrope })
             })
           ),
-          inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
+          inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: ropeTable, ...rope.inputs },
           uniforms: {
             uSplitIn: { int: split },
             ...this.pairIn(qkvgIn),
             uBase: { int: 0 },
             uPairTexels: { int: pairTexels },
-            uPos0: { int: pos0 },
+            ...rope.uniforms,
             uRowOffset: { int: row0 - s0 },
             uXOff: { int: x0 },
             uEps: c.normEps,
@@ -4284,15 +4361,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.gpu.run({
         name: "heads",
         program: read(
-          K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim })
+          K.headPrep({ out: "f32", rope: true, norm: true, headDim: c.headDim, ...(mrope && { mrope }) })
         ),
-        inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: rope },
+        inputs: { ...qkvgInputs, uNorm: layer.qNorm, uRope: ropeTable, ...rope.inputs },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
           uBase: { int: 0 },
           uPairTexels: { int: pairTexels },
-          uPos0: { int: pos0 },
+          ...rope.uniforms,
           uRowOffset: { int: 0 },
           uXOff: { int: 0 },
           uEps: c.normEps,
@@ -4318,15 +4395,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.gpu.run({
         name: "heads",
         program: read(
-          K.headPrep({ out: "h2", rope: true, norm: true, headDim: c.headDim })
+          K.headPrep({ out: "h2", rope: true, norm: true, headDim: c.headDim, ...(mrope && { mrope }) })
         ),
-        inputs: { ...qkvgInputs, uNorm: layer.kNorm, uRope: rope },
+        inputs: { ...qkvgInputs, uNorm: layer.kNorm, uRope: ropeTable, ...rope.inputs },
         uniforms: {
           uSplitIn: { int: split },
           ...this.pairIn(qkvgIn),
           uBase: { int: qDims / 4 },
           uPairTexels: { int: pairTexels },
-          uPos0: { int: pos0 },
+          ...rope.uniforms,
           uRowOffset: { int: offset },
           uXOff: { int: x0 },
           uEps: c.normEps,
@@ -5943,6 +6020,29 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return all.subarray(0, c.vocabSize)
   }
 
+  /** The images' rows among cache positions [pos0, pos0 + rows): batch row, image, its first row there, count. */
+  private imageRuns(pos0: number, rows: number) {
+    const runs: Array<{ row: number; image: EngineImage; from: number; count: number }> = []
+    for (const image of this.images) {
+      const start = Math.max(pos0, image.start)
+      const end = Math.min(pos0 + rows, image.start + image.height * image.width)
+      if (start < end) runs.push({ row: start - pos0, image, from: start - image.start, count: end - start })
+    }
+    return runs
+  }
+
+  /** Each row's t, h, w rotary positions (see ropeAt), into ropePositions. */
+  private writeRopePositions(pos0: number, rows: number) {
+    if (!this.ropePositions || this.ropePositions.height < rows) {
+      if (this.ropePositions) this.gpu.delete(this.ropePositions)
+      this.ropePositions = this.gpu.texture(GL.RGBA32F, 1, this.capacity)
+    }
+    const positions = new Float32Array(4 * rows)
+    for (let m = 0; m < rows; m++) positions.set(this.ropeAt(pos0 + m), 4 * m)
+    this.gpu.write(this.ropePositions, { x: 0, y: 0, width: 1, height: rows }, { format: GL.RGBA, type: GL.FLOAT, pixels: positions })
+    return this.ropePositions
+  }
+
   private async forwardBatch(
     batch: Array<number>,
     probe: LayerProbe | undefined,
@@ -5988,6 +6088,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         }
       )
     }
+    // Image rows in this batch: their features replace the embedding's
+    // rows, and the head passes read each row's 3D position (see ropeAt).
+    const imageRuns = this.imageRuns(pos0, rows)
+    if (imageRuns.some(({ image }) => !image.features)) throw new Error("An image's rows are read again without its features.")
+    this.batchRope = imageRuns.length ? { positions: this.writeRopePositions(pos0, rows) } : { pos0: this.ropeAt(pos0)[0] }
     const e = this.embedding
     // A few rows: the split matmuls apply the norm to the residual as they
     // read it (no norm pass; see TUNING.foldNorm).
@@ -6012,7 +6117,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return canFold && folds(l.gateUp) && (each || opFolds(l))
     }
     // The embedding draws layer 0's sums of squares and scaled input too.
-    const embedFolded = prescaled && e.rgba4 && foldAt(0)
+    const embedFolded = prescaled && e.rgba4 && foldAt(0) && !imageRuns.length
     // The last add draws the final norm's scaled input for the head.
     this.headScaled =
       prescaled &&
@@ -6122,6 +6227,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         })
         return { data, rows, dims, offset: pos0 }
       })
+    }
+    for (const { row, image, from, count } of imageRuns) {
+      if (!image.features) continue
+      this.gpu.write(
+        b.residual[0],
+        { x: 0, y: row, width: c.hiddenSize / 4, height: count },
+        {
+          format: GL.RGBA,
+          type: GL.FLOAT,
+          pixels: image.features.subarray(from * c.hiddenSize, (from + count) * c.hiddenSize)
+        }
+      )
     }
     await look(-1, "embedding", b.residual[0], c.hiddenSize)
 

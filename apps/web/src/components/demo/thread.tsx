@@ -66,6 +66,14 @@ import {
   type FC,
   type PropsWithChildren,
 } from "react";
+import {
+  AttachmentsBlockedNote,
+  ComposerAddAttachment,
+  ComposerAttachments,
+  UserMessageAttachments,
+  useAttachmentsBlocked,
+  useTakesDrops,
+} from "./attachments";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -107,7 +115,7 @@ const reasoningDuration = (timing: ThreadGroupPart["timing"]) =>
  * conversation and have no registered UI render through it instead of the
  * tool group; without it they render like any other tool call.
  * `ComposerExtra` renders in the composer's action row beside the attach
- * button.
+ * button (shown for a model that reads images).
  */
 export type ThreadComponents = {
   AssistantMessage?: ComponentType | undefined;
@@ -530,13 +538,19 @@ const ThreadSuggestionItem: FC = () => {
 };
 
 const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
+  const takesDrops = useTakesDrops();
+  const blocked = useAttachmentsBlocked();
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <div
+      <ComposerPrimitive.AttachmentDropzone
+          disabled={!takesDrops}
           data-slot="aui_composer-shell"
           className="border-fd-foreground/10 focus-within:border-fd-foreground/25 data-[dragging=true]:border-fd-ring flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-fd-accent)_50%,var(--color-fd-background))]"
         >
+          <ComposerAttachments />
+          <AttachmentsBlockedNote />
           <ComposerPrimitive.Input
+            submitMode={blocked ? "none" : "enter"}
             placeholder="Send a message..."
             className="aui-composer-input caret-fd-primary placeholder:text-fd-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
             rows={1}
@@ -545,7 +559,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
             aria-label="Message input"
           />
           <ComposerAction />
-      </div>
+      </ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };
@@ -553,6 +567,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 const ComposerAction: FC = () => {
   const { ComposerExtra } = useContext(ThreadComponentsContext);
   // The stop control only cancels the send while no run it could stop is going.
+  const blocked = useAttachmentsBlocked();
   const isSending = useAuiState(
     (s) =>
       s.composer.submission !== undefined &&
@@ -562,6 +577,7 @@ const ComposerAction: FC = () => {
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
       <div className="aui-composer-action-start flex items-center gap-1.5">
+        <ComposerAddAttachment />
         {ComposerExtra && <ComposerExtra />}
       </div>
       <div className="flex items-center gap-1.5">
@@ -605,19 +621,34 @@ const ComposerAction: FC = () => {
             !shouldShowComposerResume(s)
           }
         >
-          <ComposerPrimitive.Send asChild>
+          {blocked ? (
             <TooltipIconButton
-              tooltip="Send message"
+              tooltip="This model doesn't read images"
               side="bottom"
               type="button"
               variant="default"
               size="icon"
+              disabled
               className="aui-composer-send size-7 rounded-full"
               aria-label="Send message"
             >
               <ArrowUpIcon className="aui-composer-send-icon size-4" />
             </TooltipIconButton>
-          </ComposerPrimitive.Send>
+          ) : (
+            <ComposerPrimitive.Send asChild>
+              <TooltipIconButton
+                tooltip="Send message"
+                side="bottom"
+                type="button"
+                variant="default"
+                size="icon"
+                className="aui-composer-send size-7 rounded-full"
+                aria-label="Send message"
+              >
+                <ArrowUpIcon className="aui-composer-send-icon size-4" />
+              </TooltipIconButton>
+            </ComposerPrimitive.Send>
+          )}
         </AuiIf>
         <AuiIf condition={shouldShowComposerResume}>
           <ComposerPrimitive.Resume asChild>
@@ -849,6 +880,7 @@ const UserMessage: FC = () => {
       className="fade-in slide-in-from-bottom-1 animate-in grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
       data-role="user"
     >
+      <UserMessageAttachments />
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div className="aui-user-message-content peer bg-fd-muted text-fd-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word empty:hidden">
           <MessagePrimitive.Parts />

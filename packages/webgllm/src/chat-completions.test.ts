@@ -447,7 +447,7 @@ test("repairRequest appends the failed call and a note, drops stop strings and c
   const [attempt, note] = request.chat.slice(qwen.generate.chat.length)
   assert.deepEqual(attempt?.tool_calls?.[0]?.function, { name: "get_weather", arguments: { town: "Paris" } })
   assert.equal(note?.role, "user")
-  assert.match(note?.content ?? "", /get_weather/)
+  assert.match(String(note?.content ?? ""), /get_weather/)
   assert.deepEqual(request.tools, qwen.generate.tools)
   assert.deepEqual(request.toolChoice, { name: "get_weather" })
   assert.equal(request.stop, undefined)
@@ -462,8 +462,8 @@ test("repairRequest appends the failed call and a note, drops stop strings and c
   // LFM2 writes calls in its own format, in the content.
   const lfm2 = planCompletion({ model: "LiquidAI/LFM2.5-350M-GGUF", messages: hi, tools: [weatherTool] })
   const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "required", draft: { name: "get_time", args: {} } })
-  assert.match(written.chat.at(-2)?.content ?? "", /get_time/)
-  assert.match(written.chat.at(-1)?.content ?? "", /no tool named get_time/)
+  assert.match(String(written.chat.at(-2)?.content ?? ""), /get_time/)
+  assert.match(String(written.chat.at(-1)?.content ?? ""), /no tool named get_time/)
 })
 
 test("usage sums the reply and its repairs", () => {

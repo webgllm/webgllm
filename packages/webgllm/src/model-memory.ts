@@ -38,6 +38,8 @@ export class MemoryBudget {
   private readonly held = new Map<string, Held>()
   /** Claims one at a time, so two loads don't both count on the same room. */
   private claims: Promise<void> = Promise.resolve()
+  /** Models a claim is waiting to unload, and what each claimed since (see claim). */
+  private evicting = new Map<string, number>()
   /** A counter, not the time: two uses in one millisecond still order. */
   private clock = 0
 
@@ -59,6 +61,16 @@ export class MemoryBudget {
    * unloaded stay, and nothing is recorded for `model`.
    */
   claim(model: string, bytes: number, keepLoaded: boolean, signal?: AbortSignal): Promise<void> {
+    // A claim waiting to unload `model` holds the queue until `model`'s
+    // generation ends; that generation's own claim (its vision encoder's
+    // textures) can't wait behind it, or neither ends. It's admitted now:
+    // the claim waiting on it has counted `model` out already, and `model`
+    // unloads when its generation ends (or keeps these bytes if that claim
+    // gives up).
+    if (this.evicting.has(model)) {
+      this.evicting.set(model, bytes)
+      return Promise.resolve()
+    }
     const run = this.claims.then(async () => {
       throwIfAborted(signal)
       const limit = this.limit()
@@ -71,7 +83,16 @@ export class MemoryBudget {
         if (other.keepLoaded) continue
         this.held.delete(other.model)
         total -= other.bytes
-        if ((await this.unload(other.model, signal)) === false) this.held.set(other.model, other)
+        this.evicting.set(other.model, other.bytes)
+        let unloaded: boolean | void = undefined
+        try {
+          unloaded = await this.unload(other.model, signal)
+        } finally {
+          // (What it claimed while it waited, if it stays.)
+          const latest = this.evicting.get(other.model) ?? other.bytes
+          this.evicting.delete(other.model)
+          if (unloaded === false) this.held.set(other.model, { ...other, bytes: latest })
+        }
         throwIfAborted(signal)
       }
       this.held.set(model, {

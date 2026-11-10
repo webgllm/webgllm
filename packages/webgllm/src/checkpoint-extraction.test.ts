@@ -84,7 +84,7 @@ function fixture(scenario: Scenario) {
   Object.assign(engine, {
     tuned: {},
     gpu, position: 0, contextLength: 4096, capacity: 12, batchSize: 12, kvPositions: 256, kvShift: 8,
-    guessAt: null, draft: null, snapshots: new Map(), saving: null, prefixSaving: null, work: null, unpaced: 0,
+    guessAt: null, draft: null, images: [], snapshots: new Map(), saving: null, prefixSaving: null, work: null, unpaced: 0,
     keepPrefixes: false, slicing: new Map(), quads: new Map(), mrt: {}, chunkedRecurrence: !!scenario.chunked,
     config: { hiddenSize: 16, intermediateSize: 16, convKernel: 4, slidingWindow: 2, normEps: 1e-5, numHeads: 4, numKvHeads: 4, headDim: 4,
       ...(scenario.kind === "linear" && { linear: { numKeyHeads: 4, numValueHeads: 4, keyHeadDim: 4, valueHeadDim: 4, convKernel: 4 } }) },

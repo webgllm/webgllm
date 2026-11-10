@@ -220,3 +220,49 @@ test("sampling as Transformers reads generation_config.json; size from the name,
   assert.equal(sizeFrom("someone/tiny", 1881825088), "1.9b")
   assert.equal(sizeFrom("someone/tiny", undefined), "")
 })
+
+test("a URL model resolves its text model when the vision look can't get an answer (a server refusing HEAD)", async () => {
+  const folder = "https://models.example.com/qwen-head-405"
+  fakeHub({
+    ...servedAt(folder),
+    [`${folder}/config.json`]: { status: 200, body: { model_type: "qwen3_5", vision_config: { model_type: "qwen3_5" } } },
+    [`${folder}/vision_encoder_q4f16.onnx`]: { status: 405, body: "Method Not Allowed" }
+  })
+  const meta = await resolveModel(`${folder}/decoder_model_merged_q4f16.onnx`)
+  assert.equal(meta.files.kind, "onnx")
+  assert.deepEqual(meta.supports.input, ["text"])
+  assert.equal(meta.visionChecked, false, "looked at again later")
+})
+
+test("a stored meta from before the vision look is looked at again online, and kept offline", async (t) => {
+  const { useFolder } = await import("./fake-opfs.test.js")
+  const { saveManifest, readManifest } = await import("./storage.js")
+  const { asRepo } = await import("./fake-hub.test.js")
+  useFolder(t)
+  const legacy = (meta: Awaited<ReturnType<typeof hubModelMeta>>, name: string) => {
+    const { visionChecked: _, ...rest } = meta
+    const files = rest.files.kind === "onnx" ? (({ vision: __, ...f }) => f)(rest.files) : rest.files
+    return { ...rest, name, files, supports: { ...rest.supports, input: ["text"] as const } }
+  }
+  const answers = (name: string) => ({
+    ...asRepo("onnx-community/Qwen3.5-2B-ONNX", name),
+    [`https://huggingface.co/${name}/resolve/main/config.json`]: { status: 200, body: { model_type: "qwen3_5", vision_config: { model_type: "qwen3_5" } } }
+  })
+  // Online: refreshed, and saved.
+  const online = "someone/Qwen3.5-legacy-online"
+  fakeHub(answers(online))
+  await saveManifest(legacy(await hubModelMeta(online), online))
+  const refreshed = await resolveModel(online)
+  assert.deepEqual(refreshed.supports.input, ["text", "image"])
+  const saved = (await readManifest(online))?.files
+  assert.ok(saved?.kind === "onnx" && saved.vision, "the refreshed meta is saved")
+  // Offline: the stored meta loads text as before.
+  const offline = "someone/Qwen3.5-legacy-offline"
+  fakeHub(answers(offline))
+  await saveManifest(legacy(await hubModelMeta(offline), offline))
+  hub.fetch = async () => {
+    throw new TypeError("offline")
+  }
+  const kept = await resolveModel(offline)
+  assert.deepEqual(kept.supports.input, ["text"])
+})

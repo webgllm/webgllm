@@ -61,7 +61,7 @@ Frees a model's GPU memory, or every model's with no argument.
 | `models.downloaded(id)` | `Promise<boolean>`: whether every file the model loads is in storage, or it's loaded. Reads storage only: no network request, no load |
 | `models.delete(id)` | Removes a model's files from storage |
 
-`ModelInfo` has `id`, `format` (`"gguf"` or `"onnx"`), `contextLength`, `size` (bytes to download), `downloaded`, `loaded`, `loadedContextLength`, and `supports: { tools, thinking }`. `list()` and `retrieve()` may ask the network for sizes and context lengths; to check only whether models are downloaded, use `downloaded()`.
+`ModelInfo` has `id`, `format` (`"gguf"` or `"onnx"`), `contextLength`, `size` (bytes to download), `downloaded`, `loaded`, `loadedContextLength`, and `supports: { tools, thinking, images }` (`images`: the model reads `image_url` parts). `list()` and `retrieve()` may ask the network for sizes and context lengths; to check only whether models are downloaded, use `downloaded()`.
 
 ## `addEventListener(type, listener)`
 

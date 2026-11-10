@@ -18,7 +18,7 @@ import type { ParsedToolCall } from "./tool-calls.js"
 import type { RunTimings } from "./protocol.js"
 import { defaultWorker, hasWebGl2 } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
-import { browserStorage, fileKey, modelFiles } from "./model-files.js"
+import { browserStorage, fileKey, storedModelFiles } from "./model-files.js"
 import type { ModelStorage } from "./model-files.js"
 import { defaultMemoryBudget } from "./model-memory.js"
 import { knownModelMeta, knownModels, modelMeta, rememberModel } from "./model-meta.js"
@@ -211,7 +211,12 @@ export class WebGLLM {
     this.pool.unload(model)
   }
 
-  /** Downloads `model`'s files to the browser's storage, without loading it. */
+  /**
+   * Downloads `model`'s files to the browser's storage, without loading it:
+   * what it loads for text. A model that reads images downloads its vision
+   * encoder with the first request that has an image (so images need the
+   * network once).
+   */
   async downloadModel(model: WebGlModelId, options: DownloadModelOptions = {}): Promise<void> {
     await this.pool.download(await resolved(model, options.signal), options)
   }
@@ -460,7 +465,7 @@ class Models {
 
   /**
    * Whether `model` is ready to load without a download: every file it
-   * loads is in storage, or it's loaded. Reads storage only, with no network
+   * loads (for text; see downloadModel) is in storage, or it's loaded. Reads storage only, with no network
    * request (unlike retrieve, which also asks for sizes and context length).
    */
   async downloaded(model: WebGlModelId): Promise<boolean> {
@@ -485,12 +490,12 @@ class Models {
     for (const other of await this.allModels()) {
       if (other === id) continue
       if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
-        for (const file of modelFiles(modelMeta(other))) keep.add(fileKey(file))
+        for (const file of storedModelFiles(modelMeta(other))) keep.add(fileKey(file))
       }
     }
     // A stored meta is a downloaded model, even partly: its files stay.
     for (const meta of await this.storage.manifests()) {
-      if (meta.name !== id) for (const file of modelFiles(meta)) keep.add(fileKey(file))
+      if (meta.name !== id) for (const file of storedModelFiles(meta)) keep.add(fileKey(file))
     }
     await this.storage.remove(id, keep)
   }
@@ -518,7 +523,8 @@ class Models {
       }),
       supports: {
         tools: meta.supports.capabilities.includes("tools"),
-        thinking: meta.supports.capabilities.includes("thinking")
+        thinking: meta.supports.capabilities.includes("thinking"),
+        images: meta.supports.input.includes("image")
       }
     }
   }

@@ -30,6 +30,8 @@ Pages:
 - `bandwidth.html`, `mm2.html`, `q4-matmul.html`, `tf.html`: kernel and texture-layout experiments (below).
 - `lfm2-gguf.html`: LFM2.5 GGUF logits against llama.cpp's CPU ([LFM2-GGUF.md](LFM2-GGUF.md)).
 - `short-prefix.html`: short shared-prefix caching, a frozen baseline against this checkout ([FINDINGS](short-prefix-results/FINDINGS.md)).
+- `vision.html`: image input through `chat.completions.create` (synthetic images, a follow-up, two images, text after them), or `?prompts=/models/<dir>/prompts.json` for given PNGs and prompts ([docs/vision.md](../docs/vision.md)).
+- `vision-check.html`: the vision encoder against onnxruntime's features for the same patches (`?dir=<encoder folder under /models>&image=<name>&grid=HxW`: `<name>.pixels` and `<name>.features` under `/models`).
 - `driver.html`: one phone tab that loads each job written to `$MODELS_DIR/job.json` (`{"id":"<unique>","url":"/mem.html?…"}`) in a frame; `idle.html` or `about:blank` parks it.
 
 ## check.html
@@ -47,7 +49,7 @@ Pages:
 
 Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
 
-- `model=qwen-onnx|qwen-gguf|lfm-onnx|lfm-gguf` (or a model's full name).
+- `model=qwen-onnx|qwen-gguf|lfm-onnx|lfm-gguf` (or a model's full name, a Hugging Face repository such as `onnx-community/Qwen3.5-0.8B-ONNX`).
 - `len=512`: the first message's length in tokens; `follow=0`: what each follow-up adds (0: a short question); `reply=128`: tokens per reply; `turns=3`, or `target=8192`: turns until the cache holds that many tokens; `ctx`: the context length (the model's own when left out); `think=1`: thinking on.
 - `batch`: the prompt batch (left out: the worker's, 512); `tune=knob:v,…`: TUNING knobs; `detail=1`: every texture group at each checkpoint, not just the categories.
 - `mode=ab&variants=default|f16Matmul:2|packZeros:0|batch:256|batch:128&rounds=2`: each variant in a load of its own (TUNING knobs as `knob:v,…`, `batch:N` for the prompt batch), timed on a `len`-token first message and its reply, rounds in alternating order; prints each run, then the medians: prompt reading, first token, writing, textures at load and at the peak.
@@ -247,6 +249,14 @@ RESULTS_FILE=/tmp/webgl-perf.jsonl node packages/webgllm/bench/server.mjs 8788
 # Same tab: /webgl-perf.html?id=before&baseline=1&rounds=3&len=512
 # Same tab: /webgl-perf.html?id=after&production=1&rounds=3&len=512
 ```
+
+`baseline=1` gives its worker no painted-frame reports, which the engine paces
+by, so it writes slower than the same code as `production=1` (Qwen3.5 2B on an
+M3: 70 against 90 tok/s). To compare two builds of today's engine, run both as
+production with `worker=<file in bench/dist>`, alternating, each tuning from
+scratch with the layout fixed: `?id=a1&worker=baseline-worker.js&cold=1&tune=layerRgba4:1&model=onnx-community/Qwen3.5-2B-ONNX`
+(`model`: LFM3 1.7B GGUF when left out). A page whose tab is hidden (the
+desktop app's browser pane not shown) stops at `BEGIN idle` until it's shown.
 
 Use `load-suite-cdp.mjs` and `memory-profile.mjs` for Chrome; `safari-bench.mjs`
 reuses an explicitly selected iPhone tab through WebKit Inspector and can record

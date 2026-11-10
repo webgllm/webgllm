@@ -42,6 +42,13 @@ export type RunTimings = {
   tokenizeMs?: number
   /** Generation-local schema/constraint setup, before prefill. */
   schemaMs?: number
+  /**
+   * The prompt's images (only with images): fetching, resizing and encoding
+   * the ones not encoded before, the vision encoder's load included.
+   */
+  imagesMs?: number
+  /** Of imagesMs, loading the vision encoder (its download included; 0 when no image needed it). */
+  visionLoadMs?: number
   /** CPU prefix matching and restore-command submission, without a GPU synchronization. */
   cacheRestoreMs?: number
   /** Tokens matching the previous request before checkpoint selection. */

@@ -71,7 +71,7 @@ export type LoadOnnxOptions = {
 }
 
 /** A MatMulNBits weight: its initializers and shape. */
-type NBits = {
+export type NBits = {
   name: string
   node: OnnxNode
   N: number
@@ -475,7 +475,7 @@ export function checkOnnxModel(graph: OnnxGraph, configJson: unknown): { dataFil
   return { dataFiles: [...files] }
 }
 
-function tensorBytes(t: OnnxTensor): number {
+export function tensorBytes(t: OnnxTensor): number {
   let n = 1
   for (const d of t.dims) n *= d
   return Math.ceil(n * onnxElementSize(t.dataType))
@@ -502,7 +502,7 @@ type LayerPlan = {
 }
 
 /** Lookups over the graph. */
-class OnnxModel {
+export class OnnxModel {
   private consumers = new Map<string, Array<OnnxNode>>()
   private producers = new Map<string, OnnxNode>()
 
@@ -1029,7 +1029,7 @@ type OnnxEmbedding =
     }
   | { kind: "float"; N: number; weight: OnnxTensor }
 
-function checkShape(t: OnnxTensor, dataType: number, elements: number): void {
+export function checkShape(t: OnnxTensor, dataType: number, elements: number): void {
   let n = 1
   for (const d of t.dims) n *= d
   if (t.dataType !== dataType || n !== elements) {

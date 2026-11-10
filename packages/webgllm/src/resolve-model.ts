@@ -44,10 +44,11 @@
 import { chatTemplateOf } from "./chat-template.js"
 import { abortable, throwIfAborted, WebGLLMError } from "./errors.js"
 import { checkOnnxGraph } from "./load-onnx.js"
-import { fileUrl, knownModelMeta, rememberModel } from "./model-meta.js"
-import type { ModelFile, ModelReasoning, WebGlModelMeta } from "./model-meta.js"
+import { planVision } from "./load-vision.js"
+import { fileUrl, inputsOf, knownModelMeta, rememberModel } from "./model-meta.js"
+import type { ModelFile, ModelReasoning, VisionFiles, WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
-import { readManifest } from "./storage.js"
+import { readManifest, saveManifest } from "./storage.js"
 import type { ToolFormat } from "./tool-calls.js"
 
 const HUB = "https://huggingface.co"
@@ -57,10 +58,73 @@ export const GGUF_ARCHITECTURES = ["lfm2", "lfm3", "qwen35"] as const
 /** config.json model types the ONNX loader runs (load-onnx.ts). */
 export const ONNX_MODEL_TYPES = ["lfm2", "lfm3", "qwen3_5"] as const
 
-/** What the tests swap: the fetch the Hub is asked with, and the ONNX loader's graph check. */
+/** config.json `vision_config.model_type`s the vision encoder runs (load-vision.ts). */
+export const VISION_MODEL_TYPES = ["qwen3_5"] as const
+
+/** What the tests swap: the fetch the Hub is asked with, and the ONNX loaders' graph checks. */
 export const hub = {
   fetch: (input: string, init?: RequestInit) => fetch(input, init),
-  checkGraph: checkOnnxGraph
+  checkGraph: checkOnnxGraph,
+  /** The vision encoder graph's external data files (throws for one load-vision.ts doesn't take). */
+  checkVisionGraph: (bytes: Uint8Array): Array<string> => [
+    ...new Set(planVision(bytes).reads.flatMap((r) => (r.tensor.external ? [r.tensor.external.location] : [])))
+  ]
+}
+
+/**
+ * A model's vision encoder, by one rule: its config has a vision_config of
+ * a type the encoder runs, and beside the decoder graph (`<folder>/<name>
+ * <suffix>.onnx`) is `<folder>/vision_encoder<suffix>.onnx`, a graph the
+ * encoder loads, with its one data file, and a preprocessor_config.json.
+ * `has` says whether a file is there (a repository listing; for a URL
+ * model, whether it can be fetched).
+ */
+export async function visionFilesFor(
+  at: (path: string) => ModelFile,
+  graph: string,
+  config: Record<string, unknown>,
+  has: (path: string) => boolean | Promise<boolean>
+): Promise<VisionFiles | undefined> {
+  const type = (config.vision_config as { model_type?: unknown } | undefined)?.model_type
+  if (typeof type !== "string" || !(VISION_MODEL_TYPES as ReadonlyArray<string>).includes(type)) return undefined
+  return findVision(at, graph, has)
+}
+
+/**
+ * visionFilesFor as an optional look: the text model resolves whatever it
+ * finds (a server that refuses HEAD, a failed request), and `checked` says
+ * whether the look got an answer, to look again later if it didn't.
+ */
+async function lookForVision(...args: Parameters<typeof visionFilesFor>): Promise<{ vision?: VisionFiles; checked: boolean }> {
+  try {
+    const vision = await visionFilesFor(...args)
+    return { ...(vision && { vision }), checked: true }
+  } catch {
+    return { checked: false }
+  }
+}
+
+async function findVision(
+  at: (path: string) => ModelFile,
+  graph: string,
+  has: (path: string) => boolean | Promise<boolean>
+): Promise<VisionFiles | undefined> {
+  const slash = graph.lastIndexOf("/") + 1
+  const suffix = /(_[a-z0-9]+)?\.onnx$/.exec(graph.slice(slash))?.[1] ?? ""
+  const visionGraph = `${graph.slice(0, slash)}vision_encoder${suffix}.onnx`
+  const preprocessor = "preprocessor_config.json"
+  if (!(await has(visionGraph)) || !(await has(preprocessor))) return undefined
+  const bytes = await fileBytes(at(visionGraph))
+  if (!bytes) return undefined
+  let dataFiles: Array<string>
+  try {
+    dataFiles = hub.checkVisionGraph(bytes)
+  } catch {
+    return undefined
+  }
+  const data = `${graph.slice(0, slash)}${dataFiles[0]}`
+  if (dataFiles.length !== 1 || !(await has(data))) return undefined
+  return { graph: at(visionGraph), data: at(data), preprocessor: at(preprocessor) }
 }
 
 /** The fields of the Hub's `/api/models/{repo}` this reads. */
@@ -112,7 +176,18 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
   }
   let promise = pending.get(model)
   if (!promise) {
-    promise = (async () => (await readManifest(model)) ?? (await (url ? urlModelMeta(model) : hubModelMeta(model))))().then((meta) => {
+    promise = (async () => {
+      const resolve = () => (url ? urlModelMeta(model) : hubModelMeta(model))
+      const stored = await readManifest(model)
+      if (!stored) return resolve()
+      // A stored ONNX meta whose look for a vision encoder never got an
+      // answer (saved before there was one, or the look failed) is looked
+      // at again; offline, it loads text as it did.
+      if (stored.files.kind !== "onnx" || stored.files.vision || stored.visionChecked) return stored
+      const fresh = await resolve().catch(() => stored)
+      if (fresh !== stored) await saveManifest(fresh)
+      return fresh
+    })().then((meta) => {
       rememberModel(meta)
       return meta
     })
@@ -123,10 +198,10 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
   return abortable(promise, signal)
 }
 
-async function hubGet(url: string, what: string): Promise<Response> {
+async function hubGet(url: string, what: string, method?: "HEAD"): Promise<Response> {
   let response: Response
   try {
-    response = await hub.fetch(url, { referrerPolicy: "no-referrer" })
+    response = await hub.fetch(url, { referrerPolicy: "no-referrer", ...(method && { method }) })
   } catch (error) {
     throw new WebGLLMError("download-failed", `Couldn't reach Hugging Face for ${what}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
   }
@@ -148,9 +223,9 @@ async function apiModel(repo: string): Promise<HubModel> {
  * status) throws "download-failed": not an answer, so it isn't kept and
  * the next resolution asks again.
  */
-async function fileResponse(file: ModelFile): Promise<Response | undefined> {
+async function fileResponse(file: ModelFile, method?: "HEAD"): Promise<Response | undefined> {
   const url = fileUrl(file)
-  const response = await hubGet(url, url)
+  const response = await hubGet(url, url, method)
   if (response.ok) return response
   await response.body?.cancel()
   if (response.status === 404) return undefined
@@ -350,6 +425,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
   const files = filesOf(info)
   const gguf = pickGguf(files)
   let weights: WebGlModelMeta["files"]
+  let visionChecked = true
   let weightsFile: string
   if (gguf) {
     const arch = info.gguf?.architecture
@@ -370,11 +446,14 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
       throw notSupported(`${repo} is a "${String(type)}" model; webgllm runs ${ONNX_MODEL_TYPES.join(", ")} ONNX models.`)
     }
     const onnx = await onnxWeights(repo, files, config)
+    const look = await lookForVision((path) => ({ repo, path }), onnx.graph, config, (path) => files.has(path))
+    visionChecked = look.checked
     weights = {
       kind: "onnx",
       graph: { repo, path: onnx.graph },
       data: { repo, path: onnx.data },
-      config: { repo, path: "config.json" }
+      config: { repo, path: "config.json" },
+      ...(look.vision && { vision: look.vision })
     }
     weightsFile = onnx.graph
   }
@@ -392,6 +471,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
       : undefined
   const base = info.cardData?.base_model
   return metaFrom({
+    visionChecked,
     name: repo,
     weights,
     listed,
@@ -410,6 +490,7 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
   const file = url.slice(slash + 1)
   const here = (path: string): ModelFile => ({ repo: url.slice(0, slash), path })
   let weights: WebGlModelMeta["files"]
+  let visionChecked = true
   if (/\.gguf$/i.test(file)) {
     weights = { kind: "gguf", model: here(file) }
   } else {
@@ -428,9 +509,12 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
       throw notSupported(`${url} isn't a graph webgllm loads: ${error instanceof Error ? error.message : String(error)}`)
     }
     if (dataFiles.length !== 1) throw notSupported(`${url} keeps its weights in ${dataFiles.length} files; webgllm reads one.`)
-    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json") }
+    const look = await lookForVision(here, file, config, async (path) => (await fileResponse(here(path), "HEAD")) !== undefined)
+    visionChecked = look.checked
+    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json"), ...(look.vision && { vision: look.vision }) }
   }
   return metaFrom({
+    visionChecked,
     name: url,
     weights,
     listed: { tokenizer: here("tokenizer.json"), config: here("tokenizer_config.json"), chatTemplate: here("chat_template.jinja") },
@@ -442,6 +526,8 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
 
 /** A model's meta from its weights and tokenizer files: its template, thinking, tools and sampling. */
 async function metaFrom(model: {
+  /** Whether the look for a vision encoder got an answer (see lookForVision). */
+  visionChecked: boolean
   name: string
   weights: WebGlModelMeta["files"]
   listed: WebGlModelMeta["tokenizer"]
@@ -462,10 +548,11 @@ async function metaFrom(model: {
     format: model.weights.kind,
     files: model.weights,
     tokenizer,
-    supports: { input: ["text"], output: ["text"], capabilities },
+    supports: { input: inputsOf(model.weights), output: ["text"], capabilities },
     size: sizeFrom(model.name, model.parameters),
     ...(reasoning && { reasoning }),
     sampling: samplingFrom(generationConfig),
-    toolFormat: toolFormatFrom(template)
+    toolFormat: toolFormatFrom(template),
+    visionChecked: model.visionChecked
   }
 }

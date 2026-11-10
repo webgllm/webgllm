@@ -18,7 +18,7 @@
  * nibble (A) and the last in the high one (R): as MatMulNBits stores them,
  * so its bytes upload as they are. Kernels read them as .wzyx.
  */
-const HEADER = `#version 300 es
+export const HEADER = `#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
@@ -2172,11 +2172,34 @@ function headPrepSource(o: {
   headDim: number
   /** With "cache": texels per cache row, slots per token, query texels per token. */
   cache?: { kvWidth: number; slots: number; texels: number }
+  /**
+   * Multimodal RoPE (Qwen2-VL's, interleaved): each row's t, h, w positions
+   * from uPositions (texel (0, m), as floats), frequency j rotating by
+   * position j mod 3. Rows of text have all three equal.
+   */
+  mrope?: boolean
 }) {
   const texelsPerOut = o.out === "h2" ? 2 : 1
   // f32 texels per head; the RoPE table's sines start half a head in.
   const T = o.headDim / 4
-  const prep = `
+  const prep = `${
+    o.mrope
+      ? `
+uniform sampler2D uPositions;
+ivec4 mpos;
+/* cos and sin of position pos times frequencies 4f..4f + 3 (pos = lo + ${ROPE_LOW} · hi). */
+void angles(int pos, int f, out vec4 cs, out vec4 sn) {
+  int lo = pos & ${ROPE_LOW - 1};
+  int hi = ${ROPE_LOW} + (pos >> ${Math.log2(ROPE_LOW)});
+  vec4 c1 = texelFetch(uRope, ivec2(f, lo), 0);
+  vec4 s1 = texelFetch(uRope, ivec2(${T / 2} + f, lo), 0);
+  vec4 c2 = texelFetch(uRope, ivec2(f, hi), 0);
+  vec4 s2 = texelFetch(uRope, ivec2(${T / 2} + f, hi), 0);
+  cs = c1 * c2 - s1 * s2;
+  sn = s1 * c2 + c1 * s2;
+}`
+      : ""
+  }
 vec4 rotated(int base, int t, int pos, float inv) {
   vec4 v = pf(uQKVG, base + t, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(t, 0), 0)" : ""};
   ${
@@ -2186,7 +2209,19 @@ vec4 rotated(int base, int t, int pos, float inv) {
   int tp = first ? t + uPairTexels : t - uPairTexels;
   int f = first ? t : tp;
   vec4 p = pf(uQKVG, base + tp, m)${o.norm ? " * inv * texelFetch(uNorm, ivec2(tp, 0), 0)" : ""};
-  // pos = lo + ${ROPE_LOW} · hi: cos and sin of each part's angle, added.
+${
+    o.mrope
+      ? `  vec4 cs, sn, ch, sh, cw, sw;
+  angles(mpos.x, f, cs, sn);
+  angles(mpos.y, f, ch, sh);
+  angles(mpos.z, f, cw, sw);
+  // Frequency 4f + i takes the position (4f + i) mod 3: t, h or w.
+  ivec4 k = (ivec4(4 * f) + ivec4(0, 1, 2, 3)) % 3;
+  vec4 isH = vec4(equal(k, ivec4(1)));
+  vec4 isW = vec4(equal(k, ivec4(2)));
+  cs = mix(mix(cs, ch, isH), cw, isW);
+  sn = mix(mix(sn, sh, isH), sw, isW);`
+      : `  // pos = lo + ${ROPE_LOW} · hi: cos and sin of each part's angle, added.
   int lo = pos & ${ROPE_LOW - 1};
   int hi = ${ROPE_LOW} + (pos >> ${Math.log2(ROPE_LOW)});
   vec4 c1 = texelFetch(uRope, ivec2(f, lo), 0);
@@ -2194,7 +2229,8 @@ vec4 rotated(int base, int t, int pos, float inv) {
   vec4 c2 = texelFetch(uRope, ivec2(f, hi), 0);
   vec4 s2 = texelFetch(uRope, ivec2(${T / 2} + f, hi), 0);
   vec4 cs = c1 * c2 - s1 * s2;
-  vec4 sn = s1 * c2 + c1 * s2;
+  vec4 sn = s1 * c2 + c1 * s2;`
+  }
   return first ? v * cs - p * sn : v * cs + p * sn;`
       : "return v;"
   }
@@ -2239,7 +2275,7 @@ void main() {
   inv = inversesqrt(dot(s, vec4(1.0)) / ${o.headDim}.0 + uEps);`
       : ""
   }
-  int pos = uPos0 + m;
+  int pos = uPos0 + m;${o.mrope ? "\n  mpos = ivec4(texelFetch(uPositions, ivec2(0, m), 0) + 0.5);" : ""}
   ${
     o.out === "f32"
       ? "o = rotated(base, t0, pos, inv) * uScale;"
