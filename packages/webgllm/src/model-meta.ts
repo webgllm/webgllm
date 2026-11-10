@@ -465,6 +465,10 @@ export function modelMeta(model: string): WebGlModelMeta {
   return meta
 }
 
-/** Where a file downloads from: its latest version (main) on Hugging Face. */
+/**
+ * Where a file downloads from: its latest version (main) on Hugging Face,
+ * or, for a model given by URL (whose `repo` is the folder's URL), the
+ * folder.
+ */
 export const fileUrl = (file: ModelFile) =>
-  `https://huggingface.co/${file.repo}/resolve/main/${file.path}`
+  /^https?:\/\//.test(file.repo) ? `${file.repo}/${file.path}` : `https://huggingface.co/${file.repo}/resolve/main/${file.path}`

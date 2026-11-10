@@ -5,6 +5,12 @@ description: The models webgllm runs.
 
 Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX graph, checked before its weights download), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template) and sampling (its `generation_config.json`) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
 
+A model hosted elsewhere loads by URL: pass the URL of its `.gguf` file or its `.onnx` graph as `model`. Its tokenizer files go in the same folder, as in a Hugging Face repository: `tokenizer.json` and `tokenizer_config.json`, and `chat_template.jinja` and `generation_config.json` where there are; an ONNX graph also needs `config.json` and its one data file beside it. The same rules pick its thinking, tool-call format and sampling.
+
+```ts
+await webgllm.loadModel("https://models.example.com/lfm2/LFM2-350M-Q4_0.gguf")
+```
+
 The catalog below holds known defaults for the models webgllm is tuned and tested on, such as sampling from their model cards. `webgllm.models.list()` returns it, plus any other model downloaded or used on the page, with each model's size, context length, and whether it's downloaded or loaded.
 
 | Model | Weights | Thinks |

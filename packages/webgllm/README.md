@@ -131,7 +131,7 @@ webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${mo
 
 ## Models
 
-Any Hugging Face model whose architecture webgllm runs loads by its repository name (`owner/name`): LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export.
+Any Hugging Face model whose architecture webgllm runs loads by its repository name (`owner/name`): LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export. A model hosted elsewhere loads by the URL of its `.gguf` file or `.onnx` graph, with its `tokenizer.json` and `tokenizer_config.json` (and `chat_template.jinja`, `generation_config.json`, and for ONNX `config.json` and the graph's data file, where there are) in the same folder.
 
 ```ts
 await webgllm.chat.completions.create({ model: "LiquidAI/LFM2-350M-GGUF", messages })

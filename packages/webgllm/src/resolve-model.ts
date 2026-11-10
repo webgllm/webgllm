@@ -34,11 +34,17 @@
  *   generation_config.json: sampling with its fields (and Transformers'
  *   defaults for the rest) when it sets do_sample, else greedy decoding.
  * - Size: the name's parameter count ("1.2B", "350M"), else the Hub's.
+ *
+ * A model can also be given by URL: its `.gguf` file, or its ONNX graph
+ * (`.onnx`, with config.json and its one external data file beside it), and
+ * tokenizer.json and tokenizer_config.json (and chat_template.jinja and
+ * generation_config.json, when there are) in the same folder. The same
+ * rules apply to what's there.
  */
 import { chatTemplateOf } from "./chat-template.js"
 import { abortable, throwIfAborted, WebGLLMError } from "./errors.js"
 import { checkOnnxGraph } from "./load-onnx.js"
-import { knownModelMeta, rememberModel } from "./model-meta.js"
+import { fileUrl, knownModelMeta, rememberModel } from "./model-meta.js"
 import type { ModelFile, ModelReasoning, WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
 import { readManifest } from "./storage.js"
@@ -72,12 +78,14 @@ const notSupported = (message: string) => new WebGLLMError("model-not-supported"
 
 /** A Hugging Face model id: `owner/name`. */
 const MODEL_ID = /^[\w.-]+\/[\w.-]+$/
+/** A model's weights by URL: a `.gguf` file or an `.onnx` graph. */
+const MODEL_URL = /^https?:\/\/\S+\/[^/\s]+\.(?:gguf|onnx)$/i
 
 const pending = new Map<string, Promise<WebGlModelMeta>>()
 
 /** Whether `model` is a name the resolver can look up (a catalog model or `owner/name`). */
 export const isModelId = (model: unknown): model is string =>
-  typeof model === "string" && (!!knownModelMeta(model) || MODEL_ID.test(model))
+  typeof model === "string" && (!!knownModelMeta(model) || MODEL_ID.test(model) || MODEL_URL.test(model))
 
 /**
  * `model`'s meta: the catalog's, one resolved before, a downloaded model's
@@ -96,12 +104,15 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
   if (typeof model !== "string" || !model) return Promise.reject(new TypeError("model is required."))
   const known = knownModelMeta(model)
   if (known) return Promise.resolve(known)
-  if (!MODEL_ID.test(model)) {
-    return Promise.reject(notSupported(`${model} isn't a model webgllm runs: give a catalog model (see models.list()) or a Hugging Face repository as owner/name.`))
+  const url = MODEL_URL.test(model)
+  if (!url && !MODEL_ID.test(model)) {
+    return Promise.reject(
+      notSupported(`${model} isn't a model webgllm runs: give a catalog model (see models.list()), a Hugging Face repository as owner/name, or a URL to a .gguf or .onnx file.`)
+    )
   }
   let promise = pending.get(model)
   if (!promise) {
-    promise = (async () => (await readManifest(model)) ?? (await hubModelMeta(model)))().then((meta) => {
+    promise = (async () => (await readManifest(model)) ?? (await (url ? urlModelMeta(model) : hubModelMeta(model))))().then((meta) => {
       rememberModel(meta)
       return meta
     })
@@ -138,12 +149,12 @@ async function apiModel(repo: string): Promise<HubModel> {
  * the next resolution asks again.
  */
 async function fileResponse(file: ModelFile): Promise<Response | undefined> {
-  const what = `${file.repo}/${file.path}`
-  const response = await hubGet(`${HUB}/${file.repo}/resolve/main/${file.path}`, what)
+  const url = fileUrl(file)
+  const response = await hubGet(url, url)
   if (response.ok) return response
   await response.body?.cancel()
   if (response.status === 404) return undefined
-  throw new WebGLLMError("download-failed", `Hugging Face answered ${response.status} for ${what}.`)
+  throw new WebGLLMError("download-failed", `The server answered ${response.status} for ${url}.`)
 }
 
 async function fileText(file: ModelFile): Promise<string | undefined> {
@@ -379,23 +390,80 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
     : source.files.has(`${source.prefix}generation_config.json`)
       ? at("generation_config.json")
       : undefined
-  const [{ template, tokenizer }, generationConfig] = await Promise.all([
-    templateOf(listed),
-    generation ? fileJson(generation) : Promise.resolve(undefined)
-  ])
-  if (template === undefined) throw notSupported(`${repo} has no chat template (chat_template.jinja or tokenizer_config.json's).`)
   const base = info.cardData?.base_model
-  const labels = [repo, ...(Array.isArray(base) ? base : base ? [base] : []), ...(info.tags ?? [])]
-  const reasoning = reasoningFrom(template, labels)
+  return metaFrom({
+    name: repo,
+    weights,
+    listed,
+    generation,
+    labels: [repo, ...(Array.isArray(base) ? base : base ? [base] : []), ...(info.tags ?? [])],
+    parameters: info.gguf?.total ?? info.safetensors?.total
+  })
+}
+
+/**
+ * The model given by URL (see the header): its weights file, and the
+ * tokenizer and config files beside it, by the same rules.
+ */
+export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
+  const slash = url.lastIndexOf("/")
+  const file = url.slice(slash + 1)
+  const here = (path: string): ModelFile => ({ repo: url.slice(0, slash), path })
+  let weights: WebGlModelMeta["files"]
+  if (/\.gguf$/i.test(file)) {
+    weights = { kind: "gguf", model: here(file) }
+  } else {
+    const config = await fileJson(here("config.json"))
+    if (!config) throw notSupported(`${url} has no config.json beside it.`)
+    const type = config.model_type
+    if (typeof type !== "string" || !(ONNX_MODEL_TYPES as ReadonlyArray<string>).includes(type)) {
+      throw notSupported(`${url} is a "${String(type)}" model; webgllm runs ${ONNX_MODEL_TYPES.join(", ")} ONNX models.`)
+    }
+    const bytes = await fileBytes(here(file))
+    if (!bytes) throw notSupported(`${url} isn't there.`)
+    let dataFiles: Array<string>
+    try {
+      dataFiles = hub.checkGraph(bytes, config).dataFiles
+    } catch (error) {
+      throw notSupported(`${url} isn't a graph webgllm loads: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (dataFiles.length !== 1) throw notSupported(`${url} keeps its weights in ${dataFiles.length} files; webgllm reads one.`)
+    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json") }
+  }
+  return metaFrom({
+    name: url,
+    weights,
+    listed: { tokenizer: here("tokenizer.json"), config: here("tokenizer_config.json"), chatTemplate: here("chat_template.jinja") },
+    generation: here("generation_config.json"),
+    labels: [url],
+    parameters: undefined
+  })
+}
+
+/** A model's meta from its weights and tokenizer files: its template, thinking, tools and sampling. */
+async function metaFrom(model: {
+  name: string
+  weights: WebGlModelMeta["files"]
+  listed: WebGlModelMeta["tokenizer"]
+  generation: ModelFile | undefined
+  labels: Array<string>
+  parameters: number | undefined
+}): Promise<WebGlModelMeta> {
+  const [{ template, tokenizer }, generationConfig] = await Promise.all([
+    templateOf(model.listed),
+    model.generation ? fileJson(model.generation) : Promise.resolve(undefined)
+  ])
+  if (template === undefined) throw notSupported(`${model.name} has no chat template (chat_template.jinja or tokenizer_config.json's).`)
+  const reasoning = reasoningFrom(template, model.labels)
   const tools = /\btools\b/.test(template)
   const capabilities = [...(tools ? (["tools"] as const) : []), ...(reasoning ? (["thinking"] as const) : [])]
   return {
-    name: repo,
-    format: weights.kind,
-    files: weights,
+    name: model.name,
+    format: model.weights.kind,
+    files: model.weights,
     tokenizer,
     supports: { input: ["text"], output: ["text"], capabilities },
-    size: sizeFrom(repo, info.gguf?.total ?? info.safetensors?.total),
+    size: sizeFrom(model.name, model.parameters),
     ...(reasoning && { reasoning }),
     sampling: samplingFrom(generationConfig),
     toolFormat: toolFormatFrom(template)

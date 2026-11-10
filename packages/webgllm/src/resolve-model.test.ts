@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
 import { api, code, fakeHub, recorded } from "./fake-hub.test.js"
-import { modelMeta, WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+import { fileUrl, modelMeta, WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
 import { hub, hubModelMeta, onnxCandidates, pickGguf, resolveModel, samplingFrom, sizeFrom } from "./resolve-model.js"
 
 test("the resolver agrees with the catalog on every catalog model", async () => {
@@ -69,6 +69,48 @@ test("an uncataloged ONNX build: its q4f16 graph, one data file, the repository'
   })
   assert.equal(meta.tokenizer.tokenizer.repo, name)
   assert.equal(meta.toolFormat, "lfm2")
+})
+
+/** The recorded LFM2-350M tokenizer and config files, as served from `folder`. */
+function servedAt(folder: string) {
+  const out: Record<string, (typeof recorded)[string]> = {}
+  for (const file of ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json"]) {
+    const answer = recorded[`https://huggingface.co/LiquidAI/LFM2-350M/resolve/main/${file}`]
+    if (answer) out[`${folder}/${file}`] = answer
+  }
+  return out
+}
+
+test("a model by URL: its .gguf file, and the tokenizer files beside it", async () => {
+  const folder = "https://models.example.com/lfm2"
+  const url = `${folder}/LFM2-350M-Q4_0.gguf`
+  const calls = fakeHub(servedAt(folder))
+  const meta = await resolveModel(url)
+  assert.equal(meta.name, url)
+  assert.deepEqual(meta.files, { kind: "gguf", model: { repo: folder, path: "LFM2-350M-Q4_0.gguf" } })
+  assert.deepEqual(meta.tokenizer.tokenizer, { repo: folder, path: "tokenizer.json" })
+  assert.equal(meta.toolFormat, "lfm2")
+  assert.equal(meta.size, "350m")
+  assert.ok(calls.every((call) => call.startsWith(folder)), "nothing asked of the Hub")
+  assert.equal(fileUrl(meta.tokenizer.tokenizer), `${folder}/tokenizer.json`)
+})
+
+test("a model by URL: an .onnx graph with its config.json and data file beside it", async () => {
+  const folder = "https://models.example.com/lfm2-onnx"
+  fakeHub({ ...servedAt(folder), [`${folder}/config.json`]: { status: 200, body: { model_type: "lfm2" } } })
+  const meta = await resolveModel(`${folder}/model_q4f16.onnx`)
+  assert.deepEqual(meta.files, {
+    kind: "onnx",
+    graph: { repo: folder, path: "model_q4f16.onnx" },
+    data: { repo: folder, path: "model_q4f16.onnx_data" },
+    config: { repo: folder, path: "config.json" }
+  })
+})
+
+test("a URL that isn't a .gguf or .onnx file isn't a model", async () => {
+  fakeHub()
+  assert.equal(await code(resolveModel("https://models.example.com/lfm2/")), "model-not-supported")
+  assert.equal(await code(resolveModel("https://models.example.com/lfm2/tokenizer.json")), "model-not-supported")
 })
 
 test("concurrent resolutions of one model ask the Hub once", async () => {
