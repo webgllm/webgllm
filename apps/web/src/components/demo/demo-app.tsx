@@ -15,7 +15,7 @@ import {
 import { createLocalStorageAdapter, type AsyncStorageLike } from '@assistant-ui/core/react';
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { useSidebar } from 'fumadocs-ui/layouts/docs/slots/sidebar';
-import { useMemo, type FC } from 'react';
+import { useMemo, useSyncExternalStore, type FC } from 'react';
 import { baseOptions } from '@/lib/layout.shared';
 import { useExaToolkit } from './exa';
 import { chatModel, MediaAttachmentAdapter, MODELS, selectedModel } from './model';
@@ -33,11 +33,48 @@ const suggestions = [
   { title: 'Plan', label: 'a weekend in Lisbon', prompt: 'Plan a weekend in Lisbon for someone who likes food and walking.' },
 ];
 
-/** The browser's localStorage, as assistant-ui's async storage. */
+/** Whether the last save failed (localStorage full: chats keep their images in it). */
+let saveFailed = false;
+const saveListeners = new Set<() => void>();
+const setSaveFailed = (failed: boolean) => {
+  if (failed === saveFailed) return;
+  saveFailed = failed;
+  for (const listener of saveListeners) listener();
+};
+const subscribeSave = (listener: () => void) => {
+  saveListeners.add(listener);
+  return () => saveListeners.delete(listener);
+};
+
+/**
+ * The browser's localStorage, as assistant-ui's async storage. A save that
+ * doesn't fit (a chat's images take the most room) is shown, not lost
+ * silently: the chat stays on screen, and the notice goes once a save fits.
+ */
 const browserStorage: AsyncStorageLike = {
   getItem: async (key) => localStorage.getItem(key),
-  setItem: async (key, value) => localStorage.setItem(key, value),
+  setItem: async (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      setSaveFailed(false);
+    } catch (error) {
+      setSaveFailed(true);
+      throw error;
+    }
+  },
   removeItem: async (key) => localStorage.removeItem(key),
+};
+
+/** Says a chat couldn't be saved, while that's so. */
+const SaveFailedNotice: FC = () => {
+  const failed = useSyncExternalStore(subscribeSave, () => saveFailed, () => false);
+  if (!failed) return null;
+  return (
+    <p role="alert" className="border-b border-fd-border bg-fd-muted px-4 py-2 text-sm text-fd-muted-foreground">
+      This chat couldn&apos;t be saved: the browser&apos;s storage for this site is full, and images take the most room. It stays open
+      until you leave the page; deleting old chats with images makes room.
+    </p>
+  );
 };
 
 /** One local runtime per chat; chats and their messages are kept in localStorage. */
@@ -131,6 +168,7 @@ export function DemoApp({
               <span className="font-medium text-fd-foreground">Demo</span>
             </nav>
           </header>
+          <SaveFailedNotice />
           <div className="flex-1 overflow-hidden">
             <DemoThread chatId={chatId} />
           </div>
