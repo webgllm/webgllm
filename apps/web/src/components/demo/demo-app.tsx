@@ -18,7 +18,7 @@ import { useSidebar } from 'fumadocs-ui/layouts/docs/slots/sidebar';
 import { useMemo, type FC } from 'react';
 import { baseOptions } from '@/lib/layout.shared';
 import { useExaToolkit } from './exa';
-import { chatModel, MODELS } from './model';
+import { chatModel, MediaAttachmentAdapter, MODELS, selectedModel } from './model';
 import { ModelProgress } from './model-progress';
 import { ModelSelector } from './model-selector';
 import { Thread } from './thread';
@@ -54,6 +54,8 @@ function useDemoRuntime(chatId: string | undefined, onChatChange: (chatId: strin
   const adapters = useMemo(
     () => ({
       speech: new WebSpeechSynthesisAdapter(),
+      // Images, for a model that reads them (the composer offers them only then).
+      attachments: new MediaAttachmentAdapter(),
       // Checked in the browser only: the page also renders on the server.
       ...(typeof window !== 'undefined' &&
         WebSpeechDictationAdapter.isSupported() && { dictation: new WebSpeechDictationAdapter() }),
@@ -86,7 +88,7 @@ const isRestoring = (s: AssistantState, chatId: string | undefined) => {
 /** assistant-ui's model selector, in the composer's slot for it. */
 // Thinking starts High, so the selector shows a level from the start.
 const ComposerModelSelector: FC = () => (
-  <ModelSelector models={MODELS} defaultEffort="high" variant="ghost" size="sm" />
+  <ModelSelector models={MODELS} defaultEffort="high" variant="ghost" size="sm" onValueChange={selectedModel.set} />
 );
 
 const threadComponents = { ComposerExtra: ComposerModelSelector, Indicator: ModelProgress };
