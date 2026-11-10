@@ -1,3 +1,13 @@
+## 0.2.3 (2026-11-10)
+
+### 🚀 Features
+
+- **webgllm:** image input for Qwen3.5 ([#9](https://github.com/webgllm/webgllm/pull/9))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.2.2 (2026-11-10)
 
 ### 🚀 Features
