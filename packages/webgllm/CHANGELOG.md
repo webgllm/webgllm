@@ -1,3 +1,13 @@
+## 0.2.2 (2026-11-10)
+
+### 🚀 Features
+
+- **webgllm:** models by URL ([#8](https://github.com/webgllm/webgllm/pull/8))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.2.1 (2026-11-09)
 
 ### 🚀 Features
