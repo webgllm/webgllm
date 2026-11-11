@@ -1,4 +1,11 @@
 /** Messages between the page and the WebGL 2 worker. */
+
+/**
+ * The property that marks a message as webgllm's, set true on every one
+ * either side sends: a worker of the caller's carries its own messages
+ * too, and those are never taken for these, whatever their type.
+ */
+export const WEBGLLM = "webgllm"
 import type { WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatMessage, ChatTool } from "./tokenizer.js"
@@ -95,7 +102,7 @@ export type WorkerRequest =
        * used twice in one worker, so a late answer to an earlier load of the
        * same model can't pass for this one's.
        */
-      loadId?: number
+      loadId: number
       /** A model that isn't in the catalog: its meta, as the page resolved it from the Hub. */
       meta?: WebGlModelMeta
     }
@@ -183,13 +190,13 @@ export type WorkerResponse =
       type: "ready"
       model: string
       /** The load this answers (see "load"). */
-      loadId?: number
+      loadId: number
       /** Tokens the loaded model holds, prompt and reply together. */
       contextLength?: number
       /** Milliseconds each phase of the load took (a fresh load only). */
       timings?: Record<string, number>
     }
-  | { type: "load-error"; model: string; loadId?: number; message: string; code?: WorkerErrorCode }
+  | { type: "load-error"; model: string; loadId: number; message: string; code?: WorkerErrorCode }
   /** A load has the model's files in storage, before the GPU reads them (downloads waiting on it settle). */
   | { type: "stored"; model: string }
   | { type: "downloaded"; model: string; id: string }

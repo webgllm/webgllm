@@ -19,6 +19,7 @@ import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile } from "./model-meta.js"
+import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
@@ -53,7 +54,7 @@ import {
 } from "./prompt-images.js"
 import { VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
 
-const post = (message: WorkerResponse) => postMessage(message)
+const post = (message: WorkerResponse) => postMessage({ ...message, [WEBGLLM]: true })
 
 /**
  * Runs webgllm's models in a Web Worker of your own: construct one in the
@@ -105,11 +106,16 @@ const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
   "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune"
 ])
 
-/** Whether a message is one of the page's requests (by its type, and the fields every handler reads first). */
+/**
+ * Whether a message is one of the page's requests: marked as webgllm's
+ * (the worker's own messages aren't, whatever their type), with the
+ * fields every handler reads first and the id its answer names.
+ */
 function isRequest(data: unknown): data is WorkerRequest {
-  if (typeof data !== "object" || data === null) return false
-  const { type, model, id } = data as { type?: unknown; model?: unknown; id?: unknown }
+  if (typeof data !== "object" || data === null || (data as Record<string, unknown>)[WEBGLLM] !== true) return false
+  const { type, model, id, loadId } = data as { type?: unknown; model?: unknown; id?: unknown; loadId?: unknown }
   if (typeof type !== "string" || !REQUESTS.has(type)) return false
+  if (type === "load") return typeof model === "string" && typeof loadId === "number"
   if (type === "load" || type === "generate" || type === "forward" || type === "reset" || type === "unload" || type === "download") {
     if (typeof model !== "string") return false
   }
@@ -280,7 +286,14 @@ async function fetchFiles(model: string, signal: AbortSignal, share = 0.9) {
       totalBytes: total()
     })
   }
-  const files = await Promise.all(
+  // This request's part in each file's download: stopped with the request,
+  // and when one of its files fails (the others would be for nothing). A
+  // download another caller still needs goes on (see shared-download.ts).
+  const own = new AbortController()
+  const stop = () => own.abort(signal.reason)
+  if (signal.aborted) stop()
+  else signal.addEventListener("abort", stop, { once: true })
+  const settled = await Promise.allSettled(
     all.map((file, i) =>
       stored[i]
         ? Promise.resolve(stored[i])
@@ -292,12 +305,20 @@ async function fetchFiles(model: string, signal: AbortSignal, share = 0.9) {
               totals[i] = Math.max(totals[i], size)
               report()
             },
-            signal
-          )
+            own.signal
+          ).catch((error: unknown) => {
+            own.abort(error)
+            throw error
+          })
     )
-  ).catch((error: unknown) => {
-    throw downloadError(error, signal)
-  })
+  )
+  signal.removeEventListener("abort", stop)
+  // Every file has settled: none of this request's writers is open when it
+  // fails or says it was stopped. The failure is the first that wasn't the
+  // stop it caused.
+  const failures = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => r.reason as unknown)
+  if (failures.length) throw downloadError(signal.aborted ? failures[0] : own.signal.reason ?? failures[0], signal)
+  const files = settled.map((r) => (r as PromiseFulfilledResult<File>).value)
   // Every file is stored: a model outside the catalog keeps its meta beside them.
   await saveManifest(meta)
   const [tokenizerFile, tokenizerConfigFile, ...rest] = files
@@ -871,6 +892,8 @@ async function generate(request: GenerateRequest) {
     throw error
   }
   const { prompt, keys, images } = prepared
+  // (A reply is sampled from the logits after the prompt's last token: with none, there's nothing to read them from.)
+  if (!prompt.length) throw new Error("The prompt has no tokens.")
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
   const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
@@ -878,7 +901,8 @@ async function generate(request: GenerateRequest) {
   const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
-  const startsInThinking = think !== null &&
+  // (A raw prompt is written back as it is: no thinking of the chat template's to announce.)
+  const startsInThinking = !raw && think !== null &&
     (last === think ||
       (prompt[prompt.length - 2] === think &&
         tokenizer.decode([last]).trim() === ""))
@@ -1016,10 +1040,34 @@ async function generate(request: GenerateRequest) {
   const onGpu = !allLogits && (greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS))
   // The log probability of the token just chosen, until it's written (see emit).
   let scored: { token: number; of: (token: number) => TokenLogprob } | undefined
-  const unsent: Array<TokenLogprob> = []
-  const logprobEntry = (token: number, logprob: number) => {
-    const text = tokenizer.decode([token])
-    return { token: text, logprob, bytes: Array.from(new TextEncoder().encode(text)) }
+  // A token's own bytes: a character split across tokens decodes to nothing alone.
+  const logprobEntry = (token: number, logprob: number) => ({
+    token: tokenizer.decode([token]),
+    logprob,
+    bytes: Array.from(tokenizer.tokenBytes(token))
+  })
+  // Written tokens' log probabilities go out with their text: a token whose
+  // text a stop sequence cut isn't reported. `spans` are the pieces of text
+  // given to the stop filter and not yet all sent, each with the tokens
+  // that made it (several, when a character is split across them).
+  const spans: Array<{ entries: Array<TokenLogprob>; start: number; end: number }> = []
+  let waiting: Array<TokenLogprob> = []
+  let produced = 0
+  let sentChars = 0
+  const track = (text: string) => {
+    spans.push({ entries: waiting, start: produced, end: (produced += text.length) })
+    waiting = []
+  }
+  /** The tokens all of whose text is sent; with `cut`, those any of whose text was. */
+  const release = (cut = false) => {
+    const out: Array<TokenLogprob> = []
+    while (spans.length && (spans[0].end <= sentChars || (cut && spans[0].start < sentChars))) out.push(...spans.shift()!.entries)
+    return out
+  }
+  const postText = (text: string) => {
+    sentChars += text.length
+    const logprobs = release()
+    post({ type: "token", id, text, ...(logprobs.length && { logprobs }) })
   }
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
@@ -1205,15 +1253,16 @@ async function generate(request: GenerateRequest) {
     if (constrained && stopFilter && !unfiltered) {
       // What the filter holds back (whitespace after the thinking) first.
       const held = stopFilter.flush()
-      if (held) post({ type: "token", id, text: held })
+      if (held) postText(held)
       unfiltered = true
     }
+    track(text)
     if (!stopFilter || unfiltered) {
-      post({ type: "token", id, text, ...(unsent.length && { logprobs: unsent.splice(0) }) })
+      postText(text)
       return true
     }
     const out = stopFilter.push(text)
-    if (out.text) post({ type: "token", id, text: out.text, ...(unsent.length && { logprobs: unsent.splice(0) }) })
+    if (out.text) postText(out.text)
     stopHit = out.stopped
     return !stopHit
   }
@@ -1244,7 +1293,7 @@ async function generate(request: GenerateRequest) {
     structured?.observe(t)
     processor?.processSampledToken(t)
     // (A token the model didn't choose, like a forced close of its thinking, has no distribution: probability 1.)
-    if (request.logprobs && t !== eos) unsent.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
+    if (request.logprobs && t !== eos) waiting.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
     scored = undefined
     if (t === eos) {
       sawEos = true
@@ -1257,8 +1306,12 @@ async function generate(request: GenerateRequest) {
     history.push(t)
     const text = decoder.push(t)
     if (text) {
-      if (calling) callText += text
-      else if (!send(text, constrained)) return false
+      if (calling) {
+        // (A forced call's JSON isn't sent as text: its tokens count as written.)
+        callText += text
+        track(text)
+        sentChars += text.length
+      } else if (!send(text, constrained)) return false
     }
     return stats.outputTokens < maxTokens
   }
@@ -1383,7 +1436,11 @@ async function generate(request: GenerateRequest) {
     else send(rest, !!structured?.answering)
   }
   const held = stopHit || unfiltered ? "" : stopFilter?.flush()
-  if (held) post({ type: "token", id, text: held })
+  if (held) postText(held)
+  // What's left: tokens whose text never made a message (a forced call's,
+  // an unfinished character's); after a stop sequence, only those it left
+  // some text of.
+  const unsent = stopHit ? release(true) : [...release(), ...spans.splice(0).flatMap((span) => span.entries), ...waiting]
   if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
   if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)
@@ -1430,7 +1487,7 @@ async function generate(request: GenerateRequest) {
     model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
     void writeGpuNote(model.noteKey, model.note)
   }
-  post({ type: "done", id, stats, finishReason, ...(unsent.length && { logprobs: unsent.splice(0) }), ...(toolCall && { toolCall }) })
+  post({ type: "done", id, stats, finishReason, ...(unsent.length && { logprobs: unsent }), ...(toolCall && { toolCall }) })
   } finally {
     structured?.dispose()
     engine.setAllowedTokens(null)
@@ -1461,12 +1518,22 @@ async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }
   engine.dropGuess()
   engine.setAllowedTokens(null)
   let logits = await engine.forward(ids)
-  // What the cache holds now, for the next chat completion to compare its prompt with.
-  model.cached.push(...ids)
+  // What the cache holds now, for the next chat completion to compare its
+  // prompt with. (One at a time: a long prompt is more than a call takes as arguments.)
+  for (const t of ids) model.cached.push(t)
+  // The cache grew with them: claim what the textures take now, as a reply does.
+  if (engine.gpu.bytes > model.claimed + RECLAIM_BYTES) {
+    model.claimed = engine.gpu.bytes
+    void claimMemory(model.model, model.claimed)
+  }
   if (logits.length > vocab) logits = logits.subarray(0, vocab)
   const processor = logitProcessors?.get(request.model)
   if (processor) logits = processor.processLogits(logits)
-  const token = draw(createSampler(request.sampling).distribution(logits))
+  // The repetition penalty counts every token the cache holds, as a reply's
+  // counts its prompt's.
+  const sampler = createSampler(request.sampling)
+  sampler.see(model.cached)
+  const token = draw(sampler.distribution(logits))
   processor?.processSampledToken(token)
   post({ type: "forwarded", id: request.id, token })
 }

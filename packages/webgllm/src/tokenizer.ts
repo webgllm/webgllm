@@ -126,6 +126,12 @@ export type Tokenizer = {
   ) => Array<number>
   tokenToId: (token: string) => number | undefined
   idToToken: (id: number) => string | undefined
+  /**
+   * The bytes token `id` stands for, from the vocabulary's own form of it:
+   * part of a character when a character is split across tokens, which
+   * decoding the token alone would lose. Empty for an id without a token.
+   */
+  tokenBytes: (id: number) => Uint8Array
   /** Ids `isSpecial` is true of: those decode skips when asked to. */
   isSpecial: (id: number) => boolean
   specialTokens: SpecialTokenIds
@@ -152,6 +158,19 @@ const DEFAULT_SPECIAL_TOKENS: Record<string, string> = {
 }
 
 type AddedTokenJson = { id: number; content: string; special?: boolean }
+
+/**
+ * Byte-level BPE's characters to the bytes they stand for (GPT-2's
+ * bytes_to_unicode, reversed): printable bytes are themselves, the rest
+ * are the code points from 256 on, in byte order.
+ */
+const BYTE_LEVEL: ReadonlyMap<string, number> = (() => {
+  const printable = (b: number) => (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)
+  const table = new Map<string, number>()
+  let next = 256
+  for (let b = 0; b < 256; b++) table.set(String.fromCodePoint(printable(b) ? b : next++), b)
+  return table
+})()
 
 export function loadTokenizer(files: TokenizerFiles): Tokenizer {
   const config = files.tokenizerConfig ?? {}
@@ -222,6 +241,29 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     return hf.decode(known, {
       skip_special_tokens: options?.skipSpecialTokens ?? false
     })
+  }
+
+  // How the vocabulary writes bytes: byte-level BPE's one character a byte
+  // (Qwen3.5, LFM), or a byte-fallback's `<0xNN>` tokens.
+  const json = files.tokenizerJson as { decoder?: unknown; pre_tokenizer?: unknown }
+  const byteLevel = JSON.stringify([json.decoder ?? null, json.pre_tokenizer ?? null]).includes('"type":"ByteLevel"')
+  const addedIds = new Set(added.map((t) => t.id))
+  const utf8 = new TextEncoder()
+  const tokenBytes = (id: number): Uint8Array => {
+    const token = hf.id_to_token(id)
+    if (token === undefined) return new Uint8Array(0)
+    // An added token is its text, as it's written.
+    if (addedIds.has(id)) return utf8.encode(token)
+    const fallback = /^<0x([0-9A-Fa-f]{2})>$/.exec(token)
+    if (fallback) return Uint8Array.of(parseInt(fallback[1], 16))
+    if (!byteLevel) return utf8.encode(decode([id]))
+    const bytes: Array<number> = []
+    for (const char of token) {
+      const byte = BYTE_LEVEL.get(char)
+      if (byte !== undefined) bytes.push(byte)
+      else bytes.push(...utf8.encode(char))
+    }
+    return Uint8Array.from(bytes)
   }
 
   /*
@@ -305,6 +347,7 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
       encode(applyChatTemplate(messages, options), { addSpecialTokens: false }),
     tokenToId: (token) => hf.token_to_id(token),
     idToToken: (id) => hf.id_to_token(id),
+    tokenBytes,
     isSpecial: (id) => specialIds.has(id),
     specialTokens,
     vocabSize,

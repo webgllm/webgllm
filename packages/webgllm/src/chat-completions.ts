@@ -719,6 +719,8 @@ export function planTextCompletion(params: CompletionCreateParams): TextCompleti
   const meta = knownModelMeta(model)
   if (!meta) throw new WebGLLMError("model-not-supported", `${model} isn't a model webgllm runs (see models.list()).`)
   if (typeof body.prompt !== "string") throw new TypeError("prompt must be a string.")
+  // (The reply is sampled from the logits after the prompt's last token.)
+  if (!body.prompt) throw new TypeError("prompt must not be empty.")
   for (const key of ["n", "best_of"]) {
     const count = numberField(body, key, { min: 1, integer: true })
     if (count !== undefined && count > 1) throw unsupported(`${key} > 1 isn't supported: one choice per request.`)

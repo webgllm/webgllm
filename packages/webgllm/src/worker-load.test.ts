@@ -35,7 +35,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     class Superseded extends Error { constructor() { super("Switched to another model.") } }
     const errorMessage = (e) => e instanceof Error ? e.message : String(e)
     const errorCode = () => undefined
-    const stopped = new Set(), aborts = new Map(), TUNING = {}
+    const stopped = new Set(), aborts = new Map(), TUNING = {}, WEBGLLM = "webgllm"
     ${source.slice(claimsStart, claimsEnd)}
     const downloadModel = () => undefined
     async function generate(request) {
@@ -54,6 +54,9 @@ const { makeWorker } = await import(pathToFileURL(outfile).href)
 
 type Engine = { contextLength: number; released: boolean; gpu: { isLost: boolean } }
 type Loaded = { model: string; contextLength: number | undefined; engine: Engine; cached: number[] }
+
+/** A request as the page sends it: with webgllm's mark (a message without one is the worker's own). */
+const mark = (data: unknown) => (typeof data !== "object" || data === null || "unmarked" in data ? data : { ...data, webgllm: true })
 
 function gate() {
   let release!: () => void
@@ -92,7 +95,7 @@ function worker() {
     }
   }
   makeWorker(state)
-  const send = (data: WorkerRequest) => state.onmessage({ data })
+  const send = (data: WorkerRequest) => state.onmessage({ data: mark(data) as WorkerRequest })
   return { send, messages, loads, generations, most: () => most }
 }
 
@@ -250,7 +253,7 @@ function claiming() {
     }
   }
   makeWorker(state)
-  const send = (data: WorkerRequest) => state.onmessage({ data })
+  const send = (data: WorkerRequest) => state.onmessage({ data: mark(data) as WorkerRequest })
   /** The page's answer to the last claim made for `model`. */
   const answer = (model: string) => send({ type: "claimed", id: claimsOf(messages).filter((m) => m.model === model).at(-1)!.id })
   return { send, answer, messages, files, generations }
@@ -301,7 +304,14 @@ test("the handler takes only the page's requests: the worker's own messages chan
   await settle()
   w.loads[0].finish()
   await settle()
-  for (const data of ["ping", 7, null, { type: "ping", model: MODEL }, { type: "generate", model: MODEL }, { type: "unload", model: MODEL }, { kind: "mine" }])
+  const own = (data: object) => ({ ...data, unmarked: true })
+  for (const data of [
+    "ping", 7, null, { kind: "mine" },
+    // Types of webgllm's own, without its mark: the caller's.
+    own({ type: "load", model: OTHER }), own({ type: "load", model: OTHER, loadId: 5 }), own(generate("x")), own({ type: "unload", model: MODEL, id: 3 }), own({ type: "reset", id: "r", model: MODEL }),
+    // Marked, but not a request webgllm sends: no id for the answer to name.
+    { type: "ping", model: MODEL }, { type: "generate", model: MODEL }, { type: "unload", model: MODEL }, { type: "load", model: OTHER }
+  ])
     w.send(data as never)
   await settle()
   assert.equal(w.loads[0].engine.released, false)

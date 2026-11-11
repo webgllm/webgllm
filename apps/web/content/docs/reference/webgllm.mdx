@@ -40,7 +40,7 @@ const webgllm = new WebGLLM({ worker })
 - The worker holds one model. Loading another replaces the one there once its running generation ends, whatever `keepLoaded` says; the replaced model's `unload` event has the reason `"evicted"`.
 - `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory.
 - Completions take turns, each from its load to its last token, so two for different models don't replace each other midway.
-- The handler ignores messages that aren't webgllm's, so your own code can share the worker.
+- Every message webgllm sends or takes carries its own mark (`webgllm: true`), so your own messages can share the worker whatever their `type`.
 - For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
 - Downloads (`downloadModel`) run in the same worker, beside the loaded model.
 
@@ -59,7 +59,7 @@ OpenAI's Chat Completions. Returns a `ChatCompletion`, or an async iterable of `
 
 ## `completions.create(body, options?)`
 
-OpenAI's Completions, as WebLLM has them: `body.prompt` is read as it is, with no chat template. Returns a `Completion` (`choices[0].text`), or an async iterable of them when `stream: true`. It takes the sampling fields of chat completions, `max_tokens`, `stop`, `seed`, `echo`, `logprobs` with `top_logprobs`, and `logit_bias`.
+OpenAI's Completions, as WebLLM has them: `body.prompt` (not empty) is read as it is, with no chat template. Returns a `Completion` (`choices[0].text`), or an async iterable of them when `stream: true`. It takes the sampling fields of chat completions, `max_tokens`, `stop`, `seed`, `echo`, `logprobs` with `top_logprobs`, and `logit_bias`.
 
 ## Tokens and logits
 

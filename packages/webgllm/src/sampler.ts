@@ -263,7 +263,8 @@ export function verifyAt(
  * the sampler changes them after): the model's own distribution, before
  * temperature, top-k and the penalties. Returns what a chosen token's
  * entry is, with the `top` likeliest tokens beside it, as OpenAI reports
- * them. `entry` names a token (its text and bytes).
+ * them (fewer when fewer tokens are allowed). `entry` names a token (its
+ * text and bytes).
  */
 export function logprobsOf<Entry>(
   logits: Float32Array,
@@ -280,6 +281,8 @@ export function logprobsOf<Entry>(
   const best: Array<number> = []
   for (let i = 0; i < kept.length && top > 0; i++) {
     const x = kept[i]
+    // (A masked token isn't an alternative: it can't be written.)
+    if (!(x > -Infinity)) continue
     if (best.length === top && !(x > kept[best[top - 1]])) continue
     let at = best.length
     while (at > 0 && x > kept[best[at - 1]]) at--

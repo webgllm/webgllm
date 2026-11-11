@@ -51,7 +51,28 @@ try {
     content.slice(0, 4).map((t) => [t.token, +t.logprob.toFixed(3), t.top_logprobs.map((a) => a.token)])
   )
   check("logprobs: greedy writes the likeliest token", content.every((t) => t.top_logprobs[0].token === t.token))
-  check("logprobs: the tokens are the reply", content.map((t) => t.token).join("").includes(scored.choices[0].message.content ?? "\0"))
+  const textOf = (entries: typeof content) => new TextDecoder().decode(Uint8Array.from(entries.flatMap((t) => t.bytes)))
+  check("logprobs: the tokens' bytes are the reply", textOf(content).includes(scored.choices[0].message.content ?? "\0"))
+
+  // A character split across tokens: each token has its own bytes, and together they're the character.
+  const emoji = await webgllm.chat.completions.create({
+    model, messages: [{ role: "user", content: "Repeat exactly: 🧪🧪🧪" }], temperature: 0, max_tokens: 16, logprobs: true, top_logprobs: 2
+  })
+  const emojiTokens = emoji.choices[0].logprobs?.content ?? []
+  check(
+    "logprobs: bytes of tokens that split a character decode to the reply, with no replacement characters",
+    /🧪/.test(emoji.choices[0].message.content ?? "") && textOf(emojiTokens).includes(emoji.choices[0].message.content ?? "\0") && !textOf(emojiTokens).includes("\ufffd"),
+    [emoji.choices[0].message.content, emojiTokens.map((t) => t.bytes)]
+  )
+
+  // A stop sequence: the reply ends before it, and so do the tokens reported.
+  const cut = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 24, logprobs: true, stop: [" Paris"] })
+  const cutTokens = cut.choices[0].logprobs?.content ?? []
+  check(
+    "logprobs: no entry for text a stop sequence cut",
+    !/Paris/.test(cut.choices[0].message.content ?? "Paris") && !/Paris/.test(textOf(cutTokens)) && textOf(cutTokens) === cut.choices[0].message.content,
+    [cut.choices[0].message.content, cutTokens.map((t) => t.token)]
+  )
 
   const streamed = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 24, logprobs: true, stream: true })
   let streamedTokens = 0
@@ -70,6 +91,9 @@ try {
   const text = await webgllm.completions.create({ model, prompt: PROMPT, temperature: 0, max_tokens: 6, echo: true })
   check("completions.create: a raw prompt, continued", text.choices[0].text.startsWith(PROMPT) && /Paris/.test(text.choices[0].text), text.choices[0].text)
   check("completions.create: the prompt's tokens are counted as they are, with no chat template", text.usage?.prompt_tokens === tokenizer.encode(PROMPT).length, text.usage)
+  let refused = ""
+  await webgllm.completions.create({ model, prompt: "" }).catch((error: Error) => (refused = error.message))
+  check("completions.create: an empty prompt is refused", /empty/.test(refused), refused)
   await webgllm.unloadModel()
 
   // WebLLM's token-level API, in a worker whose handler has a logit processor.

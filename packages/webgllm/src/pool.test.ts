@@ -726,11 +726,26 @@ test("a worker of the caller's: a late answer to an earlier load of the same mod
 })
 
 test("a worker of the caller's: its own messages pass through the pool's listeners untouched", async () => {
-  const { pool: p, worker } = given({ reply: () => ({ tokens: ["ok"] }) })
-  await p.load(A)
-  for (const data of ["ping", 7, null, undefined, { type: "pong", model: A }, { kind: "mine" }]) worker.emit(data as never)
+  const held = gate()
+  const { pool: p, worker } = given({ reply: () => ({ tokens: ["ok"] }), hold: () => held.promise })
+  let loaded = false
+  const loading = p.load(A, { contextLength: 2048 }).then(() => { loaded = true })
   await settle()
+  const sent = worker.sent.find((m) => m.type === "load")!
+  // The caller's own messages, with the types and fields of webgllm's replies.
+  for (const data of [
+    "ping", 7, null, undefined, { type: "pong", model: A }, { kind: "mine" },
+    { type: "ready", model: A, contextLength: 8192 },
+    { type: "ready", model: A, loadId: sent.loadId, contextLength: 8192 },
+    { type: "load-error", model: A, loadId: sent.loadId, message: "mine" },
+    { type: "unloaded", id: 1 }
+  ]) worker.emitOwn(data)
+  await settle()
+  assert.equal(loaded, false, "a message of the caller's settled the load")
+  held.release()
+  await loading
   assert.equal(p.isLoaded(A), true)
+  assert.equal(p.loadedContext(A), undefined)
   await p.generate(A, fields, { onToken: () => undefined })
   assert.deepEqual(worker.unloaded, [])
 })

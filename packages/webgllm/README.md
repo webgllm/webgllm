@@ -147,7 +147,7 @@ const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "modu
 const webgllm = new WebGLLM({ worker })
 ```
 
-The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory. Completions take turns there, each from its load to its last token, so two for different models don't replace each other midway. Downloads run in the same worker, beside the loaded model, and the handler ignores the worker's other messages, so your own can share it. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
+The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory. Completions take turns there, each from its load to its last token, so two for different models don't replace each other midway. Downloads run in the same worker, beside the loaded model. Every message webgllm sends or takes carries its own mark (`webgllm: true`), so your own messages can share the worker whatever their `type`. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
 
 ### Sharing memory with other runtimes
 
@@ -178,7 +178,7 @@ const text = await webgllm.completions.create({ model, prompt: "The capital of F
 text.choices[0].text
 ```
 
-`logprobs` covers every token written, the reply's thinking and tool-call tokens included; they are the model's probabilities before temperature, top-k and the penalties (after a `logit_bias`). `completions.create` takes the sampling fields of chat completions, `echo`, `stop`, `seed`, `logprobs` with `top_logprobs` (a boolean and a count, as WebLLM has them), `logit_bias` and `stream`.
+`logprobs` covers every token written, the reply's thinking and tool-call tokens included, and none of the text a `stop` sequence cut; they are the model's probabilities before temperature, top-k and the penalties (after a `logit_bias`). A token's `bytes` are its own, so the tokens of a character split across them add up to it. `completions.create` takes a prompt that isn't empty, the sampling fields of chat completions, `echo`, `stop`, `seed`, `logprobs` with `top_logprobs` (a boolean and a count, as WebLLM has them), `logit_bias` and `stream`.
 
 As in WebLLM, token ids go in with `forwardTokensAndSample`, and every logit comes out through a `LogitProcessor` on the worker's handler:
 
@@ -203,7 +203,7 @@ await webgllm.forwardTokensAndSample([next], false)                // pass it ba
 await webgllm.resetChat()                                          // forget the cache
 ```
 
-`forwardTokensAndSample(inputIds, isPrefill, modelId?)` samples with the model card's settings, from the processor's logits when the model has one; `modelId` is needed only when several models are loaded. A model's processor also shapes its chat and text completions. webgllm tokenizes inside its worker and exports no tokenizer, like WebLLM: token ids come from the model's `tokenizer.json`, with a tokenizer of your own.
+`forwardTokensAndSample(inputIds, isPrefill, modelId?)` samples with the model card's settings (its repetition penalty counts the tokens the cache holds), from the processor's logits when the model has one; `modelId` is needed only when several models are loaded. A model's processor also shapes its chat and text completions. webgllm tokenizes inside its worker and exports no tokenizer, like WebLLM: token ids come from the model's `tokenizer.json`, with a tokenizer of your own.
 
 The GPU normally picks each token itself and reads back only the candidates. `logprobs`, `logit_bias` and a `LogitProcessor` read every logit back for each token instead, so those replies are written slower.
 

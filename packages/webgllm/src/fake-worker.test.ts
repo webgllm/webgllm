@@ -55,8 +55,15 @@ export class FakeWorker {
 
   constructor(private readonly options: FakeOptions) {}
 
-  postMessage(message: WorkerRequest) {
+  /** Everything posted to it that isn't webgllm's (its mark missing). */
+  readonly unmarked: Array<unknown> = []
+
+  postMessage(marked: WorkerRequest & { webgllm?: boolean }) {
     if (this.terminated) return
+    // Like the handler: only webgllm's marked messages are its requests.
+    const { webgllm, ...rest } = marked
+    if (webgllm !== true) return void this.unmarked.push(marked)
+    const message = rest as WorkerRequest
     this.sent.push(message)
     void this.handle(message)
   }
@@ -79,6 +86,11 @@ export class FakeWorker {
   }
 
   emit(data: WorkerResponse) {
+    this.emitOwn({ ...data, webgllm: true })
+  }
+
+  /** A message of the worker's own code: without webgllm's mark, whatever it looks like. */
+  emitOwn(data: unknown) {
     if (!this.terminated) for (const listener of [...this.listeners.message]) listener({ data } as never)
   }
 

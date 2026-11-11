@@ -7,6 +7,7 @@
 import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { isCatalogModel, knownModelMeta } from "./model-meta.js"
+import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import type { Sampling } from "./sampler.js"
 
@@ -71,13 +72,12 @@ export const defaultWorker = () =>
  */
 let ids = 0
 
+/** One of the worker's messages to webgllm: marked as its own, so the worker's other messages never pass for one. */
 const isResponse = (data: unknown): data is WorkerResponse =>
-  typeof data === "object" && data !== null && typeof (data as { type?: unknown }).type === "string"
+  typeof data === "object" && data !== null && (data as Record<string, unknown>)[WEBGLLM] === true && typeof (data as { type?: unknown }).type === "string"
 
 export class ModelWorker {
   private load: Load | null = null
-  /** Loads sent and not answered yet. */
-  private readonly open = new Set<number>()
   private downloading: (Pending<void> & { id: string }) | null = null
   /** What a worker of the caller's still owes once this is gone ("unloaded", a stopped download's end), by id. */
   private readonly owed = new Map<number | string, () => void>()
@@ -154,7 +154,7 @@ export class ModelWorker {
   }
 
   post(message: WorkerRequest) {
-    if (!this.gone) this.worker.postMessage(message)
+    if (!this.gone) this.worker.postMessage({ ...message, [WEBGLLM]: true })
   }
 
   /**
@@ -191,7 +191,6 @@ export class ModelWorker {
 
   private sendLoad(load: Load) {
     if (this.gone) return
-    this.open.add(load.id)
     this.post({ type: "load", model: this.model, loadId: load.id, ...(load.contextLength !== undefined && { contextLength: load.contextLength }), ...this.meta() })
   }
 
@@ -335,28 +334,9 @@ export class ModelWorker {
     this.ready = false
   }
 
-  /**
-   * The current load, if a "ready" or "load-error" answers it. A worker that
-   * names no load (one from before loadId) answers the current load only
-   * when it's the one load open: with others open it may be a late answer
-   * to one this replaced, so the load fails rather than guess.
-   */
-  private answered(loadId: number | undefined): Load | null {
-    const load = this.load
-    if (loadId !== undefined) {
-      // The worker answers loads in order: the ones before are done too.
-      for (const id of this.open) if (id <= loadId) this.open.delete(id)
-      return load?.id === loadId ? load : null
-    }
-    if (!load || !this.open.has(load.id)) {
-      if (this.open.size === 1) this.open.clear()
-      return null
-    }
-    const only = this.open.size === 1
-    this.open.clear()
-    if (only) return load
-    this.failLoad(load, new Error("The model's worker answered a load without naming it (loadId) while another was open."))
-    return null
+  /** The current load, if "ready" or "load-error" `loadId` answers it (not a late answer to one it replaced). */
+  private answered(loadId: number): Load | null {
+    return this.load?.id === loadId ? this.load : null
   }
 
   private handle(data: unknown) {

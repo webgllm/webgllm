@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
-import { fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
+import { FakeWorker, fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
 import type { FakeOptions } from "./fake-worker.test.js"
 import type { ChatCompletionChunk, LoadProgress } from "./openai.js"
 import { internals, WebGLLM } from "./webgllm.js"
@@ -579,4 +579,22 @@ test("forwardTokensAndSample and resetChat, as WebLLM has them", async () => {
   assert.ok(workers.of(QWEN))
   // Two loaded: which one must be said.
   await assert.rejects(client.forwardTokensAndSample([1], true), { code: "model-not-loaded" })
+})
+
+test("a worker of the caller's: a token forward for another model waits its turn behind a completion still loading", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const worker = new FakeWorker({ hold: (model) => (model === LFM2 ? held : Promise.resolve()), reply: () => ({ tokens: ["ok"] }) })
+  internals.storage = fakeStorage(new Set([LFM2, QWEN]))
+  const client = new WebGLLM({ worker: worker as unknown as Worker, memoryBudget: 1000 })
+  // Both models cold: the chat's load is held, then a forward for the other model is asked.
+  const chat = client.chat.completions.create({ model: LFM2, messages: hi })
+  await settle()
+  const forwarded = client.forwardTokensAndSample([5], true, QWEN)
+  await settle()
+  assert.equal(worker.sent.some((m) => m.type === "load" && m.model === QWEN), false, "the forward's model replaced the chat's while it loaded")
+  release()
+  assert.equal((await chat).choices[0]!.message.content, "ok")
+  assert.equal(await forwarded, 6)
+  assert.deepEqual(worker.sent.filter((m) => m.type === "generate" || m.type === "forward").map((m) => m.model), [LFM2, QWEN])
 })

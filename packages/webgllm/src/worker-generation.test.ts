@@ -17,8 +17,9 @@ const temporary = await mkdtemp(join(tmpdir(), "webgl-worker-generation-"))
 after(() => rm(temporary, { recursive: true, force: true }))
 const source = await readFile(join(process.cwd(), "src/handler.ts"), "utf8")
 const start = source.indexOf("async function generate(request: GenerateRequest)")
+const forwardStart = source.indexOf("\n/**\n * WebLLM's forwardTokensAndSample: reads `inputIds`", start)
 const end = source.indexOf("\n/**\n * Generations run one after another", start)
-assert.ok(start >= 0 && end > start)
+assert.ok(start >= 0 && forwardStart > start && end > forwardStart)
 const outfile = join(temporary, "generate.mjs")
 await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), contents: `
   import { adaptivePrefixFor } from './checkpoint-policy.js';
@@ -36,15 +37,20 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { DraftPolicy, lookupDraft } from './draft.js';
   import { THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
-  const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16, RECLAIM_BYTES = Infinity;
+  const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16;
   // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
   const promptImages = async (_model, prompt) => ({ prompt, keys: prompt, images: [] }), encodeImages = async () => 0;
   const abortFor = () => new AbortController().signal;
-  const claimMemory = () => undefined, writeGpuNote = () => undefined;
+  const writeGpuNote = () => undefined;
   export function makeGenerate(state) {
     const stopped = state.stopped, post = m => state.messages.push(m), logitProcessors = state.processors;
+    const claimMemory = (model, bytes) => void state.claims?.push(bytes);
+    const RECLAIM_BYTES = state.reclaimBytes ?? Infinity;
+    let current = state.model;
     const startLoad = async () => state.model, createConstraint = async () => state.constraint();
     ${source.slice(start, end)}
+    generate.forward = forwardTokens;
+    generate.reset = resetChat;
     return generate;
   }
 ` }, outfile, bundle: true, format: "esm", platform: "node", conditions: ["webgllm/source"], logLevel: "error" })
@@ -61,7 +67,7 @@ const id = (w: string) => 10 + words.indexOf(w)
  * A model whose greedy picks follow `script` (then EOS), and whose sampled
  * candidates are `candidates` (ids and logits) at every step.
  */
-function scripted(script: number[], options: { candidates?: [number[], number[]]; constraint?: () => Constraint; contextLength?: number; processors?: Map<string, { processLogits: (logits: Float32Array) => Float32Array; processSampledToken: (token: number) => void; resetState: () => void }> } = {}) {
+function scripted(script: number[], options: { candidates?: [number[], number[]]; constraint?: () => Constraint; contextLength?: number; forwardLogits?: () => Float32Array; growBy?: number; processors?: Map<string, { processLogits: (logits: Float32Array) => Float32Array; processSampledToken: (token: number) => void; resetState: () => void }> } = {}) {
   const queue = script.slice()
   const stopped = new Set<string>(), messages: WorkerResponse[] = []
   const masks: Array<Uint32Array | null> = []
@@ -69,10 +75,18 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const seen: number[][] = [], penalties: Array<[number, number]> = []
   let position = 0
   // Whole-logit readbacks, and raw prompts tokenized.
-  const reads = { logits: 0, raw: [] as string[] }
+  const reads = { logits: 0, raw: [] as string[], forwards: [] as number[] }
+  const claims: number[] = []
   const engine = {
     contextLength: options.contextLength ?? 8192, snapshotLimit: 2, canSaveInside: false, canDraft: false, guessing: false, guessedToken: -1,
     get position() { return position },
+    // Token forwards (forwardTokensAndSample): the cache grows by `growBy` bytes each.
+    async forward(ids: number[]) {
+      position += ids.length
+      reads.forwards.push(ids.length)
+      engine.gpu.bytes += options.growBy ?? 0
+      return options.forwardLogits?.() ?? new Float32Array(64)
+    },
     gpu: { compiled: { count: 0, times: new Map() }, bytes: 0, presentationAdvice: { relaxation: true }, validatedPresentation: undefined,
       calibratePromptPacing: () => undefined },
     tuned: { submissionOverlap: 0 },
@@ -108,19 +122,27 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     encodeChat: () => [2, 20, 21, 22, 23, 24],
     encode: (prompt: string) => {
       reads.raw.push(prompt)
-      return [2, 20, 21]
+      return prompt === "" ? [] : prompt.endsWith("<think>") ? [2, 20, THINK] : [2, 20, 21]
     },
     vocabSize: 64,
     specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2 },
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),
+    tokenBytes: (t: number) => new TextEncoder().encode(TEXT[t] ?? ""),
     createStreamDecoder: () => ({ push: (t: number) => TEXT[t] ?? "", flush: () => "" })
   }
-  const state = { stopped, messages, model: { engine, tokenizer, cached: [] as number[] }, constraint: options.constraint, processors: options.processors }
-  return { generate: makeGenerate(state) as (r: Request) => Promise<void>, messages, masks, seen, penalties, reads }
+  const model = { model: "LiquidAI/LFM3-1.7B-GGUF", engine, tokenizer, cached: [] as number[], claimed: 0 }
+  const state = { stopped, messages, model, constraint: options.constraint, processors: options.processors, claims, reclaimBytes: options.growBy === undefined ? undefined : 32 * 2 ** 20 }
+  const generate = makeGenerate(state) as ((r: Request) => Promise<void>) & { forward: (r: Forward) => Promise<void>; reset: (r: Extract<WorkerRequest, { type: "reset" }>) => void }
+  return { generate, messages, masks, seen, penalties, reads, claims, model }
 }
 
 type Request = Extract<WorkerRequest, { type: "generate" }>
+type Forward = Extract<WorkerRequest, { type: "forward" }>
+const forward = (inputIds: number[], sampling: Partial<Forward["sampling"]> = {}): Forward => ({
+  type: "forward", id: "f", model: "LiquidAI/LFM3-1.7B-GGUF", inputIds, sampling: { temperature: 0, top_k: 0, repetition_penalty: 1, ...sampling }
+})
+const forwarded = (messages: WorkerResponse[]) => messages.flatMap((m) => (m.type === "forwarded" ? [m.token] : []))
 const request = (extra: Partial<Request> = {}): Request => ({
   type: "generate", id: "r", model: "LiquidAI/LFM3-1.7B-GGUF", chat: [{ role: "user", content: "Hi" }], tools: [], thinking: false,
   sampling: { temperature: 0, top_k: 1, repetition_penalty: 1 }, ...extra
@@ -350,4 +372,73 @@ test("a raw prompt is tokenized as it is, with no chat template", async () => {
   assert.deepEqual(s.reads.raw, ["Once upon a time"])
   assert.equal(text(s.messages), "Hello")
   assert.equal(done(s.messages).stats.inputTokens, 3)
+})
+
+test("token forwards claim the memory their cache growth takes", async () => {
+  // 24 MiB a forward: past the 32 MiB threshold on the second, and again on the fourth.
+  const s = scripted([], { growBy: 24 * 2 ** 20 })
+  for (let i = 0; i < 4; i++) await s.generate.forward(forward([20 + i]))
+  assert.deepEqual(s.claims, [48 * 2 ** 20, 96 * 2 ** 20])
+  assert.equal(s.model.claimed, 96 * 2 ** 20)
+  assert.equal(forwarded(s.messages).length, 4)
+})
+
+test("token forwards count the cache's tokens in the repetition penalty", async () => {
+  // Token 20 at 6 and 21 at 5: with 20 already read and a penalty of 2, 21 is likelier.
+  const logits = () => {
+    const l = new Float32Array(64).fill(-10)
+    l[20] = 6
+    l[21] = 5
+    return l
+  }
+  const penalized = scripted([], { forwardLogits: logits })
+  await penalized.generate.forward(forward([20], { repetition_penalty: 2 }))
+  assert.deepEqual(forwarded(penalized.messages), [21])
+  const plain = scripted([], { forwardLogits: logits })
+  await plain.generate.forward(forward([20]))
+  assert.deepEqual(forwarded(plain.messages), [20])
+  // Tokens read by an earlier forward count too.
+  const later = scripted([], { forwardLogits: logits })
+  await later.generate.forward(forward([20], { repetition_penalty: 1 }))
+  await later.generate.forward(forward([22], { repetition_penalty: 2 }))
+  assert.deepEqual(forwarded(later.messages), [20, 21])
+})
+
+test("a token forward as long as a large context is read without a failure", async () => {
+  const s = scripted([], { contextLength: 262144 })
+  await s.generate.forward(forward(Array.from({ length: 140000 }, (_, i) => 20 + (i % 8))))
+  assert.equal(s.model.cached.length, 140000)
+  assert.equal(forwarded(s.messages).length, 1)
+  await assert.rejects(s.generate.forward(forward(Array.from({ length: 130000 }, () => 20))), { code: "context-length-exceeded" })
+})
+
+test("an empty raw prompt fails before anything is read, on a fresh engine and a used one", async () => {
+  const fresh = scripted([id("Hello")])
+  await assert.rejects(fresh.generate(request({ chat: [], prompt: "", maxTokens: 1 })), /no tokens/)
+  assert.equal(fresh.reads.logits, 0)
+  assert.deepEqual(fresh.messages, [])
+  // After a reply, whose last hidden row the engine still holds.
+  const used = scripted([id("Hello"), EOS, id(" world")])
+  await used.generate(request())
+  const before = used.messages.length
+  await assert.rejects(used.generate(request({ chat: [], prompt: "", maxTokens: 1, logprobs: true })), /no tokens/)
+  assert.equal(used.messages.length, before)
+  assert.equal(used.reads.logits, 0)
+})
+
+test("a raw prompt that ends in a thinking marker is continued as it is: no marker of the chat's is written", async () => {
+  const s = scripted([id("Hello")])
+  await s.generate(request({ chat: [], prompt: "Reason: <think>", thinking: undefined }))
+  assert.equal(text(s.messages), "Hello")
+})
+
+test("logprobs leave out tokens whose text a stop sequence cut", async () => {
+  const s = scripted([id("Hello"), id(" STOP"), id(" more")])
+  await s.generate(request({ logprobs: true, stop: [" STOP"] }))
+  assert.equal(text(s.messages), "Hello")
+  assert.deepEqual(logprobs(s.messages).map((l) => l.token), ["Hello"])
+  // Without a stop sequence, every written token is there.
+  const all = scripted([id("Hello"), id(" STOP"), id(" more")])
+  await all.generate(request({ logprobs: true }))
+  assert.deepEqual(logprobs(all.messages).map((l) => l.token), ["Hello", " STOP", " more"])
 })

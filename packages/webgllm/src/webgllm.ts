@@ -251,7 +251,13 @@ export class WebGLLM {
     if (!Array.isArray(inputIds) || !inputIds.every((t) => Number.isInteger(t) && t >= 0)) throw new TypeError("inputIds must be an array of token ids.")
     const model = await this.modelFor(modelId)
     if (!this.pool.isLoaded(model)) this.checkSupport()
-    return this.pool.forward(model, inputIds, modelMeta(model).sampling, { contextLength: this.options.contextLength })
+    // In a worker of the caller's (one model): its turn, as a completion's, from its load on.
+    const end = await this.pool.turn()
+    try {
+      return await this.pool.forward(model, inputIds, modelMeta(model).sampling, { contextLength: this.options.contextLength })
+    } finally {
+      end()
+    }
   }
 
   /**
