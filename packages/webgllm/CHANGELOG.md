@@ -1,3 +1,68 @@
+## 0.3.0 (2026-11-11)
+
+### 🚀 Features
+
+- ⚠️  **webgllm:** a worker handler at the root, a worker of your own, tokens and logits ([#10](https://github.com/webgllm/webgllm/pull/10))
+
+### ⚠️  Breaking Changes
+
+- **webgllm:** a worker handler at the root, a worker of your own, tokens and logits  ([#10](https://github.com/webgllm/webgllm/pull/10))
+  the worker option is a Worker, not () => Worker; the webgllm/advanced entry and the engine's exports are removed."
+  M	apps/web/content/docs/guides/chat-and-streaming.mdx
+  M	apps/web/content/docs/guides/loading-models.mdx
+  D	apps/web/content/docs/reference/advanced.mdx
+  M	apps/web/content/docs/reference/how-it-works.mdx
+  M	apps/web/content/docs/reference/meta.json
+  M	apps/web/content/docs/reference/webgllm.mdx
+  M	apps/web/content/docs/requirements.mdx
+  M	apps/web/src/components/demo/model.ts
+  M	packages/webgllm/README.md
+  M	packages/webgllm/bench/README.md
+  M	packages/webgllm/bench/check-worker.ts
+  A	packages/webgllm/bench/logits-worker.ts
+  A	packages/webgllm/bench/logits.html
+  A	packages/webgllm/bench/logits.ts
+  M	packages/webgllm/bench/mem-worker.ts
+  A	packages/webgllm/bench/own-worker.html
+  A	packages/webgllm/bench/own-worker.ts
+  M	packages/webgllm/bench/webgl-perf.ts
+  M	packages/webgllm/package.json
+  D	packages/webgllm/src/advanced.ts
+  M	packages/webgllm/src/chat-completions.test.ts
+  M	packages/webgllm/src/chat-completions.ts
+  M	packages/webgllm/src/client.test.ts
+  M	packages/webgllm/src/client.ts
+  M	packages/webgllm/src/engine.ts
+  M	packages/webgllm/src/fake-worker.test.ts
+  A	packages/webgllm/src/handler.ts
+  M	packages/webgllm/src/index.ts
+  M	packages/webgllm/src/manifest.test.ts
+  M	packages/webgllm/src/model-files.test.ts
+  M	packages/webgllm/src/openai.ts
+  M	packages/webgllm/src/pool.test.ts
+  M	packages/webgllm/src/pool.ts
+  M	packages/webgllm/src/prompt-images.ts
+  M	packages/webgllm/src/prompt.ts
+  M	packages/webgllm/src/protocol.ts
+  M	packages/webgllm/src/sampler.test.ts
+  M	packages/webgllm/src/sampler.ts
+  M	packages/webgllm/src/shared-download.test.ts
+  M	packages/webgllm/src/shared-download.ts
+  M	packages/webgllm/src/storage.ts
+  M	packages/webgllm/src/tokenizer-vocab.test.ts
+  M	packages/webgllm/src/tokenizer.ts
+  M	packages/webgllm/src/webgllm.test.ts
+  M	packages/webgllm/src/webgllm.ts
+  M	packages/webgllm/src/worker-cancellation.test.ts
+  A	packages/webgllm/src/worker-download.test.ts
+  M	packages/webgllm/src/worker-generation.test.ts
+  M	packages/webgllm/src/worker-load.test.ts
+  M	packages/webgllm/src/worker.ts
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.2.3 (2026-11-10)
 
 ### 🚀 Features
