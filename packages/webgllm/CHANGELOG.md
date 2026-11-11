@@ -1,3 +1,13 @@
+## 0.3.1 (2026-11-11)
+
+### 🩹 Fixes
+
+- **webgllm:** a worker of your own that fails no longer leaves requests waiting ([#11](https://github.com/webgllm/webgllm/pull/11))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.0 (2026-11-11)
 
 ### 🚀 Features
