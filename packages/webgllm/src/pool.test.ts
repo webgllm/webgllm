@@ -600,7 +600,7 @@ test("a worker of the caller's: unloading frees the model there and leaves the w
   assert.equal(p.memoryUsed, 0)
   assert.deepEqual(worker.unloaded, [A])
   assert.equal(worker.terminated, false)
-  assert.equal(worker.listening, 0, "the pool's listeners stay on the worker")
+  assert.equal(worker.listening, 1, "the model's listeners stay on the worker (the pool keeps one, for the worker's failure)")
   assert.deepEqual(events.at(-1), { type: "unload", model: A, reason: "unloaded" })
   // The same worker loads again.
   await p.load(A)
@@ -699,7 +699,8 @@ test("a worker of the caller's: aborting a download stops it there, and cancelin
   assert.equal(canceled, false, "resolved while the worker still had the files open")
   held.release()
   await canceling
-  assert.equal(worker.listening, 0)
+  // (The pool's own, for the worker's failure, stays.)
+  assert.equal(worker.listening, 1)
   assert.equal(worker.terminated, false)
 })
 

@@ -149,6 +149,8 @@ const webgllm = new WebGLLM({ worker })
 
 The worker holds one model: loading another replaces the one there once its running generation ends, whatever `keepLoaded` says (the replaced model's `unload` event has the reason `"evicted"`). `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running; webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory. Completions take turns there, each from its load to its last token, so two for different models don't replace each other midway. Downloads run in the same worker, beside the loaded model. Every message webgllm sends or takes carries its own mark (`webgllm: true`), so your own messages can share the worker whatever their `type`. For several models loaded at once, make a `WebGLLM` for each worker, or leave `worker` out.
 
+If the worker fails, what waits on it (a load, a completion, a token forward, a download, an unload) rejects with a `WebGLLMError` whose code is `worker-failed`, and the model's `error` and `unload` (`"crashed"`) events fire. A worker whose script failed to load never runs, so every later request rejects the same way, at once; a worker whose own code threw is still running, and the next request loads the model again. webgllm hears a failure only from `new WebGLLM({ worker })` on, so make the `WebGLLM` right after the worker: one that failed to load earlier looks like one that hasn't answered yet, and requests to it wait.
+
 ### Sharing memory with other runtimes
 
 An app that also runs models in other runtimes (Transformers.js, wllama) can count webgllm's GPU memory in its own budget with `onMemoryClaim`. Each time a model's worker claims memory (an estimate before loading, the measured textures after, and each time its attention cache grows), the hook gets the bytes the model will hold in all, replacing its previous claim. The worker allocates only after the hook's promise resolves, so the app can make room first, for example by unloading another runtime's model (or another webgllm model with `unloadModel`). Rejecting fails the load, or the reply whose cache grew, with an `out-of-memory` error. `signal` aborts if the model is unloaded meanwhile. The model's memory is free again at its `unload` event.
@@ -213,7 +215,7 @@ The GPU normally picks each token itself and reads back only the candidates. `lo
 
 ### Errors
 
-`WebGLLMError` has a `code`: `webgl2-unavailable`, `model-not-supported`, `model-not-loaded`, `download-failed`, `storage-full`, `out-of-memory`, `gpu-context-lost`, `context-length-exceeded`, `invalid-schema`, `invalid-output` or `unsupported-parameter`.
+`WebGLLMError` has a `code`: `webgl2-unavailable`, `model-not-supported`, `model-not-loaded`, `download-failed`, `storage-full`, `out-of-memory`, `gpu-context-lost`, `context-length-exceeded`, `invalid-schema`, `invalid-output`, `unsupported-parameter` or `worker-failed`.
 
 ## Models
 
