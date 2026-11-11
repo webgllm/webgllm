@@ -44,6 +44,8 @@ const webgllm = new WebGLLM({ worker })
 - For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
 - Downloads (`downloadModel`) run in the same worker, beside the loaded model.
 
+If the worker fails, what waits on it (a load, a completion, a token forward, a download, an unload) rejects with a `WebGLLMError` whose code is `worker-failed`, and the model's `error` and `unload` (`"crashed"`) events fire. A worker whose script failed to load never runs, so every later request rejects the same way, at once; a worker whose own code threw is still running, and the next request loads the model again. webgllm hears a failure only from `new WebGLLM({ worker })` on, so make the `WebGLLM` right after the worker: one that failed to load earlier looks like one that hasn't answered yet, and requests to it wait.
+
 ## `WebGLLM.isSupported()`
 
 Returns `true` when the browser has what webgllm needs. See [Requirements](/docs/requirements).

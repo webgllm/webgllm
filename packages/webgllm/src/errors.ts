@@ -6,10 +6,12 @@ export type WebGLLMErrorCode =
   | "model-not-supported"
   | "model-not-loaded"
   | "unsupported-parameter"
+  /** A model's worker failed: its script didn't load, or its code threw. */
+  | "worker-failed"
 
 /**
- * A failure webgllm can name. Other failures (a worker that crashed, a
- * malformed request value) are plain `Error`s, `TypeError`s or
+ * A failure webgllm can name. Other failures (a malformed request value)
+ * are plain `Error`s, `TypeError`s or
  * `RangeError`s; an aborted call rejects with a DOMException named
  * "AbortError".
  */
@@ -21,6 +23,22 @@ export class WebGLLMError extends Error {
     this.name = "WebGLLMError"
     this.code = code
   }
+}
+
+/**
+ * Whether a worker's "error" event says its script never loaded: such an
+ * event carries nothing (no message, no file), where an error thrown by
+ * running code names both. A worker that didn't load never runs; one whose
+ * code threw is still running.
+ */
+export const failedToLoad = (event: { message?: string; filename?: string }): boolean => !event.message && !event.filename
+
+/** The failure a worker's "error" event reports. */
+export function workerFailure(event: { message?: string; filename?: string }): WebGLLMError {
+  return new WebGLLMError(
+    "worker-failed",
+    failedToLoad(event) ? "The worker failed to load its script, so it can't run models." : `The model's worker failed: ${event.message || "an error in its code."}`
+  )
 }
 
 /** A worker's failure: a WebGLLMError when it carries a code, else an Error. */

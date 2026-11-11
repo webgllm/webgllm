@@ -4,7 +4,7 @@
  * the pool (pool.ts) starts a worker per loaded model, or keeps its one
  * model in the worker the caller gave it.
  */
-import { workerError } from "./errors.js"
+import { workerError, workerFailure } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { isCatalogModel, knownModelMeta } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
@@ -101,7 +101,7 @@ export class ModelWorker {
       for (const settle of [...this.owed.values()]) settle()
       return
     }
-    const error = new Error(event.message || "The model's worker stopped.")
+    const error = workerFailure(event)
     this.terminate(error)
     for (const settle of [...this.owed.values()]) settle()
     this.events.onCrash(error)

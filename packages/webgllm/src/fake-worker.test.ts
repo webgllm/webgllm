@@ -35,6 +35,8 @@ export type FakeOptions = {
   hold?: (model: string) => Promise<void>
   /** Holds a download until this resolves. */
   holdDownload?: (model: string) => Promise<void>
+  /** A worker whose script never loaded: it takes messages and answers none. */
+  dead?: boolean
   /** Holds an "unload" (the model still in memory) until this resolves. */
   holdUnload?: (model: string) => Promise<void>
 }
@@ -65,7 +67,7 @@ export class FakeWorker {
     if (webgllm !== true) return void this.unmarked.push(marked)
     const message = rest as WorkerRequest
     this.sent.push(message)
-    void this.handle(message)
+    if (!this.options.dead) void this.handle(message)
   }
 
   terminate() {
@@ -96,7 +98,12 @@ export class FakeWorker {
 
   /** The worker fails, as an uncaught error in it does. */
   fail(message: string) {
-    for (const listener of [...this.listeners.error]) listener({ message } as never)
+    for (const listener of [...this.listeners.error]) listener({ message, filename: "worker.js" } as never)
+  }
+
+  /** The worker's script fails to load: an "error" event with nothing in it, and a worker that never runs. */
+  failToLoad() {
+    for (const listener of [...this.listeners.error]) listener({ type: "error" } as never)
   }
 
   /** Claims memory again (a cache growing during a reply); resolves once "claimed". */

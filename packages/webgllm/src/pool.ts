@@ -8,7 +8,7 @@
  */
 import { ModelWorker } from "./client.js"
 import type { OnToken, WorkerEvents, WorkerGenerationEnd } from "./client.js"
-import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
+import { abortable, abortError, failedToLoad, throwIfAborted, WebGLLMError, workerFailure } from "./errors.js"
 import { monitorFrames } from "./frame-pacing.js"
 import type { ModelStorage } from "./model-files.js"
 import { MemoryBudget } from "./model-memory.js"
@@ -117,8 +117,26 @@ export class ModelPool {
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
   private turns: Promise<void> = Promise.resolve()
 
+  /**
+   * Why the caller's worker can't run anything, once it has said its script
+   * failed to load: every request rejects with it, at once.
+   */
+  private dead: WebGLLMError | null = null
+
   constructor(private readonly options: PoolOptions) {
     this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
+    // The caller's worker may fail before anything is asked of it: heard from
+    // now on, as nothing says later that it had. (A worker that failed before
+    // this can't be told from one that's slow to answer.) Its models' own
+    // listeners, added after this one, fail what waits on them.
+    options.worker?.addEventListener("error", (event: ErrorEvent) => {
+      if (failedToLoad(event)) this.dead ??= workerFailure(event)
+    })
+  }
+
+  /** Rejects as every request to a worker that failed to load does. */
+  private throwIfDead() {
+    if (this.dead) throw this.dead
   }
 
   /** Loaded, loading or downloading (or a stopped download's files still closing): its files are in use. */
@@ -170,6 +188,7 @@ export class ModelPool {
     const { contextLength, signal } = options
     const since = options.since ?? this.unloadMark(model)
     throwIfAborted(signal)
+    this.throwIfDead()
     // A download of it in another worker: let it finish (they'd write the same files).
     const download = this.downloads.get(model)
     if (download) {
@@ -321,7 +340,10 @@ export class ModelPool {
       if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }
     // (One being freed already, by an earlier unload or an eviction, too.)
-    await Promise.all(this.freeing)
+    const freeing = [...this.freeing]
+    await Promise.all(freeing)
+    // The worker failed to load while it was asked to free them: it never did (it never held them either).
+    if (freeing.length) this.throwIfDead()
   }
 
   /**
@@ -355,6 +377,7 @@ export class ModelPool {
   ): Promise<void> {
     const { onProgress, signal } = options
     throwIfAborted(signal)
+    this.throwIfDead()
     // Loaded means downloaded.
     if (this.entries.get(model)?.worker.ready) return
     let download = this.downloads.get(model)
@@ -524,6 +547,7 @@ export class ModelPool {
   /** WebLLM's resetChat: `model` forgets its cache, after the generations queued before (nothing to forget if it isn't loaded). */
   reset(model: string): Promise<void> {
     return this.queue.run(async () => {
+      this.throwIfDead()
       const entry = this.entries.get(model)
       if (entry?.worker.ready && !entry.evicting) await entry.worker.reset(`rst_${(nextId++).toString(36)}`)
     })

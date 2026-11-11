@@ -78,6 +78,17 @@
       await webgllm.loadModel(model)
       check("own worker: still running after every model is unloaded", (await webgllm.models.retrieve(model)).loaded, events)
       await webgllm.unloadModel()
+
+      // A worker whose script doesn't load: a request waiting on it, and one made after, reject with "worker-failed".
+      const ended = (promise) => Promise.race([promise.then(() => "resolved", (error) => error.code ?? String(error)), new Promise((resolve) => setTimeout(() => resolve("still waiting"), 8000))])
+      const missing = new Worker("/does-not-exist.js", { type: "module" })
+      const broken = new WebGLLM({ worker: missing })
+      const brokenEvents = []
+      broken.addEventListener("error", (e) => brokenEvents.push(`error:${e.error.code}`))
+      const during = await ended(broken.loadModel(model))
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      const later = await ended(ask(broken))
+      check("a worker that fails to load: a load waiting on it rejects, and so does a chat asked after", during === "worker-failed" && later === "worker-failed", { during, later, brokenEvents })
       if (failed) log(`ERROR ${failed} check${failed === 1 ? "" : "s"} failed`)
       else log("ALL DONE")
     } catch (error) {
