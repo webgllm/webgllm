@@ -178,7 +178,7 @@ const text = await webgllm.completions.create({ model, prompt: "The capital of F
 text.choices[0].text
 ```
 
-`logprobs` covers every token written, the reply's thinking and tool-call tokens included, and none of the text a `stop` sequence cut; they are the model's probabilities before temperature, top-k and the penalties (after a `logit_bias`). A token's `bytes` are its own, so the tokens of a character split across them add up to it. `completions.create` takes a prompt that isn't empty, the sampling fields of chat completions, `echo`, `stop`, `seed`, `logprobs` with `top_logprobs` (a boolean and a count, as WebLLM has them), `logit_bias` and `stream`.
+`logprobs` covers every token written, the reply's thinking and tool-call tokens included, and none of the text a `stop` sequence cut: a token the stop sequence cuts into is left out whole, so the last of the reply's text can have no entry; they are the model's probabilities before temperature, top-k and the penalties (after a `logit_bias`). A token's `bytes` are its own, so the tokens of a character split across them add up to it. `completions.create` takes a prompt that isn't empty, the sampling fields of chat completions, `echo`, `stop`, `seed`, `logprobs` with `top_logprobs` (a boolean and a count, as WebLLM has them), `logit_bias` and `stream`.
 
 As in WebLLM, token ids go in with `forwardTokensAndSample`, and every logit comes out through a `LogitProcessor` on the worker's handler:
 

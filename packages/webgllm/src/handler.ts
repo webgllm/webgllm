@@ -1046,27 +1046,32 @@ async function generate(request: GenerateRequest) {
     logprob,
     bytes: Array.from(tokenizer.tokenBytes(token))
   })
-  // Written tokens' log probabilities go out with their text: a token whose
-  // text a stop sequence cut isn't reported. `spans` are the pieces of text
-  // given to the stop filter and not yet all sent, each with the tokens
-  // that made it (several, when a character is split across them).
-  const spans: Array<{ entries: Array<TokenLogprob>; start: number; end: number }> = []
+  // Written tokens' log probabilities go out with their text, once all of
+  // it is sent: a token a stop sequence cut, wholly or partly, isn't
+  // reported (its bytes would say more than the reply does). `spans` are
+  // the pieces of text given to the stop filter and not yet all sent, each
+  // with the tokens that made it (several, when a character is split across
+  // them). Kept only when log probabilities were asked for.
+  const scoring = !!request.logprobs
+  const spans: Array<{ entries: Array<TokenLogprob>; end: number }> = []
   let waiting: Array<TokenLogprob> = []
   let produced = 0
   let sentChars = 0
   const track = (text: string) => {
-    spans.push({ entries: waiting, start: produced, end: (produced += text.length) })
+    if (!scoring) return
+    spans.push({ entries: waiting, end: (produced += text.length) })
     waiting = []
   }
-  /** The tokens all of whose text is sent; with `cut`, those any of whose text was. */
-  const release = (cut = false) => {
+  /** The tokens all of whose text is sent. */
+  const sentEntries = () => {
     const out: Array<TokenLogprob> = []
-    while (spans.length && (spans[0].end <= sentChars || (cut && spans[0].start < sentChars))) out.push(...spans.shift()!.entries)
+    while (spans.length && spans[0].end <= sentChars) out.push(...spans.shift()!.entries)
     return out
   }
   const postText = (text: string) => {
+    if (!scoring) return post({ type: "token", id, text })
     sentChars += text.length
-    const logprobs = release()
+    const logprobs = sentEntries()
     post({ type: "token", id, text, ...(logprobs.length && { logprobs }) })
   }
   const sampler = createSampler(
@@ -1293,7 +1298,7 @@ async function generate(request: GenerateRequest) {
     structured?.observe(t)
     processor?.processSampledToken(t)
     // (A token the model didn't choose, like a forced close of its thinking, has no distribution: probability 1.)
-    if (request.logprobs && t !== eos) waiting.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
+    if (scoring && t !== eos) waiting.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
     scored = undefined
     if (t === eos) {
       sawEos = true
@@ -1310,7 +1315,7 @@ async function generate(request: GenerateRequest) {
         // (A forced call's JSON isn't sent as text: its tokens count as written.)
         callText += text
         track(text)
-        sentChars += text.length
+        if (scoring) sentChars += text.length
       } else if (!send(text, constrained)) return false
     }
     return stats.outputTokens < maxTokens
@@ -1438,9 +1443,8 @@ async function generate(request: GenerateRequest) {
   const held = stopHit || unfiltered ? "" : stopFilter?.flush()
   if (held) postText(held)
   // What's left: tokens whose text never made a message (a forced call's,
-  // an unfinished character's); after a stop sequence, only those it left
-  // some text of.
-  const unsent = stopHit ? release(true) : [...release(), ...spans.splice(0).flatMap((span) => span.entries), ...waiting]
+  // an unfinished character's); after a stop sequence, nothing past it.
+  const unsent = !scoring ? [] : stopHit ? sentEntries() : [...sentEntries(), ...spans.splice(0).flatMap((span) => span.entries), ...waiting]
   if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
   if (thinkingBudget) Object.assign(stats, thinkingBudget.stats)

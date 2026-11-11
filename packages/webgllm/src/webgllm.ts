@@ -149,6 +149,8 @@ export class WebGLLM {
   private readonly listeners = new Map<keyof WebGLLMEventMap, Set<(event: unknown) => void>>()
   private readonly storage: ModelStorage
   private checked = false
+  /** The last forwardTokensAndSample or resetChat, once it has ended (see inOrder). */
+  private tokenCalls: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: WebGLLMOptions = {}) {
     const level = LEVELS[options.logLevel ?? "warn"]
@@ -249,15 +251,34 @@ export class WebGLLM {
   async forwardTokensAndSample(inputIds: Array<number>, isPrefill: boolean, modelId?: WebGlModelId): Promise<number> {
     void isPrefill
     if (!Array.isArray(inputIds) || !inputIds.every((t) => Number.isInteger(t) && t >= 0)) throw new TypeError("inputIds must be an array of token ids.")
-    const model = await this.modelFor(modelId)
-    if (!this.pool.isLoaded(model)) this.checkSupport()
-    // In a worker of the caller's (one model): its turn, as a completion's, from its load on.
-    const end = await this.pool.turn()
-    try {
-      return await this.pool.forward(model, inputIds, modelMeta(model).sampling, { contextLength: this.options.contextLength })
-    } finally {
-      end()
-    }
+    // Before it waits for anything: an unload asked for meanwhile stops it.
+    const asked = typeof modelId === "string" ? this.pool.unloadMark(modelId) : undefined
+    return this.inOrder(async () => {
+      const model = await this.modelFor(modelId)
+      const since = asked ?? this.pool.unloadMark(model)
+      if (!this.pool.isLoaded(model)) this.checkSupport()
+      // In a worker of the caller's (one model): its turn, as a completion's, from its load on.
+      const end = await this.pool.turn()
+      try {
+        return await this.pool.forward(model, inputIds, modelMeta(model).sampling, { contextLength: this.options.contextLength, since })
+      } finally {
+        end()
+      }
+    })
+  }
+
+  /**
+   * Token forwards and resets run in the order they were called, each after
+   * the one before has ended: a reset called after a forward (still loading
+   * its model, say) resets what that forward read, not what was there before.
+   */
+  private inOrder<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.tokenCalls.then(task)
+    this.tokenCalls = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
   }
 
   /**
@@ -267,7 +288,7 @@ export class WebGLLM {
    */
   async resetChat(keepStats?: boolean, modelId?: WebGlModelId): Promise<void> {
     void keepStats
-    await this.pool.reset(await this.modelFor(modelId))
+    await this.inOrder(async () => this.pool.reset(await this.modelFor(modelId)))
   }
 
   /** `modelId` resolved, or the one model loaded when it's left out. */
@@ -640,11 +661,12 @@ class Models {
     await this.llm.unloadModel(id)
     // (Nothing writes its files any more once this resolves.)
     await this.pool.cancelDownload(id)
-    // Files another downloaded or loaded model also reads stay.
+    // Files another model also reads stay: one downloaded or loaded, and one
+    // still loading or downloading, which is writing them now.
     const keep = new Set<string>()
     for (const other of await this.allModels()) {
       if (other === id) continue
-      if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
+      if (this.pool.inUse(other) || (await this.storage.downloaded(other))) {
         for (const file of storedModelFiles(modelMeta(other))) keep.add(fileKey(file))
       }
     }

@@ -442,3 +442,19 @@ test("logprobs leave out tokens whose text a stop sequence cut", async () => {
   await all.generate(request({ logprobs: true }))
   assert.deepEqual(logprobs(all.messages).map((l) => l.token), ["Hello", " STOP", " more"])
 })
+
+test("logprobs leave out a token a stop sequence cuts into, though part of its text is written", async () => {
+  // " STOP" with the stop "STOP": the reply keeps the token's space, and the token has no entry.
+  const s = scripted([id("Hello"), id(" STOP"), id(" more")])
+  await s.generate(request({ logprobs: true, stop: ["STOP"] }))
+  assert.equal(text(s.messages), "Hello ")
+  assert.deepEqual(logprobs(s.messages).map((l) => l.token), ["Hello"])
+  assert.ok(!logprobs(s.messages).some((l) => new TextDecoder().decode(Uint8Array.from(l.bytes)).includes("STOP")))
+})
+
+test("without logprobs, token messages carry none and nothing is kept for them", async () => {
+  const s = scripted([id("Hello"), id(" STOP"), id(" more")])
+  await s.generate(request({ stop: ["STOP"] }))
+  assert.equal(text(s.messages), "Hello ")
+  assert.ok(s.messages.every((m) => !("logprobs" in m)))
+})

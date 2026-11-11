@@ -65,7 +65,7 @@ OpenAI's Completions, as WebLLM has them: `body.prompt` (not empty) is read as i
 
 | | |
 | --- | --- |
-| `logprobs`, `top_logprobs` | On chat and text completions: `choices[0].logprobs.content` has each written token's `token`, `logprob`, `bytes` and its `top_logprobs` likeliest alternatives (0 to 20). The reply's thinking and tool-call tokens are included. |
+| `logprobs`, `top_logprobs` | On chat and text completions: `choices[0].logprobs.content` has each written token's `token`, `logprob`, `bytes` and its `top_logprobs` likeliest alternatives (0 to 20). The reply's thinking and tool-call tokens are included; a token a `stop` sequence cuts into is left out whole. |
 | `logit_bias` | Token ids to a bias from -100 to 100, added to their logits before sampling. |
 | `forwardTokensAndSample(inputIds, isPrefill, modelId?)` | WebLLM's: reads the token ids into the model's cache, after what it holds, and resolves to the next token, sampled with the model card's settings. `modelId` is needed only when several models are loaded. |
 | `resetChat(keepStats?, modelId?)` | WebLLM's: the model forgets its cache. |

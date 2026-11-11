@@ -121,6 +121,11 @@ export class ModelPool {
     this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
   }
 
+  /** Loaded, loading or downloading (or a stopped download's files still closing): its files are in use. */
+  inUse(model: string): boolean {
+    return this.entries.has(model) || this.downloads.has(model) || this.closing.has(model)
+  }
+
   /** Loaded and ready (not being unloaded). */
   isLoaded(model: string): boolean {
     const entry = this.entries.get(model)
@@ -497,11 +502,19 @@ export class ModelPool {
    * WebLLM's forwardTokensAndSample on `model` (loaded first if it isn't):
    * in the queue with the generations, as it reads the same cache.
    */
-  async forward(model: string, inputIds: Array<number>, sampling: Sampling, options: { contextLength?: number; signal?: AbortSignal } = {}): Promise<number> {
+  async forward(
+    model: string,
+    inputIds: Array<number>,
+    sampling: Sampling,
+    /** `since`: unloadMark when the caller asked (an unload since then stops it, loaded or not, however long it waited). */
+    options: { contextLength?: number; signal?: AbortSignal; since?: number } = {}
+  ): Promise<number> {
     const { signal } = options
-    await this.ensureLoaded(model, options.contextLength, undefined, signal)
+    const since = options.since ?? this.unloadMark(model)
+    await this.ensureLoaded(model, options.contextLength, undefined, signal, since)
     return this.queue.run(async () => {
-      const entry = await this.ensureLoaded(model, options.contextLength, undefined, signal)
+      // (Unloaded while it waited in the queue: it doesn't load the model again.)
+      const entry = await this.ensureLoaded(model, options.contextLength, undefined, signal, since)
       throwIfAborted(signal)
       this.budget.touch(model)
       return entry.worker.forward(`fwd_${(nextId++).toString(36)}`, inputIds, sampling)

@@ -5,6 +5,8 @@ import { FakeWorker, fakeStorage, fakeWorkers, settle, STATS } from "./fake-work
 import type { FakeOptions } from "./fake-worker.test.js"
 import type { ChatCompletionChunk, LoadProgress } from "./openai.js"
 import { internals, WebGLLM } from "./webgllm.js"
+import { fileKey, storedModelFiles } from "./model-files.js"
+import { modelMeta, rememberModel } from "./model-meta.js"
 import { hub } from "./resolve-model.js"
 import hubFixture from "./test-fixtures/hub.json"
 
@@ -597,4 +599,99 @@ test("a worker of the caller's: a token forward for another model waits its turn
   assert.equal((await chat).choices[0]!.message.content, "ok")
   assert.equal(await forwarded, 6)
   assert.deepEqual(worker.sent.filter((m) => m.type === "generate" || m.type === "forward").map((m) => m.model), [LFM2, QWEN])
+})
+
+test("a token forward queued behind a chat doesn't load its model after unloadModel() has resolved", async () => {
+  const { llm: client, workers } = llm()
+  const chat = client.chat.completions.create({ model: LFM2, messages: hi })
+  chat.catch(() => undefined)
+  await settle()
+  // Queued behind the chat's generation, for another model.
+  const forwarded = client.forwardTokensAndSample([5], true, QWEN)
+  forwarded.catch(() => undefined)
+  await settle()
+  await client.unloadModel()
+  await assert.rejects(chat, { code: "model-not-loaded" })
+  await assert.rejects(forwarded, { code: "model-not-loaded" })
+  await settle()
+  assert.deepEqual((await client.models.list()).filter((m) => m.loaded).map((m) => m.id), [])
+  assert.equal(workers.workers.some((w) => !w.terminated && w.sent.some((m) => m.type === "forward")), false)
+})
+
+test("resetChat called after a token forward resets after it: loaded, and still loading", async () => {
+  const { llm: client, workers } = llm()
+  await client.loadModel(LFM2)
+  const forwarded = client.forwardTokensAndSample([5], true)
+  const reset = client.resetChat()
+  await Promise.all([forwarded, reset])
+  assert.deepEqual(workers.of(LFM2)!.sent.filter((m) => m.type === "forward" || m.type === "reset").map((m) => m.type), ["forward", "reset"])
+  // Cold: the forward's load is held when reset is called.
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const cold = llm({ hold: () => held })
+  const first = cold.llm.forwardTokensAndSample([5], true, LFM2)
+  await settle()
+  let done = false
+  const after = cold.llm.resetChat(false, LFM2).then(() => { done = true })
+  await settle()
+  assert.equal(done, false, "the reset resolved before the forward it was called after")
+  release()
+  assert.equal(await first, 6)
+  await after
+  assert.deepEqual(cold.workers.of(LFM2)!.sent.filter((m) => m.type === "forward" || m.type === "reset").map((m) => m.type), ["forward", "reset"])
+})
+
+test("deleting a model keeps the files another model is still downloading", async () => {
+  // Two models outside the catalog with their own weights and one tokenizer between them.
+  const base = modelMeta(LFM2)
+  assert.equal(base.files.kind, "gguf")
+  const variant = (name: string) => ({ ...base, name, files: { ...base.files, model: { ...(base.files as { model: object }).model, path: `${name}.gguf` } } }) as typeof base
+  const [a, b] = ["shared-tokenizer/a", "shared-tokenizer/b"]
+  rememberModel(variant(a))
+  rememberModel(variant(b))
+  const keys = (model: string) => new Set(storedModelFiles(modelMeta(model)).map(fileKey))
+  assert.ok([...keys(a)].some((k) => keys(b).has(k)) && [...keys(a)].some((k) => !keys(b).has(k)))
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const { llm: client, storage } = llm({ holdDownload: () => held })
+  const downloads = [client.downloadModel(a), client.downloadModel(b)]
+  downloads[0]!.catch(() => undefined)
+  await settle()
+  await client.models.delete(a)
+  const [removed, kept] = storage.removed.at(-1)!
+  assert.equal(removed, a)
+  const shared = [...keys(a)].filter((k) => keys(b).has(k))
+  assert.ok(shared.every((k) => kept.has(k)), "a file the other download is writing wasn't protected")
+  release()
+  await downloads[1]
+})
+
+test("log probabilities reach whole and streamed replies as the worker reports them, a cut token left out", async () => {
+  const hello = { token: "Hello", logprob: -0.1, bytes: [72, 101, 108, 108, 111], top_logprobs: [] }
+  for (const stream of [false, true]) {
+    const { llm: client, workers } = llm()
+    const pending = client.chat.completions.create({ model: LFM2, messages: hi, logprobs: true, stop: ["STOP"], stream } as never) as Promise<unknown>
+    await settle()
+    const worker = workers.of(LFM2)!
+    const sent = worker.generations()[0]!
+    // As the worker sends a reply whose last token (" STOP") the stop sequence cut into.
+    worker.emit({ type: "token", id: sent.id, text: "Hello", logprobs: [hello] })
+    worker.emit({ type: "token", id: sent.id, text: " " })
+    worker.finish(sent.id)
+    const result = await pending
+    const entries: unknown[] = []
+    let content = ""
+    if (stream) {
+      for await (const chunk of result as AsyncIterable<ChatCompletionChunk>) {
+        content += chunk.choices[0]?.delta.content ?? ""
+        entries.push(...(chunk.choices[0]?.logprobs?.content ?? []))
+      }
+    } else {
+      const whole = result as { choices: Array<{ message: { content: string }; logprobs: { content: unknown[] } }> }
+      content = whole.choices[0]!.message.content
+      entries.push(...whole.choices[0]!.logprobs.content)
+    }
+    assert.equal(content, "Hello ")
+    assert.deepEqual(entries, [hello])
+  }
 })

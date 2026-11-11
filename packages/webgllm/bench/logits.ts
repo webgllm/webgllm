@@ -74,6 +74,16 @@ try {
     [cut.choices[0].message.content, cutTokens.map((t) => t.token)]
   )
 
+  // A stop sequence inside a token: the token's text before it is written, and the token has no entry.
+  const inside = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 24, logprobs: true, stop: ["aris"] })
+  const insideTokens = inside.choices[0].logprobs?.content ?? []
+  const insideText = inside.choices[0].message.content ?? ""
+  check(
+    "logprobs: a token a stop sequence cuts into has no entry",
+    insideText.endsWith(" P") && insideText.startsWith(textOf(insideTokens)) && !/P$/.test(textOf(insideTokens)),
+    [insideText, insideTokens.map((t) => t.token)]
+  )
+
   const streamed = await webgllm.chat.completions.create({ model, messages, temperature: 0, max_tokens: 24, logprobs: true, stream: true })
   let streamedTokens = 0
   for await (const chunk of streamed) streamedTokens += chunk.choices[0]?.logprobs?.content?.length ?? 0
