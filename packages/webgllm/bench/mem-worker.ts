@@ -2,7 +2,7 @@
  * Memory and speed over a chat, in a worker (bench/mem.html): downloads a
  * model's files as the package's worker does (to the Origin Private File
  * System, once), loads it with the worker's settings, then chats the way
- * worker.ts does (cache reuse, readPrompt's batches and snapshots, the
+ * handler.ts does (cache reuse, readPrompt's batches and snapshots, the
  * one-token guess), logging every live texture by what it is and the peak
  * since the last checkpoint. ?mode=ab instead loads the model once per
  * variant (TUNING knobs, batch sizes) and times a prompt and a reply on
@@ -280,7 +280,7 @@ function padded(tokenizer: Tokenizer, before: Array<ChatMessage>, ask: string, l
 type Turn = { prompt: number; read: number; promptMs: number; firstMs: number; reply: number; writeMs: number }
 
 /**
- * One turn as worker.ts's generate runs it: the longest prefix the cache
+ * One turn as handler.ts's generate runs it: the longest prefix the cache
  * shares reused (the whole prompt only if its end was saved with its
  * hidden row), the rest read by readPrompt, then `reply` tokens written
  * with the model's top-k and the one-token guess (greedy among the

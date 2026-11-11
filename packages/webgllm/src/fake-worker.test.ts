@@ -1,5 +1,5 @@
 /**
- * A scripted stand-in for worker.ts, for the page-side tests: it answers
+ * A scripted stand-in for handler.ts, for the page-side tests: it answers
  * the protocol the way the worker does (claims before "ready", tokens then
  * "done"), and lets a test hold generations open.
  */
@@ -35,22 +35,35 @@ export type FakeOptions = {
   hold?: (model: string) => Promise<void>
   /** Holds a download until this resolves. */
   holdDownload?: (model: string) => Promise<void>
+  /** Holds an "unload" (the model still in memory) until this resolves. */
+  holdUnload?: (model: string) => Promise<void>
 }
 
 export class FakeWorker {
-  onmessage: ((event: { data: WorkerResponse }) => void) | null = null
-  onerror: ((event: { message: string }) => void) | null = null
+  private readonly listeners = { message: new Set<(event: never) => void>(), error: new Set<(event: never) => void>() }
+  /** Models it was asked to free ("unload": a worker the caller owns). */
+  readonly unloaded: Array<string> = []
   terminated = false
   readonly sent: Array<WorkerRequest> = []
   model: string | undefined
-  private claimed: Array<() => void> = []
+  private claimed = new Map<number, () => void>()
+  private claims = 0
+  /** Downloads stopped ("stop" with their id). */
+  readonly stoppedDownloads: Array<string> = []
   readonly open = new Map<string, Generate>()
   private idlers: Array<() => void> = []
 
   constructor(private readonly options: FakeOptions) {}
 
-  postMessage(message: WorkerRequest) {
+  /** Everything posted to it that isn't webgllm's (its mark missing). */
+  readonly unmarked: Array<unknown> = []
+
+  postMessage(marked: WorkerRequest & { webgllm?: boolean }) {
     if (this.terminated) return
+    // Like the handler: only webgllm's marked messages are its requests.
+    const { webgllm, ...rest } = marked
+    if (webgllm !== true) return void this.unmarked.push(marked)
+    const message = rest as WorkerRequest
     this.sent.push(message)
     void this.handle(message)
   }
@@ -59,15 +72,43 @@ export class FakeWorker {
     this.terminated = true
   }
 
+  addEventListener(type: "message" | "error", listener: (event: never) => void) {
+    this.listeners[type].add(listener)
+  }
+
+  removeEventListener(type: "message" | "error", listener: (event: never) => void) {
+    this.listeners[type].delete(listener)
+  }
+
+  /** How many listeners the page has on it. */
+  get listening(): number {
+    return this.listeners.message.size + this.listeners.error.size
+  }
+
   emit(data: WorkerResponse) {
-    if (!this.terminated) this.onmessage?.({ data })
+    this.emitOwn({ ...data, webgllm: true })
+  }
+
+  /** A message of the worker's own code: without webgllm's mark, whatever it looks like. */
+  emitOwn(data: unknown) {
+    if (!this.terminated) for (const listener of [...this.listeners.message]) listener({ data } as never)
+  }
+
+  /** The worker fails, as an uncaught error in it does. */
+  fail(message: string) {
+    for (const listener of [...this.listeners.error]) listener({ message } as never)
   }
 
   /** Claims memory again (a cache growing during a reply); resolves once "claimed". */
   claim(bytes: number) {
+    return this.claimFor(this.model!, bytes)
+  }
+
+  private claimFor(model: string, bytes: number) {
     return new Promise<void>((resolve) => {
-      this.claimed.push(resolve)
-      this.emit({ type: "claim", model: this.model!, bytes })
+      const id = ++this.claims
+      this.claimed.set(id, resolve)
+      this.emit({ type: "claim", id, model, bytes })
     })
   }
 
@@ -85,9 +126,12 @@ export class FakeWorker {
 
   private async handle(message: WorkerRequest) {
     await Promise.resolve()
-    if (message.type === "claimed") this.claimed.shift()?.()
+    if (message.type === "claimed") {
+      this.claimed.get(message.id)?.()
+      this.claimed.delete(message.id)
+    }
     else if (message.type === "load") {
-      // Like worker.ts: after the generations running.
+      // Like handler.ts: after the generations running.
       if (this.open.size) await new Promise<void>((resolve) => this.idlers.push(resolve))
       this.model = message.model
       this.emit({ type: "progress", model: message.model, progress: 0.5, cached: true })
@@ -98,16 +142,15 @@ export class FakeWorker {
       await this.options.hold?.(message.model)
       const error = this.options.loadError?.(message.model)
       if (error) return this.emit({ type: "load-error", model: message.model, loadId: message.loadId, ...error })
-      await new Promise<void>((resolve) => {
-        this.claimed.push(resolve)
-        this.emit({ type: "claim", model: message.model, bytes: this.options.bytes?.(message.model) ?? 10 })
-      })
+      await this.claimFor(message.model, this.options.bytes?.(message.model) ?? 10)
       this.emit({ type: "ready", model: message.model, loadId: message.loadId })
     } else if (message.type === "download") {
       this.model = message.model
       await this.options.holdDownload?.(message.model)
+      if (this.stoppedDownloads.includes(message.id))
+        return this.emit({ type: "download-error", model: message.model, id: message.id, message: "The download was stopped." })
       this.emit({ type: "progress", model: message.model, progress: 0.45, cached: false, loadedBytes: 50, totalBytes: 100 })
-      this.emit({ type: "downloaded", model: message.model })
+      this.emit({ type: "downloaded", model: message.model, id: message.id })
     } else if (message.type === "generate") {
       const reply = this.options.reply?.(message)
       if (!reply) {
@@ -115,8 +158,19 @@ export class FakeWorker {
         return
       }
       this.finish(message.id, reply.tokens, reply.done)
+    } else if (message.type === "forward") {
+      // The token after the last one read.
+      this.emit({ type: "forwarded", id: message.id, token: message.inputIds.at(-1)! + 1 })
+    } else if (message.type === "reset") {
+      this.emit({ type: "reset-done", id: message.id })
     } else if (message.type === "stop") {
       if (this.open.has(message.id)) this.finish(message.id)
+      else if (message.id.startsWith("dl_")) this.stoppedDownloads.push(message.id)
+    } else if (message.type === "unload") {
+      await this.options.holdUnload?.(message.model)
+      this.unloaded.push(message.model)
+      if (this.model === message.model) this.model = undefined
+      this.emit({ type: "unloaded", id: message.id })
     }
   }
 }

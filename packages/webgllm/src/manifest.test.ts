@@ -50,7 +50,7 @@ test("after a reload, deleting one downloaded model keeps the files another stil
   const saved = internals.storage
   internals.storage = browserStorage
   try {
-    const llm = new WebGLLM({ memoryBudget: 1000, worker: () => { throw new Error("no load") } })
+    const llm = new WebGLLM({ memoryBudget: 1000 })
     await llm.models.delete(ONE.name)
     const stored = (file: { repo: string; path: string }) => fake.files.has(`${diskName(file)}.done`)
     assert.ok(!stored(ONE.files.kind === "gguf" ? ONE.files.model : ONE.files.graph), "its weights are gone")
@@ -88,7 +88,7 @@ test("models.downloaded for a model with no stored meta reads storage only", asy
   const saved = internals.storage
   internals.storage = browserStorage
   try {
-    const llm = new WebGLLM({ memoryBudget: 1000, worker: () => { throw new Error("no load") } })
+    const llm = new WebGLLM({ memoryBudget: 1000 })
     assert.equal(await llm.models.downloaded("someone/Never-GGUF"), false)
   } finally {
     internals.storage = saved

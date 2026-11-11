@@ -48,7 +48,7 @@ Send the whole chat each time, as with OpenAI. webgllm keeps the model's cache b
 | `stop`, `seed` | |
 | `cache_prompt` | webgllm's own |
 
-Unset sampling fields take the model card's values. Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
+Unset sampling fields take the model card's values. `logprobs` (with `top_logprobs`) and `logit_bias` work as in OpenAI's API; see [Tokens and logits](/docs/reference/webgllm#tokens-and-logits). Fields the engine can't honour (`n > 1`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
 
 ## Images
 

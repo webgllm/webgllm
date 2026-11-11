@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { createSampler, draw, verify } from "./sampler.js"
+import { createSampler, draw, verify, logprobsOf } from "./sampler.js"
 
 /** A seeded uniform random number generator in [0, 1). */
 function rng(seed: number) {
@@ -215,4 +215,18 @@ test("distribution(logits, false) leaves out the repetition and presence penalti
   // Token 0 leads by a little: penalized it loses, unpenalized it wins.
   assert.deepEqual(Array.from(s.distribution(Float32Array.of(2, 1.9)).ids), [1])
   assert.deepEqual(Array.from(s.distribution(Float32Array.of(2, 1.9), false).ids), [0])
+})
+
+test("log probabilities: the model's distribution, with only tokens that can be written as alternatives", () => {
+  const logits = Float32Array.of(2, -Infinity, 1, -Infinity, 0)
+  const before = logits.slice()
+  const of = logprobsOf(logits, 5, (token, logprob) => ({ token, logprob }))
+  const z = Math.log(Math.exp(2) + Math.exp(1) + 1)
+  const entry = of(2)
+  assert.ok(Math.abs(entry.logprob - (1 - z)) < 1e-6)
+  // Three tokens are allowed: three alternatives, likeliest first, none masked.
+  assert.deepEqual(entry.top_logprobs.map((a) => a.token), [0, 2, 4])
+  assert.ok(entry.top_logprobs.every((a) => Number.isFinite(a.logprob)))
+  assert.deepEqual(logits, before)
+  assert.deepEqual(logprobsOf(logits, 0, (token, logprob) => ({ token, logprob }))(0).top_logprobs, [])
 })

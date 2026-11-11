@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGLLM workers</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>WebGLLM workers</h1>
+  <p>A chat and an unload in webgllm's own worker, then in a worker of the page's own (<code>own-worker.ts</code>, written with <code>WebGLLMWorkerHandler</code>): <code>?model=&lt;id&gt;</code> (LFM2.5 350M GGUF by default), <code>&second=&lt;id&gt;</code> to also replace it with a second model in the page's worker.</p>
+  <pre id="out"></pre>
+  <script type="module">
+    import { WebGLLM } from "/bundle/src/index.js"
+
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    let failed = 0
+    const check = (name, ok, detail) => {
+      if (!ok) failed++
+      log(`${ok ? "PASS" : "FAIL"} ${name}`, detail ?? "")
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM2.5-350M-GGUF"
+    const second = params.get("second")
+    const ask = (webgllm, id = model) =>
+      webgllm.chat.completions.create({
+        model: id,
+        messages: [{ role: "user", content: "What is the capital of France? Answer in one short sentence." }],
+        temperature: 0,
+        max_tokens: 48
+      })
+
+    /** A chat, an unload and a chat again on `webgllm`, with its events. */
+    async function run(name, webgllm) {
+      const events = []
+      for (const type of ["loadstart", "load", "unload", "error"]) webgllm.addEventListener(type, (e) => events.push(`${type}:${e.model}${e.reason ? `:${e.reason}` : ""}`))
+      const first = await ask(webgllm)
+      check(`${name}: a chat completes`, /paris/i.test(first.choices[0].message.content ?? ""), first.choices[0].message.content)
+      await webgllm.unloadModel(model)
+      const info = await webgllm.models.retrieve(model)
+      check(`${name}: unloaded`, !info.loaded && events.at(-1) === `unload:${model}:unloaded`, events)
+      const again = await ask(webgllm)
+      check(`${name}: loads and chats again after the unload`, /paris/i.test(again.choices[0].message.content ?? ""), again.choices[0].message.content)
+      return events
+    }
+
+    try {
+      const own = new WebGLLM()
+      await run("webgllm's worker", own)
+      // Freed before the next phase loads the model again in another worker.
+      await own.unloadModel()
+
+      const worker = new Worker("/bundle/bench/own-worker.js", { type: "module", name: "own" })
+      // The page's own use of its worker goes on beside webgllm's: every message webgllm's handler sends reaches it too.
+      let seen = 0
+      worker.addEventListener("message", () => seen++)
+      const webgllm = new WebGLLM({ worker })
+      const events = await run("own worker", webgllm)
+      check("own worker: its messages reach the page's own listener too", seen > 0, seen)
+      // The page's own message to its worker and back, with the model loaded: webgllm takes neither for its own.
+      const pong = new Promise((resolve) => worker.addEventListener("message", (e) => e.data?.type === "pong" && resolve(e.data.model)))
+      worker.postMessage({ type: "ping", model })
+      const echoed = await Promise.race([pong, new Promise((resolve) => setTimeout(() => resolve("no answer"), 5000))])
+      const after = await ask(webgllm)
+      check("own worker: the page's own messages go round beside a loaded model", echoed === model && (await webgllm.models.retrieve(model)).loaded && /paris/i.test(after.choices[0].message.content ?? ""), echoed)
+      if (second) {
+        const other = await ask(webgllm, second)
+        const loaded = (await webgllm.models.list()).filter((m) => m.loaded).map((m) => m.id)
+        check("own worker: a second model replaces the first", loaded.length === 1 && loaded[0] === second && events.includes(`unload:${model}:evicted`), { loaded, reply: other.choices[0].message.content })
+      }
+      await webgllm.unloadModel()
+      // Still running after the last unload: it loads once more.
+      await webgllm.loadModel(model)
+      check("own worker: still running after every model is unloaded", (await webgllm.models.retrieve(model)).loaded, events)
+      await webgllm.unloadModel()
+      if (failed) log(`ERROR ${failed} check${failed === 1 ? "" : "s"} failed`)
+      else log("ALL DONE")
+    } catch (error) {
+      log("ERROR", String(error?.stack ?? error))
+    }
+  </script>
+</html>

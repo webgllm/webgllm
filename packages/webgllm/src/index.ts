@@ -1,7 +1,8 @@
 /**
  * webgllm: LLM inference in the browser on WebGL 2, for devices without
  * WebGPU, behind OpenAI's Chat Completions API. Each model runs in a Web
- * Worker on an OffscreenCanvas. The engine itself is in `webgllm/advanced`.
+ * Worker on an OffscreenCanvas: one webgllm starts, or one of your own
+ * running WebGLLMWorkerHandler.
  *
  * @example
  * ```ts
@@ -17,7 +18,8 @@
  */
 export { WebGLLM } from "./webgllm.js"
 export type { DownloadModelOptions, LoadModelOptions, LogLevel, RequestOptions, WebGLLMOptions } from "./webgllm.js"
-export type { WebGlModelId } from "./model-meta.js"
+export { WebGLLMWorkerHandler } from "./handler.js"
+export type { LogitProcessor } from "./handler.js"
 export { WebGLLMError } from "./errors.js"
 export type { WebGLLMErrorCode } from "./errors.js"
 export type {
@@ -29,6 +31,8 @@ export type {
   ChatCompletionContent,
   ChatCompletionContentPartImage,
   ChatCompletionContentPartText,
+  ChatCompletionLogprobs,
+  ChatCompletionTokenLogprob,
   ChatCompletionUserContent,
   ChatCompletionCreateParams,
   ChatCompletionCreateParamsBase,
@@ -42,6 +46,11 @@ export type {
   ChatCompletionToolChoiceOption,
   ChatCompletionToolMessageParam,
   ChatCompletionUserMessageParam,
+  Completion,
+  CompletionCreateParams,
+  CompletionCreateParamsBase,
+  CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming,
   CompletionTimings,
   CompletionUsage,
   FinishReason,
@@ -52,3 +61,7 @@ export type {
   ReasoningEffort,
   ResponseFormat
 } from "./openai.js"
+
+// The model catalog.
+export { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+export type { WebGlModelId, WebGlModelMeta, WebGlModelReasoning, WebGlTextModel } from "./model-meta.js"

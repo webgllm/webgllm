@@ -4,7 +4,7 @@ description: The WebGLLM class, its options and methods.
 ---
 
 ```ts
-import { WebGLLM, WebGLLMError } from "webgllm"
+import { WebGLLM, WebGLLMError, WebGLLMWorkerHandler, type LogitProcessor } from "webgllm"
 ```
 
 The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) and its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`).
@@ -18,7 +18,31 @@ The package also exports the OpenAI request and response types (`ChatCompletion`
 | `onProgress` | `(progress: LoadProgress) => void` | Every load's and download's progress. |
 | `onMemoryClaim` | `({ model, bytes, signal }) => Promise<void> \| void` | See [Sharing memory](/docs/guides/sharing-memory). |
 | `logLevel` | `"debug" \| "info" \| "warn" \| "error" \| "silent"` | Which worker messages reach the console. Default `"warn"`. |
-| `worker` | `() => Worker` | Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))`. |
+| `worker` | `Worker` | A Web Worker of your own to run models in. See [A worker of your own](#a-worker-of-your-own). |
+
+## A worker of your own
+
+webgllm starts a Web Worker for each model it loads. To run models in a worker you start (bundled your way, or shared with your own code), write the worker with `WebGLLMWorkerHandler` and give it to `WebGLLM`:
+
+```ts
+// worker.ts
+import { WebGLLMWorkerHandler } from "webgllm"
+
+const handler = new WebGLLMWorkerHandler()
+self.onmessage = (event) => handler.onmessage(event)
+```
+
+```ts
+const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })
+const webgllm = new WebGLLM({ worker })
+```
+
+- The worker holds one model. Loading another replaces the one there once its running generation ends, whatever `keepLoaded` says; the replaced model's `unload` event has the reason `"evicted"`.
+- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory.
+- Completions take turns, each from its load to its last token, so two for different models don't replace each other midway.
+- Every message webgllm sends or takes carries its own mark (`webgllm: true`), so your own messages can share the worker whatever their `type`.
+- For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
+- Downloads (`downloadModel`) run in the same worker, beside the loaded model.
 
 ## `WebGLLM.isSupported()`
 
@@ -32,6 +56,22 @@ OpenAI's Chat Completions. Returns a `ChatCompletion`, or an async iterable of `
 | --- | --- | --- |
 | `signal` | `AbortSignal` | Stops the generation; rejects with an `AbortError`. |
 | `onProgress` | `(progress: LoadProgress) => void` | The model's load progress, when this call loads it. |
+
+## `completions.create(body, options?)`
+
+OpenAI's Completions, as WebLLM has them: `body.prompt` (not empty) is read as it is, with no chat template. Returns a `Completion` (`choices[0].text`), or an async iterable of them when `stream: true`. It takes the sampling fields of chat completions, `max_tokens`, `stop`, `seed`, `echo`, `logprobs` with `top_logprobs`, and `logit_bias`.
+
+## Tokens and logits
+
+| | |
+| --- | --- |
+| `logprobs`, `top_logprobs` | On chat and text completions: `choices[0].logprobs.content` has each written token's `token`, `logprob`, `bytes` and its `top_logprobs` likeliest alternatives (0 to 20). The reply's thinking and tool-call tokens are included; a token a `stop` sequence cuts into is left out whole. |
+| `logit_bias` | Token ids to a bias from -100 to 100, added to their logits before sampling. |
+| `forwardTokensAndSample(inputIds, isPrefill, modelId?)` | WebLLM's: reads the token ids into the model's cache, after what it holds, and resolves to the next token, sampled with the model card's settings. `modelId` is needed only when several models are loaded. |
+| `resetChat(keepStats?, modelId?)` | WebLLM's: the model forgets its cache. |
+| `handler.setLogitProcessorRegistry(map)` | WebLLM's, on `WebGLLMWorkerHandler`: a `LogitProcessor` for each model id. Its `processLogits(logits)` gets every logit after each forward pass and returns the logits to sample from; `processSampledToken(token)` hears each token chosen; `resetState()` runs on `resetChat`. It shapes the model's chat and text completions too. |
+
+The log probabilities are the model's, before temperature, top-k and the penalties (after a `logit_bias`). The GPU normally picks each token itself; `logprobs`, `logit_bias` and a logit processor read every logit back for each token instead, so those replies are written slower. webgllm exports no tokenizer, like WebLLM: token ids come from the model's `tokenizer.json`.
 
 ## `loadModel(model, options?)`
 
@@ -50,7 +90,7 @@ Downloads a model's files into storage without loading them. Takes `onProgress` 
 
 ## `unloadModel(model?)`
 
-Frees a model's GPU memory, or every model's with no argument.
+Frees a model's GPU memory, or every model's with no argument. webgllm's own worker for the model ends; a worker of your own frees the model and stays running.
 
 ## `models`
 

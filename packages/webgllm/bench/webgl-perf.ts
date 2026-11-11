@@ -301,12 +301,14 @@ async function run() {
           : "/bundle/bench/webgl-perf-worker.js",
     { type: "module" }
   )
+  // webgllm's own messages carry its mark (a worker built from an older checkout ignores it).
+  const send = (message: object) => worker.postMessage({ ...message, webgllm: true })
   Object.assign(globalThis, { __benchWorker: worker })
   const stopFrames =
     params.get("baseline") === "1"
       ? () => undefined
       : monitorFrames((intervalMs, expectedMs, frames, startedAt, meanMs) =>
-          worker.postMessage({
+          send({
             type: "frames",
             intervalMs,
             expectedMs,
@@ -422,7 +424,7 @@ async function run() {
     }
     if (data.type === "claim") {
       gpuBytes = data.bytes
-      worker.postMessage({ type: "claimed" })
+      send({ type: "claimed", id: data.id })
     } else if (data.type === "ready" && phase === "load") {
       void end({ timings: data.timings, gpuBytes }).then(() => ready())
     } else if (data.type === "token") {
@@ -465,7 +467,7 @@ async function run() {
       })
   )
   if (Object.keys(tune).length)
-    worker.postMessage({ type: "tune", values: tune })
+    send({ type: "tune", values: tune })
   if (params.get("profile") === "1" || params.get("notune") === "1")
     worker.postMessage({ type: "bench-profile-config" })
   // `?model=`: a catalog model (LFM3 1.7B GGUF when left out).
@@ -475,7 +477,7 @@ async function run() {
   await new Promise<void>((r, j) => {
     ready = r
     reject = j
-    worker.postMessage({ type: "load", model })
+    send({ type: "load", model, loadId: 1 })
   })
   if (baseline && params.get("waitTune") === "1") {
     begin("calibration")
@@ -493,7 +495,7 @@ async function run() {
       })
   )
   if (Object.keys(inferenceTune).length)
-    worker.postMessage({ type: "tune", values: inferenceTune })
+    send({ type: "tune", values: inferenceTune })
   const rounds = Number(params.get("rounds") ?? 3),
     length = Number(params.get("len") ?? 512)
   const filler =
@@ -511,7 +513,7 @@ async function run() {
     const stats = await new Promise<RunTimings>((r, j) => {
       done = r
       reject = j
-      worker.postMessage({
+      send({
         type: "generate",
         id: `run${i}`,
         model,

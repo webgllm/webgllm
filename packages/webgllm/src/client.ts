@@ -1,12 +1,15 @@
 /**
- * The page's side of one WebGL 2 worker (worker.ts), which runs a model off
- * the main thread on an OffscreenCanvas. One worker holds one model; the
- * pool (pool.ts) keeps a worker per loaded model.
+ * The page's side of one model in a WebGL 2 worker (handler.ts), which runs
+ * it off the main thread on an OffscreenCanvas. One worker holds one model;
+ * the pool (pool.ts) starts a worker per loaded model, or keeps its one
+ * model in the worker the caller gave it.
  */
 import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { isCatalogModel, knownModelMeta } from "./model-meta.js"
-import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
+import { WEBGLLM } from "./protocol.js"
+import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { Sampling } from "./sampler.js"
 
 /** What a worker sends that the pool acts on. */
 export type WorkerEvents = {
@@ -22,8 +25,13 @@ export type WorkerEvents = {
 export type WorkerGenerationEnd = {
   stats: RunTimings
   finishReason: FinishReason
+  /** Log probabilities of the tokens written after the last text (when asked for). */
+  logprobs?: Array<TokenLogprob>
   toolCall?: { name: string; arguments: Record<string, unknown> }
 }
+
+/** A piece of a reply's raw text, with its tokens' log probabilities when they were asked for. */
+export type OnToken = (text: string, logprobs?: Array<TokenLogprob>) => void
 
 type Pending<T> = {
   promise: Promise<T>
@@ -43,7 +51,7 @@ function pending<T>(): Pending<T> {
   return { promise, resolve, reject }
 }
 
-type Generation = Pending<WorkerGenerationEnd> & { onToken: (text: string) => void }
+type Generation = Pending<WorkerGenerationEnd> & { onToken: OnToken }
 
 type Load = Pending<void> & {
   contextLength: number | undefined
@@ -52,24 +60,32 @@ type Load = Pending<void> & {
   previous?: Load
 }
 
-/** Engine knobs every new worker starts with (see setPromptBatch). */
-const tuning: Record<string, number> = {}
-const live = new Set<ModelWorker>()
-
 /** The bundled worker. Written out here so bundlers see the `new URL(…, import.meta.url)`. */
 export const defaultWorker = () =>
   new Worker(new URL("./worker.js", import.meta.url), { type: "module", name: "webgllm" })
 
+/**
+ * Ids of loads, unloads and downloads: one sequence for the page, so no
+ * two attachments to a worker (a model unloaded and loaded again in the
+ * caller's worker) ever share one, and a late answer can't pass for a new
+ * request's.
+ */
+let ids = 0
+
+/** One of the worker's messages to webgllm: marked as its own, so the worker's other messages never pass for one. */
+const isResponse = (data: unknown): data is WorkerResponse =>
+  typeof data === "object" && data !== null && (data as Record<string, unknown>)[WEBGLLM] === true && typeof (data as { type?: unknown }).type === "string"
+
 export class ModelWorker {
-  private readonly worker: Worker
   private load: Load | null = null
-  /** The last load's id: the worker's "ready" or "load-error" names the load it answers. */
-  private loads = 0
-  /** Loads sent and not answered yet. */
-  private readonly open = new Set<number>()
-  private downloading: Pending<void> | null = null
+  private downloading: (Pending<void> & { id: string }) | null = null
+  /** What a worker of the caller's still owes once this is gone ("unloaded", a stopped download's end), by id. */
+  private readonly owed = new Map<number | string, () => void>()
+  private freed: Promise<void> | undefined
   private readonly stored = pending<void>()
   private readonly generations = new Map<string, Generation>()
+  /** "forward" and "reset" requests waiting for their answer, by id. */
+  private readonly calls = new Map<string, Pending<number | undefined>>()
   /** Loaded and ready, for the context it was asked for (see contextLength). */
   ready = false
   /** Tokens the loaded model holds, as the worker reported it. */
@@ -78,20 +94,32 @@ export class ModelWorker {
   contextLength: number | undefined
   private gone: Error | null = null
 
+  private readonly onMessage = (event: MessageEvent<unknown>) => this.handle(event.data)
+  private readonly onError = (event: ErrorEvent) => {
+    // (Gone already: a worker that fails owes nothing more.)
+    if (this.gone) {
+      for (const settle of [...this.owed.values()]) settle()
+      return
+    }
+    const error = new Error(event.message || "The model's worker stopped.")
+    this.terminate(error)
+    for (const settle of [...this.owed.values()]) settle()
+    this.events.onCrash(error)
+  }
+
+  /**
+   * `owned`: a worker started for this model, ended with it. Otherwise it's
+   * the caller's: it's left running (asked to free the model), its other
+   * listeners alone, and it may carry another model's messages too.
+   */
   constructor(
     readonly model: string,
-    create: () => Worker,
+    private readonly worker: Worker,
+    private readonly owned: boolean,
     private readonly events: WorkerEvents
   ) {
-    this.worker = create()
-    this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => this.handle(event.data)
-    this.worker.onerror = (event: ErrorEvent) => {
-      const error = new Error(event.message || "The model's worker stopped.")
-      this.terminate(error)
-      this.events.onCrash(error)
-    }
-    live.add(this)
-    if (Object.keys(tuning).length) this.post({ type: "tune", values: { ...tuning } })
+    worker.addEventListener("message", this.onMessage)
+    worker.addEventListener("error", this.onError)
   }
 
   get loading(): boolean {
@@ -99,7 +127,7 @@ export class ModelWorker {
   }
 
   get busy(): boolean {
-    return this.generations.size > 0
+    return this.generations.size > 0 || this.calls.size > 0
   }
 
   /** The load in progress or done, if one was asked for. */
@@ -126,7 +154,7 @@ export class ModelWorker {
   }
 
   post(message: WorkerRequest) {
-    if (!this.gone) this.worker.postMessage(message)
+    if (!this.gone) this.worker.postMessage({ ...message, [WEBGLLM]: true })
   }
 
   /**
@@ -146,7 +174,7 @@ export class ModelWorker {
     this.load?.reject(replaced)
     this.ready = false
     this.contextLength = contextLength
-    const load: Load = { ...pending<void>(), contextLength, id: ++this.loads }
+    const load: Load = { ...pending<void>(), contextLength, id: ++ids }
     this.load = load
     if (previous && this.busy) {
       // The worker resizes after the reply running anyway: send it then, and
@@ -163,7 +191,6 @@ export class ModelWorker {
 
   private sendLoad(load: Load) {
     if (this.gone) return
-    this.open.add(load.id)
     this.post({ type: "load", model: this.model, loadId: load.id, ...(load.contextLength !== undefined && { contextLength: load.contextLength }), ...this.meta() })
   }
 
@@ -191,8 +218,9 @@ export class ModelWorker {
   download(): Promise<void> {
     if (this.gone) return Promise.reject(this.gone)
     if (!this.downloading) {
-      this.downloading = pending<void>()
-      this.post({ type: "download", model: this.model, ...this.meta() })
+      const id = `dl_${(++ids).toString(36)}`
+      this.downloading = { ...pending<void>(), id }
+      this.post({ type: "download", id, model: this.model, ...this.meta() })
     }
     return this.downloading.promise
   }
@@ -203,7 +231,7 @@ export class ModelWorker {
    */
   generate(
     request: Omit<Extract<WorkerRequest, { type: "generate" }>, "type" | "model" | "contextLength">,
-    onToken: (text: string) => void
+    onToken: OnToken
   ): Promise<WorkerGenerationEnd> {
     if (this.gone) return Promise.reject(this.gone)
     const generation = { ...pending<WorkerGenerationEnd>(), onToken }
@@ -222,20 +250,78 @@ export class ModelWorker {
     this.post({ type: "stop", id })
   }
 
-  /** Ends the worker, and with it the model and all its GPU memory. */
-  terminate(reason: Error) {
-    if (this.gone) return
+  private call(id: string): Promise<number | undefined> {
+    const call = pending<number | undefined>()
+    this.calls.set(id, call)
+    return call.promise
+  }
+
+  /** WebLLM's forwardTokensAndSample: reads `inputIds` after what the cache holds; the next token sampled. */
+  forward(id: string, inputIds: Array<number>, sampling: Sampling): Promise<number> {
+    if (this.gone) return Promise.reject(this.gone)
+    const answer = this.call(id)
+    this.post({
+      type: "forward", id, model: this.model, inputIds, sampling,
+      ...(this.contextLength !== undefined && { contextLength: this.contextLength })
+    })
+    return answer as Promise<number>
+  }
+
+  /** WebLLM's resetChat: the model forgets its cache. */
+  async reset(id: string): Promise<void> {
+    if (this.gone) throw this.gone
+    const answer = this.call(id)
+    this.post({ type: "reset", id, model: this.model })
+    await answer
+  }
+
+  /**
+   * Frees the model and all its GPU memory: by ending the worker, or in a
+   * worker of the caller's by stopping its generations and its download
+   * and asking the worker to free the model, which leaves it running.
+   * What waits on it fails with `reason` at once. Returns a promise for
+   * the caller's worker having freed the model and closed the download's
+   * files; undefined when that's done already (its own worker is ended).
+   */
+  terminate(reason: Error): Promise<void> | undefined {
+    if (this.gone) return this.freed
+    const detach = () => {
+      this.worker.removeEventListener("message", this.onMessage)
+      this.worker.removeEventListener("error", this.onError)
+    }
+    if (this.owned) {
+      detach()
+      this.worker.terminate()
+    } else {
+      const waits: Array<Promise<void>> = []
+      const owe = (id: number | string) =>
+        waits.push(new Promise<void>((resolve) => this.owed.set(id, () => (this.owed.delete(id), resolve()))))
+      for (const id of this.generations.keys()) this.post({ type: "stop", id })
+      // (Only if it was asked to load: a download leaves the worker's model alone.)
+      if (this.load) {
+        const id = ++ids
+        this.post({ type: "unload", model: this.model, id })
+        owe(id)
+      }
+      if (this.downloading) {
+        this.post({ type: "stop", id: this.downloading.id })
+        owe(this.downloading.id)
+      }
+      if (waits.length) this.freed = Promise.all(waits).then(detach)
+      else detach()
+    }
     this.gone = reason
     this.ready = false
-    live.delete(this)
-    this.worker.terminate()
     this.load?.reject(reason)
     this.load = null
     this.downloading?.reject(reason)
     this.downloading = null
     for (const generation of this.generations.values()) generation.reject(reason)
     this.generations.clear()
+    for (const call of this.calls.values()) call.reject(reason)
+    this.calls.clear()
     this.settled()
+    return this.freed
   }
 
   get terminated(): boolean {
@@ -248,31 +334,19 @@ export class ModelWorker {
     this.ready = false
   }
 
-  /**
-   * The current load, if a "ready" or "load-error" answers it. A worker that
-   * names no load (one from before loadId) answers the current load only
-   * when it's the one load open: with others open it may be a late answer
-   * to one this replaced, so the load fails rather than guess.
-   */
-  private answered(loadId: number | undefined): Load | null {
-    const load = this.load
-    if (loadId !== undefined) {
-      // The worker answers loads in order: the ones before are done too.
-      for (const id of this.open) if (id <= loadId) this.open.delete(id)
-      return load?.id === loadId ? load : null
-    }
-    if (!load || !this.open.has(load.id)) {
-      if (this.open.size === 1) this.open.clear()
-      return null
-    }
-    const only = this.open.size === 1
-    this.open.clear()
-    if (only) return load
-    this.failLoad(load, new Error("The model's worker answered a load without naming it (loadId) while another was open."))
-    return null
+  /** The current load, if "ready" or "load-error" `loadId` answers it (not a late answer to one it replaced). */
+  private answered(loadId: number): Load | null {
+    return this.load?.id === loadId ? this.load : null
   }
 
-  private handle(data: WorkerResponse) {
+  private handle(data: unknown) {
+    // A worker of the caller's carries its own messages too, and those of a download of another model.
+    if (!isResponse(data)) return
+    if (this.gone) {
+      if (data.type === "unloaded" || data.type === "downloaded" || data.type === "download-error") this.owed.get(data.id)?.()
+      return
+    }
+    if (!this.owned && "model" in data && data.model !== this.model) return
     switch (data.type) {
       case "progress":
         this.events.onProgress(data)
@@ -281,7 +355,7 @@ export class ModelWorker {
         void this.events
           .onClaim(data.bytes)
           .catch(() => undefined)
-          .then(() => this.post({ type: "claimed" }))
+          .then(() => this.post({ type: "claimed", id: data.id }))
         break
       case "stored":
         this.stored.resolve()
@@ -302,15 +376,17 @@ export class ModelWorker {
         break
       }
       case "downloaded":
-        this.downloading?.resolve()
+        if (data.id !== this.downloading?.id) break
+        this.downloading.resolve()
         this.downloading = null
         break
       case "download-error":
-        this.downloading?.reject(workerError(data.message, data.code))
+        if (data.id !== this.downloading?.id) break
+        this.downloading.reject(workerError(data.message, data.code))
         this.downloading = null
         break
       case "token":
-        this.generations.get(data.id)?.onToken(data.text)
+        this.generations.get(data.id)?.onToken(data.text, data.logprobs)
         break
       case "done": {
         const generation = this.generations.get(data.id)
@@ -319,15 +395,25 @@ export class ModelWorker {
           stats: data.stats,
           // (A worker from before finish reasons: its end-of-turn token.)
           finishReason: data.finishReason ?? "stop",
+          ...(data.logprobs && { logprobs: data.logprobs }),
           ...(data.toolCall && { toolCall: data.toolCall })
         })
         this.settled()
         break
       }
       case "error": {
-        const generation = this.generations.get(data.id)
+        const waiting = this.generations.get(data.id) ?? this.calls.get(data.id)
         this.generations.delete(data.id)
-        generation?.reject(workerError(data.message, data.code))
+        this.calls.delete(data.id)
+        waiting?.reject(workerError(data.message, data.code))
+        this.settled()
+        break
+      }
+      case "forwarded":
+      case "reset-done": {
+        const call = this.calls.get(data.id)
+        this.calls.delete(data.id)
+        call?.resolve(data.type === "forwarded" ? data.token : undefined)
         this.settled()
         break
       }
@@ -335,22 +421,10 @@ export class ModelWorker {
         this.events.onLog(data.text)
         break
       case "phase":
+      case "unloaded":
         break
     }
   }
-}
-
-/**
- * Prompt tokens per forward batch from each model's next load on
- * (undefined: the default, 512 on every device). Smaller batches take less
- * memory and read prompts slower: 128 holds Qwen3.5 2B's 8k-token chats in
- * ~270 MiB less (an iPhone page has ~2 GB), at about half the prompt speed.
- * A loaded model keeps its batch until it loads again.
- */
-export function setPromptBatch(tokens: number | undefined) {
-  if (tokens === undefined) delete tuning.promptBatch
-  else tuning.promptBatch = tokens
-  for (const worker of live) worker.post({ type: "tune", values: { promptBatch: tokens ?? 0 } })
 }
 
 /**

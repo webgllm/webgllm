@@ -47,7 +47,7 @@ Pages:
 
 ## mem.html: memory and speed over a chat (and the iPhone page)
 
-Runs a chat in a worker the way `worker.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
+Runs a chat in a worker the way `handler.ts` does (cache reuse, `readPrompt`'s batches and snapshots, the one-token guess), on one of the four builds, and at each checkpoint (after the load, the warm-up and self-check, and each turn) logs the live textures by category (weights, scratch, KV cache, recurrent and conv state, snapshots) and the most there were since the last checkpoint. The header shows the live and peak textures and the last turn's speed. The model's files download to the page's storage the first time (as the app's worker does); where there's no Origin Private File System (a page that isn't a secure context) they stream from Hugging Face on every load.
 
 - `model=qwen-onnx|qwen-gguf|lfm-onnx|lfm-gguf` (or a model's full name, a Hugging Face repository such as `onnx-community/Qwen3.5-0.8B-ONNX`).
 - `len=512`: the first message's length in tokens; `follow=0`: what each follow-up adds (0: a short question); `reply=128`: tokens per reply; `turns=3`, or `target=8192`: turns until the cache holds that many tokens; `ctx`: the context length (the model's own when left out); `think=1`: thinking on.
@@ -61,6 +61,14 @@ On an iPhone: start the server on the Mac (`node packages/webgllm/bench/server.m
 - serve the network (`HOST=0.0.0.0 node packages/webgllm/bench/server.mjs 8787`) and open `http://<the Mac's address>:8787/mem.html?…` on the same Wi-Fi: no storage there, so each load streams the model from Hugging Face again.
 
 For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html?model=qwen-gguf&len=2048&follow=1024&reply=128&target=8192&ctx=8192` (`&batch=128` for the smallest batch's memory). The timings a phone's defaults would need: `mem.html?model=qwen-gguf&mode=ab&len=535&reply=64&rounds=3&variants=default|f16Matmul:2|packZeros:0|batch:512|batch:256|batch:128|batch:128,quadMinBatch:128` (`packZeros` only matters for the ONNX builds; run it on each build). A tab that reloads by itself ran out of memory.
+
+## own-worker.html: webgllm's worker and a worker of the page's own
+
+The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded, and must leave the page's own messages to that worker alone. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`, or `ERROR` if a check failed.
+
+## logits.html: tokens and logits
+
+The token- and logit-level API on a real model: `logprobs`, `top_logprobs` and `logit_bias` on chat completions, a raw prompt through `completions.create`, then `forwardTokensAndSample`, `resetChat` and a `LogitProcessor` in a worker of the page's own (`logits-worker.ts`). The page tokenizes with the model's own tokenizer, loaded from `src`. `?model=<id>` (LFM2.5 350M GGUF by default). Ends with `ALL DONE`, or `ERROR` if a check failed.
 
 ## q4-matmul.html: the first kernel
 
@@ -182,7 +190,7 @@ Where a Qwen3.5 2B prompt's time went (`skip=recurrence`, ONNX, M3 Ultra, Chrome
 - The feed-forward in parts along its intermediate dimension (gate|up and SwiGLU a part at a time, each weight still read once; `ffnParts`): the same bits as in one go, but prompts 1.5% (Qwen3.5) to 8% (LFM3) slower at 2 parts, 11% at 4 (each part waits for the last to finish with the f16 copy's scratch). It would have saved 30 MiB (Qwen3.5) and 48 (LFM3). Not kept.
 - `scoreRows:64`: −16 MiB of scores (Qwen3.5), prompts 1.7–2.2% slower at 2k. `packZeros:0` (ONNX): −41 MiB; Qwen3.5 the same speed, LFM3 writing 1.4–2.7% slower. Not kept.
 - Kept: RGBA4 weights read in place by their own 4-token kernel in prompt matmuls, with no f16 copy (`f16Matmul` 1; byte weights, which have no such kernel, still go through f16). With `f16Matmul:0`, 3 runs a side: 0.3–5.8% faster prompts on the M3 on all four builds, the same quality, and 61–77 MiB less (the scratch is never made). A spot check after the change, M3, Chrome, 512-token batches: Qwen3.5 GGUF 2,121 against 2,067 tokens/s on a 2,069-token prompt, 1,487 against 1,549 MiB at load, prompt KL 2.08e-3 and 31 of 32 against llama.cpp; ONNX on RGBA4 KL 8.94e-6 against onnxruntime, greedy identical, 1,404 MiB. The engine picks RGBA4 where chooseLayout's timing at load favours it (Apple GPUs; the Pixel takes bytes), so no new device check. `f16Matmul:2` brings back f16 for RGBA4, which `mem.html` can time on a phone.
-- Prompt batches by model, by device or by measured memory: not kept, the batch is one value for every device and model (512; `setPromptBatch` for the caller to choose). Batches of 256 and 128 read LFM3's prompts 32% and 56% slower than 512 did before, and nothing WebGL reports tells a phone's memory from a desktop's (an M3 and an iPhone both report 16,384-texel textures).
+- Prompt batches by model, by device or by measured memory: not kept, the batch is one value for every device and model (512; the engine's `promptBatch` tuning knob for a benchmark to choose). Batches of 256 and 128 read LFM3's prompts 32% and 56% slower than 512 did before, and nothing WebGL reports tells a phone's memory from a desktop's (an M3 and an iPhone both report 16,384-texel textures).
 
 ## Fewer render passes per written token (Nov 1)
 

@@ -8,15 +8,18 @@ import {
   createReplyReader,
   planCompletion,
   planRepairs,
+  planTextCompletion,
   randomId,
   repairRequest,
+  textCompletion,
   timingsOf,
   usageOf
 } from "./chat-completions.js"
 import type { CompletionPlan, ReplyDelta } from "./chat-completions.js"
 import type { ParsedToolCall } from "./tool-calls.js"
-import type { RunTimings } from "./protocol.js"
+import type { RunTimings, TokenLogprob } from "./protocol.js"
 import { defaultWorker, hasWebGl2 } from "./client.js"
+import type { OnToken } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
 import { browserStorage, fileKey, storedModelFiles } from "./model-files.js"
 import type { ModelStorage } from "./model-files.js"
@@ -30,6 +33,10 @@ import type {
   ChatCompletionCreateParams,
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionCreateParamsStreaming,
+  Completion,
+  CompletionCreateParams,
+  CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming,
   LoadProgress,
   ModelInfo,
   WebGLLMEventMap
@@ -48,8 +55,13 @@ export type WebGLLMOptions = {
   memoryBudget?: number
   /** Which worker and engine messages reach the console ("warn" by default). */
   logLevel?: LogLevel
-  /** Starts a worker, for bundlers that don't bundle `new Worker(new URL(…))` themselves. */
-  worker?: () => Worker
+  /**
+   * A Web Worker of your own to run models in, in place of the ones webgllm
+   * starts: one running `WebGLLMWorkerHandler`. It holds one model, so
+   * loading another replaces the one there (whatever `keepLoaded` says), and
+   * unloading frees the model and leaves the worker running.
+   */
+  worker?: Worker
   /**
    * Called each time a model's worker claims memory, with the bytes the
    * model will hold in all (replacing its previous claim). The worker
@@ -107,13 +119,17 @@ async function resolved(model: unknown, signal?: AbortSignal): Promise<string> {
 const notSupported = (model: unknown) =>
   new WebGLLMError("model-not-supported", `${String(model)} isn't a model webgllm runs (see models.list()).`)
 
-/** What the tests swap (storage); not exported from the package. */
-export const internals = { storage: browserStorage as ModelStorage }
+/** What the tests swap (storage, the workers webgllm starts, the support check); not exported from the package. */
+export const internals = {
+  storage: browserStorage as ModelStorage,
+  createWorker: defaultWorker as () => Worker,
+  hasWebGl2
+}
 
 export class WebGLLM {
   /** Whether this browser can run the engine (WebGL 2 with float render targets, in a worker). */
   static isSupported(): boolean {
-    return hasWebGl2()
+    return internals.hasWebGl2()
   }
 
   /**
@@ -125,18 +141,23 @@ export class WebGLLM {
    */
   readonly baseURL = "webgllm:"
   readonly chat: { readonly completions: Completions }
+  /** OpenAI's Completions: a raw prompt, with no chat template. */
+  readonly completions: TextCompletions
   readonly models: Models
   private readonly pool: ModelPool
   /** Listeners by event type (typed at addEventListener and dispatch). */
   private readonly listeners = new Map<keyof WebGLLMEventMap, Set<(event: unknown) => void>>()
   private readonly storage: ModelStorage
   private checked = false
+  /** The last forwardTokensAndSample or resetChat, once it has ended (see inOrder). */
+  private tokenCalls: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: WebGLLMOptions = {}) {
     const level = LEVELS[options.logLevel ?? "warn"]
     this.storage = internals.storage
     this.pool = new ModelPool({
-      createWorker: options.worker ?? defaultWorker,
+      createWorker: internals.createWorker,
+      ...(options.worker && { worker: options.worker }),
       memoryBudget: () => options.memoryBudget ?? defaultMemoryBudget(),
       storage: this.storage,
       onProgress: (progress) => {
@@ -155,6 +176,7 @@ export class WebGLLM {
     this.chat = {
       completions: new Completions({ checkSupport: () => this.checkSupport(), contextLength: options.contextLength }, this.pool)
     }
+    this.completions = new TextCompletions({ checkSupport: () => this.checkSupport(), contextLength: options.contextLength }, this.pool)
     this.models = new Models(this, this.pool, this.storage)
   }
 
@@ -189,6 +211,7 @@ export class WebGLLM {
    * Loads `model` (downloading it the first time) for chats of up to
    * `contextLength` tokens. Other models stay loaded while they fit the
    * memory budget; past it, the least recently used go (not ones kept loaded).
+   * In a worker of your own (`worker`), it replaces the model loaded there.
    */
   async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
     throwIfAborted(options.signal)
@@ -206,9 +229,74 @@ export class WebGLLM {
     })
   }
 
-  /** Unloads `model`, or every model, freeing its GPU memory; its running generation fails. */
+  /**
+   * Unloads `model`, or every model, freeing its GPU memory; its running
+   * generation fails. webgllm's own worker for the model ends; a worker of
+   * your own (`worker`) frees the model and stays running. Resolves, after
+   * the model's "unload" event, once the memory is free.
+   */
   async unloadModel(model?: WebGlModelId): Promise<void> {
-    this.pool.unload(model)
+    await this.pool.unload(model)
+  }
+
+  /**
+   * WebLLM's forwardTokensAndSample: reads `inputIds` into the model's cache,
+   * after what it holds, and returns the next token, sampled with the model
+   * card's settings (from its logit processor's logits, if the worker's
+   * handler has one for it). The token isn't read in: pass it in next.
+   * `isPrefill` is accepted for WebLLM's signature and not used. `modelId`
+   * is needed only when more than one model is loaded; one that isn't loaded
+   * is loaded first.
+   */
+  async forwardTokensAndSample(inputIds: Array<number>, isPrefill: boolean, modelId?: WebGlModelId): Promise<number> {
+    void isPrefill
+    if (!Array.isArray(inputIds) || !inputIds.every((t) => Number.isInteger(t) && t >= 0)) throw new TypeError("inputIds must be an array of token ids.")
+    // Before it waits for anything: an unload asked for meanwhile stops it.
+    const asked = typeof modelId === "string" ? this.pool.unloadMark(modelId) : undefined
+    return this.inOrder(async () => {
+      const model = await this.modelFor(modelId)
+      const since = asked ?? this.pool.unloadMark(model)
+      if (!this.pool.isLoaded(model)) this.checkSupport()
+      // In a worker of the caller's (one model): its turn, as a completion's, from its load on.
+      const end = await this.pool.turn()
+      try {
+        return await this.pool.forward(model, inputIds, modelMeta(model).sampling, { contextLength: this.options.contextLength, since })
+      } finally {
+        end()
+      }
+    })
+  }
+
+  /**
+   * Token forwards and resets run in the order they were called, each after
+   * the one before has ended: a reset called after a forward (still loading
+   * its model, say) resets what that forward read, not what was there before.
+   */
+  private inOrder<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.tokenCalls.then(task)
+    this.tokenCalls = result.then(
+      () => undefined,
+      () => undefined
+    )
+    return result
+  }
+
+  /**
+   * WebLLM's resetChat: the model forgets what its cache holds (the next
+   * forwardTokensAndSample starts a new sequence), and its logit processor
+   * resets. `keepStats` is accepted for WebLLM's signature and not used.
+   */
+  async resetChat(keepStats?: boolean, modelId?: WebGlModelId): Promise<void> {
+    void keepStats
+    await this.inOrder(async () => this.pool.reset(await this.modelFor(modelId)))
+  }
+
+  /** `modelId` resolved, or the one model loaded when it's left out. */
+  private async modelFor(modelId: WebGlModelId | undefined): Promise<string> {
+    if (modelId !== undefined) return resolved(modelId)
+    const loaded = this.pool.loadedModels()
+    if (loaded.length === 1) return loaded[0]!
+    throw new WebGLLMError("model-not-loaded", loaded.length ? "More than one model is loaded: say which with modelId." : "No model is loaded: load one, or say which with modelId.")
   }
 
   /**
@@ -221,13 +309,10 @@ export class WebGLLM {
     await this.pool.download(await resolved(model, options.signal), options)
   }
 
-  /**
-   * The page can't run the engine: say so before starting a worker that
-   * would fail (skipped with a custom worker, which may know better).
-   */
+  /** The page can't run the engine: say so before a worker fails at it. */
   private checkSupport() {
-    if (this.checked || this.options.worker) return
-    if (!hasWebGl2()) {
+    if (this.checked) return
+    if (!internals.hasWebGl2()) {
       throw new WebGLLMError("webgl2-unavailable", "This browser can't run webgllm: it needs WebGL 2 with float render targets in a worker.")
     }
     this.checked = true
@@ -265,19 +350,29 @@ class Completions {
     if (named !== undefined && !knownModelMeta(named)) await resolveModel(named, signal)
     const plan = planCompletion(body)
     if (!this.pool.isLoaded(plan.model)) this.llm.checkSupport()
-    // Loaded before the call resolves, so load failures reject it.
-    await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
-    const meta = { id: randomId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
-    return plan.stream ? this.stream(plan, meta, options) : this.complete(plan, meta, options)
+    // In a worker of the caller's (one model): its turn, from this load to its last token.
+    const end = await this.pool.turn(signal)
+    try {
+      // Loaded before the call resolves, so load failures reject it.
+      await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
+      const meta = { id: randomId("chatcmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
+      if (plan.stream) return this.stream(plan, meta, options, end)
+      return await this.complete(plan, meta, options).finally(end)
+    } catch (error) {
+      end()
+      throw error
+    }
   }
 
   private async complete(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions): Promise<ChatCompletion> {
     const reader = readerFor(plan)
     const deltas: Array<ReplyDelta> = []
+    const logprobs: Array<TokenLogprob> = []
     const end = await abortable(
       this.pool.generate(plan.model, plan.generate, {
         contextLength: this.llm.contextLength,
-        onToken: (text) => {
+        onToken: (text, scored) => {
+          if (scored) logprobs.push(...scored)
           for (const d of reader.push(text)) deltas.push(d)
         },
         ...(options.onProgress && { onProgress: options.onProgress }),
@@ -285,12 +380,13 @@ class Completions {
       }),
       options.signal
     )
+    if (end.logprobs) logprobs.push(...end.logprobs)
     const last = reader.finish(end)
     for (const d of last.deltas) deltas.push(d)
     const settled = await this.settleToolCalls(plan, last, options.signal)
     for (const d of settled.deltas) deltas.push(d)
     const toolCalls = reader.toolCalls(settled.calls)
-    return buildCompletion(meta, deltas, toolCalls, toolCalls.length ? "tool_calls" : last.finishReason, end.stats, settled.repairs)
+    return buildCompletion(meta, deltas, toolCalls, toolCalls.length ? "tool_calls" : last.finishReason, end.stats, settled.repairs, plan.logprobs ? logprobs : undefined)
   }
 
   /**
@@ -331,102 +427,181 @@ class Completions {
    * The chunks as the worker writes the reply. The generation starts at
    * once; chunks wait for the reader. Leaving the loop early stops it.
    */
-  private stream(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions): AsyncIterable<ChatCompletionChunk> {
+  private stream(plan: CompletionPlan, meta: { id: string; created: number; model: string }, options: RequestOptions, end: () => void): AsyncIterable<ChatCompletionChunk> {
     const reader = readerFor(plan)
-    const writer = createChunkWriter(meta)
-    const stop = new AbortController()
-    const signal = options.signal
-    const chunks: Array<ChatCompletionChunk> = []
-    let finished = false
-    // Set by return(): reads end, and later messages are dropped.
-    let closed = false
-    let failure: { error: unknown } | null = null
-    let wake: (() => void) | null = null
-    const emit = (...more: Array<ChatCompletionChunk>) => {
-      if (!closed) chunks.push(...more)
-    }
-    const notify = () => {
-      wake?.()
-      wake = null
-    }
-    const onAbort = () => {
-      stop.abort(signal?.reason)
-      notify()
-    }
-    if (signal?.aborted) stop.abort(signal.reason)
-    else signal?.addEventListener("abort", onAbort, { once: true })
-    this.pool
-      .generate(plan.model, plan.generate, {
+    const writer = createChunkWriter(meta, plan.logprobs)
+    return streamChunks<ChatCompletionChunk>(options.signal, end, async (emit, signal) => {
+      const ended = await this.pool.generate(plan.model, plan.generate, {
         contextLength: this.llm.contextLength,
-        onToken: (text) => {
-          for (const d of reader.push(text)) emit(writer.delta(d))
-          notify()
+        onToken: (text, scored) => {
+          writer.logprobs(scored)
+          emit(...reader.push(text).map((d) => writer.delta(d)))
         },
         ...(options.onProgress && { onProgress: options.onProgress }),
-        signal: stop.signal
+        signal
       })
-      .then(async (end) => {
-        const last = reader.finish(end)
-        for (const d of last.deltas) emit(writer.delta(d))
-        notify()
-        const settled = await this.settleToolCalls(plan, last, stop.signal)
-        for (const d of settled.deltas) emit(writer.delta(d))
-        const toolCalls = reader.toolCalls(settled.calls)
-        emit(...writer.toolCalls(toolCalls))
-        const timings = timingsOf(end.stats)
-        emit(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
-        if (plan.includeUsage) emit(writer.usage(usageOf(end.stats, settled.repairs), timings))
-      })
-      .then(
-        () => undefined,
-        (error: unknown) => {
-          failure = { error }
-        }
-      )
-      .finally(() => {
-        finished = true
-        signal?.removeEventListener("abort", onAbort)
-        notify()
-      })
+      writer.logprobs(ended.logprobs)
+      const last = reader.finish(ended)
+      emit(...last.deltas.map((d) => writer.delta(d)))
+      const settled = await this.settleToolCalls(plan, last, signal)
+      emit(...settled.deltas.map((d) => writer.delta(d)))
+      const toolCalls = reader.toolCalls(settled.calls)
+      emit(...writer.toolCalls(toolCalls))
+      const timings = timingsOf(ended.stats)
+      emit(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
+      if (plan.includeUsage) emit(writer.usage(usageOf(ended.stats, settled.repairs), timings))
+    })
+  }
+}
 
-    const read = async (): Promise<IteratorResult<ChatCompletionChunk>> => {
-      for (;;) {
-        if (closed) return { value: undefined, done: true }
-        if (signal?.aborted) throw abortError(signal)
-        const chunk = chunks.shift()
-        if (chunk) return { value: chunk, done: false }
-        if (finished) {
-          if (failure) {
-            const { error } = failure
-            failure = null
-            throw error
-          }
-          return { value: undefined, done: true }
-        }
-        await new Promise<void>((resolve) => {
-          wake = resolve
-        })
+/**
+ * The chunks `run` emits, as it emits them. `run` starts at once; chunks
+ * wait for the reader. Leaving the loop early, or aborting `signal`, aborts
+ * the signal `run` is given. `end` is called when `run` has ended.
+ */
+function streamChunks<T>(
+  signal: AbortSignal | undefined,
+  end: () => void,
+  run: (emit: (...chunks: Array<T>) => void, signal: AbortSignal) => Promise<void>
+): AsyncIterable<T> {
+  const stop = new AbortController()
+  const chunks: Array<T> = []
+  let finished = false
+  // Set by return(): reads end, and later messages are dropped.
+  let closed = false
+  let failure: { error: unknown } | null = null
+  let wake: (() => void) | null = null
+  const notify = () => {
+    wake?.()
+    wake = null
+  }
+  const emit = (...more: Array<T>) => {
+    if (!closed) chunks.push(...more)
+    notify()
+  }
+  const onAbort = () => {
+    stop.abort(signal?.reason)
+    notify()
+  }
+  if (signal?.aborted) stop.abort(signal.reason)
+  else signal?.addEventListener("abort", onAbort, { once: true })
+  run(emit, stop.signal)
+    .then(
+      () => undefined,
+      (error: unknown) => {
+        failure = { error }
       }
-    }
-    // Reads run one at a time, in call order: two waiting at once would
-    // share the one wake callback, and one would never wake.
-    let reads: Promise<unknown> = Promise.resolve()
-    const iterator: AsyncIterator<ChatCompletionChunk> = {
-      next() {
-        const result = reads.then(read)
-        reads = result.catch(() => undefined)
-        return result
-      },
-      async return() {
-        // The reader left early: stop the worker too.
-        if (!finished) stop.abort(abortError())
-        closed = true
-        chunks.length = 0
-        notify()
+    )
+    .finally(() => {
+      finished = true
+      end()
+      signal?.removeEventListener("abort", onAbort)
+      notify()
+    })
+
+  const read = async (): Promise<IteratorResult<T>> => {
+    for (;;) {
+      if (closed) return { value: undefined, done: true }
+      if (signal?.aborted) throw abortError(signal)
+      if (chunks.length) return { value: chunks.shift() as T, done: false }
+      if (finished) {
+        if (failure) {
+          const { error } = failure
+          failure = null
+          throw error
+        }
         return { value: undefined, done: true }
       }
+      await new Promise<void>((resolve) => {
+        wake = resolve
+      })
     }
-    return { [Symbol.asyncIterator]: () => iterator }
+  }
+  // Reads run one at a time, in call order: two waiting at once would
+  // share the one wake callback, and one would never wake.
+  let reads: Promise<unknown> = Promise.resolve()
+  const iterator: AsyncIterator<T> = {
+    next() {
+      const result = reads.then(read)
+      reads = result.catch(() => undefined)
+      return result
+    },
+    async return() {
+      // The reader left early: stop the worker too.
+      if (!finished) stop.abort(abortError())
+      closed = true
+      chunks.length = 0
+      notify()
+      return { value: undefined, done: true }
+    }
+  }
+  return { [Symbol.asyncIterator]: () => iterator }
+}
+
+/** OpenAI's Completions, as WebLLM has them: a raw prompt, with no chat template. */
+class TextCompletions {
+  constructor(
+    private readonly llm: CompletionContext,
+    private readonly pool: ModelPool
+  ) {}
+
+  /**
+   * A completion of `body.prompt`, read as it is: a whole Completion, or
+   * with `stream: true` its chunks. Loads `body.model` first if it isn't loaded.
+   */
+  create(body: CompletionCreateParamsStreaming, options?: RequestOptions): Promise<AsyncIterable<Completion>>
+  create(body: CompletionCreateParamsNonStreaming, options?: RequestOptions): Promise<Completion>
+  create(body: CompletionCreateParams, options?: RequestOptions): Promise<Completion | AsyncIterable<Completion>>
+  async create(body: CompletionCreateParams, options: RequestOptions = {}): Promise<Completion | AsyncIterable<Completion>> {
+    const { signal, onProgress } = options
+    throwIfAborted(signal)
+    const named = body && typeof body === "object" && typeof body.model === "string" && body.model ? body.model : undefined
+    const since = named === undefined ? undefined : this.pool.unloadMark(named)
+    if (named !== undefined && !knownModelMeta(named)) await resolveModel(named, signal)
+    const plan = planTextCompletion(body)
+    if (!this.pool.isLoaded(plan.model)) this.llm.checkSupport()
+    const end = await this.pool.turn(signal)
+    try {
+      await this.pool.ensureLoaded(plan.model, this.llm.contextLength, onProgress, signal, since)
+      const meta = { id: randomId("cmpl-"), created: Math.floor(Date.now() / 1000), model: plan.model }
+      const generate = (onToken: OnToken, stop: AbortSignal | undefined) =>
+        this.pool.generate(plan.model, plan.generate, {
+          contextLength: this.llm.contextLength,
+          onToken,
+          ...(onProgress && { onProgress }),
+          ...(stop && { signal: stop })
+        })
+      if (plan.stream) {
+        return streamChunks<Completion>(signal, end, async (emit, stop) => {
+          const scored: Array<TokenLogprob> = []
+          const chunk = (text: string, finish: "stop" | "length" | null = null) =>
+            textCompletion(meta, text, finish, plan.logprobs ? scored.splice(0) : undefined)
+          if (plan.echo) emit(chunk(plan.echo))
+          const ended = await generate((text, logprobs) => {
+            if (logprobs) scored.push(...logprobs)
+            emit(chunk(text))
+          }, stop)
+          if (ended.logprobs) scored.push(...ended.logprobs)
+          const timings = timingsOf(ended.stats)
+          emit({ ...chunk("", ended.finishReason), ...(!plan.includeUsage && { timings }) })
+          if (plan.includeUsage) emit({ ...textCompletion(meta, "", null, undefined), choices: [], usage: usageOf(ended.stats), timings })
+        })
+      }
+      let text = plan.echo ?? ""
+      const scored: Array<TokenLogprob> = []
+      const ended = await abortable(
+        generate((piece, logprobs) => {
+          text += piece
+          if (logprobs) scored.push(...logprobs)
+        }, signal),
+        signal
+      ).finally(end)
+      if (ended.logprobs) scored.push(...ended.logprobs)
+      return textCompletion(meta, text, ended.finishReason, plan.logprobs ? scored : undefined, ended.stats)
+    } catch (error) {
+      end()
+      throw error
+    }
   }
 }
 
@@ -484,12 +659,14 @@ class Models {
   async delete(model: WebGlModelId): Promise<void> {
     const id = await resolved(model)
     await this.llm.unloadModel(id)
-    this.pool.cancelDownload(id)
-    // Files another downloaded or loaded model also reads stay.
+    // (Nothing writes its files any more once this resolves.)
+    await this.pool.cancelDownload(id)
+    // Files another model also reads stay: one downloaded or loaded, and one
+    // still loading or downloading, which is writing them now.
     const keep = new Set<string>()
     for (const other of await this.allModels()) {
       if (other === id) continue
-      if (this.pool.isLoaded(other) || (await this.storage.downloaded(other))) {
+      if (this.pool.inUse(other) || (await this.storage.downloaded(other))) {
         for (const file of storedModelFiles(modelMeta(other))) keep.add(fileKey(file))
       }
     }

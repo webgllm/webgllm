@@ -2,7 +2,7 @@
  * A prompt's images in the worker: fetched and resized as the model's
  * processor says (image.ts), each image slot the chat template wrote
  * expanded to the image's tokens, and keys for the prompt cache that tell
- * images apart (see worker.ts). Embedding rows are kept for a few recent
+ * images apart (see handler.ts). Embedding rows are kept for a few recent
  * images, by content, so a chat that reads an image again doesn't encode it
  * again.
  */

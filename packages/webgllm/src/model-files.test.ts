@@ -127,12 +127,7 @@ test("models.downloaded reads OPFS only: whole, missing, or partly downloaded", 
   const saved = internals.storage
   internals.storage = browserStorage
   try {
-    const llm = new WebGLLM({
-      memoryBudget: 1000,
-      worker: () => {
-        throw new Error("no load")
-      }
-    })
+    const llm = new WebGLLM({ memoryBudget: 1000 })
     assert.equal(await llm.models.downloaded(model), false, "nothing stored")
     const files = modelFiles(WEBGL_MODEL_META[model])
     for (const file of files) names.add(diskName(file)).add(`${diskName(file)}.done`)

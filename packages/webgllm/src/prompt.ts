@@ -221,7 +221,7 @@ export async function readPrompt(
     prefix?: number
     observedPrefix?: number
     checkpoints?: boolean
-    /** What `cached` gets for each token read: the prompt's tokens when left out (see worker.ts: image rows' keys). */
+    /** What `cached` gets for each token read: the prompt's tokens when left out (see handler.ts: image rows' keys). */
     keys?: Array<number>
   } = {}
 ): Promise<number> {

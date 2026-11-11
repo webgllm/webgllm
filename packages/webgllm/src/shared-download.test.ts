@@ -77,3 +77,24 @@ test("an already aborted caller doesn't start anything", async () => {
   await assert.rejects(shared("f", c.start, () => undefined, abort.signal), /gone/)
   assert.equal(c.starts, 0)
 })
+
+test("the caller whose abort stops the download is rejected once it has ended", async () => {
+  const shared = createSharedDownloads<string>()
+  let closed!: () => void
+  let signal!: AbortSignal
+  // A download that takes a moment to close its file after it's aborted.
+  const start = (_: unknown, s: AbortSignal) => {
+    signal = s
+    return new Promise<string>((_, reject) => { closed = () => reject(s.reason) })
+  }
+  const abort = new AbortController()
+  let rejected = false
+  const a = shared("f", start, () => undefined, abort.signal).catch(() => { rejected = true })
+  abort.abort(new Error("stopped"))
+  await new Promise((r) => setTimeout(r, 0))
+  assert.equal(signal.aborted, true)
+  assert.equal(rejected, false, "rejected while the file was still open")
+  closed()
+  await a
+  assert.equal(rejected, true)
+})

@@ -18,11 +18,13 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
+  Completion,
+  CompletionCreateParams,
   CompletionTimings,
   CompletionUsage,
   FinishReason
 } from "./openai.js"
-import type { FinishReason as WorkerFinishReason, RunTimings, ToolChoice, WorkerRequest } from "./protocol.js"
+import type { FinishReason as WorkerFinishReason, RunTimings, TokenLogprob, ToolChoice, WorkerRequest } from "./protocol.js"
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
@@ -41,6 +43,8 @@ export type CompletionPlan = {
   model: string
   stream: boolean
   includeUsage: boolean
+  /** The request asked for log probabilities: `choices[].logprobs` isn't null. */
+  logprobs: boolean
   generate: GenerateFields
   /** Read tool-call markup out of the answer. */
   parseTools: boolean
@@ -329,6 +333,19 @@ function outputSchemaFor(format: unknown): object | undefined {
   throw unsupported(`response_format type "${String(f.type)}" isn't supported.`)
 }
 
+/** OpenAI's logit_bias: token ids to a bias from -100 to 100. Undefined when it biases nothing. */
+export function logitBiasOf(value: unknown): Record<string, number> | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("logit_bias must be an object of token ids to numbers.")
+  const bias: Record<string, number> = {}
+  for (const [token, amount] of Object.entries(value)) {
+    if (!/^\d+$/.test(token)) throw new TypeError(`logit_bias's keys are token ids: ${JSON.stringify(token)} isn't one.`)
+    if (typeof amount !== "number" || !(amount >= -100 && amount <= 100)) throw new TypeError("logit_bias's values are numbers from -100 to 100.")
+    if (amount !== 0) bias[token] = amount
+  }
+  return Object.keys(bias).length ? bias : undefined
+}
+
 /** Checks a request and plans its generation. Throws on unsupported or malformed fields. */
 export function planCompletion(params: ChatCompletionCreateParams): CompletionPlan {
   if (!params || typeof params !== "object") throw new TypeError("The request must be an object.")
@@ -341,9 +358,11 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
 
   const n = numberField(body, "n", { min: 1, integer: true })
   if (n !== undefined && n > 1) throw unsupported("n > 1 isn't supported: one choice per request.")
-  if (body.logprobs === true) throw unsupported("logprobs aren't supported.")
-  if (body.top_logprobs !== undefined && body.top_logprobs !== null) throw unsupported("top_logprobs aren't supported.")
-  if (body.logit_bias && Object.keys(body.logit_bias as object).length > 0) throw unsupported("logit_bias isn't supported.")
+  if (body.logprobs !== undefined && body.logprobs !== null && typeof body.logprobs !== "boolean") throw new TypeError("logprobs must be a boolean.")
+  const logprobs = body.logprobs === true
+  const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })
+  if (topLogprobs !== undefined && !logprobs) throw new TypeError("top_logprobs needs logprobs: true.")
+  const logitBias = logitBiasOf(body.logit_bias)
   if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
     throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
   }
@@ -397,12 +416,15 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     ...(stops.length && { stop: stops }),
     ...(seed !== undefined && { seed }),
     ...(toolChoice !== "auto" && { toolChoice }),
-    ...(body.cache_prompt === false && { cachePrompt: false })
+    ...(body.cache_prompt === false && { cachePrompt: false }),
+    ...(logprobs && { logprobs, ...(topLogprobs !== undefined && { topLogprobs }) }),
+    ...(logitBias && { logitBias })
   }
   return {
     model,
     stream: body.stream === true,
     includeUsage: (body.stream_options as { include_usage?: boolean } | undefined)?.include_usage === true,
+    logprobs,
     generate,
     // A JSON answer can't hold markup; a forced call comes back in "done".
     parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto"),
@@ -600,8 +622,10 @@ export function timingsOf(stats: RunTimings): CompletionTimings {
 }
 
 /** Builds one stream's chunks: the role on the first, finish_reason and usage at the end. */
-export function createChunkWriter(meta: { id: string; created: number; model: string }) {
+export function createChunkWriter(meta: { id: string; created: number; model: string }, logprobs = false) {
   let roleSent = false
+  // Log probabilities of tokens whose text hasn't made a chunk yet (held by the reader): they go with the next one.
+  const unsent: Array<TokenLogprob> = []
   const chunk = (
     delta: ChatCompletionChunkDelta,
     finish_reason: FinishReason | null = null
@@ -615,10 +639,12 @@ export function createChunkWriter(meta: { id: string; created: number; model: st
       object: "chat.completion.chunk",
       created: meta.created,
       model: meta.model,
-      choices: [{ index: 0, delta, finish_reason, logprobs: null }]
+      choices: [{ index: 0, delta, finish_reason, logprobs: logprobs ? { content: unsent.splice(0), refusal: null } : null }]
     }
   }
   return {
+    /** Tokens' log probabilities, for the next chunk. */
+    logprobs: (entries: ReadonlyArray<TokenLogprob> | undefined) => void (entries && unsent.push(...entries)),
     delta: (delta: ReplyDelta) => chunk(delta),
     toolCalls: (calls: Array<ChatCompletionMessageToolCall>) =>
       calls.map((call, index) => chunk({ tool_calls: [{ index, id: call.id, type: "function", function: { ...call.function } }] })),
@@ -639,7 +665,9 @@ export function buildCompletion(
   toolCalls: Array<ChatCompletionMessageToolCall>,
   finishReason: FinishReason,
   stats: RunTimings,
-  repairs: ReadonlyArray<RunTimings> = []
+  repairs: ReadonlyArray<RunTimings> = [],
+  /** The written tokens' log probabilities, when the request asked for them. */
+  logprobs?: Array<TokenLogprob>
 ): ChatCompletion {
   let content = ""
   let reasoning = ""
@@ -663,10 +691,95 @@ export function buildCompletion(
           refusal: null
         },
         finish_reason: finishReason,
-        logprobs: null
+        logprobs: logprobs ? { content: logprobs, refusal: null } : null
       }
     ],
     usage: usageOf(stats, repairs),
     timings: timingsOf(stats)
+  }
+}
+
+/** A checked Completions request: what to send the worker. */
+export type TextCompletionPlan = {
+  model: string
+  stream: boolean
+  includeUsage: boolean
+  logprobs: boolean
+  /** The prompt, when `echo` writes it before the completion. */
+  echo: string | undefined
+  generate: GenerateFields
+}
+
+/** Checks a Completions request (a raw prompt) and plans its generation. */
+export function planTextCompletion(params: CompletionCreateParams): TextCompletionPlan {
+  if (!params || typeof params !== "object") throw new TypeError("The request must be an object.")
+  const body = params as unknown as Record<string, unknown>
+  if (typeof body.model !== "string" || !body.model) throw new TypeError("model is required.")
+  const model = body.model
+  const meta = knownModelMeta(model)
+  if (!meta) throw new WebGLLMError("model-not-supported", `${model} isn't a model webgllm runs (see models.list()).`)
+  if (typeof body.prompt !== "string") throw new TypeError("prompt must be a string.")
+  // (The reply is sampled from the logits after the prompt's last token.)
+  if (!body.prompt) throw new TypeError("prompt must not be empty.")
+  for (const key of ["n", "best_of"]) {
+    const count = numberField(body, key, { min: 1, integer: true })
+    if (count !== undefined && count > 1) throw unsupported(`${key} > 1 isn't supported: one choice per request.`)
+  }
+  if (body.suffix !== undefined && body.suffix !== null) throw unsupported("suffix isn't supported.")
+  if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
+    throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
+  }
+  if (body.logprobs !== undefined && body.logprobs !== null && typeof body.logprobs !== "boolean") throw new TypeError("logprobs must be a boolean.")
+  const logprobs = body.logprobs === true
+  const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })
+  if (topLogprobs !== undefined && !logprobs) throw new TypeError("top_logprobs needs logprobs: true.")
+  const logitBias = logitBiasOf(body.logit_bias)
+  const maxTokens = numberField(body, "max_tokens", { min: 0, integer: true })
+  const seed = numberField(body, "seed", { integer: true })
+  const stop = typeof body.stop === "string" ? [body.stop] : body.stop
+  if (stop !== undefined && stop !== null && (!Array.isArray(stop) || stop.some((s) => typeof s !== "string"))) {
+    throw new TypeError("stop must be a string or an array of strings.")
+  }
+  const stops = (stop ?? []).filter(Boolean) as Array<string>
+  if (body.echo !== undefined && body.echo !== null && typeof body.echo !== "boolean") throw new TypeError("echo must be a boolean.")
+  if (body.cache_prompt !== undefined && body.cache_prompt !== null && typeof body.cache_prompt !== "boolean") {
+    throw new TypeError("cache_prompt must be a boolean.")
+  }
+  return {
+    model,
+    stream: body.stream === true,
+    includeUsage: (body.stream_options as { include_usage?: boolean } | undefined)?.include_usage === true,
+    logprobs,
+    echo: body.echo === true ? body.prompt : undefined,
+    generate: {
+      chat: [],
+      tools: [],
+      prompt: body.prompt,
+      sampling: samplingFor(body, meta, undefined),
+      ...(maxTokens !== undefined && { maxTokens }),
+      ...(stops.length && { stop: stops }),
+      ...(seed !== undefined && { seed }),
+      ...(body.cache_prompt === false && { cachePrompt: false }),
+      ...(logprobs && { logprobs, ...(topLogprobs !== undefined && { topLogprobs }) }),
+      ...(logitBias && { logitBias })
+    }
+  }
+}
+
+/** A Completion: a whole one (with `usage`), or one chunk of a stream. */
+export function textCompletion(
+  meta: { id: string; created: number; model: string },
+  text: string,
+  finishReason: "stop" | "length" | null,
+  logprobs: Array<TokenLogprob> | undefined,
+  stats?: RunTimings
+): Completion {
+  return {
+    id: meta.id,
+    object: "text_completion",
+    created: meta.created,
+    model: meta.model,
+    choices: [{ index: 0, text, finish_reason: finishReason, logprobs: logprobs ? { content: logprobs, refusal: null } : null }],
+    ...(stats && { usage: usageOf(stats), timings: timingsOf(stats) })
   }
 }

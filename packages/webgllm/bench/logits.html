@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGLLM tokens and logits</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>WebGLLM tokens and logits</h1>
+  <p><code>logprobs</code>, <code>top_logprobs</code> and <code>logit_bias</code> on chat completions, a raw prompt through <code>completions.create</code>, then <code>forwardTokensAndSample</code>, <code>resetChat</code> and a <code>LogitProcessor</code> in a worker of the page's own: <code>?model=&lt;id&gt;</code> (LFM2.5 350M GGUF by default).</p>
+  <pre id="out"></pre>
+  <script type="module" src="/bundle/bench/logits.js"></script>
+</html>

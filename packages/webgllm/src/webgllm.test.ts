@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
-import { fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
+import { FakeWorker, fakeStorage, fakeWorkers, settle, STATS } from "./fake-worker.test.js"
 import type { FakeOptions } from "./fake-worker.test.js"
 import type { ChatCompletionChunk, LoadProgress } from "./openai.js"
 import { internals, WebGLLM } from "./webgllm.js"
+import { fileKey, storedModelFiles } from "./model-files.js"
+import { modelMeta, rememberModel } from "./model-meta.js"
 import { hub } from "./resolve-model.js"
 import hubFixture from "./test-fixtures/hub.json"
 
@@ -12,12 +14,16 @@ const QWEN = "unsloth/Qwen3.5-2B-GGUF"
 const LFM2 = "LiquidAI/LFM2.5-350M-GGUF"
 const hi = [{ role: "user" as const, content: "hi" }]
 
+// (Node has no WebGL 2: the fake workers stand in for the engine.)
+internals.hasWebGl2 = () => true
+
 function llm(options: FakeOptions = {}, downloaded = new Set<string>()) {
   const workers = fakeWorkers(options)
   const storage = fakeStorage(downloaded)
   internals.storage = storage
+  internals.createWorker = workers.create
   const progress: Array<LoadProgress> = []
-  const instance = new WebGLLM({ worker: workers.create, onProgress: (p) => progress.push(p), memoryBudget: 1000 })
+  const instance = new WebGLLM({ onProgress: (p) => progress.push(p), memoryBudget: 1000 })
   return { llm: instance, workers, progress, storage }
 }
 
@@ -368,7 +374,7 @@ test("lifecycle events: a model evicted for room, a failed load, an aborted load
   const crashing = llm()
   const crashes = recordEvents(crashing.llm)
   await crashing.llm.loadModel(LFM2)
-  crashing.workers.of(LFM2)!.onerror?.({ message: "boom" })
+  crashing.workers.of(LFM2)!.fail("boom")
   await settle()
   assert.equal(crashes[2]?.startsWith(`error ${LFM2}:`), true, crashes.join(", "))
   assert.equal(crashes[3], `unload ${LFM2} crashed`)
@@ -392,9 +398,9 @@ test("a throwing listener doesn't break loading", async () => {
 test("onMemoryClaim forwards each model's claims, released at its unload event", async () => {
   const workers = fakeWorkers({ bytes: () => 700 })
   internals.storage = fakeStorage(new Set([QWEN]))
+  internals.createWorker = workers.create
   const host = new Map<string, number>()
   const instance = new WebGLLM({
-    worker: workers.create,
     memoryBudget: 1000,
     onMemoryClaim: ({ model, bytes }) => void host.set(model, bytes)
   })
@@ -506,4 +512,186 @@ test("unloading a model while it resolves stops its load", async () => {
   await assert.rejects(load, { code: "model-not-loaded" })
   await assert.rejects(reply, { code: "model-not-loaded" })
   assert.equal(workers.of(name), undefined, "no worker started")
+})
+
+test("completions.create: a raw prompt, whole and streamed, with echo and log probabilities", async () => {
+  const entry = { token: "Hello", logprob: -0.25, bytes: [72, 101, 108, 108, 111], top_logprobs: [] }
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["Hello", "!"] }) })
+  const whole = await client.completions.create({ model: LFM2, prompt: "Say hi: ", echo: true })
+  assert.equal(whole.object, "text_completion")
+  assert.equal(whole.choices[0]!.text, "Say hi: Hello!")
+  assert.equal(whole.choices[0]!.finish_reason, "stop")
+  assert.equal(whole.choices[0]!.logprobs, null)
+  assert.equal(whole.usage!.completion_tokens, STATS.outputTokens)
+  const sent = workers.of(LFM2)!.generations()[0]!
+  assert.equal(sent.prompt, "Say hi: ")
+  assert.deepEqual(sent.chat, [])
+  // Streamed: the worker's log probabilities ride on the chunks.
+  const held = llm()
+  const stream = await held.llm.completions.create({ model: LFM2, prompt: "x", stream: true, logprobs: true, stream_options: { include_usage: true } })
+  await settle()
+  const worker = held.workers.of(LFM2)!
+  const id = worker.generations()[0]!.id
+  assert.equal(worker.generations()[0]!.logprobs, true)
+  worker.emit({ type: "token", id, text: "Hello", logprobs: [entry] })
+  worker.finish(id)
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  assert.equal(chunks[0]!.choices[0]!.text, "Hello")
+  assert.deepEqual(chunks[0]!.choices[0]!.logprobs, { content: [entry], refusal: null })
+  assert.equal(chunks.at(-2)!.choices[0]!.finish_reason, "stop")
+  assert.deepEqual(chunks.at(-1)!.choices, [])
+  assert.equal(chunks.at(-1)!.usage!.completion_tokens, STATS.outputTokens)
+})
+
+test("chat completions return log probabilities when asked for", async () => {
+  const entry = { token: "Hi", logprob: -0.5, bytes: [72, 105], top_logprobs: [{ token: "Hi", logprob: -0.5, bytes: [72, 105] }] }
+  const { llm: client, workers } = llm()
+  const pending = client.chat.completions.create({ model: LFM2, messages: hi, logprobs: true, top_logprobs: 1 })
+  await settle()
+  const worker = workers.of(LFM2)!
+  const sent = worker.generations()[0]!
+  assert.equal(sent.logprobs, true)
+  assert.equal(sent.topLogprobs, 1)
+  worker.emit({ type: "token", id: sent.id, text: "Hi", logprobs: [entry] })
+  worker.finish(sent.id)
+  const completion = await pending
+  assert.deepEqual(completion.choices[0]!.logprobs, { content: [entry], refusal: null })
+  // Not asked for: null, as before.
+  const plain = llm({ reply: () => ({ tokens: ["Hi"] }) })
+  assert.equal((await plain.llm.chat.completions.create({ model: LFM2, messages: hi })).choices[0]!.logprobs, null)
+})
+
+test("forwardTokensAndSample and resetChat, as WebLLM has them", async () => {
+  const { llm: client, workers } = llm()
+  await assert.rejects(client.forwardTokensAndSample([1, 2], true), { code: "model-not-loaded" })
+  await client.loadModel(LFM2)
+  // The one loaded model, when modelId is left out.
+  assert.equal(await client.forwardTokensAndSample([5, 6, 7], true), 8)
+  assert.equal(await client.forwardTokensAndSample([8], false, LFM2), 9)
+  const worker = workers.of(LFM2)!
+  const forwards = worker.sent.filter((m) => m.type === "forward")
+  assert.deepEqual(forwards.map((m) => m.inputIds), [[5, 6, 7], [8]])
+  assert.equal(typeof forwards[0]!.sampling.temperature, "number")
+  await client.resetChat()
+  assert.equal(worker.sent.filter((m) => m.type === "reset").length, 1)
+  await assert.rejects(client.forwardTokensAndSample([1.5], true), TypeError)
+  // A model that isn't loaded is loaded first.
+  assert.equal(await client.forwardTokensAndSample([1], true, QWEN), 2)
+  assert.ok(workers.of(QWEN))
+  // Two loaded: which one must be said.
+  await assert.rejects(client.forwardTokensAndSample([1], true), { code: "model-not-loaded" })
+})
+
+test("a worker of the caller's: a token forward for another model waits its turn behind a completion still loading", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const worker = new FakeWorker({ hold: (model) => (model === LFM2 ? held : Promise.resolve()), reply: () => ({ tokens: ["ok"] }) })
+  internals.storage = fakeStorage(new Set([LFM2, QWEN]))
+  const client = new WebGLLM({ worker: worker as unknown as Worker, memoryBudget: 1000 })
+  // Both models cold: the chat's load is held, then a forward for the other model is asked.
+  const chat = client.chat.completions.create({ model: LFM2, messages: hi })
+  await settle()
+  const forwarded = client.forwardTokensAndSample([5], true, QWEN)
+  await settle()
+  assert.equal(worker.sent.some((m) => m.type === "load" && m.model === QWEN), false, "the forward's model replaced the chat's while it loaded")
+  release()
+  assert.equal((await chat).choices[0]!.message.content, "ok")
+  assert.equal(await forwarded, 6)
+  assert.deepEqual(worker.sent.filter((m) => m.type === "generate" || m.type === "forward").map((m) => m.model), [LFM2, QWEN])
+})
+
+test("a token forward queued behind a chat doesn't load its model after unloadModel() has resolved", async () => {
+  const { llm: client, workers } = llm()
+  const chat = client.chat.completions.create({ model: LFM2, messages: hi })
+  chat.catch(() => undefined)
+  await settle()
+  // Queued behind the chat's generation, for another model.
+  const forwarded = client.forwardTokensAndSample([5], true, QWEN)
+  forwarded.catch(() => undefined)
+  await settle()
+  await client.unloadModel()
+  await assert.rejects(chat, { code: "model-not-loaded" })
+  await assert.rejects(forwarded, { code: "model-not-loaded" })
+  await settle()
+  assert.deepEqual((await client.models.list()).filter((m) => m.loaded).map((m) => m.id), [])
+  assert.equal(workers.workers.some((w) => !w.terminated && w.sent.some((m) => m.type === "forward")), false)
+})
+
+test("resetChat called after a token forward resets after it: loaded, and still loading", async () => {
+  const { llm: client, workers } = llm()
+  await client.loadModel(LFM2)
+  const forwarded = client.forwardTokensAndSample([5], true)
+  const reset = client.resetChat()
+  await Promise.all([forwarded, reset])
+  assert.deepEqual(workers.of(LFM2)!.sent.filter((m) => m.type === "forward" || m.type === "reset").map((m) => m.type), ["forward", "reset"])
+  // Cold: the forward's load is held when reset is called.
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const cold = llm({ hold: () => held })
+  const first = cold.llm.forwardTokensAndSample([5], true, LFM2)
+  await settle()
+  let done = false
+  const after = cold.llm.resetChat(false, LFM2).then(() => { done = true })
+  await settle()
+  assert.equal(done, false, "the reset resolved before the forward it was called after")
+  release()
+  assert.equal(await first, 6)
+  await after
+  assert.deepEqual(cold.workers.of(LFM2)!.sent.filter((m) => m.type === "forward" || m.type === "reset").map((m) => m.type), ["forward", "reset"])
+})
+
+test("deleting a model keeps the files another model is still downloading", async () => {
+  // Two models outside the catalog with their own weights and one tokenizer between them.
+  const base = modelMeta(LFM2)
+  assert.equal(base.files.kind, "gguf")
+  const variant = (name: string) => ({ ...base, name, files: { ...base.files, model: { ...(base.files as { model: object }).model, path: `${name}.gguf` } } }) as typeof base
+  const [a, b] = ["shared-tokenizer/a", "shared-tokenizer/b"]
+  rememberModel(variant(a))
+  rememberModel(variant(b))
+  const keys = (model: string) => new Set(storedModelFiles(modelMeta(model)).map(fileKey))
+  assert.ok([...keys(a)].some((k) => keys(b).has(k)) && [...keys(a)].some((k) => !keys(b).has(k)))
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const { llm: client, storage } = llm({ holdDownload: () => held })
+  const downloads = [client.downloadModel(a), client.downloadModel(b)]
+  downloads[0]!.catch(() => undefined)
+  await settle()
+  await client.models.delete(a)
+  const [removed, kept] = storage.removed.at(-1)!
+  assert.equal(removed, a)
+  const shared = [...keys(a)].filter((k) => keys(b).has(k))
+  assert.ok(shared.every((k) => kept.has(k)), "a file the other download is writing wasn't protected")
+  release()
+  await downloads[1]
+})
+
+test("log probabilities reach whole and streamed replies as the worker reports them, a cut token left out", async () => {
+  const hello = { token: "Hello", logprob: -0.1, bytes: [72, 101, 108, 108, 111], top_logprobs: [] }
+  for (const stream of [false, true]) {
+    const { llm: client, workers } = llm()
+    const pending = client.chat.completions.create({ model: LFM2, messages: hi, logprobs: true, stop: ["STOP"], stream } as never) as Promise<unknown>
+    await settle()
+    const worker = workers.of(LFM2)!
+    const sent = worker.generations()[0]!
+    // As the worker sends a reply whose last token (" STOP") the stop sequence cut into.
+    worker.emit({ type: "token", id: sent.id, text: "Hello", logprobs: [hello] })
+    worker.emit({ type: "token", id: sent.id, text: " " })
+    worker.finish(sent.id)
+    const result = await pending
+    const entries: unknown[] = []
+    let content = ""
+    if (stream) {
+      for await (const chunk of result as AsyncIterable<ChatCompletionChunk>) {
+        content += chunk.choices[0]?.delta.content ?? ""
+        entries.push(...(chunk.choices[0]?.logprobs?.content ?? []))
+      }
+    } else {
+      const whole = result as { choices: Array<{ message: { content: string }; logprobs: { content: unknown[] } }> }
+      content = whole.choices[0]!.message.content
+      entries.push(...whole.choices[0]!.logprobs.content)
+    }
+    assert.equal(content, "Hello ")
+    assert.deepEqual(entries, [hello])
+  }
 })

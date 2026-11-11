@@ -2,7 +2,10 @@
  * One download of a file at a time per worker: a "download" request and a
  * load of the same model share it (two would contend for the file's
  * exclusive access handle). Each caller hears its progress, and it's
- * aborted only once every caller that joined it has aborted.
+ * aborted only once every caller that joined it has aborted. The caller
+ * whose abort stops it is rejected once the download has ended (its file
+ * closed), so the file may be deleted then; one that leaves while others
+ * go on is rejected at once.
  */
 
 type Progress = (loaded: number, total: number) => void
@@ -48,12 +51,13 @@ export function createSharedDownloads<T>() {
       }
       const aborted = () => {
         leave()
+        // Others go on with it.
+        if (joined.listeners.size) return reject(signal.reason)
         // The last caller gone: stop it, and let a new caller start afresh.
-        if (!joined.listeners.size) {
-          if (running.get(key) === joined) running.delete(key)
-          joined.abort.abort(signal.reason)
-        }
-        reject(signal.reason)
+        if (running.get(key) === joined) running.delete(key)
+        joined.abort.abort(signal.reason)
+        const ended = () => reject(signal.reason)
+        joined.promise.then(ended, ended)
       }
       signal.addEventListener("abort", aborted, { once: true })
       joined.promise.then(

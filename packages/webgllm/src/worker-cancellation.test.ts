@@ -13,7 +13,7 @@ const require = createRequire(join(process.cwd(), "package.json"))
 const { build } = await import(pathToFileURL(require.resolve("esbuild")).href) as typeof import("esbuild")
 const temporary = await mkdtemp(join(tmpdir(), "webgl-worker-cancel-"))
 after(() => rm(temporary, { recursive: true, force: true }))
-const source = await readFile(join(process.cwd(), "src/worker.ts"), "utf8")
+const source = await readFile(join(process.cwd(), "src/handler.ts"), "utf8")
 const start = source.indexOf("async function generate(request: GenerateRequest)")
 const end = source.indexOf("\n/**\n * Generations run one after another", start)
 assert.ok(start >= 0 && end > start, "exercise the current complete worker generate function")
@@ -31,7 +31,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { seededUniforms } from './seeded-random.js';
   import { CodedError } from './worker-errors.js';
   export function makeGenerate(state) {
-    const stopped=state.stopped,post=m=>state.messages.push(m);
+    const stopped=state.stopped,post=m=>state.messages.push(m),logitProcessors=undefined;
     const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();
     // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
     const promptImages=(...a)=>(state.promptImages??(async(_model,prompt)=>({prompt,keys:prompt,images:[]})))(...a),encodeImages=(...a)=>(state.encodeImages??(async()=>0))(...a);

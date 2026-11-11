@@ -7,18 +7,26 @@ import { settle } from "./fake-worker.test.js"
 
 function manual() {
   const sent: WorkerRequest[] = []
+  const raw: unknown[] = []
+  let listener: ((event: { data: WorkerResponse }) => void) | undefined
   const fake = {
-    onmessage: null as ((event: { data: WorkerResponse }) => void) | null,
-    onerror: null,
-    postMessage: (message: WorkerRequest) => void sent.push(message),
+    addEventListener: (type: string, added: (event: { data: WorkerResponse }) => void) => {
+      if (type === "message") listener = added
+    },
+    removeEventListener() {},
+    postMessage: (message: WorkerRequest) => {
+      raw.push(message)
+      sent.push(message)
+    },
     terminate() {}
   }
-  const emit = (data: WorkerResponse) => fake.onmessage?.({ data })
-  const worker = new ModelWorker("LiquidAI/LFM3-1.7B-GGUF", () => fake as unknown as Worker, {
+  const emitOwn = (data: unknown) => listener?.({ data: data as WorkerResponse })
+  const emit = (data: WorkerResponse) => emitOwn({ ...data, webgllm: true })
+  const worker = new ModelWorker("LiquidAI/LFM3-1.7B-GGUF", fake as unknown as Worker, true, {
     onProgress() {}, onClaim: async () => undefined, onLog() {}, onCrash() {}
   })
   const loads = () => sent.filter((m): m is Extract<WorkerRequest, { type: "load" }> => m.type === "load")
-  return { worker, emit, loads }
+  return { worker, emit, emitOwn, loads, raw }
 }
 
 test("a late ready for a replaced load doesn't resolve the new one", async () => {
@@ -48,23 +56,28 @@ test("a late load-error for a replaced load doesn't fail the new one", async () 
   assert.equal(worker.ready, true)
 })
 
-test("a worker that doesn't name its loads answers the only one asked", async () => {
-  const { worker, emit } = manual()
-  const load = worker.loadModel(undefined)
-  emit({ type: "ready", model: worker.model, contextLength: 4096 })
+test("an answer without webgllm's mark, or naming no load of this one's, settles nothing", async () => {
+  const { worker, emit, emitOwn, loads } = manual()
+  let loaded = false
+  const load = worker.loadModel(2048).then(() => { loaded = true })
+  const [sent] = loads()
+  // The worker's own message, shaped like an answer (even with the load's id).
+  emitOwn({ type: "ready", model: worker.model, contextLength: 8192 })
+  emitOwn({ type: "ready", model: worker.model, loadId: sent.loadId, contextLength: 8192 })
+  // webgllm's, for another load.
+  emit({ type: "ready", model: worker.model, loadId: sent.loadId + 1000, contextLength: 8192 })
+  await settle()
+  assert.equal(loaded, false)
+  assert.equal(worker.ready, false)
+  emit({ type: "ready", model: worker.model, loadId: sent.loadId, contextLength: 2048 })
   await load
-  assert.equal(worker.ready, true)
-  // A resize after it was answered: still unambiguous.
-  const resize = worker.loadModel(64)
-  emit({ type: "load-error", model: worker.model, message: "boom" })
-  await assert.rejects(resize, { message: "boom" })
+  assert.equal(worker.loadedContextLength, 2048)
 })
 
-test("an unnamed answer while two loads are open fails the load rather than guess", async () => {
-  const { worker, emit } = manual()
+test("every request carries webgllm's mark", () => {
+  const { worker, raw } = manual()
   void worker.loadModel(undefined)
-  const resized = worker.loadModel(64)
-  emit({ type: "ready", model: worker.model, contextLength: 4096 })
-  await assert.rejects(resized, /loadId/)
-  assert.equal(worker.ready, false)
+  void worker.download()
+  assert.equal(raw.length, 2)
+  assert.ok(raw.every((message) => (message as { webgllm?: unknown }).webgllm === true))
 })

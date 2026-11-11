@@ -295,7 +295,7 @@ export const TUNING = {
    */
   qInCache: 1,
   /**
-   * The worker's speculative decoding (see worker.ts): drafts follow an
+   * The worker's speculative decoding (see handler.ts): drafts follow an
    * earlier occurrence of at least draftMatch last tokens, as many as
    * pay by measured cost (see DraftPolicy); with
    * guessDrafts, a draft batch also guesses the token after its last row.
