@@ -32,7 +32,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';
   import { CodedError } from './worker-errors.js';
-  import { createSampler, draw, drawAt, verify, verifyAt } from './sampler.js';
+  import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from './sampler.js';
   import { DraftPolicy, lookupDraft } from './draft.js';
   import { THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
@@ -42,7 +42,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   const abortFor = () => new AbortController().signal;
   const claimMemory = () => undefined, writeGpuNote = () => undefined;
   export function makeGenerate(state) {
-    const stopped = state.stopped, post = m => state.messages.push(m);
+    const stopped = state.stopped, post = m => state.messages.push(m), logitProcessors = state.processors;
     const startLoad = async () => state.model, createConstraint = async () => state.constraint();
     ${source.slice(start, end)}
     return generate;
@@ -61,13 +61,15 @@ const id = (w: string) => 10 + words.indexOf(w)
  * A model whose greedy picks follow `script` (then EOS), and whose sampled
  * candidates are `candidates` (ids and logits) at every step.
  */
-function scripted(script: number[], options: { candidates?: [number[], number[]]; constraint?: () => Constraint; contextLength?: number } = {}) {
+function scripted(script: number[], options: { candidates?: [number[], number[]]; constraint?: () => Constraint; contextLength?: number; processors?: Map<string, { processLogits: (logits: Float32Array) => Float32Array; processSampledToken: (token: number) => void; resetState: () => void }> } = {}) {
   const queue = script.slice()
   const stopped = new Set<string>(), messages: WorkerResponse[] = []
   const masks: Array<Uint32Array | null> = []
   // What the penalties were given: the tokens set as seen, and each pick's penalties.
   const seen: number[][] = [], penalties: Array<[number, number]> = []
   let position = 0
+  // Whole-logit readbacks, and raw prompts tokenized.
+  const reads = { logits: 0, raw: [] as string[] }
   const engine = {
     contextLength: options.contextLength ?? 8192, snapshotLimit: 2, canSaveInside: false, canDraft: false, guessing: false, guessedToken: -1,
     get position() { return position },
@@ -86,6 +88,14 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
       penalties.push([penalty, presence])
       return Int32Array.of(queue.shift() ?? EOS)
     },
+    // Every logit read back: the scripted token at 4, the one after it in the script at 2, the rest at 0.
+    async logits() {
+      const logits = new Float32Array(64)
+      if (queue.length > 1) logits[queue[1]] = 2
+      logits[queue.shift() ?? EOS] = 4
+      reads.logits++
+      return logits
+    },
     async candidates() {
       const [ids, logits] = options.candidates!
       return { ids: Int32Array.from(ids), logits: Float32Array.from(logits) }
@@ -96,14 +106,18 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   }
   const tokenizer = {
     encodeChat: () => [2, 20, 21, 22, 23, 24],
+    encode: (prompt: string) => {
+      reads.raw.push(prompt)
+      return [2, 20, 21]
+    },
     vocabSize: 64,
     specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2 },
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),
     createStreamDecoder: () => ({ push: (t: number) => TEXT[t] ?? "", flush: () => "" })
   }
-  const state = { stopped, messages, model: { engine, tokenizer, cached: [] as number[] }, constraint: options.constraint }
-  return { generate: makeGenerate(state) as (r: Request) => Promise<void>, messages, masks, seen, penalties }
+  const state = { stopped, messages, model: { engine, tokenizer, cached: [] as number[] }, constraint: options.constraint, processors: options.processors }
+  return { generate: makeGenerate(state) as (r: Request) => Promise<void>, messages, masks, seen, penalties, reads }
 }
 
 type Request = Extract<WorkerRequest, { type: "generate" }>
@@ -273,4 +287,67 @@ test("with thinking switched off, the reply can't open or close thinking", async
   const on = scripted([id("Hello")])
   await on.generate(request({ thinking: undefined }))
   assert.deepEqual(on.masks.filter((m) => m !== null), [])
+})
+
+const logprobs = (messages: WorkerResponse[]) =>
+  messages.flatMap((m) => (m.type === "token" || m.type === "done") && m.logprobs ? m.logprobs : [])
+
+test("logprobs: each written token's log probability, with its likeliest alternatives", async () => {
+  const s = scripted([id("Hello"), id(" world")])
+  await s.generate(request({ logprobs: true, topLogprobs: 2 }))
+  assert.equal(text(s.messages), "Hello world")
+  const scored = logprobs(s.messages)
+  assert.deepEqual(scored.map((l) => l.token), ["Hello", " world"])
+  // 64 logits: one at 4, one at 2 (the token scripted next), 60 at 0, and
+  // the two thinking markers out (the request has thinking off).
+  const z = Math.log(Math.exp(4) + Math.exp(2) + 60)
+  assert.ok(Math.abs(scored[0].logprob - (4 - z)) < 1e-5)
+  assert.deepEqual(scored[0].top_logprobs.map((l) => l.token), ["Hello", " world"])
+  assert.ok(Math.abs(scored[0].top_logprobs[1].logprob - (2 - z)) < 1e-5)
+  assert.deepEqual(scored[0].bytes, [...new TextEncoder().encode("Hello")])
+  // Without them, the GPU picks the token and no logits are read back.
+  const plain = scripted([id("Hello"), id(" world")])
+  await plain.generate(request())
+  assert.equal(plain.reads.logits, 0)
+  assert.deepEqual(logprobs(plain.messages), [])
+})
+
+test("logit_bias is added to its tokens' logits before sampling", async () => {
+  const s = scripted([id("Hello"), id("Hello"), id("Hello")])
+  await s.generate(request({ logitBias: { [id(" more")]: 100 }, maxTokens: 2 }))
+  assert.equal(text(s.messages), " more more")
+  const banned = scripted([id("Hello"), id(" world")])
+  await banned.generate(request({ logitBias: { [id("Hello")]: -100 }, maxTokens: 1 }))
+  assert.equal(text(banned.messages), " world")
+})
+
+test("a logit processor gets every logit before each token, and hears each token written", async () => {
+  const sampled: number[] = []
+  let calls = 0
+  const processor = {
+    processLogits: (logits: Float32Array) => {
+      calls++
+      // The second token is the processor's choice.
+      if (calls === 2) logits[id(" more")] = 50
+      return logits
+    },
+    processSampledToken: (token: number) => void sampled.push(token),
+    resetState: () => undefined
+  }
+  const s = scripted([id("Hello"), id(" world")], { processors: new Map([["LiquidAI/LFM3-1.7B-GGUF", processor]]) })
+  await s.generate(request({ maxTokens: 2 }))
+  assert.equal(text(s.messages), "Hello more")
+  assert.deepEqual(sampled, [id("Hello"), id(" more")])
+  // Another model's processor isn't this model's.
+  const other = scripted([id("Hello")], { processors: new Map([["another/model", processor]]) })
+  await other.generate(request())
+  assert.equal(other.reads.logits, 0)
+})
+
+test("a raw prompt is tokenized as it is, with no chat template", async () => {
+  const s = scripted([id("Hello")])
+  await s.generate(request({ chat: [], prompt: "Once upon a time" }))
+  assert.deepEqual(s.reads.raw, ["Once upon a time"])
+  assert.equal(text(s.messages), "Hello")
+  assert.equal(done(s.messages).stats.inputTokens, 3)
 })

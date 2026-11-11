@@ -6,6 +6,7 @@ import {
   createReplyReader,
   planCompletion,
   planRepairs,
+  planTextCompletion,
   randomId,
   repairRequest,
   timingsOf,
@@ -130,9 +131,6 @@ test("reasoning.effort works as reasoning_effort; the two must agree, and other 
 test("unsupported OpenAI fields throw unsupported-parameter", () => {
   const bad: Array<Partial<ChatCompletionCreateParams> & Record<string, unknown>> = [
     { n: 2 },
-    { logprobs: true },
-    { top_logprobs: 2 },
-    { logit_bias: { "1": 5 } },
     { frequency_penalty: 0.5 },
     { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } } as never] }] },
     { response_format: { type: "grammar" } as never },
@@ -482,4 +480,51 @@ test("repair_tool_calls must be a boolean and defaults to on", () => {
   assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, true)
   assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: false }).repairToolCalls, false)
   assert.throws(() => planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: "yes" as never }), TypeError)
+})
+
+test("logprobs, top_logprobs and logit_bias go to the worker", () => {
+  const plan = planCompletion({ model: LFM3, messages: hi, logprobs: true, top_logprobs: 3, logit_bias: { "12": 5, "13": 0 } })
+  assert.equal(plan.logprobs, true)
+  assert.equal(plan.generate.logprobs, true)
+  assert.equal(plan.generate.topLogprobs, 3)
+  assert.deepEqual(plan.generate.logitBias, { "12": 5 })
+  const plain = planCompletion({ model: LFM3, messages: hi, logprobs: false, logit_bias: {} })
+  assert.equal(plain.logprobs, false)
+  assert.equal("logprobs" in plain.generate, false)
+  assert.equal("logitBias" in plain.generate, false)
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, top_logprobs: 2 })), "TypeError")
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, logprobs: true, top_logprobs: 21 })), "RangeError")
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, logit_bias: { hello: 1 } })), "TypeError")
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, logit_bias: { "1": 101 } })), "TypeError")
+})
+
+test("chunks and whole completions carry log probabilities when asked for", () => {
+  const entry = (token: string) => ({ token, logprob: -0.5, bytes: [...new TextEncoder().encode(token)], top_logprobs: [] })
+  const w = createChunkWriter({ id: "chatcmpl-x", created: 1, model: LFM3 }, true)
+  w.logprobs([entry("Hel")])
+  // Its text is still held by the reader: it goes with the next chunk.
+  w.logprobs([entry("lo")])
+  assert.deepEqual(w.delta({ content: "Hello" }).choices[0]?.logprobs, { content: [entry("Hel"), entry("lo")], refusal: null })
+  assert.deepEqual(w.finish("stop").choices[0]?.logprobs, { content: [], refusal: null })
+  const whole = buildCompletion({ id: "chatcmpl-x", created: 1, model: LFM3 }, [{ content: "Hello" }], [], "stop", stats, [], [entry("Hello")])
+  assert.deepEqual(whole.choices[0]?.logprobs, { content: [entry("Hello")], refusal: null })
+  assert.equal(buildCompletion({ id: "chatcmpl-x", created: 1, model: LFM3 }, [{ content: "Hello" }], [], "stop", stats).choices[0]?.logprobs, null)
+})
+
+test("a Completions request: a raw prompt, no chat, the card's sampling", () => {
+  const plan = planTextCompletion({ model: LFM3, prompt: "Once upon a time", max_tokens: 8, stop: "\n", echo: true, logprobs: true, top_logprobs: 1 })
+  assert.equal(plan.generate.prompt, "Once upon a time")
+  assert.deepEqual(plan.generate.chat, [])
+  assert.deepEqual(plan.generate.tools, [])
+  assert.equal(plan.generate.maxTokens, 8)
+  assert.deepEqual(plan.generate.stop, ["\n"])
+  assert.equal(plan.echo, "Once upon a time")
+  assert.equal(plan.generate.topLogprobs, 1)
+  assert.equal(typeof plan.generate.sampling.temperature, "number")
+  assert.equal(planTextCompletion({ model: LFM3, prompt: "x" }).echo, undefined)
+  assert.equal(code(() => planTextCompletion({ model: LFM3 } as never)), "TypeError")
+  assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: ["a"] } as never)), "TypeError")
+  assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: "x", n: 2 })), "unsupported-parameter")
+  assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: "x", suffix: "y" })), "unsupported-parameter")
+  assert.equal(code(() => planTextCompletion({ model: "gpt-4o", prompt: "x" })), "model-not-supported")
 })

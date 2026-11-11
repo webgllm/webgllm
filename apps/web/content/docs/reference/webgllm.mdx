@@ -4,7 +4,7 @@ description: The WebGLLM class, its options and methods.
 ---
 
 ```ts
-import { WebGLLM, WebGLLMError, WebGLLMWorkerHandler } from "webgllm"
+import { WebGLLM, WebGLLMError, WebGLLMWorkerHandler, type LogitProcessor } from "webgllm"
 ```
 
 The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) and its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`).
@@ -56,6 +56,22 @@ OpenAI's Chat Completions. Returns a `ChatCompletion`, or an async iterable of `
 | --- | --- | --- |
 | `signal` | `AbortSignal` | Stops the generation; rejects with an `AbortError`. |
 | `onProgress` | `(progress: LoadProgress) => void` | The model's load progress, when this call loads it. |
+
+## `completions.create(body, options?)`
+
+OpenAI's Completions, as WebLLM has them: `body.prompt` is read as it is, with no chat template. Returns a `Completion` (`choices[0].text`), or an async iterable of them when `stream: true`. It takes the sampling fields of chat completions, `max_tokens`, `stop`, `seed`, `echo`, `logprobs` with `top_logprobs`, and `logit_bias`.
+
+## Tokens and logits
+
+| | |
+| --- | --- |
+| `logprobs`, `top_logprobs` | On chat and text completions: `choices[0].logprobs.content` has each written token's `token`, `logprob`, `bytes` and its `top_logprobs` likeliest alternatives (0 to 20). The reply's thinking and tool-call tokens are included. |
+| `logit_bias` | Token ids to a bias from -100 to 100, added to their logits before sampling. |
+| `forwardTokensAndSample(inputIds, isPrefill, modelId?)` | WebLLM's: reads the token ids into the model's cache, after what it holds, and resolves to the next token, sampled with the model card's settings. `modelId` is needed only when several models are loaded. |
+| `resetChat(keepStats?, modelId?)` | WebLLM's: the model forgets its cache. |
+| `handler.setLogitProcessorRegistry(map)` | WebLLM's, on `WebGLLMWorkerHandler`: a `LogitProcessor` for each model id. Its `processLogits(logits)` gets every logit after each forward pass and returns the logits to sample from; `processSampledToken(token)` hears each token chosen; `resetState()` runs on `resetChat`. It shapes the model's chat and text completions too. |
+
+The log probabilities are the model's, before temperature, top-k and the penalties (after a `logit_bias`). The GPU normally picks each token itself; `logprobs`, `logit_bias` and a logit processor read every logit back for each token instead, so those replies are written slower. webgllm exports no tokenizer, like WebLLM: token ids come from the model's `tokenizer.json`.
 
 ## `loadModel(model, options?)`
 

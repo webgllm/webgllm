@@ -19,6 +19,7 @@
 export { WebGLLM } from "./webgllm.js"
 export type { DownloadModelOptions, LoadModelOptions, LogLevel, RequestOptions, WebGLLMOptions } from "./webgllm.js"
 export { WebGLLMWorkerHandler } from "./handler.js"
+export type { LogitProcessor } from "./handler.js"
 export { WebGLLMError } from "./errors.js"
 export type { WebGLLMErrorCode } from "./errors.js"
 export type {
@@ -30,6 +31,8 @@ export type {
   ChatCompletionContent,
   ChatCompletionContentPartImage,
   ChatCompletionContentPartText,
+  ChatCompletionLogprobs,
+  ChatCompletionTokenLogprob,
   ChatCompletionUserContent,
   ChatCompletionCreateParams,
   ChatCompletionCreateParamsBase,
@@ -43,6 +46,11 @@ export type {
   ChatCompletionToolChoiceOption,
   ChatCompletionToolMessageParam,
   ChatCompletionUserMessageParam,
+  Completion,
+  CompletionCreateParams,
+  CompletionCreateParamsBase,
+  CompletionCreateParamsNonStreaming,
+  CompletionCreateParamsStreaming,
   CompletionTimings,
   CompletionUsage,
   FinishReason,

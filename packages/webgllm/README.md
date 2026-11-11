@@ -161,9 +161,55 @@ const webgllm = new WebGLLM({
 webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${model}`))
 ```
 
+### Tokens and logits
+
+What OpenAI's API, WebLLM and wllama offer below the chat level:
+
+```ts
+// Each written token's log probability, with the 3 likeliest at its position.
+const completion = await webgllm.chat.completions.create({ model, messages, logprobs: true, top_logprobs: 3 })
+completion.choices[0].logprobs.content // [{ token, logprob, bytes, top_logprobs }, …]
+
+// Token ids to a bias from -100 to 100, added to their logits before sampling.
+await webgllm.chat.completions.create({ model, messages, logit_bias: { "5242": -100 } })
+
+// A raw prompt, read as it is with no chat template.
+const text = await webgllm.completions.create({ model, prompt: "The capital of France is", max_tokens: 8 })
+text.choices[0].text
+```
+
+`logprobs` covers every token written, the reply's thinking and tool-call tokens included; they are the model's probabilities before temperature, top-k and the penalties (after a `logit_bias`). `completions.create` takes the sampling fields of chat completions, `echo`, `stop`, `seed`, `logprobs` with `top_logprobs` (a boolean and a count, as WebLLM has them), `logit_bias` and `stream`.
+
+As in WebLLM, token ids go in with `forwardTokensAndSample`, and every logit comes out through a `LogitProcessor` on the worker's handler:
+
+```ts
+// worker.ts
+import { WebGLLMWorkerHandler, type LogitProcessor } from "webgllm"
+
+const processor: LogitProcessor = {
+  processLogits: (logits) => logits,   // every logit after each forward pass; return the ones to sample from
+  processSampledToken: (token) => {},  // each token chosen
+  resetState: () => {}                 // resetChat() was called
+}
+const handler = new WebGLLMWorkerHandler()
+handler.setLogitProcessorRegistry(new Map([["LiquidAI/LFM2.5-350M-GGUF", processor]]))
+self.onmessage = (event) => handler.onmessage(event)
+```
+
+```ts
+const webgllm = new WebGLLM({ worker })
+const next = await webgllm.forwardTokensAndSample(inputIds, true) // reads the ids after what the cache holds; the next token
+await webgllm.forwardTokensAndSample([next], false)                // pass it back in to go on
+await webgllm.resetChat()                                          // forget the cache
+```
+
+`forwardTokensAndSample(inputIds, isPrefill, modelId?)` samples with the model card's settings, from the processor's logits when the model has one; `modelId` is needed only when several models are loaded. A model's processor also shapes its chat and text completions. webgllm tokenizes inside its worker and exports no tokenizer, like WebLLM: token ids come from the model's `tokenizer.json`, with a tokenizer of your own.
+
+The GPU normally picks each token itself and reads back only the candidates. `logprobs`, `logit_bias` and a `LogitProcessor` read every logit back for each token instead, so those replies are written slower.
+
 ### Other request fields
 
-`max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `logprobs`, `logit_bias`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.
+`max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.
 
 ### Errors
 

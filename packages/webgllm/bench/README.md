@@ -66,6 +66,10 @@ For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html
 
 The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded, and must leave the page's own messages to that worker alone. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`, or `ERROR` if a check failed.
 
+## logits.html: tokens and logits
+
+The token- and logit-level API on a real model: `logprobs`, `top_logprobs` and `logit_bias` on chat completions, a raw prompt through `completions.create`, then `forwardTokensAndSample`, `resetChat` and a `LogitProcessor` in a worker of the page's own (`logits-worker.ts`). The page tokenizes with the model's own tokenizer, loaded from `src`. `?model=<id>` (LFM2.5 350M GGUF by default). Ends with `ALL DONE`, or `ERROR` if a check failed.
+
 ## q4-matmul.html: the first kernel
 
 The first step, before the engine: one Q4_0 matmul kernel (`q4-matmul.js`, run by `gpu-bench-worker.js`) on every LFM3 projection shape at 128 tokens (`?m=128`; `?run=gpu` runs on load), each variant checked against a JavaScript reference first. On a Pixel 10 Pro in Firefox, LFM3's matmuls for 128 tokens took 1.49 s (86 tokens/s) against 24.5 prompt tokens/s for a whole-model llama.cpp CPU build, so the engine was built (that comparison page stays in tanstack-ai-browser).

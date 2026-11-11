@@ -7,13 +7,14 @@
  * pacing assumes one.
  */
 import { ModelWorker } from "./client.js"
-import type { WorkerEvents, WorkerGenerationEnd } from "./client.js"
+import type { OnToken, WorkerEvents, WorkerGenerationEnd } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
 import { monitorFrames } from "./frame-pacing.js"
 import type { ModelStorage } from "./model-files.js"
 import { MemoryBudget } from "./model-memory.js"
 import type { LoadProgress, ModelUnloadReason, WebGLLMEventMap } from "./openai.js"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { Sampling } from "./sampler.js"
 
 export type LogLevel = "debug" | "info" | "warn" | "error" | "silent"
 
@@ -461,7 +462,7 @@ export class ModelPool {
     fields: GenerateFields,
     options: {
       contextLength?: number
-      onToken: (text: string) => void
+      onToken: OnToken
       onProgress?: ProgressListener
       signal?: AbortSignal
     }
@@ -490,6 +491,29 @@ export class ModelPool {
   private modelWorker(model: string, events: WorkerEvents): ModelWorker {
     const given = this.options.worker
     return new ModelWorker(model, given ?? this.options.createWorker(), !given, events)
+  }
+
+  /**
+   * WebLLM's forwardTokensAndSample on `model` (loaded first if it isn't):
+   * in the queue with the generations, as it reads the same cache.
+   */
+  async forward(model: string, inputIds: Array<number>, sampling: Sampling, options: { contextLength?: number; signal?: AbortSignal } = {}): Promise<number> {
+    const { signal } = options
+    await this.ensureLoaded(model, options.contextLength, undefined, signal)
+    return this.queue.run(async () => {
+      const entry = await this.ensureLoaded(model, options.contextLength, undefined, signal)
+      throwIfAborted(signal)
+      this.budget.touch(model)
+      return entry.worker.forward(`fwd_${(nextId++).toString(36)}`, inputIds, sampling)
+    }, signal)
+  }
+
+  /** WebLLM's resetChat: `model` forgets its cache, after the generations queued before (nothing to forget if it isn't loaded). */
+  reset(model: string): Promise<void> {
+    return this.queue.run(async () => {
+      const entry = this.entries.get(model)
+      if (entry?.worker.ready && !entry.evicting) await entry.worker.reset(`rst_${(nextId++).toString(36)}`)
+    })
   }
 
   private spawn(model: string): Entry {

@@ -19,9 +19,9 @@ import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
 import type { ModelFile } from "./model-meta.js"
-import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
-import { createSampler, draw, drawAt, verify, verifyAt } from "./sampler.js"
+import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
 import { download, previousGpuTuning, readGpuNotes, saveManifest, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
@@ -69,6 +69,15 @@ const post = (message: WorkerResponse) => postMessage(message)
  * ```
  */
 export class WebGLLMWorkerHandler {
+  /**
+   * Logit processors by model id, as WebLLM's handler takes them: each
+   * model's is given every logit after each forward pass, before the next
+   * token is sampled from what it returns.
+   */
+  setLogitProcessorRegistry(registry?: Map<string, LogitProcessor>): void {
+    logitProcessors = registry
+  }
+
   /** A message from the page: `self.onmessage = (event) => handler.onmessage(event)`. */
   onmessage(event: { data: unknown }): void {
     // The worker's own messages come this way too: only webgllm's are taken.
@@ -76,8 +85,24 @@ export class WebGLLMWorkerHandler {
   }
 }
 
+/**
+ * Changes a model's logits before each token is sampled: WebLLM's
+ * LogitProcessor. It runs in the worker, on the CPU, so a model with one
+ * reads every logit back for each token.
+ */
+export interface LogitProcessor {
+  /** The logits right after a forward pass; returns the logits to sample from. */
+  processLogits: (logits: Float32Array) => Float32Array
+  /** The token sampled from them (or written without sampling), to update the processor's state. */
+  processSampledToken: (token: number) => void
+  /** Clears its state: the chat was reset (see resetChat). */
+  resetState: () => void
+}
+
+let logitProcessors: Map<string, LogitProcessor> | undefined
+
 const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
-  "load", "generate", "stop", "unload", "download", "frames", "claimed", "tune"
+  "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune"
 ])
 
 /** Whether a message is one of the page's requests (by its type, and the fields every handler reads first). */
@@ -85,10 +110,10 @@ function isRequest(data: unknown): data is WorkerRequest {
   if (typeof data !== "object" || data === null) return false
   const { type, model, id } = data as { type?: unknown; model?: unknown; id?: unknown }
   if (typeof type !== "string" || !REQUESTS.has(type)) return false
-  if (type === "load" || type === "generate" || type === "unload" || type === "download") {
+  if (type === "load" || type === "generate" || type === "forward" || type === "reset" || type === "unload" || type === "download") {
     if (typeof model !== "string") return false
   }
-  if (type === "generate" || type === "stop" || type === "download") return typeof id === "string"
+  if (type === "generate" || type === "forward" || type === "reset" || type === "stop" || type === "download") return typeof id === "string"
   if (type === "claimed" || type === "unload") return typeof id === "number"
   return true
 }
@@ -824,11 +849,15 @@ async function generate(request: GenerateRequest) {
   // A forced call is the reply: its arguments' schema takes the answer's place.
   const answerSchema = forced ? forced.schema : request.outputSchema
   const tokenizeAt = performance.now()
-  const encoded = tokenizer.encodeChat(request.chat, {
-    tools,
-    ...(request.thinking !== undefined && { enableThinking: request.thinking }),
-    addGenerationPrompt: true
-  })
+  // A raw prompt (OpenAI's Completions) is read as it is: no chat template, so nothing of a chat's framing to cache by.
+  const raw = request.prompt !== undefined
+  const encoded = raw
+    ? tokenizer.encode(request.prompt!)
+    : tokenizer.encodeChat(request.chat, {
+        tools,
+        ...(request.thinking !== undefined && { enableThinking: request.thinking }),
+        addGenerationPrompt: true
+      })
   // Each image's token expanded to its tokens (the image fetched and
   // resized here); `keys` is what the cache compares.
   const imagesAt = performance.now()
@@ -844,8 +873,8 @@ async function generate(request: GenerateRequest) {
   const { prompt, keys, images } = prepared
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
-  const prefix = cacheEnabled ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
-  const anchor = cacheEnabled ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
+  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
+  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
   const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
@@ -911,7 +940,7 @@ async function generate(request: GenerateRequest) {
     let at = start
     for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
   }
-  const framing = cacheEnabled && common > 0 && !whole
+  const framing = cacheEnabled && !raw && common > 0 && !whole
     ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking) : 0
   const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
   if (!whole) model.previousShared = plan.previousShared
@@ -979,7 +1008,19 @@ async function generate(request: GenerateRequest) {
   // Greedy (temperature 0, or top_k 1): the GPU picks the token itself and
   // only its id is read back (see Engine.argmax).
   const greedy = sampling.temperature <= 0 || sampling.top_k === 1
-  const onGpu = greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS)
+  // Log probabilities, a logit bias and a logit processor need every logit
+  // read back: the token is then picked here, not on the GPU.
+  const processor = logitProcessors?.get(request.model)
+  const bias = request.logitBias ? Object.entries(request.logitBias).map(([token, value]) => [Number(token), value] as const).filter(([token]) => Number.isInteger(token) && token >= 0 && token < vocab) : []
+  const allLogits = !!request.logprobs || bias.length > 0 || !!processor
+  const onGpu = !allLogits && (greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS))
+  // The log probability of the token just chosen, until it's written (see emit).
+  let scored: { token: number; of: (token: number) => TokenLogprob } | undefined
+  const unsent: Array<TokenLogprob> = []
+  const logprobEntry = (token: number, logprob: number) => {
+    const text = tokenizer.decode([token])
+    return { token: text, logprob, bytes: Array.from(new TextEncoder().encode(text)) }
+  }
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
@@ -992,10 +1033,17 @@ async function generate(request: GenerateRequest) {
   // and the token's place in the reply (see seeded-random.ts); else
   // Math.random, as before. Greedy picks don't depend on either.
   const uniform = request.seed === undefined ? undefined : seededUniforms(request.seed)
-  const pick = (d: { ids: Int32Array; p: Float32Array }) =>
-    uniform ? drawAt(d, uniform(stats.outputTokens)) : draw(d)
-  const check = (d: { ids: Int32Array; p: Float32Array }, drafted: number) =>
-    uniform ? verifyAt(d, drafted, uniform(stats.outputTokens)) : verify(d, drafted)
+  type Distribution = { ids: Int32Array; p: Float32Array; of?: (token: number) => TokenLogprob }
+  const pick = (d: Distribution) => {
+    const token = uniform ? drawAt(d, uniform(stats.outputTokens)) : draw(d)
+    if (d.of) scored = { token, of: d.of }
+    return token
+  }
+  const check = (d: Distribution, drafted: number) => {
+    const verdict = uniform ? verifyAt(d, drafted, uniform(stats.outputTokens)) : verify(d, drafted)
+    if (d.of) scored = { token: verdict.kept ? drafted : verdict.token, of: d.of }
+    return verdict
+  }
   // The likeliest token is read forward while each token is drawn (see
   // Engine.forwardGuess), while that's usually the token drawn.
   const guesses: Array<boolean> = []
@@ -1066,7 +1114,7 @@ async function generate(request: GenerateRequest) {
   const presence = () => penalize() ? sampling.presence_penalty : 0
   const distribution = async (r: number, guess = false) => {
     const mask = updateAllowed()
-    if (greedy) {
+    if (greedy && onGpu) {
       const [token] = await engine.argmax(
         r,
         1,
@@ -1090,10 +1138,16 @@ async function generate(request: GenerateRequest) {
       const d = sampler.distribution(logits)
       return { ids: Int32Array.from(d.ids, (i) => ids[i]), p: d.p }
     }
-    const logits = await engine.logits(r)
+    let logits = await engine.logits(r)
     if (logits.length > vocab) logits.fill(-Infinity, vocab)
+    // The caller's processor and bias first, as WebLLM applies them; then
+    // what the model's distribution is, before the sampler's own settings.
+    if (processor) logits = processor.processLogits(logits)
+    for (const [token, value] of bias) logits[token] += value
     if (mask) maskLogits(logits, mask)
-    return sampler.distribution(logits, penalize())
+    const of = request.logprobs ? logprobsOf(logits, request.topLogprobs ?? 0, logprobEntry) : undefined
+    const d = sampler.distribution(logits, penalize())
+    return of ? { ...d, of } : d
   }
   // On the GPU: the distributions after rows 0..rows-1 of a batch whose
   // inputs after the first are `drafts`, in one pass and one readback.
@@ -1155,11 +1209,11 @@ async function generate(request: GenerateRequest) {
       unfiltered = true
     }
     if (!stopFilter || unfiltered) {
-      post({ type: "token", id, text })
+      post({ type: "token", id, text, ...(unsent.length && { logprobs: unsent.splice(0) }) })
       return true
     }
     const out = stopFilter.push(text)
-    if (out.text) post({ type: "token", id, text: out.text })
+    if (out.text) post({ type: "token", id, text: out.text, ...(unsent.length && { logprobs: unsent.splice(0) }) })
     stopHit = out.stopped
     return !stopHit
   }
@@ -1188,6 +1242,10 @@ async function generate(request: GenerateRequest) {
     const constrained = !!structured?.answering
     const calling = !!forced && constrained
     structured?.observe(t)
+    processor?.processSampledToken(t)
+    // (A token the model didn't choose, like a forced close of its thinking, has no distribution: probability 1.)
+    if (request.logprobs && t !== eos) unsent.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
+    scored = undefined
     if (t === eos) {
       sawEos = true
       return false
@@ -1372,13 +1430,55 @@ async function generate(request: GenerateRequest) {
     model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
     void writeGpuNote(model.noteKey, model.note)
   }
-  post({ type: "done", id, stats, finishReason, ...(toolCall && { toolCall }) })
+  post({ type: "done", id, stats, finishReason, ...(unsent.length && { logprobs: unsent.splice(0) }), ...(toolCall && { toolCall }) })
   } finally {
     structured?.dispose()
     engine.setAllowedTokens(null)
     engine.dropGuess()
   }
   })
+}
+
+/**
+ * WebLLM's forwardTokensAndSample: reads `inputIds` after what the model's
+ * cache holds and samples the next token from the logits after them (its
+ * logit processor's, if it has one). The token isn't read into the cache:
+ * the caller passes it in next.
+ */
+async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }>) {
+  const model = await startLoad(request.model, request.contextLength)
+  const { engine } = model
+  const ids = request.inputIds
+  if (!ids.length) throw new Error("forwardTokensAndSample needs at least one token.")
+  const vocab = model.tokenizer.vocabSize
+  if (ids.some((t) => !Number.isInteger(t) || t < 0 || t >= vocab)) throw new Error(`Token ids go from 0 to ${vocab - 1}.`)
+  if (engine.position + ids.length > engine.contextLength) {
+    throw new CodedError(
+      `This session is too long for the model: ${engine.position + ids.length} tokens, and it can read ${engine.contextLength} at most. Call resetChat() to start again.`,
+      "context-length-exceeded"
+    )
+  }
+  engine.dropGuess()
+  engine.setAllowedTokens(null)
+  let logits = await engine.forward(ids)
+  // What the cache holds now, for the next chat completion to compare its prompt with.
+  model.cached.push(...ids)
+  if (logits.length > vocab) logits = logits.subarray(0, vocab)
+  const processor = logitProcessors?.get(request.model)
+  if (processor) logits = processor.processLogits(logits)
+  const token = draw(createSampler(request.sampling).distribution(logits))
+  processor?.processSampledToken(token)
+  post({ type: "forwarded", id: request.id, token })
+}
+
+/** WebLLM's resetChat: forgets what the model's cache holds, and its logit processor's state. */
+function resetChat(request: Extract<WorkerRequest, { type: "reset" }>) {
+  if (current?.model === request.model) {
+    current.cached.length = 0
+    current.engine.reset()
+  }
+  logitProcessors?.get(request.model)?.resetState()
+  post({ type: "reset-done", id: request.id })
 }
 
 /**
@@ -1429,9 +1529,17 @@ function receive(data: WorkerRequest) {
   } else if (data.type === "download") {
     if (data.meta) rememberModel(data.meta)
     void downloadModel(data.model, data.id)
-  } else if (data.type === "generate") {
+  } else if (data.type === "reset") {
+    queue = queue.then(() => {
+      try {
+        resetChat(data)
+      } catch (error) {
+        post({ type: "error", id: data.id, message: errorMessage(error), code: errorCode(error) })
+      }
+    })
+  } else if (data.type === "generate" || data.type === "forward") {
     queue = queue
-      .then(() => generate(data))
+      .then(() => (data.type === "generate" ? generate(data) : forwardTokens(data)))
       .catch((error: unknown) => {
         // A lost GPU context can't be used again: the next generation
         // loads the model afresh. Otherwise the cache may hold part of a

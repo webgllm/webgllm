@@ -70,6 +70,16 @@ export type RunTimings = {
   thinkingBudgetExhausted?: boolean
 }
 
+/** A token's log probability, as OpenAI's chat completions report it. */
+export type TokenLogprob = {
+  token: string
+  logprob: number
+  /** The token's UTF-8 bytes. */
+  bytes: Array<number>
+  /** The likeliest tokens at this position (`top_logprobs` of them). */
+  top_logprobs: Array<{ token: string; logprob: number; bytes: Array<number> }>
+}
+
 export type WorkerRequest =
   | {
       type: "load"
@@ -99,6 +109,13 @@ export type WorkerRequest =
       /** The context to load it for, if it's loaded first (see "load"). */
       contextLength?: number
       chat: Array<ChatMessage>
+      /** A raw prompt in place of `chat`: tokenized as it is, with no chat template (OpenAI's Completions). */
+      prompt?: string
+      /** Send each written token's log probability, with its `topLogprobs` likeliest alternatives. */
+      logprobs?: boolean
+      topLogprobs?: number
+      /** OpenAI's logit_bias: token ids to a bias added to their logits before sampling. */
+      logitBias?: Record<string, number>
       /** Explicit false disables cross-call inference-cache reuse and retention. */
       cachePrompt?: boolean
       tools: Array<ChatTool>
@@ -129,6 +146,14 @@ export type WorkerRequest =
        */
       pipeline?: boolean
     }
+  /**
+   * WebLLM's forwardTokensAndSample: read `inputIds` into the model's cache
+   * after what it holds, and sample the next token ("forwarded"). In the
+   * queue with the generations; the model loads first if it isn't loaded.
+   */
+  | { type: "forward"; id: string; model: string; contextLength?: number; inputIds: Array<number>; sampling: Sampling }
+  /** WebLLM's resetChat: forget the model's cache ("reset-done"). */
+  | { type: "reset"; id: string; model: string }
   /** Stops generation `id`, or download `id`. */
   | { type: "stop"; id: string }
   /**
@@ -179,14 +204,20 @@ export type WorkerResponse =
    */
   | { type: "claim"; id: number; model: string; bytes: number }
   | { type: "phase"; id: string; phase: GenerationPhase }
-  | { type: "token"; id: string; text: string }
+  | { type: "token"; id: string; text: string; logprobs?: Array<TokenLogprob> }
   | {
       type: "done"
       id: string
       stats: RunTimings
       finishReason: FinishReason
+      /** Log probabilities of tokens written after the last "token" message. */
+      logprobs?: Array<TokenLogprob>
       /** The call a forced toolChoice ("required" or a name) produced. */
       toolCall?: { name: string; arguments: Record<string, unknown> }
     }
+  /** A generation, a "forward" or a "reset" failed. */
   | { type: "error"; id: string; message: string; code?: WorkerErrorCode }
+  /** "forward" `id`'s next token. */
+  | { type: "forwarded"; id: string; token: number }
+  | { type: "reset-done"; id: string }
   | { type: "log"; text: string }

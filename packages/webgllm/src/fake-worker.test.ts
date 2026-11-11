@@ -146,6 +146,11 @@ export class FakeWorker {
         return
       }
       this.finish(message.id, reply.tokens, reply.done)
+    } else if (message.type === "forward") {
+      // The token after the last one read.
+      this.emit({ type: "forwarded", id: message.id, token: message.inputIds.at(-1)! + 1 })
+    } else if (message.type === "reset") {
+      this.emit({ type: "reset-done", id: message.id })
     } else if (message.type === "stop") {
       if (this.open.has(message.id)) this.finish(message.id)
       else if (message.id.startsWith("dl_")) this.stoppedDownloads.push(message.id)

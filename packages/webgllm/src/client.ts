@@ -7,7 +7,8 @@
 import { workerError } from "./errors.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { isCatalogModel, knownModelMeta } from "./model-meta.js"
-import type { FinishReason, RunTimings, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
+import type { Sampling } from "./sampler.js"
 
 /** What a worker sends that the pool acts on. */
 export type WorkerEvents = {
@@ -23,8 +24,13 @@ export type WorkerEvents = {
 export type WorkerGenerationEnd = {
   stats: RunTimings
   finishReason: FinishReason
+  /** Log probabilities of the tokens written after the last text (when asked for). */
+  logprobs?: Array<TokenLogprob>
   toolCall?: { name: string; arguments: Record<string, unknown> }
 }
+
+/** A piece of a reply's raw text, with its tokens' log probabilities when they were asked for. */
+export type OnToken = (text: string, logprobs?: Array<TokenLogprob>) => void
 
 type Pending<T> = {
   promise: Promise<T>
@@ -44,7 +50,7 @@ function pending<T>(): Pending<T> {
   return { promise, resolve, reject }
 }
 
-type Generation = Pending<WorkerGenerationEnd> & { onToken: (text: string) => void }
+type Generation = Pending<WorkerGenerationEnd> & { onToken: OnToken }
 
 type Load = Pending<void> & {
   contextLength: number | undefined
@@ -78,6 +84,8 @@ export class ModelWorker {
   private freed: Promise<void> | undefined
   private readonly stored = pending<void>()
   private readonly generations = new Map<string, Generation>()
+  /** "forward" and "reset" requests waiting for their answer, by id. */
+  private readonly calls = new Map<string, Pending<number | undefined>>()
   /** Loaded and ready, for the context it was asked for (see contextLength). */
   ready = false
   /** Tokens the loaded model holds, as the worker reported it. */
@@ -119,7 +127,7 @@ export class ModelWorker {
   }
 
   get busy(): boolean {
-    return this.generations.size > 0
+    return this.generations.size > 0 || this.calls.size > 0
   }
 
   /** The load in progress or done, if one was asked for. */
@@ -224,7 +232,7 @@ export class ModelWorker {
    */
   generate(
     request: Omit<Extract<WorkerRequest, { type: "generate" }>, "type" | "model" | "contextLength">,
-    onToken: (text: string) => void
+    onToken: OnToken
   ): Promise<WorkerGenerationEnd> {
     if (this.gone) return Promise.reject(this.gone)
     const generation = { ...pending<WorkerGenerationEnd>(), onToken }
@@ -241,6 +249,31 @@ export class ModelWorker {
 
   stop(id: string) {
     this.post({ type: "stop", id })
+  }
+
+  private call(id: string): Promise<number | undefined> {
+    const call = pending<number | undefined>()
+    this.calls.set(id, call)
+    return call.promise
+  }
+
+  /** WebLLM's forwardTokensAndSample: reads `inputIds` after what the cache holds; the next token sampled. */
+  forward(id: string, inputIds: Array<number>, sampling: Sampling): Promise<number> {
+    if (this.gone) return Promise.reject(this.gone)
+    const answer = this.call(id)
+    this.post({
+      type: "forward", id, model: this.model, inputIds, sampling,
+      ...(this.contextLength !== undefined && { contextLength: this.contextLength })
+    })
+    return answer as Promise<number>
+  }
+
+  /** WebLLM's resetChat: the model forgets its cache. */
+  async reset(id: string): Promise<void> {
+    if (this.gone) throw this.gone
+    const answer = this.call(id)
+    this.post({ type: "reset", id, model: this.model })
+    await answer
   }
 
   /**
@@ -286,6 +319,8 @@ export class ModelWorker {
     this.downloading = null
     for (const generation of this.generations.values()) generation.reject(reason)
     this.generations.clear()
+    for (const call of this.calls.values()) call.reject(reason)
+    this.calls.clear()
     this.settled()
     return this.freed
   }
@@ -371,7 +406,7 @@ export class ModelWorker {
         this.downloading = null
         break
       case "token":
-        this.generations.get(data.id)?.onToken(data.text)
+        this.generations.get(data.id)?.onToken(data.text, data.logprobs)
         break
       case "done": {
         const generation = this.generations.get(data.id)
@@ -380,15 +415,25 @@ export class ModelWorker {
           stats: data.stats,
           // (A worker from before finish reasons: its end-of-turn token.)
           finishReason: data.finishReason ?? "stop",
+          ...(data.logprobs && { logprobs: data.logprobs }),
           ...(data.toolCall && { toolCall: data.toolCall })
         })
         this.settled()
         break
       }
       case "error": {
-        const generation = this.generations.get(data.id)
+        const waiting = this.generations.get(data.id) ?? this.calls.get(data.id)
         this.generations.delete(data.id)
-        generation?.reject(workerError(data.message, data.code))
+        this.calls.delete(data.id)
+        waiting?.reject(workerError(data.message, data.code))
+        this.settled()
+        break
+      }
+      case "forwarded":
+      case "reset-done": {
+        const call = this.calls.get(data.id)
+        this.calls.delete(data.id)
+        call?.resolve(data.type === "forwarded" ? data.token : undefined)
         this.settled()
         break
       }

@@ -135,11 +135,15 @@ export type ChatCompletionCreateParamsBase = {
   reasoning?: { effort?: ReasoningEffort | null; max_tokens?: number | null } | null
   /** Only 1 (or unset) is supported. */
   n?: number | null
-  /** Unsupported when true. */
+  /**
+   * Returns each written token's log probability in `choices[0].logprobs.content`
+   * (the reply's thinking and tool-call tokens included). Every logit is
+   * read back for each token then, so the reply is written slower.
+   */
   logprobs?: boolean | null
-  /** Unsupported. */
+  /** With `logprobs`: this many of the likeliest tokens at each position too, 0 to 20. */
   top_logprobs?: number | null
-  /** Unsupported. */
+  /** Token ids to a bias from -100 to 100, added to their logits before sampling. Read back like `logprobs`. */
   logit_bias?: Record<string, number> | null
   /** Accepted and ignored, like the rest of OpenAI's bookkeeping fields. */
   user?: string
@@ -198,6 +202,18 @@ export type CompletionTimings = {
   images_ms?: number
 }
 
+/** A token's log probability (see `logprobs`). */
+export type ChatCompletionTokenLogprob = {
+  token: string
+  logprob: number
+  /** The token's UTF-8 bytes. */
+  bytes: Array<number>
+  top_logprobs: Array<{ token: string; logprob: number; bytes: Array<number> }>
+}
+
+/** `choices[].logprobs`: null unless the request asked for `logprobs`. */
+export type ChatCompletionLogprobs = { content: Array<ChatCompletionTokenLogprob> | null; refusal: null } | null
+
 export type ChatCompletionMessage = {
   role: "assistant"
   /** Null when the reply is only tool calls. */
@@ -217,7 +233,7 @@ export type ChatCompletion = {
     index: 0
     message: ChatCompletionMessage
     finish_reason: FinishReason
-    logprobs: null
+    logprobs: ChatCompletionLogprobs
   }>
   usage: CompletionUsage
   timings: CompletionTimings
@@ -247,7 +263,7 @@ export type ChatCompletionChunk = {
     index: 0
     delta: ChatCompletionChunkDelta
     finish_reason: FinishReason | null
-    logprobs: null
+    logprobs: ChatCompletionLogprobs
   }>
   /** On the last chunk, with `stream_options.include_usage`. */
   usage?: CompletionUsage
@@ -303,4 +319,66 @@ export type WebGLLMEventMap = {
   error: { model: string; error: Error }
   /** A model left memory. */
   unload: { model: string; reason: ModelUnloadReason }
+}
+
+/**
+ * OpenAI's Completions request, as WebLLM takes it: a raw prompt, read as
+ * it is with no chat template. Sampling fields the request leaves out come
+ * from the model card.
+ */
+export type CompletionCreateParamsBase = {
+  model: WebGlModelId
+  prompt: string
+  /** Writes the prompt before the completion. */
+  echo?: boolean | null
+  max_tokens?: number | null
+  temperature?: number | null
+  top_p?: number | null
+  top_k?: number | null
+  min_p?: number | null
+  presence_penalty?: number | null
+  repetition_penalty?: number | null
+  /** Unsupported unless 0. */
+  frequency_penalty?: number | null
+  seed?: number | null
+  stop?: string | Array<string> | null
+  /** As in chat completions: a boolean, with `top_logprobs` alternatives. */
+  logprobs?: boolean | null
+  top_logprobs?: number | null
+  logit_bias?: Record<string, number> | null
+  /** Only 1 (or unset) is supported. */
+  n?: number | null
+  /** Only 1 (or unset) is supported. */
+  best_of?: number | null
+  /** Unsupported. */
+  suffix?: string | null
+  stream_options?: { include_usage?: boolean } | null
+  /** False reads the prompt without the cache, and keeps nothing of it. */
+  cache_prompt?: boolean | null
+  /** Accepted and ignored. */
+  user?: string
+}
+
+export type CompletionCreateParamsNonStreaming = CompletionCreateParamsBase & { stream?: false | null }
+export type CompletionCreateParamsStreaming = CompletionCreateParamsBase & { stream: true }
+export type CompletionCreateParams = CompletionCreateParamsNonStreaming | CompletionCreateParamsStreaming
+
+/** OpenAI's Completion: a whole one, or with `stream: true` each chunk of one. */
+export type Completion = {
+  id: string
+  object: "text_completion"
+  /** Unix seconds. */
+  created: number
+  model: string
+  /** Empty in a stream's usage chunk (`stream_options.include_usage`). */
+  choices: Array<{
+    index: 0
+    text: string
+    /** Null on a stream's chunks before its last. */
+    finish_reason: "stop" | "length" | null
+    logprobs: ChatCompletionLogprobs
+  }>
+  /** On a whole completion; in a stream, on the last chunk with `stream_options.include_usage`. */
+  usage?: CompletionUsage
+  timings?: CompletionTimings
 }

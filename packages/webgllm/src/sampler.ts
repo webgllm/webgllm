@@ -257,3 +257,35 @@ export function verifyAt(
   const token = drawAt(d, u)
   return token === drafted ? { kept: true } : { kept: false, token }
 }
+
+/**
+ * The log probabilities of a position's tokens, from its logits (copied:
+ * the sampler changes them after): the model's own distribution, before
+ * temperature, top-k and the penalties. Returns what a chosen token's
+ * entry is, with the `top` likeliest tokens beside it, as OpenAI reports
+ * them. `entry` names a token (its text and bytes).
+ */
+export function logprobsOf<Entry>(
+  logits: Float32Array,
+  top: number,
+  entry: (token: number, logprob: number) => Entry
+): (token: number) => Entry & { top_logprobs: Array<Entry> } {
+  const kept = logits.slice()
+  let max = -Infinity
+  for (let i = 0; i < kept.length; i++) if (kept[i] > max) max = kept[i]
+  let sum = 0
+  for (let i = 0; i < kept.length; i++) sum += Math.exp(kept[i] - max)
+  const logZ = max + Math.log(sum)
+  // The `top` largest, likeliest first.
+  const best: Array<number> = []
+  for (let i = 0; i < kept.length && top > 0; i++) {
+    const x = kept[i]
+    if (best.length === top && !(x > kept[best[top - 1]])) continue
+    let at = best.length
+    while (at > 0 && x > kept[best[at - 1]]) at--
+    best.splice(at, 0, i)
+    if (best.length > top) best.pop()
+  }
+  const alternatives = best.map((i) => entry(i, kept[i] - logZ))
+  return (token) => ({ ...entry(token, kept[token] - logZ), top_logprobs: alternatives })
+}

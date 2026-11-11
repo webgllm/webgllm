@@ -511,3 +511,72 @@ test("unloading a model while it resolves stops its load", async () => {
   await assert.rejects(reply, { code: "model-not-loaded" })
   assert.equal(workers.of(name), undefined, "no worker started")
 })
+
+test("completions.create: a raw prompt, whole and streamed, with echo and log probabilities", async () => {
+  const entry = { token: "Hello", logprob: -0.25, bytes: [72, 101, 108, 108, 111], top_logprobs: [] }
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["Hello", "!"] }) })
+  const whole = await client.completions.create({ model: LFM2, prompt: "Say hi: ", echo: true })
+  assert.equal(whole.object, "text_completion")
+  assert.equal(whole.choices[0]!.text, "Say hi: Hello!")
+  assert.equal(whole.choices[0]!.finish_reason, "stop")
+  assert.equal(whole.choices[0]!.logprobs, null)
+  assert.equal(whole.usage!.completion_tokens, STATS.outputTokens)
+  const sent = workers.of(LFM2)!.generations()[0]!
+  assert.equal(sent.prompt, "Say hi: ")
+  assert.deepEqual(sent.chat, [])
+  // Streamed: the worker's log probabilities ride on the chunks.
+  const held = llm()
+  const stream = await held.llm.completions.create({ model: LFM2, prompt: "x", stream: true, logprobs: true, stream_options: { include_usage: true } })
+  await settle()
+  const worker = held.workers.of(LFM2)!
+  const id = worker.generations()[0]!.id
+  assert.equal(worker.generations()[0]!.logprobs, true)
+  worker.emit({ type: "token", id, text: "Hello", logprobs: [entry] })
+  worker.finish(id)
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  assert.equal(chunks[0]!.choices[0]!.text, "Hello")
+  assert.deepEqual(chunks[0]!.choices[0]!.logprobs, { content: [entry], refusal: null })
+  assert.equal(chunks.at(-2)!.choices[0]!.finish_reason, "stop")
+  assert.deepEqual(chunks.at(-1)!.choices, [])
+  assert.equal(chunks.at(-1)!.usage!.completion_tokens, STATS.outputTokens)
+})
+
+test("chat completions return log probabilities when asked for", async () => {
+  const entry = { token: "Hi", logprob: -0.5, bytes: [72, 105], top_logprobs: [{ token: "Hi", logprob: -0.5, bytes: [72, 105] }] }
+  const { llm: client, workers } = llm()
+  const pending = client.chat.completions.create({ model: LFM2, messages: hi, logprobs: true, top_logprobs: 1 })
+  await settle()
+  const worker = workers.of(LFM2)!
+  const sent = worker.generations()[0]!
+  assert.equal(sent.logprobs, true)
+  assert.equal(sent.topLogprobs, 1)
+  worker.emit({ type: "token", id: sent.id, text: "Hi", logprobs: [entry] })
+  worker.finish(sent.id)
+  const completion = await pending
+  assert.deepEqual(completion.choices[0]!.logprobs, { content: [entry], refusal: null })
+  // Not asked for: null, as before.
+  const plain = llm({ reply: () => ({ tokens: ["Hi"] }) })
+  assert.equal((await plain.llm.chat.completions.create({ model: LFM2, messages: hi })).choices[0]!.logprobs, null)
+})
+
+test("forwardTokensAndSample and resetChat, as WebLLM has them", async () => {
+  const { llm: client, workers } = llm()
+  await assert.rejects(client.forwardTokensAndSample([1, 2], true), { code: "model-not-loaded" })
+  await client.loadModel(LFM2)
+  // The one loaded model, when modelId is left out.
+  assert.equal(await client.forwardTokensAndSample([5, 6, 7], true), 8)
+  assert.equal(await client.forwardTokensAndSample([8], false, LFM2), 9)
+  const worker = workers.of(LFM2)!
+  const forwards = worker.sent.filter((m) => m.type === "forward")
+  assert.deepEqual(forwards.map((m) => m.inputIds), [[5, 6, 7], [8]])
+  assert.equal(typeof forwards[0]!.sampling.temperature, "number")
+  await client.resetChat()
+  assert.equal(worker.sent.filter((m) => m.type === "reset").length, 1)
+  await assert.rejects(client.forwardTokensAndSample([1.5], true), TypeError)
+  // A model that isn't loaded is loaded first.
+  assert.equal(await client.forwardTokensAndSample([1], true, QWEN), 2)
+  assert.ok(workers.of(QWEN))
+  // Two loaded: which one must be said.
+  await assert.rejects(client.forwardTokensAndSample([1], true), { code: "model-not-loaded" })
+})
