@@ -1,3 +1,13 @@
+## 0.3.2 (2026-11-12)
+
+### 🔥 Performance
+
+- **webgllm:** reading a prompt, waits on the GPU sleep instead of polling ([e46db93](https://github.com/webgllm/webgllm/commit/e46db93))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.1 (2026-11-11)
 
 ### 🩹 Fixes
