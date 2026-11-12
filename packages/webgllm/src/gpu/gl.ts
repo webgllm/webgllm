@@ -1142,6 +1142,17 @@ export class Gpu {
 
   /** Bound active polling as well as GPU work, to avoid heating a CPU core. */
   pollsBeforeSleep = 32
+  /**
+   * Reading a prompt, a wait polls on messages this long, then sleeps on
+   * 1 ms timers until the GPU is there (-1: polls as writing does, with a
+   * sleep every pollsBeforeSleep polls). A warm iPhone 16 Pro Max read
+   * prompts 8 to 10% faster sleeping, and missed no more frames (fewer in
+   * one of two runs); cool, the same speed. The polling kept a CPU core
+   * busy, heat the throttled GPU paid for.
+   * Writing keeps polling: its chunks are a few ms, and timer sleeps cost
+   * it 4 ms a token there.
+   */
+  promptSpinMs = 0.25
   private polls = 0
 
   /** A zero-timeout fence check avoids a synchronous parameter-query round trip. */
@@ -1169,11 +1180,16 @@ export class Gpu {
         // Spin on messages at first; back off to timers on long waits. With
         // timers throttled (a hidden page: a 1 ms wait can take a second),
         // block on a pixel of the last pass instead, as pace does.
+        // Reading a prompt, sleep as soon as the wait isn't a short one:
+        // its chunks are long, so a timer's delay costs little, and the
+        // polling was a busy CPU core (see promptSpinMs).
         const sleep =
-          this.phase !== "load" &&
-          this.pollsBeforeSleep > 0 &&
-          performance.now() - began >= pollGraceMs &&
-          ++this.polls % this.pollsBeforeSleep === 0
+          this.phase === "prompt" && this.promptSpinMs >= 0
+            ? performance.now() - began >= this.promptSpinMs
+            : this.phase !== "load" &&
+              this.pollsBeforeSleep > 0 &&
+              performance.now() - began >= pollGraceMs &&
+              ++this.polls % this.pollsBeforeSleep === 0
         if (spins < 2000 && !sleep) await this.yieldOnce()
         else if (performance.now() < this.throttledUntil) {
           this.readBack()

@@ -330,6 +330,8 @@ export const TUNING = {
   submissionMs: 4,
   /** Message polls between 1 ms sleeps while waiting for GPU work (0: no periodic sleep). */
   fencePolls: 32,
+  /** Reading a prompt, how long a wait polls before it sleeps on timers (see Gpu.promptSpinMs; -1: as writing). */
+  promptFenceSpinMs: 0.25,
   /** A full compute-queue drain after this many display frames (0 disables). */
   presentationFrames: 4,
   /** Decode layers per fenced submission (0 disables). */
@@ -644,6 +646,7 @@ export class Engine {
     this.gpu.presentationFrames = TUNING.presentationFrames
     this.gpu.configurePacing(this.tuned.submissionReads ?? TUNING.submissionReads, TUNING.submissionMs)
     this.gpu.pollsBeforeSleep = TUNING.fencePolls
+    this.gpu.promptSpinMs = TUNING.promptFenceSpinMs
     this.gpu.presentationFrames = TUNING.presentationFrames
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
@@ -6070,6 +6073,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       TUNING.submissionMs
     )
     this.gpu.pollsBeforeSleep = TUNING.fencePolls
+    this.gpu.promptSpinMs = TUNING.promptFenceSpinMs
     this.gpu.presentationFrames = TUNING.presentationFrames
     // (Writing: room past the batch for its queries too, see queryInCache.)
     await this.reserve(
