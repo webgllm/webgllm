@@ -11,7 +11,7 @@ The worker downloads the files to the Origin Private File System, resuming a dro
 
 ## Weights
 
-`loadGguf` and `loadOnnx` read either format into the same weights: 4-bit blocks of 32, in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is read natively in the shader, so its weights are exactly llama.cpp's. Only tensors are read from the ONNX graph; its ops aren't run.
+The GGUF and ONNX loaders read either format into the same weights: 4-bit blocks of 32, in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is read natively in the shader, so its weights are exactly llama.cpp's. Only tensors are read from the ONNX graph; its ops aren't run.
 
 ## Kernels
 
@@ -28,6 +28,12 @@ With top-k, the GPU applies the repetition penalty and narrows the logits down t
 A follow-up reads only what's new. The attention cache rewinds to any position, and the models' recurrent and convolution states are saved at points a follow-up can resume from.
 
 The cache starts small and grows as a chat does, up to the loaded context length. Long contexts are read in segments.
+
+## Images
+
+A model with a vision encoder (Qwen3.5's ONNX builds) reads an image in passes of its own, once per image. The encoder downloads with the first request that has an image, is loaded on the GPU only while a request's new images are encoded, and is freed after them, so text chats never pay for it.
+
+The encoder's output rows take the place of the image tokens' embeddings in the prompt. They are kept for a few recent images, and the prompt cache tells images apart by their content, so a follow-up about an image already in the chat reads only the new turn. The repository's [vision notes](https://github.com/webgllm/webgllm/blob/main/packages/webgllm/docs/vision.md) have the details.
 
 ## Performance
 

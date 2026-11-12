@@ -7,7 +7,7 @@ description: The WebGLLM class, its options and methods.
 import { WebGLLM, WebGLLMError, WebGLLMWorkerHandler, type LogitProcessor } from "webgllm"
 ```
 
-The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) and its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`).
+The package also exports the OpenAI request and response types (`ChatCompletion`, `ChatCompletionChunk`, `ChatCompletionCreateParams`, …) its own (`LoadProgress`, `ModelInfo`, `WebGLLMEventMap`), and the model catalog: `WEBGL_TEXT_MODELS` (the catalog's ids) and `WEBGL_MODEL_META` (each one's files, capabilities, reasoning and sampling).
 
 ## `new WebGLLM(options?)`
 
@@ -88,7 +88,7 @@ Loads a model, downloading it first if needed.
 
 ## `downloadModel(model, options?)`
 
-Downloads a model's files into storage without loading them. Takes `onProgress` and `signal`; an aborted download resumes next time.
+Downloads a model's files into storage without loading them. Takes `onProgress` and `signal`; an aborted download resumes next time. It fetches what the model loads for text: a model that reads images downloads its vision encoder with the first request that has an image.
 
 ## `unloadModel(model?)`
 
@@ -98,8 +98,8 @@ Frees a model's GPU memory, or every model's with no argument. webgllm's own wor
 
 | Method | Returns |
 | --- | --- |
-| `models.list()` | `Promise<ModelInfo[]>`: every supported model |
-| `models.retrieve(id)` | `Promise<ModelInfo>` |
+| `models.list()` | `Promise<ModelInfo[]>`: the catalog, plus any other model downloaded or used on the page |
+| `models.retrieve(id)` | `Promise<ModelInfo>`: any model webgllm runs, resolved first if it isn't known yet |
 | `models.downloaded(id)` | `Promise<boolean>`: whether every file the model loads is in storage, or it's loaded. Reads storage only: no network request, no load |
 | `models.delete(id)` | Removes a model's files from storage |
 
@@ -107,7 +107,11 @@ Frees a model's GPU memory, or every model's with no argument. webgllm's own wor
 
 ## `addEventListener(type, listener)`
 
-Events: `progress`, `loadstart`, `load`, `error`, `unload`. See [Events and errors](/docs/guides/events-and-errors).
+Events: `progress`, `loadstart`, `load`, `error`, `unload`. See [Events and errors](/docs/guides/events-and-errors). `removeEventListener(type, listener)` stops a listener.
+
+## `baseURL`
+
+`"webgllm:"`: where requests go, as an OpenAI client reports it (in the page, not over the network). TanStack AI's Chat Completions adapters read it; `WebGLLM` isn't a whole OpenAI client.
 
 ## `LoadProgress`
 

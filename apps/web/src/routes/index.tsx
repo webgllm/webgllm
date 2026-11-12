@@ -223,7 +223,7 @@ const features = [
     icon: <Plug />,
     title: 'OpenAI-compatible',
     description:
-      'chat.completions.create with streaming, stop sequences, seeds, usage and timings. Unsupported fields throw instead of being ignored.',
+      'chat.completions.create with streaming, images, logprobs, stop sequences, seeds, usage and timings. Unsupported fields throw instead of being ignored.',
   },
   {
     icon: <Gauge />,
@@ -309,7 +309,7 @@ const models = [
     name: 'Qwen3.5',
     vendor: 'Qwen',
     note: '2B',
-    description: 'Gated DeltaNet layers, with thinking on request.',
+    description: 'Gated DeltaNet layers, with thinking on request. Its ONNX build reads images.',
     ids: ['unsloth/Qwen3.5-2B-GGUF', 'onnx-community/Qwen3.5-2B-ONNX'],
   },
   {

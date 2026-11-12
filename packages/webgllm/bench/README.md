@@ -27,6 +27,7 @@ Pages:
 - `mem.html`: memory and speed over a chat, also the iPhone page (below).
 - `webgl-perf.html`: load, prompt and writing throughput with painted-frame cadence (below).
 - `gl-info.html`: what this browser's WebGL 2 offers against what the engine needs.
+- `api.html`: the public API end to end, each check a `PASS` or `FAIL` line (`?model=<id>`, LFM2.5 350M GGUF by default; `&second=<id>` also loads a second model at once).
 - `bandwidth.html`, `mm2.html`, `q4-matmul.html`, `tf.html`: kernel and texture-layout experiments (below).
 - `lfm2-gguf.html`: LFM2.5 GGUF logits against llama.cpp's CPU ([LFM2-GGUF.md](LFM2-GGUF.md)).
 - `short-prefix.html`: short shared-prefix caching, a frozen baseline against this checkout ([FINDINGS](short-prefix-results/FINDINGS.md)).

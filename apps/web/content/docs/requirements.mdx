@@ -39,4 +39,4 @@ Phones have the least room. iOS Safari ends a tab that uses about 2 GB, so load 
 - Images only on models with a vision encoder (Qwen3.5's ONNX builds; `supports.images` in `models.list()`). Images for other models, and audio, throw `unsupported-parameter`.
 - One completion per request (`n` is 1); no `frequency_penalty`.
 - Generations run one at a time, across all models.
-- Only the [listed models](/docs/models) run.
+- Only the architectures webgllm runs load: LFM2, LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export. See [Models](/docs/models).
