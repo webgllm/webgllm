@@ -30,7 +30,7 @@
  * MatMul over the same tensor transposed: it is quantized to 8 bits at
  * load, as the GGUF loader does a float embedding.
  */
-import { halfTable, halvesToFloats } from "./half.js"
+import { halfTable, halvesToFloats, toHalf } from "./half.js"
 import {
   OnnxDataType,
   onnxElementSize,
@@ -42,6 +42,7 @@ import {
 } from "./onnx.js"
 import { ReadPlan } from "./read-plan.js"
 import {
+  headPermutation,
   newQuantMatrix,
   packMatMulNBits,
   packMatMulNBitsScales,
@@ -62,13 +63,19 @@ import type {
 export type LoadOnnxOptions = {
   /** The .onnx file (graph), as bytes or a source. */
   graph: ByteSource | Uint8Array
-  /** The external data file (.onnx_data). */
-  data: ByteSource
+  /**
+   * The external data file (.onnx_data); or, for a graph whose weights are
+   * in several, each file by the name the graph gives it (its `location`).
+   */
+  data: ByteSource | ((location: string) => ByteSource)
   /** The model's config.json, parsed. */
   config: unknown
   /** Embedding rows converted per step (default 2048). */
   embeddingChunkRows?: number
 }
+
+/** The source of a read that needs none (an inline tensor's bytes are in the graph). */
+const NO_SOURCE: ByteSource = { size: 0, read: async () => new Uint8Array(0) }
 
 /** A MatMulNBits weight: its initializers and shape. */
 export type NBits = {
@@ -76,10 +83,15 @@ export type NBits = {
   node: OnnxNode
   N: number
   K: number
+  /** 4, or 8 where the export keeps a matrix at 8 bits (blocks of 32 too, zero points a byte each). */
+  bits: 4 | 8
   quant: OnnxTensor
   scales: OnnxTensor
   zp: OnnxTensor | null
 }
+
+/** A MatMulNBits weight of 4 or 8 bits, in blocks of any multiple of 32 (OnnxModel.wideNBits). */
+export type WideNBits = NBits & { blockSize: number }
 
 /** Rows [start, start + rows) of a weight. */
 type Segment = { start: number; rows: number }
@@ -101,7 +113,8 @@ export async function* loadOnnx(
     graphBytes,
     options.config,
     options.embeddingChunkRows ?? 2048,
-    (read) => plan.add({ ...read, source: data })
+    // (A tensor in the graph itself has its bytes already: it is in no data file.)
+    (read) => plan.add({ ...read, source: typeof data !== "function" ? data : read.bytes ? NO_SOURCE : data(read.location) })
   )
   yield { kind: "config", config }
 
@@ -142,10 +155,15 @@ export async function* loadOnnx(
 
   /**
    * MatMulNBits weights into one matrix, read in the order given; each
-   * segment's rows go to destination row `to`.
+   * segment's rows go to destination row `to` (row `to + i` from the
+   * segment's row `perm[i]` where it has a `perm`). 4-bit weights stay as
+   * they are; if any part is 8-bit the whole matrix is: every part
+   * dequantized (scale · (q − zero point)) and quantized to 8 bits per
+   * block of 32, symmetric (quantizeQ8), as the GGUF loader stores a
+   * matrix that isn't Q4_0 or Q8_0.
    */
   const matrix = async (
-    parts: Array<{ w: NBits; segments: Array<Segment & { to: number }> }>
+    parts: Array<{ w: NBits; segments: Array<Segment & { to: number; perm?: Int32Array }> }>
   ): Promise<QuantMatrix> => {
     const K = parts[0].w.K
     let N = 0
@@ -162,6 +180,22 @@ export async function* loadOnnx(
     }
     if (N % 4 !== 0) throw new Error(`ONNX: ${N} rows isn't a multiple of 4`)
     const rowBlocks = K / 32
+    if (parts.some((p) => p.w.bits === 8)) {
+      const m = newQuantMatrix(N, K, 8, false)
+      const row = new Float32Array(K)
+      for (const { w, segments } of parts) {
+        const quant = await plan.take(w.quant.name)
+        const scales = halfBytes(w.scales, await plan.take(w.scales.name))
+        const zp = w.zp ? await plan.take(w.zp.name) : null
+        for (const { start, rows, to, perm } of segments) {
+          for (let i = 0; i < rows; i++) {
+            dequantizeNBitsRow(w.bits, K, quant, scales, zp, start + (perm ? perm[i] : i), row)
+            quantizeQ8(m, to + i, row, 1)
+          }
+        }
+      }
+      return m
+    }
     const rowZp = Math.ceil(rowBlocks / 2)
     // The quants stay as MatMulNBits stores them (rows copied into place):
     // the engine rearranges them on the GPU (QuantMatrix.raw).
@@ -178,18 +212,22 @@ export async function* loadOnnx(
     const raw = m.raw as Uint8Array
     for (const { w, segments } of parts) {
       const quant = await plan.take(w.quant.name)
-      const scales = await plan.take(w.scales.name)
+      const scales = halfBytes(w.scales, await plan.take(w.scales.name))
       const zp = w.zp ? await plan.take(w.zp.name) : null
-      for (const { start, rows, to } of segments) {
-        const row = rowBlocks * 16
-        raw.set(quant.subarray(start * row, (start + rows) * row), to * row)
-        packMatMulNBitsScales(
-          m,
-          to,
-          scales.subarray(start * rowBlocks * 2),
-          zp ? zp.subarray(start * rowZp) : null,
-          rows
-        )
+      const row = rowBlocks * 16
+      for (const { start, rows, to, perm } of segments) {
+        // Row by row where the rows are reordered, else all at once.
+        const runs = perm ? Array.from(perm.subarray(0, rows), (src, i) => ({ from: start + src, at: to + i, count: 1 })) : [{ from: start, at: to, count: rows }]
+        for (const { from, at, count } of runs) {
+          raw.set(quant.subarray(from * row, (from + count) * row), at * row)
+          packMatMulNBitsScales(
+            m,
+            at,
+            scales.subarray(from * rowBlocks * 2),
+            zp ? zp.subarray(from * rowZp) : null,
+            count
+          )
+        }
       }
     }
     return m
@@ -259,22 +297,30 @@ export async function* loadOnnx(
             }
           ]).flat()
         : null
+      // A graph with HF's head layout: each head's rotated dims are put
+      // first, q's, k's and their norms' (see headPermutation).
+      const reorder = l.hfHeads && rotatedDims(l.type, config) < headDim
+      const qPerm = reorder ? headPermutation(numHeads, headDim, rotatedDims(l.type, config)) : undefined
+      const kPerm = reorder ? headPermutation(numKvHeads, headDim, rotatedDims(l.type, config)) : undefined
+      const normPerm = reorder ? headPermutation(1, headDim, rotatedDims(l.type, config)) : undefined
+      if (l.hfHeads) checkRotaryCache(await plan.take(`rope@${i}`), l.hfHeads, rotatedDims(l.type, config), i)
       // Rows: q, k, v, gate (the gate from q_proj's own rows, or its own weight).
       const qkvg = await matrix([
         {
           w: qW,
           segments: perHead ?? [
-            { ...l.q, to: 0 },
+            { ...l.q, to: 0, ...(qPerm && { perm: qPerm }) },
             ...(l.gate ? [{ ...l.gate, to: gateTo }] : [])
           ]
         },
-        whole(kW, qRows),
+        { w: kW, segments: [{ start: 0, rows: kW.N, to: qRows, ...(kPerm && { perm: kPerm }) }] },
         whole(vW, qRows + kv),
         ...(l.gateWeight ? [whole(l.gateWeight, gateTo)] : [])
       ])
       const o = await matrix([whole(oW)])
-      const qNorm = await floats(l.extra[0], headDim)
-      const kNorm = await floats(l.extra[1], headDim)
+      const reordered = (values: Float32Array) => (normPerm ? Float32Array.from(normPerm, (src) => values[src]) : values)
+      const qNorm = reordered(await floats(l.extra[0], headDim))
+      const kNorm = reordered(await floats(l.extra[1], headDim))
       attention = { qkvg, o, qNorm, kNorm }
     }
     const [gateW, upW, downW] = l.matrices.slice(-3) as [NBits, NBits, NBits]
@@ -312,9 +358,94 @@ export async function* loadOnnx(
     const quant = await plan.take(`quant@${r}`)
     const scales = await plan.take(`scales@${r}`)
     const zp = emb.zp ? await plan.take(`zp@${r}`) : null
+    if (emb.kind === "q8") {
+      // 8-bit rows with zero points: dequantized, and quantized like a float embedding.
+      const m = newQuantMatrix(rows, D, 8, false)
+      const row = new Float32Array(D)
+      for (let i = 0; i < rows; i++) {
+        dequantizeNBitsRow(8, D, quant, scales, zp, i, row)
+        quantizeQ8(m, i, row, 1)
+      }
+      yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
+      continue
+    }
     const m = newQuantMatrix(rows, D, 4, emb.zp !== null)
     packMatMulNBits(m, 0, quant, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
+  }
+}
+
+/**
+ * A scales tensor's bytes as float16 (the QuantMatrix's scales): as they
+ * are, or float32 scales (a `q4` export's, where `q4f16` has float16)
+ * rounded to the nearest half.
+ */
+export function halfBytes(t: OnnxTensor, bytes: Uint8Array): Uint8Array {
+  if (t.dataType === OnnxDataType.FLOAT16) return bytes
+  if (t.dataType !== OnnxDataType.FLOAT)
+    throw new Error(`ONNX: ${t.name} has data type ${t.dataType}, expected float16 or float`)
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const out = new Uint8Array(bytes.length / 2)
+  for (let i = 0; i < bytes.length / 4; i++) {
+    const h = toHalf(view.getFloat32(i * 4, true))
+    out[2 * i] = h & 255
+    out[2 * i + 1] = h >> 8
+  }
+  return out
+}
+
+/**
+ * Row `n` of a MatMulNBits (or GatherBlockQuantized) weight as floats:
+ * scale · (q − zero point) per block of 32. `quant` is [rows][K / 32]
+ * [bits · 4 bytes] (4-bit: element 2i of a block in byte i's low nibble),
+ * `scales` float16 bytes, `zp` packed two blocks a byte for 4 bits (null:
+ * 8), a byte a block for 8 (null: 128).
+ */
+export function dequantizeNBitsRow(
+  bits: 4 | 8,
+  K: number,
+  quant: Uint8Array,
+  scales: Uint8Array,
+  zp: Uint8Array | null,
+  n: number,
+  out: Float32Array
+): void {
+  const blocks = K / 32
+  const half = halfTable()
+  const zpStride = bits === 4 ? Math.ceil(blocks / 2) : blocks
+  for (let b = 0; b < blocks; b++) {
+    const sp = (n * blocks + b) * 2
+    const scale = half[scales[sp] | (scales[sp + 1] << 8)]
+    const o = b * 32
+    if (bits === 8) {
+      const zero = zp ? zp[n * zpStride + b] : 128
+      const q = (n * blocks + b) * 32
+      for (let j = 0; j < 32; j++) out[o + j] = scale * (quant[q + j] - zero)
+    } else {
+      const zero = zp ? (zp[n * zpStride + (b >> 1)] >> ((b & 1) << 2)) & 15 : 8
+      const q = (n * blocks + b) * 16
+      for (let j = 0; j < 16; j++) {
+        const byte = quant[q + j]
+        out[o + 2 * j] = scale * ((byte & 15) - zero)
+        out[o + 2 * j + 1] = scale * ((byte >> 4) - zero)
+      }
+    }
+  }
+}
+
+/** The dims RoPE rotates per head in a layer of this type. */
+const rotatedDims = (type: LayerType, config: ModelConfig) => (type === "full_attention" ? config.ropeDimsFull : config.ropeDimsSliding)
+
+/**
+ * Checks a rotary sin cache's row for position 1 (headDim / 2 frequencies)
+ * against HF's layout: the first `rotated / 2` frequencies turn (sin > 0),
+ * the rest don't (sin 0).
+ */
+function checkRotaryCache(row: Uint8Array, cache: OnnxTensor, rotated: number, layer: number): void {
+  const sin = cache.dataType === OnnxDataType.FLOAT16 ? halvesToFloats(row) : new Float32Array(row.slice().buffer)
+  for (let j = 0; j < sin.length; j++) {
+    if (j < rotated / 2 ? sin[j] > 0 : sin[j] === 0) continue
+    throw new Error(`ONNX: layer ${layer}'s rotary cache doesn't rotate its first ${rotated} dims per head`)
   }
 }
 
@@ -410,8 +541,15 @@ function planOnnx(
   }
   // In the order the layer code takes them: norms, operator matrices,
   // conv kernel or q/k norms, MLP matrices.
-  for (const l of layers) {
+  for (const [i, l] of layers.entries()) {
     for (const t of l.norms) want(t)
+    if (l.hfHeads) {
+      // The sin cache's row for position 1, to check the head layout against (checkRotaryCache).
+      const cache = l.hfHeads
+      const row = cache.dims[1] * onnxElementSize(cache.dataType)
+      if (!cache.external || cache.external.length !== tensorBytes(cache)) throw new Error(`ONNX: ${cache.name} is expected in the external data file`)
+      add({ key: `rope@${i}`, location: cache.external.location, offset: cache.external.offset + row, length: row })
+    }
     for (const w of l.matrices.slice(0, -3)) wantNBits(w)
     for (const t of l.extra) want(t)
     for (const w of l.matrices.slice(-3)) wantNBits(w)
@@ -450,9 +588,9 @@ function planOnnx(
       ext(emb.weight, D * onnxElementSize(emb.weight.dataType), "floats")
       continue
     }
-    ext(emb.quant, blocks * 16, "quant")
+    ext(emb.quant, blocks * (emb.kind === "q8" ? 32 : 16), "quant")
     ext(emb.scales, blocks * 2, "scales")
-    if (emb.zp) ext(emb.zp, zpStride, "zp")
+    if (emb.zp) ext(emb.zp, emb.kind === "q8" ? blocks : zpStride, "zp")
   }
   return { config, layers, finalNorm, emb, chunkRows }
 }
@@ -499,6 +637,13 @@ type LayerPlan = {
   gate?: Segment
   /** attention: a separate gate projection, when the export has one. */
   gateWeight?: NBits
+  /**
+   * attention: the graph rotates q and k with RotaryEmbedding nodes over
+   * HF's head layout (dims j and j + headDim / 2), not the engine's
+   * (rotated dims first): the rotary sin cache, for the loader to check
+   * and reorder the heads by.
+   */
+  hfHeads?: OnnxTensor
 }
 
 /** Lookups over the graph. */
@@ -572,8 +717,12 @@ export class OnnxModel {
     return this.nbitsNode(path) !== undefined
   }
 
-  /** The MatMulNBits weight under `path` (see nbitsNode). */
-  nbits(path: string): NBits {
+  /**
+   * The MatMulNBits weight under `path`, as the vision loaders take one:
+   * 4-bit in blocks of 32 or 8-bit in blocks of a multiple of 32, scales in
+   * float16 or float32, zero points or none.
+   */
+  wideNBits(path: string): WideNBits {
     const node = this.nbitsNode(path)
     if (!node) throw new Error(`ONNX: no MatMulNBits node under ${path}`)
     const quant = this.init(node.inputs[1])
@@ -582,21 +731,28 @@ export class OnnxModel {
     const attr = (key: string) => node.attributes.get(key)?.i
     const N = attr("N")
     const K = attr("K")
-    if (
-      attr("bits") !== 4 ||
-      attr("block_size") !== 32 ||
-      N === undefined ||
-      K === undefined
-    ) {
-      throw new Error(`ONNX: ${node.name} is not 4-bit with block size 32`)
-    }
-    if (node.inputs[4] || node.inputs[5])
-      throw new Error(`ONNX: ${node.name} has g_idx or bias inputs`)
-    const blocks = K / 32
-    checkShape(quant, OnnxDataType.UINT8, N * blocks * 16)
-    checkShape(scales, OnnxDataType.FLOAT16, N * blocks)
-    if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(blocks / 2))
-    return { name: path, node, N, K, quant, scales, zp }
+    const bits = attr("bits")
+    const blockSize = attr("block_size")
+    if (N === undefined || K === undefined || blockSize === undefined || (bits !== 4 && bits !== 8) || blockSize % 32 || (bits === 4 && blockSize !== 32))
+      throw new Error(`ONNX: ${node.name} is not 4-bit in blocks of 32 or 8-bit in blocks of a multiple of 32`)
+    if (node.inputs[4] || node.inputs[5]) throw new Error(`ONNX: ${node.name} has g_idx or bias inputs`)
+    const blocks = Math.ceil(K / blockSize)
+    checkShape(quant, OnnxDataType.UINT8, N * blocks * ((blockSize * bits) / 8))
+    if (scales.dataType !== OnnxDataType.FLOAT16 && scales.dataType !== OnnxDataType.FLOAT)
+      throw new Error(`ONNX: ${scales.name} has data type ${scales.dataType}, expected float16 or float`)
+    checkShape(scales, scales.dataType, N * blocks)
+    if (zp) checkShape(zp, OnnxDataType.UINT8, N * (bits === 4 ? Math.ceil(blocks / 2) : blocks))
+    return { name: path, node, N, K, bits, blockSize, quant, scales, zp }
+  }
+
+  /**
+   * The MatMulNBits weight under `path` (see nbitsNode), as the text
+   * loader takes one: blocks of 32, 4-bit or 8-bit.
+   */
+  nbits(path: string): NBits {
+    const w = this.wideNBits(path)
+    if (w.blockSize !== 32) throw new Error(`ONNX: ${w.node.name} is not in blocks of 32`)
+    return w
   }
 
   /** What a layer needs, with the graph checked against the layout assumptions. */
@@ -654,7 +810,8 @@ export class OnnxModel {
       this.init(`${p}attn.q_norm.layernorm.weight`),
       this.init(`${p}attn.k_norm.layernorm.weight`)
     ]
-    this.checkRotary(i, type, config)
+    const hfHeads = this.checkRotary(i, type, config)
+    const heads = hfHeads ? { hfHeads } : {}
     if (q.N === qRows && !config.attentionGate) {
       // LFM2: no output gate.
       return {
@@ -662,7 +819,8 @@ export class OnnxModel {
         norms,
         matrices: [q, k, v, o, ...mlp],
         extra,
-        q: { start: 0, rows: qRows }
+        q: { start: 0, rows: qRows },
+        ...heads
       }
     }
     if (q.N === qRows) {
@@ -673,11 +831,12 @@ export class OnnxModel {
         matrices: [q, k, v, gateWeight, o, ...mlp],
         extra,
         q: { start: 0, rows: qRows },
-        gateWeight
+        gateWeight,
+        ...heads
       }
     }
     const { q: qSeg, gate } = this.qGateSegments(q, config)
-    return { type, norms, matrices: [q, k, v, o, ...mlp], extra, q: qSeg, gate }
+    return { type, norms, matrices: [q, k, v, o, ...mlp], extra, q: qSeg, gate, ...heads }
   }
 
   /** A Qwen3.5 layer (Gated DeltaNet or gated full attention). */
@@ -871,20 +1030,39 @@ export class OnnxModel {
   }
 
   /**
-   * GroupQueryAttention's rotary cache must rotate ropeDimsFull (full
-   * layers) or ropeDimsSliding dims, non-interleaved: the layout the
-   * loaders produce.
+   * Checks how a layer's attention rotates q and k, non-interleaved:
+   * - by GroupQueryAttention itself, whose rotary cache must rotate
+   *   ropeDimsFull (full layers) or ropeDimsSliding dims: each head's
+   *   rotated dims first, the layout the loaders produce;
+   * - or by RotaryEmbedding nodes before it, over all of each head (a
+   *   cache of headDim / 2 frequencies, HF's layout): returns their sin
+   *   cache, for the loader to check and reorder the heads by (see
+   *   LayerPlan.hfHeads).
    */
-  private checkRotary(i: number, type: LayerType, config: ModelConfig): void {
+  private checkRotary(i: number, type: LayerType, config: ModelConfig): OnnxTensor | undefined {
     const prefix = `/model/layers.${i}/`
     const gqa = this.graph.nodes.find(
       (n) => n.opType === "GroupQueryAttention" && n.name.startsWith(prefix)
     )
     if (!gqa) throw new Error(`ONNX: no GroupQueryAttention in layer ${i}`)
-    if (
-      gqa.attributes.get("do_rotary")?.i !== 1 ||
-      (gqa.attributes.get("rotary_interleaved")?.i ?? 0) !== 0
-    ) {
+    const expected =
+      type === "full_attention" ? config.ropeDimsFull : config.ropeDimsSliding
+    if (gqa.attributes.get("do_rotary")?.i !== 1) {
+      const rotary = this.graph.nodes.filter((n) => n.opType === "RotaryEmbedding" && n.name.startsWith(`${prefix}attn/`))
+      const sin = rotary[0]?.inputs[3]
+      const cache = sin ? this.graph.initializers.get(sin) : undefined
+      if (
+        rotary.length !== 2 ||
+        !cache ||
+        rotary.some((n) => n.inputs[3] !== sin || (n.attributes.get("interleaved")?.i ?? 0) !== 0 || (n.attributes.get("rotary_embedding_dim")?.i ?? 0) !== 0) ||
+        cache.dims.length !== 2 ||
+        cache.dims[1] * 2 !== config.headDim ||
+        !gqa.inputs.slice(0, 2).every((input) => rotary.some((n) => n.outputs[0] === input))
+      )
+        throw new Error(`ONNX: layer ${i}'s attention doesn't rotate q and k over each head, non-interleaved`)
+      return cache
+    }
+    if ((gqa.attributes.get("rotary_interleaved")?.i ?? 0) !== 0) {
       throw new Error(
         `ONNX: ${gqa.name} doesn't apply non-interleaved rotary embeddings`
       )
@@ -892,25 +1070,29 @@ export class OnnxModel {
     const cos = gqa.inputs[7]
     const dims = cos ? this.graph.initializers.get(cos)?.dims : undefined
     const rotated = dims ? dims[dims.length - 1] * 2 : Number.NaN
-    const expected =
-      type === "full_attention" ? config.ropeDimsFull : config.ropeDimsSliding
     if (rotated !== expected) {
       throw new Error(
         `ONNX: layer ${i} rotates ${rotated} dims per head, expected ${expected}`
       )
     }
+    return undefined
   }
 
-  /** The LM head: the MatMulNBits or MatMul node under `/lm_head/`. */
+  /**
+   * The LM head: the MatMulNBits or MatMul node under `/lm_head/`, or the
+   * one that writes the graph's `logits` (through a Cast, in a float16
+   * graph).
+   */
   private lmHead(): OnnxNode {
-    const heads = this.graph.nodes.filter(
-      (n) =>
-        n.name.startsWith("/lm_head/") &&
-        (n.opType === "MatMulNBits" || n.opType === "MatMul")
-    )
-    if (heads.length !== 1)
-      throw new Error(`ONNX: ${heads.length} LM head MatMul nodes`)
-    return heads[0]
+    const isHead = (n: OnnxNode | undefined): n is OnnxNode => n?.opType === "MatMulNBits" || n?.opType === "MatMul"
+    const heads = this.graph.nodes.filter((n) => n.name.startsWith("/lm_head/") && isHead(n))
+    if (heads.length === 1) return heads[0]
+    if (heads.length === 0) {
+      let node = this.producerOf("logits")
+      if (node?.opType === "Cast") node = this.producerOf(node.inputs[0])
+      if (isHead(node)) return node
+    }
+    throw new Error(`ONNX: ${heads.length} LM head MatMul nodes`)
   }
 
   /** The final norm's weight: the norm feeding the LM head. */
@@ -930,11 +1112,14 @@ export class OnnxModel {
 
   /**
    * The embedding (also the output head):
-   * - 4-bit, read by GatherBlockQuantized;
+   * - 4-bit, read by GatherBlockQuantized; or 8-bit with zero points
+   *   (LFM3-VL's), which the loader quantizes again as it does floats;
    * - floats read by a plain Gather, when the LM head is a MatMul over the
    *   same tensor transposed (tied): the loader quantizes it to 8 bits, as
    *   it does a GGUF's float embedding;
-   * - in a decoder-only graph (Qwen3.5's), the 4-bit tied head itself.
+   * - in a decoder-only graph, the tied head itself: 4-bit (Qwen3.5's), or
+   *   a float MatMul over the embedding transposed (LFM2-VL's decoders,
+   *   which read embeddings), quantized to 8 bits too.
    */
   embedding(D: number): OnnxEmbedding {
     const gather = this.graph.nodes.find(
@@ -942,31 +1127,37 @@ export class OnnxModel {
     )
     if (gather) {
       const attr = (key: string) => gather.attributes.get(key)?.i
+      const bits = attr("bits")
       if (
-        attr("bits") !== 4 ||
+        (bits !== 4 && bits !== 8) ||
         attr("block_size") !== 32 ||
         attr("quantize_axis") !== 1 ||
         (attr("gather_axis") ?? 0) !== 0
       ) {
         throw new Error(
-          `ONNX: ${gather.name} is not 4-bit, block 32, quantized along rows`
+          `ONNX: ${gather.name} is not 4-bit or 8-bit, block 32, quantized along rows`
         )
       }
-      const quant = this.init(gather.inputs[0])
+      // (An export may reshape the head's [rows][blocks][bytes] to rows for the Gather.)
+      const reshaped = this.has(gather.inputs[0]) ? undefined : this.producerOf(gather.inputs[0])
+      const quant = this.init(reshaped?.opType === "Reshape" ? reshaped.inputs[0] : gather.inputs[0])
       const scales = this.init(gather.inputs[2])
       const zp = gather.inputs[3] ? this.init(gather.inputs[3]) : null
       const N = quant.dims[0]
-      if (quant.dims[1] !== D / 2)
-        throw new Error(`ONNX: ${quant.name} is [${quant.dims}]`)
-      checkShape(quant, OnnxDataType.UINT8, (N * D) / 2)
+      checkShape(quant, OnnxDataType.UINT8, (N * D * bits) / 8)
       checkShape(scales, OnnxDataType.FLOAT16, (N * D) / 32)
-      if (zp) checkShape(zp, OnnxDataType.UINT8, N * Math.ceil(D / 64))
-      // The engine's head is the embedding: a 4-bit head is taken as
+      if (zp) checkShape(zp, OnnxDataType.UINT8, bits === 4 ? N * Math.ceil(D / 64) : (N * D) / 32)
+      // The engine's head is the embedding: a quantized head is taken as
       // tied (it is in these exports); a float one has its own weights.
-      if (this.lmHead().opType === "MatMul")
+      const head = this.lmHead()
+      if (head.opType === "MatMul")
         throw new Error(
           "ONNX: the LM head is a float MatMul with its own weights, not the embedding (only a tied head is supported)"
         )
+      if (bits === 8) {
+        if (head.inputs[1] !== quant.name) throw new Error(`ONNX: the LM head isn't ${quant.name} (only a tied head is supported)`)
+        return { kind: "q8", N, quant, scales, zp }
+      }
       return { kind: "q4", N, quant, scales, zp }
     }
     const floatGather = this.graph.nodes.find(
@@ -1002,6 +1193,20 @@ export class OnnxModel {
         )
       return { kind: "float", N, weight }
     }
+    const head = this.lmHead()
+    const transposed = head.opType === "MatMul" ? this.producerOf(head.inputs[1]) : undefined
+    if (transposed?.opType === "Transpose" && this.has(transposed.inputs[0])) {
+      // A decoder that reads embeddings (inputs_embeds: LFM2-VL's), its
+      // head a MatMul over the float embedding transposed: the tied
+      // embedding, quantized to 8 bits like any float one.
+      const weight = this.init(transposed.inputs[0])
+      const perm = transposed.attributes.get("perm")?.ints
+      if (weight.dataType !== OnnxDataType.FLOAT16 && weight.dataType !== OnnxDataType.FLOAT)
+        throw new Error(`ONNX: ${weight.name} has data type ${weight.dataType}, expected float16 or float`)
+      if (weight.dims.length !== 2 || weight.dims[1] !== D || (perm && (perm[0] !== 1 || perm[1] !== 0)))
+        throw new Error(`ONNX: the LM head's ${weight.name} is [${weight.dims}], not the embedding transposed`)
+      return { kind: "float", N: weight.dims[0], weight }
+    }
     if (this.hasNBits("/lm_head/")) {
       // A decoder-only graph (Qwen3.5's): the tied head is the embedding.
       const head = this.nbits("/lm_head/")
@@ -1021,7 +1226,8 @@ export class OnnxModel {
 /** The embedding as the graph has it (OnnxModel.embedding). */
 type OnnxEmbedding =
   | {
-      kind: "q4"
+      /** 4-bit rows, kept; or 8-bit rows with zero points, quantized again like floats. */
+      kind: "q4" | "q8"
       N: number
       quant: OnnxTensor
       scales: OnnxTensor

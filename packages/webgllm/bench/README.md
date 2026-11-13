@@ -32,7 +32,7 @@ Pages:
 - `lfm2-gguf.html`: LFM2.5 GGUF logits against llama.cpp's CPU ([LFM2-GGUF.md](LFM2-GGUF.md)).
 - `short-prefix.html`: short shared-prefix caching, a frozen baseline against this checkout ([FINDINGS](short-prefix-results/FINDINGS.md)).
 - `vision.html`: image input through `chat.completions.create` (synthetic images, a follow-up, two images, text after them), or `?prompts=/models/<dir>/prompts.json` for given PNGs and prompts ([docs/vision.md](../docs/vision.md)).
-- `vision-check.html`: the vision encoder against onnxruntime's features for the same patches (`?dir=<encoder folder under /models>&image=<name>&grid=HxW`: `<name>.pixels` and `<name>.features` under `/models`).
+- `vision-check.html`: the vision encoder against onnxruntime's features for the same patches (`?encoder=<an ONNX encoder graph or a GGUF projector under /models>&image=<name>&grid=HxW`: `<name>.pixels`, patches in merge order, and `<name>.features` under `/models`; `?dir=<folder>` is its `vision_encoder_q4f16.onnx`).
 - `driver.html`: one phone tab that loads each job written to `$MODELS_DIR/job.json` (`{"id":"<unique>","url":"/mem.html?…"}`) in a frame; `idle.html` or `about:blank` parks it.
 
 ## check.html

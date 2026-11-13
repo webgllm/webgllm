@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Vision-language builds</title>
+  <style>
+    body { background: #fff; color: #111; font: 13px/1.4 ui-monospace, monospace; margin: 12px; }
+    pre { white-space: pre-wrap; }
+    img { height: 96px; border: 1px solid #ccc; margin-right: 6px; }
+  </style>
+  <h1>Vision-language builds</h1>
+  <p>
+    A build's speed and memory through <code>chat.completions.create</code>:
+    <code>?model=LiquidAI/LFM2.5-VL-450M-GGUF&amp;ctx=8192&amp;len=512&amp;reply=64&amp;rounds=2&amp;hold=0</code>.
+  </p>
+  <div id="images"></div>
+  <pre id="out"></pre>
+  <script type="module">
+    // Loads the model, then: a text prompt of about `len` tokens and a
+    // `reply`-token answer (prompt and writing speed, `rounds` times, each a
+    // new prompt), an image that is one view, the same question about
+    // another image (the encoder warm in storage), and a larger image
+    // (LFM2.5-VL reads it in tiles). The model's memory claims are logged as
+    // they come (onMemoryClaim: its textures once loaded, and the room the
+    // vision encoder takes while it reads an image). At each CHECKPOINT the
+    // page posts a /result line and waits `hold` seconds, for a driver to
+    // measure the browser's processes.
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM2.5-VL-450M-GGUF"
+    const contextLength = Number(params.get("ctx") ?? 8192)
+    const length = Number(params.get("len") ?? 512)
+    const reply = Number(params.get("reply") ?? 64)
+    const rounds = Number(params.get("rounds") ?? 2)
+    const hold = Number(params.get("hold") ?? 0)
+    const MiB = (bytes) => `${(bytes / 2 ** 20).toFixed(1)} MiB`
+    const checkpoint = async (name) => {
+      log(`CHECKPOINT ${name}`)
+      await fetch("/result", { method: "POST", body: JSON.stringify({ page: "vl", model, checkpoint: name, at: Date.now() }) }).catch(() => {})
+      if (hold) await new Promise((resolve) => setTimeout(resolve, hold * 1000))
+    }
+    /** A width × height scene: a sun, a red house with a blue roof, and a line of text. */
+    const scene = (width, height, text) => {
+      const canvas = document.createElement("canvas")
+      canvas.width = width
+      canvas.height = height
+      const c = canvas.getContext("2d")
+      c.fillStyle = "#f5f5f0"
+      c.fillRect(0, 0, width, height)
+      c.fillStyle = "#3c8c46"
+      c.fillRect(0, height * 0.75, width, height * 0.25)
+      c.fillStyle = "#fac814"
+      c.beginPath()
+      c.arc(width * 0.18, height * 0.22, width * 0.1, 0, 2 * Math.PI)
+      c.fill()
+      c.fillStyle = "#be2828"
+      c.fillRect(width * 0.55, height * 0.4, width * 0.3, height * 0.35)
+      c.fillStyle = "#4646a0"
+      c.beginPath()
+      c.moveTo(width * 0.5, height * 0.4)
+      c.lineTo(width * 0.7, height * 0.18)
+      c.lineTo(width * 0.9, height * 0.4)
+      c.fill()
+      c.fillStyle = "#fff"
+      c.font = `bold ${Math.round(height * 0.09)}px Helvetica, Arial, sans-serif`
+      c.fillText(text, width * 0.08, height * 0.9)
+      const url = canvas.toDataURL("image/png")
+      const img = document.createElement("img")
+      img.src = url
+      document.getElementById("images").append(img)
+      return url
+    }
+    const passage =
+      "The lighthouse keeper kept a careful log of every ship that passed the point, noting its heading, its flag and the state of the sea. "
+    try {
+      let claimed = 0
+      let peak = 0
+      const webgllm = new WebGLLM({
+        onMemoryClaim: ({ bytes }) => {
+          claimed = bytes
+          peak = Math.max(peak, bytes)
+        }
+      })
+      await checkpoint("start")
+      let t = performance.now()
+      await webgllm.loadModel(model, { contextLength })
+      log("loaded", model, `${Math.round(performance.now() - t)} ms; textures ${MiB(claimed)}`)
+      const info = await webgllm.models.retrieve(model)
+      if (!info.supports.images) throw new Error(`${model} doesn't read images`)
+      const ask = async (label, content, maxTokens) => {
+        peak = claimed
+        t = performance.now()
+        const r = await webgllm.chat.completions.create({
+          model,
+          messages: [{ role: "user", content }],
+          temperature: 0,
+          max_tokens: maxTokens,
+          reasoning_effort: "none",
+          cache_prompt: false
+        })
+        const g = r.timings
+        log(
+          JSON.stringify({
+            label,
+            prompt_tokens: r.usage.prompt_tokens,
+            completion_tokens: r.usage.completion_tokens,
+            ms: Math.round(performance.now() - t),
+            images_ms: g.images_ms === undefined ? undefined : Math.round(g.images_ms),
+            prompt_ms: Math.round(g.prompt_ms),
+            prompt_tps: Math.round(g.prompt_tokens_per_second),
+            decode_tps: Number(g.decode_tokens_per_second.toFixed(1)),
+            textures: MiB(claimed),
+            peak: MiB(peak),
+            reply: (r.choices[0].message.content ?? "").slice(0, 160)
+          })
+        )
+        return r
+      }
+      await checkpoint("loaded")
+      // A warm-up, then text prompts of about `length` tokens (each begins differently: nothing cached).
+      await ask("warm-up", "Say hello.", 8)
+      for (let round = 0; round < rounds; round++) {
+        const text = `Note ${round + 1}. ${passage.repeat(Math.max(1, Math.round((length - 40) / 27)))}\nWrite a short story about the lighthouse keeper.`
+        await ask(`text ${round + 1}`, text, reply)
+      }
+      await checkpoint("text")
+      const question = "What text is written in this image? Then name the colors of the house and its roof."
+      const image = (url) => [{ type: "image_url", image_url: { url } }, { type: "text", text: question }]
+      await ask("image 512x384 (first: the encoder's files are read)", image(scene(512, 384, "HELLO 2026")), 48)
+      await checkpoint("image")
+      await ask("image 512x384 (another)", image(scene(512, 384, "WEBGL 77")), 48)
+      await ask("image 1024x768", image(scene(1024, 768, "HELLO 2026")), 48)
+      await checkpoint("large image")
+      log("ALL DONE")
+    } catch (error) {
+      log("ERROR:", error instanceof Error ? `${error.message}\n${error.stack}` : String(error))
+    }
+  </script>
+</html>

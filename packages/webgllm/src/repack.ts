@@ -499,3 +499,32 @@ export function q4WordsToRgba4(words: Uint32Array) {
   }
   return out
 }
+
+/**
+ * For each output row (head h, dim d), the HF row it comes from, so that
+ * the rotated dims of each head come first: HF's partial RoPE rotates dims
+ * j and j + headDim / 2 for j < ropeDims / 2, and the engine's layout has
+ * each head's rotated dims first, pairs (j, j + ropeDims / 2). HF dims
+ * [0, R) [H/2, H/2 + R) [R, H/2) [H/2 + R, H) for R = ropeDims / 2, H =
+ * headDim (see load-gguf.ts).
+ */
+export function headPermutation(
+  heads: number,
+  headDim: number,
+  ropeDims: number
+): Int32Array {
+  const R = ropeDims / 2
+  const H = headDim / 2
+  const perm = new Int32Array(heads * headDim)
+  for (let h = 0; h < heads; h++) {
+    for (let d = 0; d < headDim; d++) {
+      let src: number
+      if (d < R) src = d
+      else if (d < 2 * R) src = H + d - R
+      else if (d < H + R) src = d - R
+      else src = d
+      perm[h * headDim + d] = h * headDim + src
+    }
+  }
+  return perm
+}

@@ -21,6 +21,7 @@ import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
 import { checkPrefixCache } from "./prefix-cache-check.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
+import type { ByteSource } from "../src/weights.js"
 
 type Params = {
   model: WebGlTextModel
@@ -173,7 +174,7 @@ async function files(model: WebGlTextModel) {
   const meta = modelMeta(model)
   const t = meta.tokenizer
   const weights =
-    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data]
+    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data, ...(meta.files.moreData ?? [])]
   const all = [t.tokenizer, t.config, ...(t.chatTemplate ? [t.chatTemplate] : []), ...weights]
   // Without the Origin Private File System (a page that isn't a secure
   // context: a phone on http://<the Mac's address>), the files stream
@@ -239,12 +240,24 @@ async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>
       : loadOnnx({
           config: JSON.parse(await text(weightFiles[0])) as Record<string, unknown>,
           graph: await source(weightFiles[1]),
-          data: await source(weightFiles[2])
+          data: await onnxData(meta.files, weightFiles.slice(2), source)
         })
   const t0 = performance.now()
   await engine.load(pieces)
   const loadMs = performance.now() - t0
   return { engine, loadMs }
+}
+
+/** An ONNX graph's external data: its one file, or each of several by the name the graph gives it. */
+async function onnxData<F>(files: Extract<ReturnType<typeof modelMeta>["files"], { kind: "onnx" }>, data: Array<F>, source: (file: F) => Promise<ByteSource>) {
+  const sources = await Promise.all(data.map(source))
+  if (sources.length === 1) return sources[0]
+  const byName = new Map([files.data, ...(files.moreData ?? [])].map((file, i) => [file.path.split("/").pop()!, sources[i]]))
+  return (location: string) => {
+    const found = byName.get(location)
+    if (!found) throw new Error(`The graph reads ${location}, which isn't one of the model's files.`)
+    return found
+  }
 }
 
 const FILLER =

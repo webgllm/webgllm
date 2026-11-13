@@ -1,14 +1,19 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { WebGLLMError } from "./errors.js"
-import { api, code, fakeHub, recorded } from "./fake-hub.test.js"
+import { api, asRepo, code, fakeHub, recorded } from "./fake-hub.test.js"
 import { fileUrl, modelMeta, WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
+import type { WebGlModelMeta } from "./model-meta.js"
 import { hub, hubModelMeta, onnxCandidates, pickGguf, resolveModel, samplingFrom, sizeFrom } from "./resolve-model.js"
 
 test("the resolver agrees with the catalog on every catalog model", async () => {
   fakeHub()
+  const oneFile = hub.checkGraph
   for (const name of WEBGL_TEXT_MODELS) {
-    const catalog = WEBGL_MODEL_META[name]
+    const catalog: WebGlModelMeta = WEBGL_MODEL_META[name]
+    // The fake's graph check names one data file: a graph whose weights are in several (LFM2.5-VL 3B's) names its own.
+    const several = catalog.files.kind === "onnx" && catalog.files.moreData ? [catalog.files.data, ...catalog.files.moreData] : undefined
+    hub.checkGraph = several ? () => ({ dataFiles: several.map((file) => file.path.split("/").pop()!) }) : oneFile
     const meta = await hubModelMeta(name)
     assert.equal(meta.name, name)
     assert.equal(meta.format, catalog.format, name)
@@ -154,14 +159,37 @@ test("a repository with no weights webgllm loads fails clearly", async () => {
     assert.match(error.message, /no weights webgllm loads/)
     return true
   })
-  // A graph whose weights are in two files.
-  hub.checkGraph = () => ({ dataFiles: ["model.onnx_data", "model.onnx_data_1"] })
+  // A graph whose weights are in a file the repository doesn't have.
+  hub.checkGraph = () => ({ dataFiles: ["model.onnx_data", "model.onnx_data_2"] })
   await assert.rejects(resolveModel("someone/split-onnx"), (error: unknown) => {
     assert.ok(error instanceof WebGLLMError)
     assert.equal(error.code, "model-not-supported")
-    assert.match(error.message, /in 2 files/)
+    assert.match(error.message, /onnx\/model\.onnx_data_2, which the repository doesn't have/)
     return true
   })
+})
+
+test("an ONNX graph whose weights are in several data files lists them all", async () => {
+  const name = "someone/Split-350M-ONNX"
+  const base = asRepo("LiquidAI/LFM2.5-350M-ONNX", name)
+  const listing = base[api(name)]!.body as { siblings: Array<{ rfilename: string }> }
+  fakeHub({
+    ...base,
+    [api(name)]: { status: 200, body: { ...listing, siblings: [...listing.siblings, { rfilename: "onnx/model_q4f16.onnx_data_1" }] } }
+  })
+  hub.checkGraph = (bytes: Uint8Array) => {
+    const graph = new TextDecoder().decode(bytes)
+    return { dataFiles: [`${graph}_data_1`, `${graph}_data`] }
+  }
+  const meta = await resolveModel(name)
+  assert.ok(meta.files.kind === "onnx")
+  assert.deepEqual(meta.files.data, { repo: name, path: "onnx/model_q4f16.onnx_data_1" })
+  assert.deepEqual(meta.files.moreData, [{ repo: name, path: "onnx/model_q4f16.onnx_data" }])
+  const { modelFiles } = await import("./model-files.js")
+  assert.deepEqual(
+    modelFiles(meta).map((f) => f.path).filter((path) => path.includes("onnx_data")),
+    ["onnx/model_q4f16.onnx_data_1", "onnx/model_q4f16.onnx_data"]
+  )
 })
 
 test("names that aren't Hub repositories, and an unreachable Hub", async () => {
@@ -226,7 +254,8 @@ test("a URL model resolves its text model when the vision look can't get an answ
   fakeHub({
     ...servedAt(folder),
     [`${folder}/config.json`]: { status: 200, body: { model_type: "qwen3_5", vision_config: { model_type: "qwen3_5" } } },
-    [`${folder}/vision_encoder_q4f16.onnx`]: { status: 405, body: "Method Not Allowed" }
+    // (The first encoder graph the look asks for: the 8-bit one.)
+    [`${folder}/vision_encoder_q8.onnx`]: { status: 405, body: "Method Not Allowed" }
   })
   const meta = await resolveModel(`${folder}/decoder_model_merged_q4f16.onnx`)
   assert.equal(meta.files.kind, "onnx")

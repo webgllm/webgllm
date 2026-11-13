@@ -5,7 +5,7 @@
  * (sizes, context lengths) are looked up once per page.
  */
 import { blobSource } from "./byte-source.js"
-import { fileUrl, modelMeta } from "./model-meta.js"
+import { fileUrl, modelMeta, visionFileList } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
 import { diskName, isOldVersion, readManifest, removeManifest, storedFile, storedManifests } from "./storage.js"
 import type { ByteSource } from "./weights.js"
@@ -13,7 +13,7 @@ import type { ByteSource } from "./weights.js"
 /** Every file a model loads: tokenizer, chat template and weights (as the worker fetches them). */
 export function modelFiles(meta: WebGlModelMeta): Array<ModelFile> {
   const weights =
-    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data]
+    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data, ...(meta.files.moreData ?? [])]
   return [
     meta.tokenizer.tokenizer,
     meta.tokenizer.config,
@@ -28,8 +28,8 @@ export function modelFiles(meta: WebGlModelMeta): Array<ModelFile> {
  * deleting a model removes, and what another model's files keep.
  */
 export function storedModelFiles(meta: WebGlModelMeta): Array<ModelFile> {
-  const vision = meta.files.kind === "onnx" ? meta.files.vision : undefined
-  return [...modelFiles(meta), ...(vision ? [vision.graph, vision.data, vision.preprocessor] : [])]
+  const { vision } = meta.files
+  return [...modelFiles(meta), ...(vision ? visionFileList(vision) : [])]
 }
 
 /** The storage questions the pool asks (a fake one in tests). */

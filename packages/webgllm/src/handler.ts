@@ -18,7 +18,7 @@ import { modelMeta, rememberModel } from "./model-meta.js"
 import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
-import type { ModelFile } from "./model-meta.js"
+import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
@@ -40,6 +40,7 @@ import { CodedError, downloadError, errorCode } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
 import { imageProcessorConfig, type ImageProcessorConfig } from "./image.js"
 import { loadVision, planVision } from "./load-vision.js"
+import { loadVisionGguf, planVisionGguf } from "./load-vision-gguf.js"
 import {
   chatImages,
   contentId,
@@ -48,11 +49,15 @@ import {
   expandImageTokens,
   fetchImage,
   ImageCache,
+  imageTokenCount,
   patchesOf,
+  type ImageLayout,
   type ImageSlot,
+  type ImageView,
   type PreparedImage
 } from "./prompt-images.js"
 import { VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
+import type { VisionConfig, VisionPiece } from "./vision-weights.js"
 
 const post = (message: WorkerResponse) => postMessage({ ...message, [WEBGLLM]: true })
 
@@ -177,6 +182,8 @@ type Loaded = {
   images: ImageCache
   /** The image processor's settings, read the first time a prompt has images. */
   imageConfig?: ImageProcessorConfig
+  /** How the model places an image's rows (the vision encoder's config.positions), known once it has encoded one. */
+  imagePositions?: VisionConfig["positions"]
   /** Recent verified common content, for conservative short-prefix promotion. */
   previousShared?: number
   /** Milliseconds each phase of the load took. */
@@ -259,7 +266,7 @@ async function fetchFiles(model: string, signal: AbortSignal, share = 0.9) {
   const weights: Array<ModelFile> =
     meta.files.kind === "gguf"
       ? [meta.files.model]
-      : [meta.files.config, meta.files.graph, meta.files.data]
+      : [meta.files.config, meta.files.graph, meta.files.data, ...(meta.files.moreData ?? [])]
   const template = meta.tokenizer.chatTemplate
     ? [meta.tokenizer.chatTemplate]
     : []
@@ -442,7 +449,7 @@ async function load(
               unknown
             >,
             graph: blobSource(weightFiles[1]),
-            data: blobSource(weightFiles[2])
+            data: onnxData(meta.files, weightFiles.slice(2))
           })
     let layers = 0
     await engine.load(pieces, (piece) => {
@@ -717,6 +724,21 @@ const errorMessage = (error: unknown) =>
       ? error.message
       : String(error)
 
+/**
+ * An ONNX model's external data, as loadOnnx takes it: its one file, or
+ * (where the graph's weights are in several) each by the name the graph
+ * gives it, the file's name in the graph's folder.
+ */
+function onnxData(files: Extract<WebGlModelMeta["files"], { kind: "onnx" }>, blobs: Array<Blob>) {
+  if (!files.moreData?.length) return blobSource(blobs[0])
+  const sources = new Map([files.data, ...files.moreData].map((file, i) => [file.path.split("/").pop()!, blobSource(blobs[i])]))
+  return (location: string) => {
+    const source = sources.get(location)
+    if (!source) throw new Error(`The graph reads ${location}, which isn't one of the model's files.`)
+    return source
+  }
+}
+
 /** One of a model's files: stored, or downloaded now. */
 async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
   return (
@@ -730,6 +752,28 @@ async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
 }
 
 /**
+ * How the model's chat template writes an image, in its tokenizer's ids
+ * (see prompt-images.ts ImageSlot): LFM2-VL's processor (the one whose
+ * patch rows end in the channel) replaces a bare `<image>`; Qwen3.5's and
+ * LFM3-VL's fill a placeholder between `<|vision_start|>` and
+ * `<|vision_end|>`.
+ */
+function imageSlotOf(tokenizer: Tokenizer, config: ImageProcessorConfig): ImageSlot {
+  const id = (token: string) => {
+    const found = tokenizer.tokenToId(token)
+    if (found == null) throw new Error(`The tokenizer has no ${token} token for images.`)
+    return found
+  }
+  if (config.layout === "channel-last") {
+    return { kind: "bare", pad: id("<image>"), start: id("<|image_start|>"), end: id("<|image_end|>"), thumbnail: id("<|img_thumbnail|>"), tile: (row, col) => id(`<|img_row_${row}_col_${col}|>`) }
+  }
+  return { kind: "wrapped", start: id("<|vision_start|>"), pad: tokenizer.tokenToId("<|image_pad|>") ?? id("<|image|>"), end: id("<|vision_end|>") }
+}
+
+/** A view of an image in a prompt: where its rows start. */
+type PromptView = { start: number; view: ImageView }
+
+/**
  * The prompt's images, prepared (fetched and resized) or found among
  * recent ones, and the prompt with each image slot expanded to its image's
  * tokens, with the cache's keys (see prompt-images.ts). Images are taken
@@ -740,26 +784,20 @@ async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
  */
 async function promptImages(model: Loaded, prompt: Array<number>, chat: GenerateRequest["chat"], reuse: boolean, signal: AbortSignal) {
   const wanted = chatImages(chat)
-  if (!wanted.length) return { prompt, keys: prompt, images: [] as Array<{ start: number; image: PreparedImage }> }
+  if (!wanted.length) return { prompt, keys: prompt, images: [] as Array<PromptView> }
   const files = (await resolveModel(model.model, signal)).files
-  if (files.kind !== "onnx" || !files.vision) throw new Error(`${model.model} doesn't read images.`)
+  if (!files.vision) throw new Error(`${model.model} doesn't read images.`)
   const { tokenizer, engine } = model
-  const slot = {
-    start: tokenizer.tokenToId("<|vision_start|>"),
-    pad: tokenizer.tokenToId("<|image_pad|>"),
-    end: tokenizer.tokenToId("<|vision_end|>")
-  }
-  if (slot.start == null || slot.pad == null || slot.end == null) throw new Error("The tokenizer has no image tokens.")
-  const imageSlot = slot as ImageSlot
-  const slots = countImageSlots(prompt, imageSlot)
-  if (slots !== wanted.length) throw new Error(`The prompt has ${slots} image slots for ${wanted.length} images.`)
   model.imageConfig ??= imageProcessorConfig(JSON.parse(await (await modelFile(files.vision.preprocessor, signal)).text()))
   const config = model.imageConfig
+  const slot = imageSlotOf(tokenizer, config)
+  const slots = countImageSlots(prompt, slot)
+  if (slots !== wanted.length) throw new Error(`The prompt has ${slots} image slots for ${wanted.length} images.`)
   const maxPatches = engine.gpu.limits.maxTextureSize
-  // Tokens so far: the text, and each image's (its slot's pad stands in until it's sized).
+  // Tokens so far: the text, and each image's (its slot's placeholder stands in until it's sized).
   let tokens = prompt.length - slots
-  const fits = (more: number) => {
-    tokens += more
+  const fits = (image: ImageLayout) => {
+    tokens += imageTokenCount(image, slot)
     if (tokens >= engine.contextLength)
       throw new CodedError(
         `This session is too long for the model: its images alone take it past ${engine.contextLength} tokens, the most it can read, reply included. Send fewer or smaller images (detail: "low"), or start a new session.`,
@@ -779,7 +817,7 @@ async function promptImages(model: Loaded, prompt: Array<number>, chat: Generate
       content = await contentId(blob, image.detail)
       found = local.get(content) ?? (reuse ? model.images.get(content) : undefined)
     }
-    if (found) fits(found.height * found.width)
+    if (found) fits(found)
     else {
       found = await decodeImage(blob!, image.detail, config, maxPatches, fits, signal)
       if (reuse) model.images.set(image, content!, found)
@@ -788,47 +826,61 @@ async function promptImages(model: Loaded, prompt: Array<number>, chat: Generate
     if (content) local.set(content, found)
     prepared.push(found)
   }
-  const expanded = expandImageTokens(prompt, imageSlot, prepared)
-  return { prompt: expanded.tokens, keys: expanded.keys, images: expanded.starts.map((start, i) => ({ start, image: prepared[i] })) }
+  const expanded = expandImageTokens(prompt, slot, prepared)
+  const views = prepared.flatMap((image) => image.views)
+  return { prompt: expanded.tokens, keys: expanded.keys, images: expanded.starts.map((start, i): PromptView => ({ start, view: views[i] })) }
 }
 
 /**
- * Encodes the images whose rows the prompt reads from `start` on (the
+ * Encodes the image views whose rows the prompt reads from `start` on (the
  * cache holds the rest), loading the vision encoder for them and freeing
  * it after: text-only prompts never load it. Returns the ms the load took
  * (its download included; 0 without one).
  */
-async function encodeImages(model: Loaded, images: Array<{ start: number; image: PreparedImage }>, start: number, signal: AbortSignal) {
-  const needed = images.filter(
-    ({ start: at, image }) => at + image.height * image.width > start && !image.features
-  )
+async function encodeImages(model: Loaded, images: Array<PromptView>, start: number, signal: AbortSignal) {
+  const needed = images.filter(({ start: at, view }) => at + view.height * view.width > start && !view.features)
   if (!needed.length) return 0
   const loadAt = performance.now()
-  const meta = (await resolveModel(model.model)).files
-  if (meta.kind !== "onnx" || !meta.vision) throw new Error(`${model.model} doesn't read images.`)
-  const [graph, data] = await Promise.all([modelFile(meta.vision.graph, signal), modelFile(meta.vision.data, signal)])
+  const { vision } = (await resolveModel(model.model)).files
+  if (!vision) throw new Error(`${model.model} doesn't read images.`)
   const { engine } = model
-  // Room for the encoder's weights and its largest image's work while it's
-  // loaded, sized from the graph as the encoder allocates them.
-  const graphBytes = new Uint8Array(await graph.arrayBuffer())
-  const { config } = planVision(graphBytes)
+  // The encoder's shapes, read before its weights: from a GGUF projector's header, or an ONNX graph.
+  let config: VisionConfig
+  let bits: 4 | 8
+  let zeros: boolean
+  let pieces: () => AsyncIterable<VisionPiece>
+  if ("projector" in vision) {
+    const source = blobSource(await modelFile(vision.projector, signal))
+    ;({ config, bits, zeros } = await planVisionGguf(source))
+    pieces = () => loadVisionGguf(source)
+  } else {
+    const [graph, data] = await Promise.all([modelFile(vision.graph, signal), modelFile(vision.data, signal)])
+    const graphBytes = new Uint8Array(await graph.arrayBuffer())
+    ;({ config, bits, zeros } = planVision(graphBytes))
+    pieces = () => loadVision({ graph: graphBytes, data: blobSource(data) })
+  }
+  if (config.outWidth !== engine.config.hiddenSize)
+    throw new Error(`The vision encoder writes ${config.outWidth}-wide rows; the model reads ${engine.config.hiddenSize}.`)
+  model.imagePositions = config.positions
+  // Room for the encoder's weights and its largest view's work while it's
+  // loaded, sized as the encoder allocates them.
   const maxTexture = engine.gpu.limits.maxTextureSize
   const work = Math.max(
-    ...needed.map(({ image }) => visionWorkBytes(config, image.height * config.merge, image.width * config.merge, maxTexture))
+    ...needed.map(({ view }) => visionWorkBytes(config, view.height * config.merge, view.width * config.merge, maxTexture))
   )
   const encoder = new VisionEncoder(engine.gpu)
   try {
     signal.throwIfAborted()
-    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config) + work, signal)
+    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config, bits, zeros) + work, signal)
     signal.throwIfAborted()
-    await encoder.load(loadVision({ graph: graphBytes, data: blobSource(data) }), signal)
-    if (encoder.config.outWidth !== engine.config.hiddenSize)
-      throw new Error(`The vision encoder writes ${encoder.config.outWidth}-wide rows; the model reads ${engine.config.hiddenSize}.`)
+    await encoder.load(pieces(), signal)
     const loadMs = performance.now() - loadAt
-    for (const { image } of needed) {
+    for (const { view } of needed) {
       signal.throwIfAborted()
-      image.features = await encoder.encode(patchesOf(image, model.imageConfig!), signal)
-      image.pixels = null
+      // (A view the prompt has twice is encoded once.)
+      if (view.features) continue
+      view.features = await encoder.encode(patchesOf(view, model.imageConfig!), signal)
+      view.pixels = null
     }
     return loadMs
   } finally {
@@ -984,7 +1036,10 @@ async function generate(request: GenerateRequest) {
     if (stopped.has(id)) return post({ type: "done", id, stats: { ...empty, inputTokens: prompt.length, cachedTokens: start }, finishReason: "stop" })
     throw error
   }
-  engine.setImages(images.map(({ start: at, image }) => ({ start: at, height: image.height, width: image.width, features: image.features })))
+  engine.setImages(
+    images.map(({ start: at, view }) => ({ start: at, height: view.height, width: view.width, features: view.features })),
+    model.imagePositions
+  )
   const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix

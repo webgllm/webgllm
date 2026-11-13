@@ -13,18 +13,25 @@ export type Answer = { status: number; body: unknown }
  * has one, a graph answers with its own name, a config.json with {}, and
  * the graph checks (decoder and vision encoder) say the graph's weights
  * are in `<graph>_data`, as the exports' are. Tests of the real check set it back.
+ * A GGUF projector (`mmproj…gguf`) answers too, and its check passes for
+ * Liquid AI's (the types the encoder runs), not for others (Qwen's).
  */
 export function fakeHub(extra: Record<string, Answer | (() => Answer)> = {}) {
   const answers: Record<string, Answer | (() => Answer)> = { ...recorded, ...extra }
   const calls: Array<string> = []
   hub.checkGraph = (bytes: Uint8Array) => ({ dataFiles: [`${new TextDecoder().decode(bytes)}_data`] })
   hub.checkVisionGraph = (bytes: Uint8Array) => [`${new TextDecoder().decode(bytes)}_data`]
+  hub.checkProjector = async (source) => {
+    if (new TextDecoder().decode(await source.read(0, source.size)) !== "lfm") throw new Error("not a projector type the encoder runs")
+  }
   hub.fetch = async (url: string) => {
     calls.push(url)
     const found = answers[url]
     const answer = typeof found === "function" ? found() : found
     if (!answer) {
       if (url.endsWith(".onnx")) return new Response(url.split("/").pop())
+      // A GGUF projector, asked for its size before its header is read.
+      if (/\/mmproj[^/]*\.gguf$/.test(url)) return new Response(/LFM/.test(url) ? "lfm" : "etc", { headers: { "content-length": "3" } })
       if (url.endsWith("/resolve/main/config.json")) return new Response("{}")
       return new Response("Entry not found", { status: 404, headers: { "X-Error-Code": "EntryNotFound" } })
     }

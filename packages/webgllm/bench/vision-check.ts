@@ -1,12 +1,16 @@
 /**
- * The vision encoder (src/vision.ts) against reference features: loads
- * `/models/<dir>/vision_encoder_q4f16.onnx` (+ data), encodes the patches in
- * `/models/<image>.pixels` and compares with `/models/<image>.features`
- * (onnxruntime's, from the same patches). `?dir=vision08&image=circle-256&grid=16x16&rounds=3`.
+ * The vision encoder (src/vision.ts) against reference features: loads an
+ * encoder under `/models` (an ONNX graph with its data file beside it, or a
+ * GGUF projector), encodes the patches in `/models/<image>.pixels` (merge
+ * order, as the engine cuts them) and compares with
+ * `/models/<image>.features` (onnxruntime's, from the same patches).
+ * `?encoder=vision08/vision_encoder_q4f16.onnx&image=circle-256&grid=16x16&rounds=3`
+ * (`?dir=vision08` is that encoder path).
  */
 import { blobSource } from "../src/byte-source.js"
 import { Gpu } from "../src/gpu/gl.js"
-import { loadVision } from "../src/load-vision.js"
+import { loadVision, planVision } from "../src/load-vision.js"
+import { loadVisionGguf } from "../src/load-vision-gguf.js"
 import { VisionEncoder } from "../src/vision.js"
 
 const out = document.getElementById("out") as HTMLPreElement
@@ -15,7 +19,7 @@ const log = (text: string) => {
   void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
 }
 const params = new URLSearchParams(location.search)
-const dir = params.get("dir") ?? "vision08"
+const encoderPath = params.get("encoder") ?? `${params.get("dir") ?? "vision08"}/vision_encoder_q4f16.onnx`
 const image = params.get("image") ?? "circle-256"
 const [gridH, gridW] = (params.get("grid") ?? "16x16").split("x").map(Number)
 const rounds = Number(params.get("rounds") ?? 3)
@@ -29,11 +33,17 @@ async function bytes(path: string) {
 try {
   log(navigator.userAgent)
   const gpu = new Gpu(document.getElementById("gl") as HTMLCanvasElement)
-  const graph = await bytes(`/models/${dir}/vision_encoder_q4f16.onnx`)
-  const data = blobSource(await (await fetch(`/models/${dir}/vision_encoder_q4f16.onnx_data`)).blob())
   const encoder = new VisionEncoder(gpu)
   let t = performance.now()
-  await encoder.load(loadVision({ graph, data }))
+  if (/\.gguf$/i.test(encoderPath)) {
+    await encoder.load(loadVisionGguf(blobSource(await (await fetch(`/models/${encoderPath}`)).blob())))
+  } else {
+    const graph = await bytes(`/models/${encoderPath}`)
+    const dataFile = planVision(graph).reads.find((r) => r.tensor.external)?.tensor.external?.location
+    const folder = encoderPath.slice(0, encoderPath.lastIndexOf("/") + 1)
+    const data = blobSource(await (await fetch(`/models/${folder}${dataFile}`)).blob())
+    await encoder.load(loadVision({ graph, data }))
+  }
   await gpu.finish()
   log(`loaded in ${Math.round(performance.now() - t)} ms: ${(encoder.bytes / 2 ** 20).toFixed(1)} MiB of textures; ${JSON.stringify(encoder.config)}`)
   const pixels = new Float32Array((await bytes(`/models/${image}.pixels`)).buffer)
