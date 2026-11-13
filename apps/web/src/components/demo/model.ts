@@ -13,8 +13,9 @@ import { WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 
 /**
- * The models the demo offers: regular builds, each with tools. Qwen3.5 2B's
- * ONNX build has a vision encoder, so it also reads images.
+ * The models the demo offers: regular builds, each with tools. Those with a
+ * vision encoder also read images: Qwen3.5 2B's ONNX build, and Liquid AI's
+ * vision-language models (LFM3-VL and LFM2.5-VL, in their GGUF builds).
  */
 const MODEL_NAMES = [
   ['LiquidAI/LFM3-1.7B-GGUF', 'LFM3 1.7B'],
@@ -23,6 +24,10 @@ const MODEL_NAMES = [
   ['LiquidAI/LFM2.5-1.2B-Instruct-GGUF', 'LFM2.5 1.2B Instruct'],
   ['LiquidAI/LFM2.5-1.2B-Thinking-GGUF', 'LFM2.5 1.2B Thinking'],
   ['LiquidAI/LFM2.5-350M-GGUF', 'LFM2.5 350M'],
+  ['LiquidAI/LFM3-VL-2B-GGUF', 'LFM3-VL 2B'],
+  ['LiquidAI/LFM2.5-VL-3B-GGUF', 'LFM2.5-VL 3B'],
+  ['LiquidAI/LFM2.5-VL-1.6B-GGUF', 'LFM2.5-VL 1.6B'],
+  ['LiquidAI/LFM2.5-VL-450M-GGUF', 'LFM2.5-VL 450M'],
 ] as const;
 
 /**
