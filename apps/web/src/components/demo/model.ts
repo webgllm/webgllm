@@ -13,14 +13,13 @@ import { WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
 
 /**
- * The models the demo offers: regular builds, each with tools. Those with a
- * vision encoder also read images: Qwen3.5 2B's ONNX build, and Liquid AI's
- * vision-language models (LFM3-VL and LFM2.5-VL, in their GGUF builds).
+ * The models the demo offers: GGUF builds, each with tools. Those with a
+ * vision projector also read images: Qwen3.5 2B, and Liquid AI's
+ * vision-language models (LFM3-VL and LFM2.5-VL).
  */
 const MODEL_NAMES = [
   ['LiquidAI/LFM3-1.7B-GGUF', 'LFM3 1.7B'],
   ['unsloth/Qwen3.5-2B-GGUF', 'Qwen3.5 2B'],
-  ['onnx-community/Qwen3.5-2B-ONNX', 'Qwen3.5 2B ONNX'],
   ['LiquidAI/LFM2.5-1.2B-Instruct-GGUF', 'LFM2.5 1.2B Instruct'],
   ['LiquidAI/LFM2.5-1.2B-Thinking-GGUF', 'LFM2.5 1.2B Thinking'],
   ['LiquidAI/LFM2.5-350M-GGUF', 'LFM2.5 350M'],
