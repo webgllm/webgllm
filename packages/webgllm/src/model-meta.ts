@@ -31,6 +31,27 @@ export type VisionFiles =
   | { graph: ModelFile; data: ModelFile; preprocessor: ModelFile }
   | { projector: ModelFile; preprocessor: ModelFile }
 
+/**
+ * An ONNX graph's external data as loadOnnx takes it, from `sources` (one
+ * per data file, `data` then `moreData`): the one source, or, where the
+ * graph's weights are in several files, each by the location the graph
+ * gives it. A location is the file's path from the graph's folder, its
+ * subfolders kept (`weights/layers.bin`): two files of the same name in
+ * different folders are different files.
+ */
+export function onnxDataSources<S>(files: Extract<WebGlModelMeta["files"], { kind: "onnx" }>, sources: ReadonlyArray<S>): S | ((location: string) => S) {
+  if (!files.moreData?.length) return sources[0]
+  const folder = files.graph.path.slice(0, files.graph.path.lastIndexOf("/") + 1)
+  const byLocation = new Map(
+    [files.data, ...files.moreData].map((file, i) => [file.path.startsWith(folder) ? file.path.slice(folder.length) : file.path, sources[i]])
+  )
+  return (location: string) => {
+    const source = byLocation.get(location.replace(/^(\.\/)+/, ""))
+    if (source === undefined) throw new Error(`The graph reads ${location}, which isn't one of the model's files.`)
+    return source
+  }
+}
+
 /** A vision encoder's files, each one (as storedModelFiles lists them). */
 export const visionFileList = (vision: VisionFiles): Array<ModelFile> =>
   "projector" in vision ? [vision.projector, vision.preprocessor] : [vision.graph, vision.data, vision.preprocessor]

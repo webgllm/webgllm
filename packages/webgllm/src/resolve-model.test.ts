@@ -192,6 +192,42 @@ test("an ONNX graph whose weights are in several data files lists them all", asy
   )
 })
 
+test("a graph's data files in subfolders are found by the locations the graph gives them, same names apart", async () => {
+  const { onnxDataSources } = await import("./model-meta.js")
+  const name = "someone/Subfolders-350M-ONNX"
+  const base = asRepo("LiquidAI/LFM2.5-350M-ONNX", name)
+  const listing = base[api(name)]!.body as { siblings: Array<{ rfilename: string }> }
+  const locations = ["weights/layers.bin", "extra/layers.bin", "head.bin"]
+  fakeHub({
+    ...base,
+    [api(name)]: { status: 200, body: { ...listing, siblings: [...listing.siblings, ...locations.map((l) => ({ rfilename: `onnx/${l}` }))] } }
+  })
+  hub.checkGraph = () => ({ dataFiles: locations })
+  const meta = await resolveModel(name)
+  assert.ok(meta.files.kind === "onnx")
+  assert.deepEqual([meta.files.data, ...(meta.files.moreData ?? [])].map((f) => f.path), locations.map((l) => `onnx/${l}`))
+  // What the loader asks for is the graph's location, not the file's name.
+  const data = onnxDataSources(meta.files, ["first", "second", "third"])
+  assert.ok(typeof data === "function")
+  assert.deepEqual(locations.map(data), ["first", "second", "third"])
+  assert.throws(() => data("layers.bin"), /The graph reads layers\.bin, which isn't one of the model's files\./)
+  // A graph given by its address: its data files are beside it, by the same locations.
+  const byUrl = onnxDataSources(
+    {
+      kind: "onnx",
+      graph: { repo: "https://example.com/models", path: "model.onnx" },
+      data: { repo: "https://example.com/models", path: "weights/layers.bin" },
+      moreData: [{ repo: "https://example.com/models", path: "extra/layers.bin" }],
+      config: { repo: "https://example.com/models", path: "config.json" }
+    },
+    [1, 2]
+  )
+  assert.ok(typeof byUrl === "function")
+  assert.deepEqual([byUrl("weights/layers.bin"), byUrl("./extra/layers.bin")], [1, 2])
+  // One data file is the graph's whatever it calls it.
+  assert.equal(onnxDataSources({ ...meta.files, moreData: undefined }, ["only"]), "only")
+})
+
 test("names that aren't Hub repositories, and an unreachable Hub", async () => {
   const calls = fakeHub()
   assert.equal(await code(resolveModel("gpt-4o")), "model-not-supported")

@@ -27,8 +27,15 @@ type GpuBlock =
 
 type GpuMerger = { norm: GpuNorm; linear1: GpuLinear; linear2: GpuLinear }
 
+/**
+ * A view to encode: its patch grid, and its patches (ImagePatches'
+ * pixels), asked for when the patch projection reads them and not held
+ * after it.
+ */
+export type ViewSource = { gridH: number; gridW: number; pixels: () => Float32Array }
+
 /** A view on its way through the encoder: its residual stream (each step writes `next`, and the two swap), and its RoPE table. */
-type ViewState = { image: ImagePatches; count: number; x: Texture; next: Texture; cs: Texture | null }
+type ViewState = { view: ViewSource; count: number; x: Texture; next: Texture; cs: Texture | null }
 
 /** The blocks' tensors, for views of up to their rows. */
 type Work = { normed: Texture; wide: Texture; qk: Texture | null; mixed: Texture; inner: Texture; gated: Texture | null }
@@ -540,23 +547,29 @@ export class VisionEncoder {
   }
 
   /** A view's RoPE table and residual stream (`next` is the caller's to give: see encodeStream). */
-  private open(image: ImagePatches): ViewState {
+  private open(view: ViewSource): ViewState {
     const c = this.config
-    const { gridH, gridW } = image
+    const { gridH, gridW } = view
     const count = gridH * gridW
     if (count > this.maxPatches) throw new RangeError(`An image of ${count} patches is past this GPU's ${this.maxPatches}.`)
     if (gridH % c.merge || gridW % c.merge) throw new RangeError("The patch grid isn't in whole merge blocks.")
-    if (image.pixels.length !== count * c.patchValues) throw new RangeError("The image's patches don't match the encoder.")
     const cs = c.rope ? this.f32(c.headDim, count, ropeTable(this.invFreq!, gridH, gridW, c.merge)) : null
     const x = this.f32(c.width, count)
-    return { image, count, x, next: x, cs }
+    return { view, count, x, next: x, cs }
   }
 
-  /** The patch projection of a view into its stream; its inputs are freed once it has read them. */
+  /**
+   * The patch projection of a view into its stream. The view's patches
+   * are made here and uploaded, and nothing keeps them after: only this
+   * step reads them, so a request's views don't all hold theirs at once
+   * (7 views of a large photo are 21 MiB of floats).
+   */
   private async embed(s: ViewState) {
     const c = this.config
-    const { gridH, gridW } = s.image
-    const pixels = this.f32(c.patchValues, s.count, s.image.pixels)
+    const { gridH, gridW } = s.view
+    const values = s.view.pixels()
+    if (values.length !== s.count * c.patchValues) throw new RangeError("The image's patches don't match the encoder.")
+    const pixels = this.f32(c.patchValues, s.count, values)
     const pos = this.positions
       ? this.f32(c.width, s.count, positionEmbeddings(this.positions, c.grid, c.width, gridH, gridW, c.merge, c.interpolation))
       : null
@@ -591,7 +604,7 @@ export class VisionEncoder {
     const c = this.config
     const W = c.width
     const { count } = s
-    const { gridH, gridW } = s.image
+    const { gridH, gridW } = s.view
     await this.blockNorm(s.x, b.norm1, w.normed, count)
     if (b.type === "attention") {
       const qkRows = attentionRows(c).qk
@@ -668,7 +681,7 @@ export class VisionEncoder {
   async encode(image: ImagePatches, signal?: AbortSignal): Promise<Float32Array> {
     this.signal = signal
     try {
-      const s = this.open(image)
+      const s = this.open({ gridH: image.gridH, gridW: image.gridW, pixels: () => image.pixels })
       s.next = this.f32(this.config.width, s.count)
       await this.embed(s)
       const w = this.work(s.count)
@@ -683,16 +696,17 @@ export class VisionEncoder {
   }
 
   /**
-   * The views' embedding rows (as encode's, in `images`' order) from the
+   * The views' embedding rows (as encode's, in `views`' order) from the
    * encoder's pieces as they arrive, without holding the encoder: each
    * piece's weights are on the GPU only while every view passes through
    * that piece, then freed, so the most held at once is one block (or the
    * merger) beside the views' work (visionStreamBytes), not the whole
    * tower. The draws and the bytes read are the same as load's and
-   * encode's. The pieces must come in the encoder's order: its config,
-   * the patch projection, the blocks, the merger.
+   * encode's. A view's patches are asked for as its patch projection
+   * runs, one view at a time. The pieces must come in the encoder's
+   * order: its config, the patch projection, the blocks, the merger.
    */
-  async encodeStream(pieces: AsyncIterable<VisionPiece>, images: Array<ImagePatches>, signal?: AbortSignal): Promise<Array<Float32Array>> {
+  async encodeStream(pieces: AsyncIterable<VisionPiece>, sources: Array<ViewSource>, signal?: AbortSignal): Promise<Array<Float32Array>> {
     this.signal = signal
     const views: Array<ViewState> = []
     // One spare stream texture per size of view: a step writes it, and it swaps with the view's.
@@ -719,8 +733,8 @@ export class VisionEncoder {
         if (piece.kind === "patch") {
           if (views.length) throw new Error("The vision encoder's weights are out of order.")
           this.takePatch(piece)
-          for (const image of images) {
-            const s = this.open(image)
+          for (const source of sources) {
+            const s = this.open(source)
             views.push(s)
             if (!spare.has(s.count)) spare.set(s.count, this.f32(c.width, s.count))
           }

@@ -15,7 +15,7 @@ import { names } from "./memory-names.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
-import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
+import { fileUrl, modelMeta, onnxDataSources, type WebGlTextModel } from "../src/model-meta.js"
 import { resolveModel } from "../src/resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
@@ -248,16 +248,9 @@ async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>
   return { engine, loadMs }
 }
 
-/** An ONNX graph's external data: its one file, or each of several by the name the graph gives it. */
+/** An ONNX graph's external data: its one file, or each of several by the location the graph gives it. */
 async function onnxData<F>(files: Extract<ReturnType<typeof modelMeta>["files"], { kind: "onnx" }>, data: Array<F>, source: (file: F) => Promise<ByteSource>) {
-  const sources = await Promise.all(data.map(source))
-  if (sources.length === 1) return sources[0]
-  const byName = new Map([files.data, ...(files.moreData ?? [])].map((file, i) => [file.path.split("/").pop()!, sources[i]]))
-  return (location: string) => {
-    const found = byName.get(location)
-    if (!found) throw new Error(`The graph reads ${location}, which isn't one of the model's files.`)
-    return found
-  }
+  return onnxDataSources(files, await Promise.all(data.map(source)))
 }
 
 const FILLER =

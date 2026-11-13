@@ -81,14 +81,63 @@ export type ImageSlot =
   | { kind: "wrapped"; start: number; pad: number; end: number }
   | { kind: "bare"; pad: number; start: number; end: number; thumbnail: number; tile: (row: number, col: number) => number }
 
-const isSlot = (prompt: ArrayLike<number>, i: number, slot: ImageSlot) =>
-  prompt[i] === slot.pad && (slot.kind === "bare" || (prompt[i - 1] === slot.start && prompt[i + 1] === slot.end))
+/** What stands for a placeholder a message's own text has, in imagePlaceholders' render. */
+const LITERAL = "@@webgllm-literal-placeholder@@"
 
-/** How many image slots the template wrote (a wrapped placeholder in a message's text isn't one). */
-export function countImageSlots(prompt: ArrayLike<number>, slot: ImageSlot): number {
-  let count = 0
-  for (let i = 0; i < prompt.length; i++) if (isSlot(prompt, i, slot)) count++
-  return count
+/** `value` with `change` applied to every string in it (arrays and plain objects, keys as they are). */
+function mapStrings<T>(value: T, change: (text: string) => string): T {
+  if (typeof value === "string") return change(value) as T
+  if (Array.isArray(value)) return value.map((item) => mapStrings(item, change)) as T
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, mapStrings(item, change)])) as T
+  }
+  return value
+}
+
+/**
+ * For each `placeholder` in a chat's rendered text, in order: whether the
+ * template wrote it for an image part (true), or it is a message's own
+ * text (false). A user can write "<image>" in a message, and the tokenizer
+ * makes the template's placeholder token of it: that one is text, not an
+ * attachment. Told apart by rendering `input` (what `render` reads: the
+ * messages, the tools) with the placeholder in every string of it replaced
+ * by a marker: the placeholders left are the template's own.
+ */
+export function imagePlaceholders<T>(input: T, placeholder: string, render: (input: T) => string): Array<boolean> {
+  const probe = render(mapStrings(input, (text) => text.split(placeholder).join(LITERAL)))
+  const written: Array<boolean> = []
+  let at = 0
+  for (;;) {
+    const part = probe.indexOf(placeholder, at)
+    const literal = probe.indexOf(LITERAL, at)
+    if (part < 0 && literal < 0) return written
+    const isPart = literal < 0 || (part >= 0 && part < literal)
+    written.push(isPart)
+    at = isPart ? part + placeholder.length : literal + LITERAL.length
+  }
+}
+
+/**
+ * Where the prompt's image slots are. `written` says, for each placeholder
+ * token in order, whether the template wrote it for an image part (see
+ * imagePlaceholders); without it every placeholder token is taken for one
+ * (a wrapped one only between its start and end tokens).
+ */
+function slotPositions(prompt: ArrayLike<number>, slot: ImageSlot, written?: ReadonlyArray<boolean>): Set<number> {
+  const at = new Set<number>()
+  let placeholder = 0
+  for (let i = 0; i < prompt.length; i++) {
+    if (prompt[i] !== slot.pad) continue
+    const part = written ? written[placeholder] === true : true
+    placeholder++
+    if (part && (slot.kind === "bare" || (prompt[i - 1] === slot.start && prompt[i + 1] === slot.end))) at.add(i)
+  }
+  return at
+}
+
+/** How many image slots the template wrote (a wrapped placeholder alone in a message's text isn't one; see slotPositions for `written`). */
+export function countImageSlots(prompt: ArrayLike<number>, slot: ImageSlot, written?: ReadonlyArray<boolean>): number {
+  return slotPositions(prompt, slot, written).size
 }
 
 /** The tokens an image's slot becomes around and between its views' rows, and in all. */
@@ -102,13 +151,16 @@ export function imageTokenCount(image: ImageLayout, slot: ImageSlot): number {
  * The prompt with each image slot expanded to its image's tokens, and the
  * keys the cache compares: the tokens, with each image's rows its key.
  * `starts` is where each view's rows begin, images and their views in
- * order.
+ * order. A placeholder that isn't a slot (`written`: see slotPositions)
+ * stays the one token it is, as text.
  */
 export function expandImageTokens(
   prompt: Array<number>,
   slot: ImageSlot,
-  images: Array<Pick<PreparedImage, "key"> & ImageLayout>
+  images: Array<Pick<PreparedImage, "key"> & ImageLayout>,
+  written?: ReadonlyArray<boolean>
 ): { tokens: Array<number>; keys: Array<number>; starts: Array<number> } {
+  const slots = slotPositions(prompt, slot, written)
   const tokens: Array<number> = []
   const keys: Array<number> = []
   const starts: Array<number> = []
@@ -118,7 +170,7 @@ export function expandImageTokens(
   }
   let next = 0
   for (let i = 0; i < prompt.length; i++) {
-    if (!isSlot(prompt, i, slot)) {
+    if (!slots.has(i)) {
       literal(prompt[i])
       continue
     }

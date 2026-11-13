@@ -63,7 +63,10 @@ index plus a delta (max(gh, gw) − gh · gw per image before it).
    of the request is passed through that piece, and the weights are freed
    before the next piece is read. Each view keeps its residual stream
    between pieces (4 MB a megapixel-sized view); the blocks' tensors are
-   one set, sized for the largest view. So the most held beside the model
+   one set, sized for the largest view. A view's patches (floats cut from
+   its pixels) are made as its patch projection reads them and dropped
+   after it, one view at a time: 7 views of a large photo would hold 21
+   MiB of them together. So the most held beside the model
    is one block's weights and a view's work (`visionStreamBytes`, which
    the memory claim is made from and a test holds to the byte), not the
    tower: 204 MiB of weights for LFM3-VL's, 354 for Qwen3.5's GGUF
@@ -198,6 +201,14 @@ base encoder for 450M (768 wide, 12 blocks, 12 heads of 64), so400m for
   image's tiles each after `<|img_row_R_col_C|>` and its thumbnail after
   `<|img_thumbnail|>`. Image rows take their place in the sequence like any
   token (LFM2's 1D RoPE).
+- Only the placeholders the template writes for image parts are images. A
+  message can have "<image>" in its own text (this turn's or an earlier
+  one's), and the tokenizer makes the same token of it: that one stays a
+  token of text. They are told apart by rendering the chat once more with
+  the placeholder in every string of the messages and tools replaced by a
+  marker, so the placeholders left are the template's
+  (`imagePlaceholders`); the same holds for Qwen3.5's and LFM3-VL's
+  wrapped placeholder.
 
 **LFM3-VL** is LFM3 with a vision tower of its own kind: 14 blocks, 1,024
 wide, RMS norms, no biases.
@@ -244,7 +255,9 @@ wide, RMS norms, no biases.
   embedding transposed: the head is read as the tied embedding and stored
   at 8 bits (the separate `embed_tokens` file isn't downloaded), and scales
   round to float16. 3B's weights are in four data files
-  (`WebGlModelMeta.files.moreData`). LFM3-VL's keeps 28 projections and
+  (`WebGlModelMeta.files.moreData`), each found by the location the graph
+  gives it: its path from the graph's folder, subfolders kept
+  (`onnxDataSources`). LFM3-VL's keeps 28 projections and
   the embedding at 8 bits with zero points (asymmetric): those are
   dequantized and stored at 8 bits per block of 32, symmetric, as the GGUF
   loader stores a matrix that isn't Q4_0 or Q8_0. A matrix fused from

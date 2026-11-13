@@ -1,11 +1,12 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { toChatMessages, userContent } from "./chat-completions.js"
+import type { ChatMessage } from "./tokenizer.js"
 import { Engine, type EngineImage } from "./engine.js"
 import { asRepo, fakeHub } from "./fake-hub.test.js"
 import { imageProcessorConfig, patchPlace, pixelBudget, planViews, smartResize, tileGrid, tileResize, toPatches } from "./image.js"
 import { dequantizeTable } from "./load-vision.js"
-import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, imageTokenCount, type PreparedImage } from "./prompt-images.js"
+import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, imagePlaceholders, imageTokenCount, type PreparedImage } from "./prompt-images.js"
 import { hubModelMeta } from "./resolve-model.js"
 import { positionEmbeddings, ropeTable, VisionEncoder, visionStreamBytes, visionWeightBytes, visionWorkBytes } from "./vision.js"
 import { newVisionMatrix, type VisionConfig, type VisionLinear, type VisionPiece } from "./vision-weights.js"
@@ -449,13 +450,117 @@ async function* piecesOf(pieces: Array<VisionPiece>) {
   yield* pieces
 }
 
+test("a literal <image> in a message's text isn't an attachment: only the placeholders the template writes for image parts are slots", async () => {
+  const { loadTokenizer } = await import("./tokenizer.js")
+  const { readFileSync } = await import("node:fs")
+  // Liquid AI's chat template (LiquidAI/LFM2.5-VL-450M) and its special tokens' names, over a vocabulary of one text token.
+  const specials = ["<|startoftext|>", "<|im_start|>", "<|im_end|>", "<|pad|>", "<image>", "<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"]
+  const tokenizer = loadTokenizer({
+    tokenizerJson: {
+      model: { type: "BPE", vocab: { x: 0 }, merges: [], unk_token: "x" },
+      normalizer: null,
+      pre_tokenizer: null,
+      post_processor: null,
+      decoder: null,
+      added_tokens: specials.map((content, i) => ({ id: 10 + i, content, special: true, normalized: false }))
+    },
+    tokenizerConfig: {
+      chat_template: readFileSync("src/test-fixtures/lfm2.5-vl-450m-onnx/chat_template.jinja", "utf8"),
+      bos_token: "<|startoftext|>",
+      eos_token: "<|im_end|>",
+      pad_token: "<|pad|>"
+    }
+  })
+  const id = (token: string) => tokenizer.tokenToId(token)!
+  const IMG = id("<image>")
+  const slot = { kind: "bare" as const, pad: IMG, start: id("<|image_start|>"), end: id("<|image_end|>"), thumbnail: id("<|img_thumbnail|>"), tile: () => 99 }
+  const picture = { type: "image" as const, image: "data:image/png;base64,AAAA" }
+  const text = (t: string) => ({ type: "text" as const, text: t })
+  const view = { key: -5, views: [{ height: 1, width: 2 }] }
+  const render = (input: { chat: Array<ChatMessage> }) => tokenizer.applyChatTemplate(input.chat, { addGenerationPrompt: true })
+  const cases: Array<[string, Array<ChatMessage>, Array<boolean>]> = [
+    ["no literal", [{ role: "user", content: [picture, text("what is this?")] }], [true]],
+    ["a literal after the image, in the same message", [{ role: "user", content: [picture, text("explain the literal <image> marker")] }], [true, false]],
+    ["a literal right after the image", [{ role: "user", content: [picture, text("<image>")] }], [true, false]],
+    ["a literal before the image", [{ role: "user", content: [text("the <image> marker, then:"), picture] }], [false, true]],
+    [
+      "a literal earlier in the conversation",
+      [
+        { role: "user", content: "what does <image> mean in a prompt?" },
+        { role: "assistant", content: "It marks where <image> rows go." },
+        { role: "user", content: [text("and this one?"), picture] }
+      ],
+      [false, false, true]
+    ],
+    ["two images around a literal", [{ role: "user", content: [picture, text("<image><image>"), picture] }], [true, false, false, true]]
+  ]
+  for (const [name, chat, expected] of cases) {
+    const prompt = tokenizer.encodeChat(chat, { addGenerationPrompt: true })
+    const written = imagePlaceholders({ chat }, "<image>", render)
+    assert.deepEqual(written, expected, name)
+    // One placeholder token per placeholder in the rendered text, in its order.
+    assert.equal(prompt.filter((t) => t === IMG).length, expected.length, name)
+    const images = expected.filter(Boolean).length
+    assert.equal(chatImages(chat).length, images, name)
+    assert.equal(countImageSlots(prompt, slot, written), images, name)
+    // Without the template's word for it, every placeholder token counts: what failed before.
+    assert.equal(countImageSlots(prompt, slot), expected.length, name)
+    const { tokens, keys, starts } = expandImageTokens(prompt, slot, Array.from({ length: images }, () => view), written)
+    assert.equal(starts.length, images, name)
+    // Each image part's placeholder became start, its rows, end; each literal one is still that one token, keyed as text.
+    let at = 0
+    let image = 0
+    for (let i = 0; i < prompt.length; i++) {
+      if (prompt[i] !== IMG) {
+        assert.equal(tokens[at++], prompt[i], name)
+        continue
+      }
+      if (expected.shift()) {
+        assert.deepEqual(tokens.slice(at, at + 4), [slot.start, IMG, IMG, slot.end], name)
+        assert.equal(starts[image++], at + 1, name)
+        assert.deepEqual(keys.slice(at, at + 4), [slot.start, -5, -5, slot.end], name)
+        at += 4
+      } else {
+        assert.deepEqual([tokens[at], keys[at]], [IMG, IMG], name)
+        at++
+      }
+    }
+    assert.equal(at, tokens.length, name)
+  }
+  // A template that writes a wrapped placeholder: a literal pad token between literal start and end tokens is text too.
+  const wrapped = { kind: "wrapped" as const, start: 7, pad: 9, end: 8 }
+  assert.equal(countImageSlots([7, 9, 8, 5, 7, 9, 8], wrapped), 2)
+  assert.equal(countImageSlots([7, 9, 8, 5, 7, 9, 8], wrapped, [false, true]), 1)
+  assert.deepEqual(expandImageTokens([7, 9, 8, 5, 7, 9, 8], wrapped, [view], [false, true]).tokens, [7, 9, 8, 5, 7, 9, 9, 8])
+  // Placeholders in a tool's description and a tool call's arguments are text as well.
+  const withTools = imagePlaceholders(
+    { chat: [{ role: "user", content: [picture] }] as Array<ChatMessage>, tools: "<image>" },
+    "<image>",
+    (input) => `${input.tools}|${tokenizer.applyChatTemplate(input.chat, {})}`
+  )
+  assert.deepEqual(withTools, [false, true])
+})
+
 test("a streamed encode holds one piece of the encoder at a time: its claim is what it allocates, and its draws are the loaded encoder's", async () => {
   for (const [name, pieces, bits] of [["a ViT, 4-bit", tinyEncoder(), 4], ["a conv and attention tower, 8-bit", tinyTower(), 8]] as const) {
     const config = (pieces[0] as { config: VisionConfig }).config
     const view = (gridH: number, gridW: number) => ({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
     for (const grids of [[[4, 4]], [[40, 40]], [[8, 12], [8, 12], [4, 4]], [[4, 4], [40, 40]]] as Array<Array<[number, number]>>) {
       const counter = countingGpu()
-      const rows = await new VisionEncoder(counter.gpu).encodeStream(piecesOf(pieces), grids.map(([h, w]) => view(h, w)))
+      // Each view's patches are asked for once, as its own patch projection runs: after the draws of the views before it.
+      const asked: Array<[number, number]> = []
+      const sources = grids.map(([gridH, gridW], i) => ({
+        gridH,
+        gridW,
+        pixels: () => {
+          asked.push([i, counter.draws.length])
+          return view(gridH, gridW).pixels
+        }
+      }))
+      const rows = await new VisionEncoder(counter.gpu).encodeStream(piecesOf(pieces), sources)
+      assert.deepEqual(asked.map(([i]) => i), grids.map((_, i) => i))
+      for (let i = 1; i < asked.length; i++) assert.ok(asked[i][1] > asked[i - 1][1], "a view's patches are made after the last view's projection drew")
+      assert.ok(asked[asked.length - 1][1] < counter.draws.length)
       const label = `${name}, ${grids.map((g) => g.join("×")).join(" ")}`
       assert.deepEqual(rows.map((r) => r.length), grids.map(([h, w]) => ((h * w) / 4) * config.outWidth), label)
       assert.equal(counter.peak(), visionStreamBytes(config, bits, bits === 4, grids, 16384), label)
@@ -485,7 +590,7 @@ test("a streamed encode refuses pieces out of the encoder's order, and frees wha
     [[1, 2, 3, 4], /before its config/]
   ] as const) {
     const counter = countingGpu()
-    await assert.rejects(new VisionEncoder(counter.gpu).encodeStream(piecesOf(order.map((i) => pieces[i])), [view]), message)
+    await assert.rejects(new VisionEncoder(counter.gpu).encodeStream(piecesOf(order.map((i) => pieces[i])), [{ ...view, pixels: () => view.pixels }]), message)
     assert.equal(counter.live(), 0)
   }
 })

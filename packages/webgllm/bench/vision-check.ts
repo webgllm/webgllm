@@ -97,7 +97,7 @@ try {
     const wholeMs = performance.now() - t
     const before = gpu.bytes
     t = performance.now()
-    const [streamed] = await new VisionEncoder(gpu).encodeStream(pieces(), [{ pixels, gridH, gridW }])
+    const [streamed] = await new VisionEncoder(gpu).encodeStream(pieces(), [{ gridH, gridW, pixels: () => pixels }])
     const streamMs = performance.now() - t
     let differ = 0
     for (let i = 0; i < streamed.length; i++) if (streamed[i] !== whole![i]) differ++
