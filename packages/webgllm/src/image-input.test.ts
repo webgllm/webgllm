@@ -1,14 +1,18 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { toChatMessages, userContent } from "./chat-completions.js"
+import type { ChatMessage } from "./tokenizer.js"
 import { Engine, type EngineImage } from "./engine.js"
 import { asRepo, fakeHub } from "./fake-hub.test.js"
-import { imageProcessorConfig, patchPlace, pixelBudget, smartResize, toPatches } from "./image.js"
+import { imageProcessorConfig, patchPlace, pixelBudget, planViews, smartResize, tileGrid, tileResize, toPatches } from "./image.js"
 import { dequantizeTable } from "./load-vision.js"
-import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, type PreparedImage } from "./prompt-images.js"
+import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, imagePlaceholders, imageTokenCount, type PreparedImage } from "./prompt-images.js"
 import { hubModelMeta } from "./resolve-model.js"
-import { positionEmbeddings, ropeTable, VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
-import type { VisionConfig, VisionLinear, VisionPiece } from "./load-vision.js"
+import { positionEmbeddings, ropeTable, VisionEncoder, visionStreamBytes, visionWeightBytes, visionWorkBytes } from "./vision.js"
+import { newVisionMatrix, type VisionConfig, type VisionLinear, type VisionPiece } from "./vision-weights.js"
+
+/** An image read as one view of height × width tokens. */
+const oneView = (image: { key: number; height: number; width: number }) => ({ key: image.key, views: [{ height: image.height, width: image.width }] })
 import type { Gpu, Texture } from "./gpu/gl.js"
 import { storedModelFiles } from "./model-files.js"
 
@@ -98,7 +102,7 @@ test("the engine's rotary positions are Qwen2-VL's: images in 3D, the text after
     { key: -2, height: 4, width: 2 }
   ]
   const prompt = [1, 2, 7, IMG, 8, 4, 5, 7, IMG, 8, 6]
-  const { tokens, starts } = expandImageTokens(prompt, { start: 7, pad: IMG, end: 8 }, images)
+  const { tokens, starts } = expandImageTokens(prompt, { kind: "wrapped", start: 7, pad: IMG, end: 8 }, images.map(oneView))
   const engine = Object.create(Engine.prototype) as Engine
   Object.assign(engine, { config: { hiddenSize: 4 }, images: [] })
   engine.setImages(
@@ -117,6 +121,12 @@ test("the engine's rotary positions are Qwen2-VL's: images in 3D, the text after
   // Without images, positions are the cache's.
   engine.setImages([])
   assert.deepEqual(engine.ropeAt(17), [17, 17, 17])
+  // LFM2-VL and LFM3-VL: an image's rows keep their cache positions, like any token.
+  engine.setImages(
+    starts.map((start, i): EngineImage => ({ start, height: images[i].height, width: images[i].width, features: null })),
+    "sequence"
+  )
+  for (const pos of [0, starts[0], starts[0] + 7, starts[1] + 3, tokens.length]) assert.deepEqual(engine.ropeAt(pos), [pos, pos, pos])
   assert.throws(() => engine.setImages([{ start: 4, height: 2, width: 2, features: null }, { start: 6, height: 1, width: 1, features: null }]), RangeError)
   assert.throws(() => engine.setImages([{ start: 0, height: 2, width: 2, features: new Float32Array(3) }]), RangeError)
 })
@@ -126,8 +136,9 @@ test("image tokens expand to their images' tokens, and image rows key by content
     { key: imageKey(new Uint8Array([1, 2, 3]), 32, 32), height: 1, width: 2 },
     { key: imageKey(new Uint8Array([1, 2, 4]), 32, 32), height: 2, width: 1 }
   ]
-  const slot = { start: 7, pad: 9, end: 8 }
-  const { tokens, keys, starts } = expandImageTokens([5, 7, 9, 8, 6, 7, 9, 8], slot, images)
+  const slot = { kind: "wrapped", start: 7, pad: 9, end: 8 } as const
+  const views = images.map(oneView)
+  const { tokens, keys, starts } = expandImageTokens([5, 7, 9, 8, 6, 7, 9, 8], slot, views)
   assert.deepEqual(tokens, [5, 7, 9, 9, 8, 6, 7, 9, 9, 8])
   assert.deepEqual(starts, [2, 7])
   assert.deepEqual(keys, [5, 7, images[0].key, images[0].key, 8, 6, 7, images[1].key, images[1].key, 8])
@@ -135,13 +146,84 @@ test("image tokens expand to their images' tokens, and image rows key by content
   assert.notEqual(images[0].key, images[1].key)
   // The same pixels at another size are another image.
   assert.notEqual(imageKey(new Uint8Array([1, 2, 3]), 32, 64), images[0].key)
-  assert.throws(() => expandImageTokens([7, 9, 8, 7, 9, 8], slot, images.slice(0, 1)))
-  assert.throws(() => expandImageTokens([7, 9, 8], slot, images))
+  assert.throws(() => expandImageTokens([7, 9, 8, 7, 9, 8], slot, views.slice(0, 1)))
+  assert.throws(() => expandImageTokens([7, 9, 8], slot, views))
   // The pad token written in a message's text (the literal "<|image_pad|>")
   // isn't a slot: it stays one token, and the image still finds its own.
   const literal = [5, 9, 6, 7, 9, 8]
   assert.equal(countImageSlots(literal, slot), 1)
-  assert.deepEqual(expandImageTokens(literal, slot, images.slice(0, 1)).tokens, [5, 9, 6, 7, 9, 9, 8])
+  assert.deepEqual(expandImageTokens(literal, slot, views.slice(0, 1)).tokens, [5, 9, 6, 7, 9, 9, 8])
+})
+
+test("LFM2-VL's bare image token becomes its start, each tile after its place, the thumbnail and its end", () => {
+  const IMG = 9, START = 20, END = 21, THUMB = 22
+  const slot = { kind: "bare", pad: IMG, start: START, end: END, thumbnail: THUMB, tile: (row: number, col: number) => 100 + row * 10 + col } as const
+  // One view: no place tokens.
+  const single = { key: -5, views: [{ height: 1, width: 2 }] }
+  const one = expandImageTokens([1, IMG, 2], slot, [single])
+  assert.deepEqual(one.tokens, [1, START, IMG, IMG, END, 2])
+  assert.deepEqual(one.keys, [1, START, -5, -5, END, 2])
+  assert.deepEqual(one.starts, [2])
+  assert.equal(imageTokenCount(single, slot), 4)
+  // Tiles (1 × 2 here), row by row, then the thumbnail.
+  const tiled = {
+    key: -6,
+    views: [
+      { height: 1, width: 1, place: { row: 1, col: 1 } },
+      { height: 1, width: 1, place: { row: 1, col: 2 } },
+      { height: 1, width: 2, place: "thumbnail" as const }
+    ]
+  }
+  const many = expandImageTokens([IMG, 3, IMG], slot, [tiled, single])
+  assert.deepEqual(many.tokens, [START, 111, IMG, 112, IMG, THUMB, IMG, IMG, END, 3, START, IMG, IMG, END])
+  assert.deepEqual(many.keys, [START, 111, -6, 112, -6, THUMB, -6, -6, END, 3, START, -5, -5, END])
+  assert.deepEqual(many.starts, [2, 4, 6, 11])
+  assert.equal(imageTokenCount(tiled, slot), 9)
+  assert.equal(countImageSlots([IMG, 3, IMG], slot), 2)
+  assert.throws(() => expandImageTokens([IMG], slot, []))
+})
+
+test("LFM2-VL's processor: one view up to 256 tokens, then a grid of 512-pixel tiles and a thumbnail", () => {
+  const LFM2 = imageProcessorConfig({
+    image_processor: {
+      do_image_splitting: true, downsample_factor: 2, encoder_patch_size: 16, image_mean: [0.5, 0.5, 0.5], image_std: [0.5, 0.5, 0.5],
+      max_image_tokens: 256, max_pixels_tolerance: 2.0, max_tiles: 10, min_image_tokens: 64, min_tiles: 2, tile_size: 512, use_thumbnail: true
+    }
+  })
+  assert.equal(LFM2.layout, "channel-last")
+  assert.equal(LFM2.temporalPatchSize, 1)
+  assert.deepEqual(LFM2.tiles, { size: 512, min: 2, max: 10, tolerance: 2, thumbnail: true })
+  // Transformers' smart_resize: whole 32-pixel blocks, 64 to 256 tokens.
+  assert.deepEqual(tileResize(400, 400, LFM2), { height: 416, width: 416 })
+  assert.deepEqual(tileResize(100, 100, LFM2), { height: 256, width: 256 })
+  assert.deepEqual(tileResize(600, 800, LFM2), { height: 416, width: 576 })
+  // An image within twice the pixel limit is one view.
+  assert.deepEqual(planViews(400, 400, undefined, LFM2, 16384), [{ height: 416, width: 416 }])
+  assert.deepEqual(planViews(700, 700, undefined, LFM2, 16384), [{ height: 512, width: 512 }])
+  // A larger one: the grid nearest its aspect ratio, of two as near the larger when it has the pixels.
+  assert.deepEqual(tileGrid(768, 1024, LFM2.tiles!), { cols: 3, rows: 2 })
+  assert.deepEqual(tileGrid(1024, 1024, LFM2.tiles!), { cols: 2, rows: 2 })
+  assert.deepEqual(tileGrid(2000, 2000, LFM2.tiles!), { cols: 3, rows: 3 })
+  assert.deepEqual(tileGrid(3024, 4032, LFM2.tiles!), { cols: 3, rows: 2 })
+  assert.deepEqual(tileGrid(512, 4096, LFM2.tiles!), { cols: 8, rows: 1 })
+  const views = planViews(768, 1024, undefined, LFM2, 16384)
+  assert.equal(views.length, 7)
+  assert.deepEqual(views[0], { height: 512, width: 512, from: { height: 1024, width: 1536, x: 0, y: 0 }, place: { row: 1, col: 1 } })
+  assert.deepEqual(views[4], { height: 512, width: 512, from: { height: 1024, width: 1536, x: 512, y: 512 }, place: { row: 2, col: 2 } })
+  assert.deepEqual(views[6], { height: 416, width: 576, place: "thumbnail" })
+  // detail "low": the whole image as one view, however large.
+  assert.deepEqual(planViews(768, 1024, "low", LFM2, 16384), [{ height: 416, width: 576 }])
+  // Splitting off (or one tile at most): one view.
+  const whole = imageProcessorConfig({ encoder_patch_size: 16, downsample_factor: 2, min_image_tokens: 64, max_image_tokens: 256, do_image_splitting: false, image_mean: [0.5, 0.5, 0.5], image_std: [0.5, 0.5, 0.5] })
+  assert.equal(whole.tiles, undefined)
+  assert.deepEqual(planViews(3000, 4000, undefined, whole, 16384), [{ height: 416, width: 576 }])
+  // Its patch rows are y, x, channel.
+  const rgba = Uint8Array.from({ length: 32 * 32 * 4 }, (_, i) => (i * 31) % 251)
+  const got = toPatches(rgba, 32, 32, LFM2)
+  assert.equal(got.pixels.length, 4 * 768)
+  const value = (c: number, y: number, x: number) => (rgba[(y * 32 + x) * 4 + c] / 255 - 0.5) / 0.5
+  // Patch 3 (merge order: row 1, column 1), pixel (y 5, x 7), channel 2.
+  assert.ok(Math.abs(got.pixels[3 * 768 + (5 * 16 + 7) * 3 + 2] - value(2, 16 + 5, 16 + 7)) < 1e-6)
 })
 
 test("a chat's images in template order, and the cache of prepared ones", () => {
@@ -175,7 +257,7 @@ test("a chat's images in template order, and the cache of prepared ones", () => 
   ])
   // By content; data URLs (whose bytes never change) by URL too, http URLs never.
   const cache = new ImageCache(2)
-  const made = (key: number): PreparedImage => ({ key, height: 1, width: 1, pixels: null, features: null })
+  const made = (key: number): PreparedImage => ({ key, views: [{ height: 1, width: 1, pixels: null, features: null }] })
   cache.set({ url: "data:image/png;base64,AA" }, "auto|1", made(-1))
   cache.set({ url: "https://example.com/b.png" }, "auto|2", made(-2))
   assert.equal(cache.getUrl({ url: "data:image/png;base64,AA" })?.key, -1)
@@ -212,10 +294,21 @@ test("image input is declared by the rule: a vision encoder beside the decoder, 
     "https://huggingface.co/someone/Qwen3.5-2B-text/resolve/main/config.json": { status: 200, body: { model_type: "qwen3_5" } }
   })
   assert.deepEqual((await hubModelMeta("someone/Qwen3.5-2B-text")).supports.input, ["text"])
-  // GGUF and LFM builds: text only.
+  // A GGUF build: the repository's projector (the float16 one where there's no Q8_0), and the processor config where its tokenizer is.
   fakeHub()
-  for (const name of ["unsloth/Qwen3.5-2B-GGUF", "onnx-community/LFM3-1.7B-ONNX"])
-    assert.deepEqual((await hubModelMeta(name)).supports.input, ["text"], name)
+  const gguf = await hubModelMeta("unsloth/Qwen3.5-2B-GGUF")
+  assert.deepEqual(gguf.supports.input, ["text", "image"])
+  assert.deepEqual(gguf.files.vision, {
+    projector: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "mmproj-F16.gguf" },
+    preprocessor: { repo: "Qwen/Qwen3.5-2B", path: "preprocessor_config.json" }
+  })
+  assert.equal(gguf.projectorChecked, true)
+  // A projector of a type the encoder doesn't run, and a build without one: text only.
+  fakeHub(asRepo("unsloth/Qwen3.5-2B-GGUF", "someone/Other-Qwen3.5-2B-GGUF"))
+  const other = await hubModelMeta("someone/Other-Qwen3.5-2B-GGUF")
+  assert.deepEqual([other.supports.input, other.files.vision, other.projectorChecked], [["text"], undefined, true])
+  fakeHub()
+  assert.deepEqual((await hubModelMeta("onnx-community/LFM3-1.7B-ONNX")).supports.input, ["text"])
 })
 
 test("the position table dequantizes nibble by nibble, low first, minus its block's zero point", () => {
@@ -289,6 +382,7 @@ function countingGpu() {
   let id = 0
   const bytesPer: Record<number, number> = { 0x8d70: 16, 0x8814: 16, 0x881a: 8, 0x8d7c: 4 }
   const textures = new Set<Texture>()
+  const draws: Array<string> = []
   const gpu = {
     limits: { maxTextureSize: 16384 },
     texture(internal: number, width: number, height: number) {
@@ -303,29 +397,52 @@ function countingGpu() {
     },
     program: (source: string) => ({ source }),
     run: () => undefined,
-    runAsync: async () => undefined,
+    runAsync: async (pass: { program: { source: string }; rect: unknown; uniforms: unknown }) => {
+      draws.push(JSON.stringify([pass.program.source.length, pass.rect, pass.uniforms]))
+    },
     pace: async () => undefined,
     read: async (t: Texture) => new Float32Array(t.width * t.height * 4)
   }
-  return { gpu: gpu as unknown as Gpu, live: () => live, peak: () => peak, resetPeak: () => (peak = live) }
+  return { gpu: gpu as unknown as Gpu, live: () => live, peak: () => peak, resetPeak: () => (peak = live), draws }
 }
 
-/** A tiny encoder's pieces (64-wide, one head, one block). */
+const linear = (N: number, K: number, bits: 4 | 8 = 4, bias = true): VisionLinear => ({ m: newVisionMatrix(N, K, bits, false), bias: bias ? new Float32Array(N) : null })
+
+/** A tiny Qwen-style encoder's pieces (64-wide, one head, one block; 4-bit). */
 function tinyEncoder(): Array<VisionPiece> {
   const config: VisionConfig = {
-    width: 64, heads: 1, headDim: 64, ffn: 128, depth: 1, outWidth: 128, patchSize: 16, temporal: 2, merge: 2,
-    patchValues: 1536, grid: 4, eps: 1e-6, act: "tanh", mergerAct: "erf"
+    width: 64, heads: 1, kvHeads: 1, headDim: 64, ffn: 128, mergerWidth: 256, outWidth: 128, merge: 2, patchValues: 1536,
+    layers: ["attention"], norm: "layer", eps: 1e-6, mergerEps: 1e-6, mlp: "tanh", mergerAct: "erf",
+    grid: 4, interpolation: "corners", rope: true, qkNorm: false, positions: "grid"
   }
-  const linear = (N: number, K: number): VisionLinear => ({
-    m: { N, K, bits: 4, quants: new Uint32Array(0), scales: new Uint16Array(N * (K / 32)), zeros: null, raw: new Uint8Array(N * (K / 32) * 16) },
-    bias: new Float32Array(N)
-  })
   const norm = { weight: new Float32Array(64), bias: new Float32Array(64) }
   return [
     { kind: "config", config },
     { kind: "patch", patch: linear(64, 1536), positions: new Float32Array(16 * 64), invFreq: new Float32Array(16) },
-    { kind: "block", index: 0, value: { norm1: norm, qkv: linear(192, 64), proj: linear(64, 64), norm2: norm, fc1: linear(128, 64), fc2: linear(64, 128) } },
+    { kind: "block", index: 0, value: { type: "attention", norm1: norm, qkv: linear(192, 64), proj: linear(64, 64), norm2: norm, fc1: linear(128, 64), fc2: linear(64, 128) } },
     { kind: "merger", norm, linear1: linear(256, 256), linear2: linear(128, 256) }
+  ]
+}
+
+/** A tiny LFM3-VL-style tower's pieces (64-wide: a conv block and a grouped-query attention block; 8-bit, an MLP width that isn't whole blocks). */
+function tinyTower(): Array<VisionPiece> {
+  const config: VisionConfig = {
+    width: 64, heads: 4, kvHeads: 2, headDim: 16, ffn: 80, mergerWidth: 256, outWidth: 128, merge: 2, patchValues: 1536,
+    layers: ["conv", "attention"], norm: "rms", eps: 1e-5, mergerEps: 1e-6, mlp: "swiglu", mergerAct: "erf",
+    grid: 0, interpolation: "corners", rope: true, qkNorm: true, positions: "sequence"
+  }
+  const rms = { weight: new Float32Array(64), bias: null }
+  const mlp = { norm2: rms, fc1: linear(160, 64, 8, false), fc2: linear(64, 80, 8, false) }
+  return [
+    { kind: "config", config },
+    { kind: "patch", patch: linear(64, 1536, 8, false), invFreq: new Float32Array(4), norm: rms },
+    { kind: "block", index: 0, value: { type: "conv", norm1: rms, inProj: linear(192, 64, 8, false), kernel: new Float32Array(64 * 9), outProj: linear(64, 64, 8, false), ...mlp } },
+    {
+      kind: "block",
+      index: 1,
+      value: { type: "attention", norm1: rms, qkv: linear(128, 64, 8, false), qNorm: new Float32Array(16), kNorm: new Float32Array(16), proj: linear(64, 64, 8, false), ...mlp }
+    },
+    { kind: "merger", norm: { weight: new Float32Array(64), bias: new Float32Array(64) }, linear1: linear(256, 256, 8), linear2: linear(128, 256, 8) }
   ]
 }
 
@@ -333,22 +450,168 @@ async function* piecesOf(pieces: Array<VisionPiece>) {
   yield* pieces
 }
 
-test("the vision claim is what the encoder allocates: its weights, and its largest image's work at once", async () => {
-  const counter = countingGpu()
-  const encoder = new VisionEncoder(counter.gpu)
-  const pieces = tinyEncoder()
-  await encoder.load(piecesOf(pieces))
-  const config = (pieces[0] as { config: VisionConfig }).config
-  assert.equal(counter.live(), visionWeightBytes(config))
-  for (const [gridH, gridW] of [[4, 4], [8, 12], [40, 40]]) {
-    counter.resetPeak()
-    const weights = counter.live()
-    await encoder.encode({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
-    assert.equal(counter.peak() - weights, visionWorkBytes(config, gridH, gridW, 16384), `${gridH}×${gridW}`)
-    assert.equal(counter.live(), weights, "its work textures are freed")
+test("a literal <image> in a message's text isn't an attachment: only the placeholders the template writes for image parts are slots", async () => {
+  const { loadTokenizer } = await import("./tokenizer.js")
+  const { readFileSync } = await import("node:fs")
+  // Liquid AI's chat template (LiquidAI/LFM2.5-VL-450M) and its special tokens' names, over a vocabulary of one text token.
+  const specials = ["<|startoftext|>", "<|im_start|>", "<|im_end|>", "<|pad|>", "<image>", "<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"]
+  const tokenizer = loadTokenizer({
+    tokenizerJson: {
+      model: { type: "BPE", vocab: { x: 0 }, merges: [], unk_token: "x" },
+      normalizer: null,
+      pre_tokenizer: null,
+      post_processor: null,
+      decoder: null,
+      added_tokens: specials.map((content, i) => ({ id: 10 + i, content, special: true, normalized: false }))
+    },
+    tokenizerConfig: {
+      chat_template: readFileSync("src/test-fixtures/lfm2.5-vl-450m-onnx/chat_template.jinja", "utf8"),
+      bos_token: "<|startoftext|>",
+      eos_token: "<|im_end|>",
+      pad_token: "<|pad|>"
+    }
+  })
+  const id = (token: string) => tokenizer.tokenToId(token)!
+  const IMG = id("<image>")
+  const slot = { kind: "bare" as const, pad: IMG, start: id("<|image_start|>"), end: id("<|image_end|>"), thumbnail: id("<|img_thumbnail|>"), tile: () => 99 }
+  const picture = { type: "image" as const, image: "data:image/png;base64,AAAA" }
+  const text = (t: string) => ({ type: "text" as const, text: t })
+  const view = { key: -5, views: [{ height: 1, width: 2 }] }
+  const render = (input: { chat: Array<ChatMessage> }) => tokenizer.applyChatTemplate(input.chat, { addGenerationPrompt: true })
+  const cases: Array<[string, Array<ChatMessage>, Array<boolean>]> = [
+    ["no literal", [{ role: "user", content: [picture, text("what is this?")] }], [true]],
+    ["a literal after the image, in the same message", [{ role: "user", content: [picture, text("explain the literal <image> marker")] }], [true, false]],
+    ["a literal right after the image", [{ role: "user", content: [picture, text("<image>")] }], [true, false]],
+    ["a literal before the image", [{ role: "user", content: [text("the <image> marker, then:"), picture] }], [false, true]],
+    [
+      "a literal earlier in the conversation",
+      [
+        { role: "user", content: "what does <image> mean in a prompt?" },
+        { role: "assistant", content: "It marks where <image> rows go." },
+        { role: "user", content: [text("and this one?"), picture] }
+      ],
+      [false, false, true]
+    ],
+    ["two images around a literal", [{ role: "user", content: [picture, text("<image><image>"), picture] }], [true, false, false, true]]
+  ]
+  for (const [name, chat, expected] of cases) {
+    const prompt = tokenizer.encodeChat(chat, { addGenerationPrompt: true })
+    const written = imagePlaceholders({ chat }, "<image>", render)
+    assert.deepEqual(written, expected, name)
+    // One placeholder token per placeholder in the rendered text, in its order.
+    assert.equal(prompt.filter((t) => t === IMG).length, expected.length, name)
+    const images = expected.filter(Boolean).length
+    assert.equal(chatImages(chat).length, images, name)
+    assert.equal(countImageSlots(prompt, slot, written), images, name)
+    // Without the template's word for it, every placeholder token counts: what failed before.
+    assert.equal(countImageSlots(prompt, slot), expected.length, name)
+    const { tokens, keys, starts } = expandImageTokens(prompt, slot, Array.from({ length: images }, () => view), written)
+    assert.equal(starts.length, images, name)
+    // Each image part's placeholder became start, its rows, end; each literal one is still that one token, keyed as text.
+    let at = 0
+    let image = 0
+    for (let i = 0; i < prompt.length; i++) {
+      if (prompt[i] !== IMG) {
+        assert.equal(tokens[at++], prompt[i], name)
+        continue
+      }
+      if (expected.shift()) {
+        assert.deepEqual(tokens.slice(at, at + 4), [slot.start, IMG, IMG, slot.end], name)
+        assert.equal(starts[image++], at + 1, name)
+        assert.deepEqual(keys.slice(at, at + 4), [slot.start, -5, -5, slot.end], name)
+        at += 4
+      } else {
+        assert.deepEqual([tokens[at], keys[at]], [IMG, IMG], name)
+        at++
+      }
+    }
+    assert.equal(at, tokens.length, name)
   }
-  encoder.dispose()
-  assert.equal(counter.live(), 0)
+  // A template that writes a wrapped placeholder: a literal pad token between literal start and end tokens is text too.
+  const wrapped = { kind: "wrapped" as const, start: 7, pad: 9, end: 8 }
+  assert.equal(countImageSlots([7, 9, 8, 5, 7, 9, 8], wrapped), 2)
+  assert.equal(countImageSlots([7, 9, 8, 5, 7, 9, 8], wrapped, [false, true]), 1)
+  assert.deepEqual(expandImageTokens([7, 9, 8, 5, 7, 9, 8], wrapped, [view], [false, true]).tokens, [7, 9, 8, 5, 7, 9, 9, 8])
+  // Placeholders in a tool's description and a tool call's arguments are text as well.
+  const withTools = imagePlaceholders(
+    { chat: [{ role: "user", content: [picture] }] as Array<ChatMessage>, tools: "<image>" },
+    "<image>",
+    (input) => `${input.tools}|${tokenizer.applyChatTemplate(input.chat, {})}`
+  )
+  assert.deepEqual(withTools, [false, true])
+})
+
+test("a streamed encode holds one piece of the encoder at a time: its claim is what it allocates, and its draws are the loaded encoder's", async () => {
+  for (const [name, pieces, bits] of [["a ViT, 4-bit", tinyEncoder(), 4], ["a conv and attention tower, 8-bit", tinyTower(), 8]] as const) {
+    const config = (pieces[0] as { config: VisionConfig }).config
+    const view = (gridH: number, gridW: number) => ({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
+    for (const grids of [[[4, 4]], [[40, 40]], [[8, 12], [8, 12], [4, 4]], [[4, 4], [40, 40]]] as Array<Array<[number, number]>>) {
+      const counter = countingGpu()
+      // Each view's patches are asked for once, as its own patch projection runs: after the draws of the views before it.
+      const asked: Array<[number, number]> = []
+      const sources = grids.map(([gridH, gridW], i) => ({
+        gridH,
+        gridW,
+        pixels: () => {
+          asked.push([i, counter.draws.length])
+          return view(gridH, gridW).pixels
+        }
+      }))
+      const rows = await new VisionEncoder(counter.gpu).encodeStream(piecesOf(pieces), sources)
+      assert.deepEqual(asked.map(([i]) => i), grids.map((_, i) => i))
+      for (let i = 1; i < asked.length; i++) assert.ok(asked[i][1] > asked[i - 1][1], "a view's patches are made after the last view's projection drew")
+      assert.ok(asked[asked.length - 1][1] < counter.draws.length)
+      const label = `${name}, ${grids.map((g) => g.join("×")).join(" ")}`
+      assert.deepEqual(rows.map((r) => r.length), grids.map(([h, w]) => ((h * w) / 4) * config.outWidth), label)
+      assert.equal(counter.peak(), visionStreamBytes(config, bits, bits === 4, grids, 16384), label)
+      assert.equal(counter.live(), 0, "nothing is left on the GPU")
+      // Less than the loaded encoder and its largest view's work.
+      const loaded = visionWeightBytes(config, bits) + Math.max(...grids.map(([h, w]) => visionWorkBytes(config, h, w, 16384)))
+      if (grids.length === 1) assert.ok(counter.peak() < loaded, label)
+      if (grids.length > 1) continue
+      // One view: the same draws, in the same order, as the encoder loaded whole.
+      const whole = countingGpu()
+      const encoder = new VisionEncoder(whole.gpu)
+      await encoder.load(piecesOf(pieces))
+      await encoder.encode(view(grids[0][0], grids[0][1]))
+      assert.deepEqual(counter.draws, whole.draws, label)
+      assert.ok(whole.draws.length > 0)
+    }
+  }
+})
+
+test("a streamed encode refuses pieces out of the encoder's order, and frees what it made", async () => {
+  const pieces = tinyTower()
+  const view = { pixels: new Float32Array(16 * 1536), gridH: 4, gridW: 4 }
+  for (const [order, message] of [
+    [[0, 2, 1, 3, 4], /incomplete|out of order/],
+    [[0, 1, 2, 4], /incomplete/],
+    [[0, 1, 2, 3], /incomplete/],
+    [[1, 2, 3, 4], /before its config/]
+  ] as const) {
+    const counter = countingGpu()
+    await assert.rejects(new VisionEncoder(counter.gpu).encodeStream(piecesOf(order.map((i) => pieces[i])), [{ ...view, pixels: () => view.pixels }]), message)
+    assert.equal(counter.live(), 0)
+  }
+})
+
+test("the vision claim is what the encoder allocates: its weights, and its largest image's work at once", async () => {
+  for (const [name, pieces, bits] of [["a ViT, 4-bit", tinyEncoder(), 4], ["a conv and attention tower, 8-bit", tinyTower(), 8]] as const) {
+    const counter = countingGpu()
+    const encoder = new VisionEncoder(counter.gpu)
+    await encoder.load(piecesOf(pieces))
+    const config = (pieces[0] as { config: VisionConfig }).config
+    assert.equal(counter.live(), visionWeightBytes(config, bits), name)
+    for (const [gridH, gridW] of [[4, 4], [8, 12], [40, 40]]) {
+      counter.resetPeak()
+      const weights = counter.live()
+      await encoder.encode({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
+      assert.equal(counter.peak() - weights, visionWorkBytes(config, gridH, gridW, 16384), `${name}, ${gridH}×${gridW}`)
+      assert.equal(counter.live(), weights, "its work textures are freed")
+    }
+    encoder.dispose()
+    assert.equal(counter.live(), 0)
+  }
 })
 
 test("a stopped encode rejects, freeing its work textures", async () => {

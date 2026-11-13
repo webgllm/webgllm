@@ -6,9 +6,10 @@
  *
  * The models: LFM3 1.7B (Liquid AI's QAD Q4_0 GGUF and two
  * 4-bit ONNX builds), official LFM2.5 GGUFs, the LFM2.5 / LFM2 ONNX builds
- * the Transformers.js package runs, and Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
- * q4f16 ONNX), each with its files (at their latest version) and the
- * sampling from its card.
+ * the Transformers.js package runs, Qwen3.5 2B (unsloth's Q4_0 GGUF and onnx-community's
+ * q4f16 ONNX), and Liquid AI's vision-language models (LFM3-VL 2B and
+ * LFM2.5-VL 3B, 1.6B and 450M, each in its GGUF and its ONNX build), each
+ * with its files (at their latest version) and the sampling from its card.
  */
 
 import type { Sampling } from "./sampler.js"
@@ -20,8 +21,40 @@ export type ModelFile = {
   path: string
 }
 
-/** A model's vision encoder files (see WebGlModelMeta.files). */
-export type VisionFiles = { graph: ModelFile; data: ModelFile; preprocessor: ModelFile }
+/**
+ * A model's vision encoder files (see WebGlModelMeta.files): an ONNX graph
+ * and its data, or a GGUF projector (`mmproj-*.gguf`), and the image
+ * processor's config (preprocessor_config.json, or a processor_config.json
+ * that holds it).
+ */
+export type VisionFiles =
+  | { graph: ModelFile; data: ModelFile; preprocessor: ModelFile }
+  | { projector: ModelFile; preprocessor: ModelFile }
+
+/**
+ * An ONNX graph's external data as loadOnnx takes it, from `sources` (one
+ * per data file, `data` then `moreData`): the one source, or, where the
+ * graph's weights are in several files, each by the location the graph
+ * gives it. A location is the file's path from the graph's folder, its
+ * subfolders kept (`weights/layers.bin`): two files of the same name in
+ * different folders are different files.
+ */
+export function onnxDataSources<S>(files: Extract<WebGlModelMeta["files"], { kind: "onnx" }>, sources: ReadonlyArray<S>): S | ((location: string) => S) {
+  if (!files.moreData?.length) return sources[0]
+  const folder = files.graph.path.slice(0, files.graph.path.lastIndexOf("/") + 1)
+  const byLocation = new Map(
+    [files.data, ...files.moreData].map((file, i) => [file.path.startsWith(folder) ? file.path.slice(folder.length) : file.path, sources[i]])
+  )
+  return (location: string) => {
+    const source = byLocation.get(location.replace(/^(\.\/)+/, ""))
+    if (source === undefined) throw new Error(`The graph reads ${location}, which isn't one of the model's files.`)
+    return source
+  }
+}
+
+/** A vision encoder's files, each one (as storedModelFiles lists them). */
+export const visionFileList = (vision: VisionFiles): Array<ModelFile> =>
+  "projector" in vision ? [vision.projector, vision.preprocessor] : [vision.graph, vision.data, vision.preprocessor]
 
 /**
  * Whether thinking can be switched off (`off`) and capped by a token budget.
@@ -41,16 +74,24 @@ export type WebGlModelMeta = {
    * (plus config.json for the architecture).
    */
   files:
-    | { kind: "gguf"; model: ModelFile }
+    | {
+        kind: "gguf"
+        model: ModelFile
+        /** The vision encoder (the repository's `mmproj-*.gguf`), for models that read images. */
+        vision?: VisionFiles
+      }
     | {
         kind: "onnx"
         graph: ModelFile
         data: ModelFile
+        /** The graph's other external data files, when its weights are in several (`data` is the first it names). */
+        moreData?: ReadonlyArray<ModelFile>
         config: ModelFile
         /**
-         * The vision encoder (`onnx/vision_encoder<the decoder's suffix>.onnx`,
-         * its data, and preprocessor_config.json), for models that read
-         * images: loaded only for a request with images (see vision.ts).
+         * The vision encoder (the graph beside the decoder, such as
+         * `onnx/vision_encoder_q4.onnx`, and its data), for models that
+         * read images: loaded only for a request with images (see
+         * vision.ts).
          */
         vision?: VisionFiles
       }
@@ -76,11 +117,17 @@ export type WebGlModelMeta = {
   /** How the model writes tool calls: LFM3's when left out. */
   toolFormat?: ToolFormat
   /**
-   * Whether the resolver looked for a vision encoder (an ONNX model's
-   * `files.vision`): a stored meta from before it did, or whose look
+   * Whether the resolver looked for an ONNX model's vision encoder
+   * (`files.vision`): a stored meta from before it did, or whose look
    * failed, is looked at again when the Hub can be reached.
    */
   visionChecked?: boolean
+  /**
+   * The same for a GGUF model: whether the resolver looked for a vision
+   * projector in its repository (a stored meta from before it did is
+   * looked at again).
+   */
+  projectorChecked?: boolean
 }
 
 const THINKING_SWITCH = {
@@ -90,7 +137,7 @@ const THINKING_SWITCH = {
 
 /** What a model reads, from its files: images where it has a vision encoder (`files.vision`). */
 export function inputsOf(files: WebGlModelMeta["files"]): ReadonlyArray<"text" | "image"> {
-  return files.kind === "onnx" && files.vision ? ["text", "image"] : ["text"]
+  return files.vision ? ["text", "image"] : ["text"]
 }
 
 const TOOLS_AND_THINKING = {
@@ -298,22 +345,30 @@ const QWEN_3_5_2B_REPO = { repo: "Qwen/Qwen3.5-2B" }
 /**
  * Qwen3.5 2B in unsloth's Q4_0 GGUF (1.21 GB): Gated DeltaNet layers with
  * full attention every fourth. Its projections are Q4_0; a few matrices
- * (Q4_1, Q5_K) load as 8-bit. Tokenizer and chat template from Qwen's own
- * repository. Thinking is off unless turned on.
+ * (Q4_1, Q5_K) load as 8-bit. Tokenizer, chat template and the image
+ * processor's config from Qwen's own repository. Its vision projector is
+ * the repository's float16 one (668 MB: there is no smaller), stored at 8
+ * bits. Thinking is off unless turned on.
  */
+const QWEN_3_5_2B_GGUF_FILES = {
+  kind: "gguf",
+  model: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" },
+  vision: {
+    projector: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "mmproj-F16.gguf" },
+    preprocessor: { ...QWEN_3_5_2B_REPO, path: "preprocessor_config.json" }
+  }
+} as const
+
 const QWEN_3_5_2B_GGUF = {
   name: "unsloth/Qwen3.5-2B-GGUF",
   format: "gguf",
-  files: {
-    kind: "gguf",
-    model: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" }
-  },
+  files: QWEN_3_5_2B_GGUF_FILES,
   tokenizer: {
     tokenizer: { ...QWEN_3_5_2B_REPO, path: "tokenizer.json" },
     config: { ...QWEN_3_5_2B_REPO, path: "tokenizer_config.json" },
     chatTemplate: { ...QWEN_3_5_2B_REPO, path: "chat_template.jinja" }
   },
-  supports: TOOLS_AND_THINKING,
+  supports: { ...TOOLS_AND_THINKING, input: inputsOf(QWEN_3_5_2B_GGUF_FILES) },
   size: "2b",
   reasoning: THINKING_SWITCH,
   sampling: QWEN_3_5_SAMPLING,
@@ -417,6 +472,228 @@ const LFM2_1_2B_TOOL_ONNX = {
   toolFormat: "lfm2"
 } as const satisfies WebGlModelMeta
 
+/** LFM2.5-VL 450M's and 1.6B's cards, for text: temperature 0.1, min-p 0.15, repetition penalty 1.05 (Transformers' top-k, 50). */
+const LFM2_5_VL_SAMPLING = {
+  temperature: 0.1,
+  top_k: 50,
+  min_p: 0.15,
+  repetition_penalty: 1.05
+} as const satisfies Sampling
+
+/** LFM2.5-VL 3B's card: temperature 0.2, top-k 50, repetition penalty 1.0. */
+const LFM2_5_VL_3B_SAMPLING = {
+  temperature: 0.2,
+  top_k: 50,
+  repetition_penalty: 1
+} as const satisfies Sampling
+
+const IMAGES_AND_TOOLS = { input: ["text", "image"], output: ["text"], capabilities: ["tools"] } as const
+const IMAGES = { input: ["text", "image"], output: ["text"], capabilities: [] } as const
+const IMAGES_TOOLS_AND_THINKING = { input: ["text", "image"], output: ["text"], capabilities: ["tools", "thinking"] } as const
+
+/**
+ * A Liquid AI vision-language model in its official GGUF build: the text
+ * model's Q4_0 file (quantization-aware where there is one) and the
+ * repository's Q8_0 vision projector (`mmproj`). The tokenizer, the chat
+ * template and the image processor's config come from the original
+ * repository (the GGUF repository has none).
+ */
+function vlGguf<const Name extends string, const Supports extends WebGlModelMeta["supports"]>(o: {
+  name: Name
+  /** The original repository. */
+  base: string
+  file: string
+  projector: string
+  size: string
+  supports: Supports
+  sampling: Sampling
+  toolFormat: ToolFormat
+}) {
+  const repo = { repo: o.name }
+  const base = { repo: o.base }
+  return {
+    name: o.name,
+    format: "gguf",
+    files: {
+      kind: "gguf",
+      model: { ...repo, path: o.file },
+      vision: { projector: { ...repo, path: o.projector }, preprocessor: { ...base, path: "processor_config.json" } }
+    },
+    tokenizer: {
+      tokenizer: { ...base, path: "tokenizer.json" },
+      config: { ...base, path: "tokenizer_config.json" },
+      chatTemplate: { ...base, path: "chat_template.jinja" }
+    },
+    supports: o.supports,
+    size: o.size,
+    reasoning: undefined,
+    sampling: o.sampling,
+    toolFormat: o.toolFormat
+  } as const satisfies WebGlModelMeta
+}
+
+/**
+ * A Liquid AI vision-language model in its official ONNX export: the 4-bit
+ * decoder (its float embedding, which is also its head, is quantized to 8
+ * bits at load) and the 8-bit vision encoder beside it (`vision_encoder_q8`,
+ * or `embed_images_q8`), whose features are within a few percent of the
+ * float encoder's (the 4-bit one's are far off). The separate embed_tokens
+ * file isn't needed.
+ */
+function vlOnnx<const Name extends string, const Supports extends WebGlModelMeta["supports"]>(o: {
+  name: Name
+  /** The decoder graph, and the vision encoder graph, under onnx/. */
+  decoder: string
+  /** The decoder's external data files, in the order the loader reads them. */
+  data: [string, ...Array<string>]
+  encoder: string
+  /** The image processor's config: preprocessor_config.json, or the processor_config.json that holds it. */
+  preprocessor: string
+  size: string
+  supports: Supports
+  sampling: Sampling
+  toolFormat: ToolFormat
+}) {
+  const repo = { repo: o.name }
+  const [data, ...more] = o.data
+  return {
+    name: o.name,
+    format: "onnx",
+    files: {
+      kind: "onnx",
+      graph: { ...repo, path: `onnx/${o.decoder}.onnx` },
+      data: { ...repo, path: `onnx/${data}` },
+      ...(more.length > 0 && { moreData: more.map((path) => ({ ...repo, path: `onnx/${path}` })) }),
+      config: { ...repo, path: "config.json" },
+      vision: {
+        graph: { ...repo, path: `onnx/${o.encoder}.onnx` },
+        data: { ...repo, path: `onnx/${o.encoder}.onnx_data` },
+        preprocessor: { ...repo, path: o.preprocessor }
+      }
+    },
+    tokenizer: {
+      tokenizer: { ...repo, path: "tokenizer.json" },
+      config: { ...repo, path: "tokenizer_config.json" },
+      chatTemplate: { ...repo, path: "chat_template.jinja" }
+    },
+    supports: o.supports,
+    size: o.size,
+    reasoning: undefined,
+    sampling: o.sampling,
+    toolFormat: o.toolFormat
+  } as const satisfies WebGlModelMeta
+}
+
+/** LFM3-VL 2B: LFM3 with a vision tower of its own; thinks unless turned off. Its card's sampling is LFM3's. */
+const LFM3_VL_2B_GGUF = {
+  ...vlGguf({
+    name: "LiquidAI/LFM3-VL-2B-GGUF",
+    base: "LiquidAI/LFM3-VL-2B",
+    file: "LFM3-VL-2B-QAD-Q4_0.gguf",
+    projector: "mmproj-LFM3-VL-2B-Q8_0.gguf",
+    size: "2b",
+    supports: IMAGES_TOOLS_AND_THINKING,
+    sampling: LFM3_SAMPLING,
+    toolFormat: "lfm3"
+  }),
+  reasoning: THINKING_SWITCH
+} as const satisfies WebGlModelMeta
+
+/** LFM3-VL 2B's ONNX export: a decoder of 4- and 8-bit projections (q4f16), which reads token ids. */
+const LFM3_VL_2B_ONNX = {
+  ...vlOnnx({
+    name: "LiquidAI/LFM3-VL-2B-ONNX",
+    decoder: "decoder_q4f16",
+    data: ["decoder_q4f16.onnx_data"],
+    encoder: "vision_encoder_q8",
+    preprocessor: "processor_config.json",
+    size: "2b",
+    supports: IMAGES_TOOLS_AND_THINKING,
+    sampling: LFM3_SAMPLING,
+    toolFormat: "lfm3"
+  }),
+  reasoning: THINKING_SWITCH
+} as const satisfies WebGlModelMeta
+
+/** LFM2.5-VL 3B: LFM2.5 with SigLIP2 (so400m); large images are read in 512-pixel tiles. */
+const LFM2_5_VL_3B_GGUF = vlGguf({
+  name: "LiquidAI/LFM2.5-VL-3B-GGUF",
+  base: "LiquidAI/LFM2.5-VL-3B",
+  file: "LFM2.5-VL-3B-Q4_0.gguf",
+  projector: "mmproj-LFM2.5-VL-3B-Q8_0.gguf",
+  size: "3b",
+  supports: IMAGES_AND_TOOLS,
+  sampling: LFM2_5_VL_3B_SAMPLING,
+  toolFormat: "lfm2"
+})
+
+/** LFM2.5-VL 3B's ONNX export: its decoder's weights are in four data files. */
+const LFM2_5_VL_3B_ONNX = vlOnnx({
+  name: "LiquidAI/LFM2.5-VL-3B-ONNX",
+  decoder: "decoder_model_merged_q4",
+  data: [
+    "decoder_model_merged_q4.onnx_data_2",
+    "decoder_model_merged_q4.onnx_data_3",
+    "decoder_model_merged_q4.onnx_data_4",
+    "decoder_model_merged_q4.onnx_data_1"
+  ],
+  encoder: "vision_encoder_q8",
+  preprocessor: "preprocessor_config.json",
+  size: "3b",
+  supports: IMAGES_AND_TOOLS,
+  sampling: LFM2_5_VL_3B_SAMPLING,
+  toolFormat: "lfm2"
+})
+
+/** LFM2.5-VL 1.6B: LFM2.5 1.2B with SigLIP2 (so400m). */
+const LFM2_5_VL_1_6B_GGUF = vlGguf({
+  name: "LiquidAI/LFM2.5-VL-1.6B-GGUF",
+  base: "LiquidAI/LFM2.5-VL-1.6B",
+  file: "LFM2.5-VL-1.6B-Q4_0.gguf",
+  projector: "mmproj-LFM2.5-VL-1.6b-Q8_0.gguf",
+  size: "1.6b",
+  supports: IMAGES_AND_TOOLS,
+  sampling: LFM2_5_VL_SAMPLING,
+  toolFormat: "lfm2"
+})
+
+/** LFM2.5-VL 1.6B's ONNX export, whose chat template takes no tools. */
+const LFM2_5_VL_1_6B_ONNX = vlOnnx({
+  name: "LiquidAI/LFM2.5-VL-1.6B-ONNX",
+  decoder: "decoder_q4",
+  data: ["decoder_q4.onnx_data"],
+  encoder: "embed_images_q8",
+  preprocessor: "processor_config.json",
+  size: "1.6b",
+  supports: IMAGES,
+  sampling: LFM2_5_VL_SAMPLING,
+  toolFormat: "lfm2"
+})
+
+/** LFM2.5-VL 450M: LFM2.5 350M with SigLIP2 (base), the smallest that reads images. */
+const LFM2_5_VL_450M_GGUF = vlGguf({
+  name: "LiquidAI/LFM2.5-VL-450M-GGUF",
+  base: "LiquidAI/LFM2.5-VL-450M",
+  file: "LFM2.5-VL-450M-Q4_0.gguf",
+  projector: "mmproj-LFM2.5-VL-450m-Q8_0.gguf",
+  size: "450m",
+  supports: IMAGES_AND_TOOLS,
+  sampling: LFM2_5_VL_SAMPLING,
+  toolFormat: "lfm2"
+})
+
+const LFM2_5_VL_450M_ONNX = vlOnnx({
+  name: "LiquidAI/LFM2.5-VL-450M-ONNX",
+  decoder: "decoder_model_merged_q4",
+  data: ["decoder_model_merged_q4.onnx_data"],
+  encoder: "vision_encoder_q8",
+  preprocessor: "preprocessor_config.json",
+  size: "450m",
+  supports: IMAGES_AND_TOOLS,
+  sampling: LFM2_5_VL_SAMPLING,
+  toolFormat: "lfm2"
+})
+
 export const WEBGL_TEXT_MODELS = [
   LFM3_1_7B_GGUF.name,
   LFM3_1_7B_ONNX.name,
@@ -429,7 +706,15 @@ export const WEBGL_TEXT_MODELS = [
   QWEN_3_5_2B_GGUF.name,
   QWEN_3_5_2B_ONNX.name,
   LFM2_1_2B_TOOL_GGUF.name,
-  LFM2_1_2B_TOOL_ONNX.name
+  LFM2_1_2B_TOOL_ONNX.name,
+  LFM3_VL_2B_GGUF.name,
+  LFM3_VL_2B_ONNX.name,
+  LFM2_5_VL_3B_GGUF.name,
+  LFM2_5_VL_3B_ONNX.name,
+  LFM2_5_VL_1_6B_GGUF.name,
+  LFM2_5_VL_1_6B_ONNX.name,
+  LFM2_5_VL_450M_GGUF.name,
+  LFM2_5_VL_450M_ONNX.name
 ] as const
 
 /** A model this package runs. */
@@ -452,7 +737,15 @@ export const WEBGL_MODEL_META = {
   [QWEN_3_5_2B_GGUF.name]: QWEN_3_5_2B_GGUF,
   [QWEN_3_5_2B_ONNX.name]: QWEN_3_5_2B_ONNX,
   [LFM2_1_2B_TOOL_GGUF.name]: LFM2_1_2B_TOOL_GGUF,
-  [LFM2_1_2B_TOOL_ONNX.name]: LFM2_1_2B_TOOL_ONNX
+  [LFM2_1_2B_TOOL_ONNX.name]: LFM2_1_2B_TOOL_ONNX,
+  [LFM3_VL_2B_GGUF.name]: LFM3_VL_2B_GGUF,
+  [LFM3_VL_2B_ONNX.name]: LFM3_VL_2B_ONNX,
+  [LFM2_5_VL_3B_GGUF.name]: LFM2_5_VL_3B_GGUF,
+  [LFM2_5_VL_3B_ONNX.name]: LFM2_5_VL_3B_ONNX,
+  [LFM2_5_VL_1_6B_GGUF.name]: LFM2_5_VL_1_6B_GGUF,
+  [LFM2_5_VL_1_6B_ONNX.name]: LFM2_5_VL_1_6B_ONNX,
+  [LFM2_5_VL_450M_GGUF.name]: LFM2_5_VL_450M_GGUF,
+  [LFM2_5_VL_450M_ONNX.name]: LFM2_5_VL_450M_ONNX
 } as const satisfies Readonly<Record<WebGlTextModel, WebGlModelMeta>>
 
 /** A model's reasoning, exactly: its levels, or undefined for a model that doesn't think. */

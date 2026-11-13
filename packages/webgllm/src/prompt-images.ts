@@ -1,34 +1,48 @@
 /**
- * A prompt's images in the worker: fetched and resized as the model's
- * processor says (image.ts), each image slot the chat template wrote
- * expanded to the image's tokens, and keys for the prompt cache that tell
+ * A prompt's images in the worker: fetched and resized into views as the
+ * model's processor says (image.ts), each image slot the chat template
+ * wrote expanded to the image's tokens, and keys for the prompt cache that tell
  * images apart (see handler.ts). Embedding rows are kept for a few recent
  * images, by content, so a chat that reads an image again doesn't encode it
  * again.
  */
-import { pixelBudget, smartResize, toPatches, type ImageDetail, type ImagePatches, type ImageProcessorConfig } from "./image.js"
+import { planViews, toPatches, type ImageDetail, type ImagePatches, type ImageProcessorConfig } from "./image.js"
 import type { ChatMessage } from "./tokenizer.js"
 
 /** An image part of a chat message, as the worker gets it. */
 export type ChatImage = { url: string; detail?: ImageDetail }
 
-/** An image ready for a prompt. */
-export type PreparedImage = {
-  /** The prompt cache's key for its rows: negative (never a token id), from its bytes, detail and size. */
-  key: number
+/** A view of an image (the whole image, a tile of it, or its thumbnail): what the encoder reads at once. */
+export type ImageView = {
   /** Merged tokens: rows and columns. */
   height: number
   width: number
+  /** A tile's row and column (from 1), or "thumbnail", where the image is tiled. */
+  place?: { row: number; col: number } | "thumbnail"
   /** Its resized pixels (RGBA), until it's encoded. */
   pixels: { rgba: Uint8ClampedArray; height: number; width: number } | null
   /** Its embedding rows, once encoded. */
   features: Float32Array | null
 }
 
-/** An image's patches, cut from its resized pixels when it's encoded. */
-export function patchesOf(image: PreparedImage, config: ImageProcessorConfig): ImagePatches {
-  if (!image.pixels) throw new Error("An image's pixels were dropped before it was encoded.")
-  const { rgba, height, width } = image.pixels
+/** An image ready for a prompt. */
+export type PreparedImage = {
+  /** The prompt cache's key for its rows: negative (never a token id), from its bytes, detail and size. */
+  key: number
+  /** What it's read as, in prompt order: one view, or its tiles then its thumbnail. */
+  views: Array<ImageView>
+}
+
+/** What of an image its place in a prompt needs: each view's size, and where a tile is. */
+export type ImageLayout = { views: Array<Pick<ImageView, "height" | "width" | "place">> }
+
+/** An image's tokens in the prompt that are its rows (the views' tokens; the tokens around them aside). */
+export const imageRows = (image: ImageLayout) => image.views.reduce((sum, v) => sum + v.height * v.width, 0)
+
+/** A view's patches, cut from its resized pixels when it's encoded. */
+export function patchesOf(view: ImageView, config: ImageProcessorConfig): ImagePatches {
+  if (!view.pixels) throw new Error("An image's pixels were dropped before it was encoded.")
+  const { rgba, height, width } = view.pixels
   return toPatches(rgba, height, width, config)
 }
 
@@ -55,47 +69,123 @@ export function imageKey(bytes: Uint8Array, height: number, width: number): numb
   return -(1 + (a >>> 0) * 2 ** 20 + ((b >>> 0) & 0xfffff))
 }
 
-/** The chat template's image slot: `<|vision_start|><|image_pad|><|vision_end|>`, as token ids. */
-export type ImageSlot = { start: number; pad: number; end: number }
+/**
+ * How a chat template writes an image, as token ids. Qwen3.5 and LFM3-VL
+ * write a placeholder between a vision start and end, which becomes the
+ * image's tokens (`wrapped`). LFM2-VL writes a bare placeholder, which
+ * becomes `<|image_start|>`, the image's tokens and `<|image_end|>`; a
+ * tiled image's are each tile's after its `<|img_row_R_col_C|>`, then the
+ * thumbnail's after `<|img_thumbnail|>`.
+ */
+export type ImageSlot =
+  | { kind: "wrapped"; start: number; pad: number; end: number }
+  | { kind: "bare"; pad: number; start: number; end: number; thumbnail: number; tile: (row: number, col: number) => number }
 
-/** How many image slots the template wrote (a pad between a start and an end; a pad in text isn't one). */
-export function countImageSlots(prompt: ArrayLike<number>, slot: ImageSlot): number {
-  let count = 0
-  for (let i = 1; i + 1 < prompt.length; i++)
-    if (prompt[i] === slot.pad && prompt[i - 1] === slot.start && prompt[i + 1] === slot.end) count++
-  return count
+/** What stands for a placeholder a message's own text has, in imagePlaceholders' render. */
+const LITERAL = "@@webgllm-literal-placeholder@@"
+
+/** `value` with `change` applied to every string in it (arrays and plain objects, keys as they are). */
+function mapStrings<T>(value: T, change: (text: string) => string): T {
+  if (typeof value === "string") return change(value) as T
+  if (Array.isArray(value)) return value.map((item) => mapStrings(item, change)) as T
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, mapStrings(item, change)])) as T
+  }
+  return value
 }
 
 /**
- * The prompt with each image slot's pad expanded to its image's tokens,
- * and the keys the cache compares: the tokens, with each image's rows its
- * key. Only pads the template put between a vision start and end are
- * slots; the same token written in a message's text stays as it is.
+ * For each `placeholder` in a chat's rendered text, in order: whether the
+ * template wrote it for an image part (true), or it is a message's own
+ * text (false). A user can write "<image>" in a message, and the tokenizer
+ * makes the template's placeholder token of it: that one is text, not an
+ * attachment. Told apart by rendering `input` (what `render` reads: the
+ * messages, the tools) with the placeholder in every string of it replaced
+ * by a marker: the placeholders left are the template's own.
+ */
+export function imagePlaceholders<T>(input: T, placeholder: string, render: (input: T) => string): Array<boolean> {
+  const probe = render(mapStrings(input, (text) => text.split(placeholder).join(LITERAL)))
+  const written: Array<boolean> = []
+  let at = 0
+  for (;;) {
+    const part = probe.indexOf(placeholder, at)
+    const literal = probe.indexOf(LITERAL, at)
+    if (part < 0 && literal < 0) return written
+    const isPart = literal < 0 || (part >= 0 && part < literal)
+    written.push(isPart)
+    at = isPart ? part + placeholder.length : literal + LITERAL.length
+  }
+}
+
+/**
+ * Where the prompt's image slots are. `written` says, for each placeholder
+ * token in order, whether the template wrote it for an image part (see
+ * imagePlaceholders); without it every placeholder token is taken for one
+ * (a wrapped one only between its start and end tokens).
+ */
+function slotPositions(prompt: ArrayLike<number>, slot: ImageSlot, written?: ReadonlyArray<boolean>): Set<number> {
+  const at = new Set<number>()
+  let placeholder = 0
+  for (let i = 0; i < prompt.length; i++) {
+    if (prompt[i] !== slot.pad) continue
+    const part = written ? written[placeholder] === true : true
+    placeholder++
+    if (part && (slot.kind === "bare" || (prompt[i - 1] === slot.start && prompt[i + 1] === slot.end))) at.add(i)
+  }
+  return at
+}
+
+/** How many image slots the template wrote (a wrapped placeholder alone in a message's text isn't one; see slotPositions for `written`). */
+export function countImageSlots(prompt: ArrayLike<number>, slot: ImageSlot, written?: ReadonlyArray<boolean>): number {
+  return slotPositions(prompt, slot, written).size
+}
+
+/** The tokens an image's slot becomes around and between its views' rows, and in all. */
+export function imageTokenCount(image: ImageLayout, slot: ImageSlot): number {
+  const rows = imageRows(image)
+  if (slot.kind === "wrapped") return rows
+  return rows + 2 + image.views.filter((v) => v.place).length
+}
+
+/**
+ * The prompt with each image slot expanded to its image's tokens, and the
+ * keys the cache compares: the tokens, with each image's rows its key.
+ * `starts` is where each view's rows begin, images and their views in
+ * order. A placeholder that isn't a slot (`written`: see slotPositions)
+ * stays the one token it is, as text.
  */
 export function expandImageTokens(
   prompt: Array<number>,
   slot: ImageSlot,
-  images: Array<Pick<PreparedImage, "key" | "height" | "width">>
+  images: Array<Pick<PreparedImage, "key"> & ImageLayout>,
+  written?: ReadonlyArray<boolean>
 ): { tokens: Array<number>; keys: Array<number>; starts: Array<number> } {
+  const slots = slotPositions(prompt, slot, written)
   const tokens: Array<number> = []
   const keys: Array<number> = []
   const starts: Array<number> = []
+  const literal = (token: number) => {
+    tokens.push(token)
+    keys.push(token)
+  }
   let next = 0
   for (let i = 0; i < prompt.length; i++) {
-    const token = prompt[i]
-    const isSlot = token === slot.pad && prompt[i - 1] === slot.start && prompt[i + 1] === slot.end
-    if (!isSlot) {
-      tokens.push(token)
-      keys.push(token)
+    if (!slots.has(i)) {
+      literal(prompt[i])
       continue
     }
     const image = images[next++]
     if (!image) throw new Error("The prompt has more image slots than images.")
-    starts.push(tokens.length)
-    for (let r = 0; r < image.height * image.width; r++) {
-      tokens.push(token)
-      keys.push(image.key)
+    if (slot.kind === "bare") literal(slot.start)
+    for (const view of image.views) {
+      if (slot.kind === "bare" && view.place) literal(view.place === "thumbnail" ? slot.thumbnail : slot.tile(view.place.row, view.place.col))
+      starts.push(tokens.length)
+      for (let r = 0; r < view.height * view.width; r++) {
+        tokens.push(slot.pad)
+        keys.push(image.key)
+      }
     }
+    if (slot.kind === "bare") literal(slot.end)
   }
   if (next !== images.length) throw new Error(`The prompt has ${next} image slots for ${images.length} images.`)
   return { tokens, keys, starts }
@@ -113,33 +203,17 @@ export async function fetchImage(url: string, signal?: AbortSignal): Promise<Blo
   }
 }
 
-/** The size an image is resized to, and its tokens, for its detail and the GPU's patch limit. */
-export function resizedSize(
-  height: number,
-  width: number,
-  detail: ImageDetail | undefined,
-  config: ImageProcessorConfig,
-  maxPatches: number
-) {
-  const factor = config.patchSize * config.mergeSize
-  const budget = pixelBudget(detail, config)
-  // The encoder reads at most maxPatches (a texture's height).
-  const maxPixels = Math.min(budget.maxPixels, maxPatches * config.patchSize * config.patchSize)
-  const size = smartResize(height, width, factor, Math.min(budget.minPixels, maxPixels), maxPixels)
-  return { ...size, tokens: (size.height / factor) * (size.width / factor) }
-}
-
 /**
- * Decodes an image's bytes and resizes it into its pixel budget (on white,
- * as transformers' convert_to_rgb composites transparency). `fits` sees its
- * token count before any pixels are made, and may throw to stop there.
+ * Decodes an image's bytes and resizes it into its views (on white, as
+ * transformers' convert_to_rgb composites transparency). `fits` sees its
+ * views before any pixels are made, and may throw to stop there.
  */
 export async function decodeImage(
   blob: Blob,
   detail: ImageDetail | undefined,
   config: ImageProcessorConfig,
   maxPatches: number,
-  fits: (tokens: number) => void,
+  fits: (image: ImageLayout) => void,
   signal?: AbortSignal
 ): Promise<PreparedImage> {
   let bitmap: ImageBitmap
@@ -150,26 +224,33 @@ export async function decodeImage(
   }
   try {
     signal?.throwIfAborted()
-    const size = resizedSize(bitmap.height, bitmap.width, detail, config, maxPatches)
-    fits(size.tokens)
-    const canvas = new OffscreenCanvas(size.width, size.height)
-    const context = canvas.getContext("2d", { willReadFrequently: true })
-    if (!context) throw new Error("No 2D canvas to resize an image on.")
-    context.fillStyle = "#fff"
-    context.fillRect(0, 0, size.width, size.height)
-    context.imageSmoothingEnabled = true
-    context.imageSmoothingQuality = "high"
-    context.drawImage(bitmap, 0, 0, size.width, size.height)
-    const rgba = context.getImageData(0, 0, size.width, size.height).data
-    const bytes = new Uint8Array(await blob.arrayBuffer())
     const merged = config.patchSize * config.mergeSize
-    return {
-      key: imageKey(bytes, size.height, size.width),
-      height: size.height / merged,
-      width: size.width / merged,
-      pixels: { rgba, height: size.height, width: size.width },
+    const plans = planViews(bitmap.height, bitmap.width, detail, config, maxPatches)
+    const views: Array<ImageView> = plans.map((plan) => ({
+      height: plan.height / merged,
+      width: plan.width / merged,
+      ...(plan.place && { place: plan.place }),
+      pixels: null,
       features: null
+    }))
+    fits({ views })
+    for (const [i, plan] of plans.entries()) {
+      signal?.throwIfAborted()
+      const canvas = new OffscreenCanvas(plan.width, plan.height)
+      const context = canvas.getContext("2d", { willReadFrequently: true })
+      if (!context) throw new Error("No 2D canvas to resize an image on.")
+      context.fillStyle = "#fff"
+      context.fillRect(0, 0, plan.width, plan.height)
+      context.imageSmoothingEnabled = true
+      context.imageSmoothingQuality = "high"
+      // A tile: the image resized to the whole grid, drawn so the tile's part lands on the canvas.
+      if (plan.from) context.drawImage(bitmap, -plan.from.x, -plan.from.y, plan.from.width, plan.from.height)
+      else context.drawImage(bitmap, 0, 0, plan.width, plan.height)
+      views[i].pixels = { rgba: context.getImageData(0, 0, plan.width, plan.height).data, height: plan.height, width: plan.width }
     }
+    const bytes = new Uint8Array(await blob.arrayBuffer())
+    const first = plans[0]
+    return { key: imageKey(bytes, first.height * plans.length, first.width), views }
   } finally {
     bitmap.close()
   }

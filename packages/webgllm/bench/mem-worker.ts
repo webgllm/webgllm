@@ -15,12 +15,13 @@ import { names } from "./memory-names.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
-import { fileUrl, modelMeta, type WebGlTextModel } from "../src/model-meta.js"
+import { fileUrl, modelMeta, onnxDataSources, type WebGlTextModel } from "../src/model-meta.js"
 import { resolveModel } from "../src/resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor } from "../src/prompt.js"
 import { download } from "../src/storage.js"
 import { checkPrefixCache } from "./prefix-cache-check.js"
 import { loadTokenizer, type ChatMessage, type Tokenizer } from "../src/tokenizer.js"
+import type { ByteSource } from "../src/weights.js"
 
 type Params = {
   model: WebGlTextModel
@@ -173,7 +174,7 @@ async function files(model: WebGlTextModel) {
   const meta = modelMeta(model)
   const t = meta.tokenizer
   const weights =
-    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data]
+    meta.files.kind === "gguf" ? [meta.files.model] : [meta.files.config, meta.files.graph, meta.files.data, ...(meta.files.moreData ?? [])]
   const all = [t.tokenizer, t.config, ...(t.chatTemplate ? [t.chatTemplate] : []), ...weights]
   // Without the Origin Private File System (a page that isn't a secure
   // context: a phone on http://<the Mac's address>), the files stream
@@ -239,12 +240,17 @@ async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>
       : loadOnnx({
           config: JSON.parse(await text(weightFiles[0])) as Record<string, unknown>,
           graph: await source(weightFiles[1]),
-          data: await source(weightFiles[2])
+          data: await onnxData(meta.files, weightFiles.slice(2), source)
         })
   const t0 = performance.now()
   await engine.load(pieces)
   const loadMs = performance.now() - t0
   return { engine, loadMs }
+}
+
+/** An ONNX graph's external data: its one file, or each of several by the location the graph gives it. */
+async function onnxData<F>(files: Extract<ReturnType<typeof modelMeta>["files"], { kind: "onnx" }>, data: Array<F>, source: (file: F) => Promise<ByteSource>) {
+  return onnxDataSources(files, await Promise.all(data.map(source)))
 }
 
 const FILLER =

@@ -1,80 +1,50 @@
 /**
- * Loads a Qwen3.5 vision encoder from its ONNX export
- * (onnx-community/Qwen3.5-*-ONNX's onnx/vision_encoder_q4f16.onnx + its
- * .onnx_data): a ViT over 16-pixel patches (two frames of each, the image
- * twice), a learned 48 × 48 position table interpolated to the image's
- * grid, `depth` pre-norm blocks with 2D RoPE, and a merger that folds each
- * 2 × 2 block of patches into one token of the text model's width (see
- * docs/vision.md).
+ * Loads a vision encoder from its ONNX export (the graph and its one
+ * external data file) as the pieces vision.ts runs (vision-weights.ts).
+ * Three graphs are read, told apart by their modules:
+ *
+ * - Qwen3.5's (onnx-community/Qwen3.5-*-ONNX's vision_encoder_q4f16): a
+ *   ViT over 16-pixel patches (two frames of each, the image twice), a
+ *   learned 48 × 48 position table interpolated to the image's grid,
+ *   pre-norm blocks with a fused q|k|v projection and 2D RoPE, and a
+ *   merger that folds each 2 × 2 block of patches into one token.
+ * - LFM2-VL's (LiquidAI/LFM2.5-VL-*-ONNX's vision_encoder or
+ *   embed_images): SigLIP2 NaFlex. Patches of 16 × 16 pixels, a learned
+ *   16 × 16 position table resized to the image's grid, pre-norm blocks
+ *   with separate q, k and v projections and a tanh-GELU MLP, a final
+ *   LayerNorm, then the projector: each 2 × 2 block of patches as one row,
+ *   two projections with an exact GELU between.
+ * - LFM3-VL's (LiquidAI/LFM3-VL-*-ONNX's vision_encoder): a patch
+ *   projection and an RMS norm, then RMS-norm blocks of either a gated
+ *   3 × 3 depthwise convolution over the patch grid or grouped-query
+ *   attention with 2D RoPE and per-head q and k norms, each with a SwiGLU
+ *   MLP; and a projector like LFM2-VL's behind a LayerNorm.
  *
  * Weights are found by the graph's structure, as load-onnx.ts finds the
  * text model's: a projection is the MatMulNBits node under its module path
  * (`/model/layers.0/attn/qkv/`), its bias the Add after it, a norm the
- * LayerNormalization its input comes from.
+ * normalization its input comes from.
  */
 import { halvesToFloats } from "./half.js"
-import { checkShape, OnnxModel, tensorBytes, type NBits } from "./load-onnx.js"
+import { checkShape, OnnxModel, tensorBytes, type WideNBits } from "./load-onnx.js"
 import { OnnxDataType, parseOnnxModel, type OnnxNode, type OnnxTensor } from "./onnx.js"
 import { ReadPlan } from "./read-plan.js"
-import { packMatMulNBitsScales } from "./repack.js"
-import type { ByteSource, QuantMatrix } from "./weights.js"
+import {
+  checkVisionConfig,
+  matMulNBitsMatrix,
+  stackLinears,
+  type VisionBlock,
+  type VisionConfig,
+  type VisionLinear,
+  type VisionNorm,
+  type VisionPiece
+} from "./vision-weights.js"
+import type { ByteSource } from "./weights.js"
 
-export type VisionConfig = {
-  /** The ViT's width (0.8B: 768, 2B: 1024). */
-  width: number
-  heads: number
-  /** Dims per head (64); RoPE rotates all of them. */
-  headDim: number
-  /** The MLP's inner width. */
-  ffn: number
-  depth: number
-  /** The merger's output: the text model's hidden size. */
-  outWidth: number
-  /** Pixels per patch side (16). */
-  patchSize: number
-  /** Frames per patch (2: a still image is repeated). */
-  temporal: number
-  /** Patches per merged token side (2). */
-  merge: number
-  /** Values per patch row of pixel_values: 3 · temporal · patchSize². */
-  patchValues: number
-  /** The position table's side (48: 2304 rows). */
-  grid: number
-  /** LayerNorm's epsilon. */
-  eps: number
-  /** The blocks' MLP activation, and the merger's. */
-  act: "tanh" | "erf"
-  mergerAct: "tanh" | "erf"
-}
-
-/** A projection: 4-bit rows as MatMulNBits stores them (QuantMatrix.raw), and its bias. */
-export type VisionLinear = { m: QuantMatrix; bias: Float32Array }
-export type VisionNorm = { weight: Float32Array; bias: Float32Array }
-
-export type VisionBlock = {
-  norm1: VisionNorm
-  qkv: VisionLinear
-  proj: VisionLinear
-  norm2: VisionNorm
-  fc1: VisionLinear
-  fc2: VisionLinear
-}
-
-export type VisionPiece =
-  | { kind: "config"; config: VisionConfig }
-  | {
-      kind: "patch"
-      patch: VisionLinear
-      /** The position table, dequantized: grid² rows of `width`. */
-      positions: Float32Array
-      /** RoPE's 16 frequencies (headDim / 4): rows use 0..15, columns the same again. */
-      invFreq: Float32Array
-    }
-  | { kind: "block"; index: number; value: VisionBlock }
-  | { kind: "merger"; norm: VisionNorm; linear1: VisionLinear; linear2: VisionLinear }
+export type { VisionBlock, VisionConfig, VisionLinear, VisionNorm, VisionPiece } from "./vision-weights.js"
 
 export type LoadVisionOptions = {
-  /** vision_encoder*.onnx, as bytes or a source. */
+  /** The encoder's .onnx file, as bytes or a source. */
   graph: ByteSource | Uint8Array
   /** Its external data file. */
   data: ByteSource
@@ -82,47 +52,96 @@ export type LoadVisionOptions = {
 
 type Read = { key: string; tensor: OnnxTensor }
 
-/** The encoder's graph, read: its config and every tensor the load takes, in order. */
-export function planVision(graphBytes: Uint8Array) {
-  const model = new OnnxModel(parseOnnxModel(graphBytes))
-  const nodes = model.graph.nodes
-  const reads: Array<Read> = []
-  const want = (t: OnnxTensor | null) => {
-    if (t) reads.push({ key: t.name, tensor: t })
+/** A projection in the graph: its weight and the bias added after it, if any. */
+type LinearRef = { w: WideNBits; bias: OnnxTensor | null; out: string }
+type NormRef = { weight: OnnxTensor; bias: OnnxTensor | null }
+type BlockRef = { norm1: NormRef; norm2: NormRef; fc1: Array<LinearRef>; fc2: LinearRef } & (
+  | { type: "attention"; qkv: Array<LinearRef>; qNorm?: OnnxTensor; kNorm?: OnnxTensor; proj: LinearRef }
+  | { type: "conv"; inProj: LinearRef; kernel: OnnxTensor; outProj: LinearRef }
+)
+
+/** What a graph's plan found: the config and where each piece's tensors are. */
+type VisionPlan = {
+  config: VisionConfig
+  patch: LinearRef
+  patchNorm?: NormRef
+  /** The position table: 4-bit rows (Qwen3.5), or floats, [1, width, grid, grid]. */
+  table?: { kind: "q4"; quant: OnnxTensor; scales: OnnxTensor; zp: OnnxTensor | null } | { kind: "float"; values: OnnxTensor }
+  /** RoPE's frequencies as a tensor, or the sin table they are read from (row 1 is sin of each). */
+  invFreq?: { kind: "values"; tensor: OnnxTensor } | { kind: "sin"; tensor: OnnxTensor }
+  blocks: Array<BlockRef>
+  merger: { norm: NormRef; linear1: LinearRef; linear2: LinearRef }
+}
+
+/** Lookups the three plans share. */
+class VisionGraph {
+  readonly model: OnnxModel
+  constructor(graphBytes: Uint8Array) {
+    this.model = new OnnxModel(parseOnnxModel(graphBytes))
   }
 
-  /** The node behind `name`, past Casts and Reshapes. */
-  const source = (name: string): OnnxNode | undefined => {
-    let node = model.producerOf(name)
-    while (node && (node.opType === "Cast" || node.opType === "Reshape")) node = model.producerOf(node.inputs[0])
+  get nodes() {
+    return this.model.graph.nodes
+  }
+
+  /** The node behind `name`, past Casts, Reshapes and Transposes (the merger's regrouping of patches). */
+  source(name: string): OnnxNode | undefined {
+    let node = this.model.producerOf(name)
+    while (node && (node.opType === "Cast" || node.opType === "Reshape" || node.opType === "Transpose")) node = this.model.producerOf(node.inputs[0])
     return node
   }
-  const linear = (path: string) => {
-    const w = model.nbits(path)
-    const add = model.consumersOf(w.node.outputs[0]).find((n) => n.opType === "Add")
-    const bias = add?.inputs.map((i) => (model.has(i) ? model.init(i) : null)).find((t) => t !== null)
-    if (!add || !bias) throw new Error(`ONNX: ${path} has no bias`)
-    checkShape(bias, bias.dataType, w.N)
-    return { w, bias, out: add.outputs[0] }
+
+  /** The projection under `path`: `bias` says whether an Add of a constant must follow it. */
+  linear(path: string, bias: boolean): LinearRef {
+    const w = this.model.wideNBits(path)
+    const add = this.model.consumersOf(w.node.outputs[0]).find((n) => n.opType === "Add" && n.inputs.some((i) => this.model.has(i)))
+    const tensor = add?.inputs.map((i) => (this.model.has(i) ? this.model.init(i) : null)).find((t) => t !== null) ?? null
+    if (bias !== (tensor !== null)) throw new Error(`ONNX: ${path} has ${tensor ? "a" : "no"} bias`)
+    if (tensor) checkShape(tensor, tensor.dataType, w.N)
+    return { w, bias: tensor, out: add && tensor ? add.outputs[0] : w.node.outputs[0] }
   }
-  const normBefore = (w: NBits) => {
-    const ln = source(w.node.inputs[0])
-    if (ln?.opType !== "LayerNormalization") throw new Error(`ONNX: no LayerNorm before ${w.name}`)
-    const weight = model.init(ln.inputs[1])
-    const bias = model.init(ln.inputs[2])
-    return { ln, weight, bias }
+
+  /** The norm a projection's input comes from: a LayerNormalization (weight and bias) or an RMS norm (weight). */
+  normBefore(w: WideNBits, op: "LayerNormalization" | "SimplifiedLayerNormalization"): NormRef & { node: OnnxNode } {
+    const node = this.source(w.node.inputs[0])
+    if (node?.opType !== op) throw new Error(`ONNX: no ${op} before ${w.name}`)
+    return { node, weight: this.model.init(node.inputs[1]), bias: op === "LayerNormalization" ? this.model.init(node.inputs[2]) : null }
   }
-  const activation = (after: string): "tanh" | "erf" => {
-    const act = model.consumersOf(after).find((n) => n.opType === "Gelu" || n.opType === "FastGelu")
+
+  /** The GELU after a projection: by tanh, or exact. */
+  gelu(after: string): "tanh" | "erf" {
+    const act = this.model.consumersOf(after).find((n) => n.opType === "Gelu" || n.opType === "FastGelu")
     if (!act) throw new Error(`ONNX: no GELU after ${after}`)
     return act.opType === "FastGelu" || act.attributes.get("approximate")?.s === "tanh" ? "tanh" : "erf"
   }
 
-  const patch = linear("/model/embeddings/patch_embed/")
-  const table = nodes.find((n) => n.opType === "GatherBlockQuantized")
+  attr(n: OnnxNode, key: string) {
+    return n.attributes.get(key)?.i
+  }
+
+  /** The graph's attention heads (every attention node agrees). */
+  heads(): number {
+    const mha = this.nodes.find((n) => n.opType === "MultiHeadAttention")
+    const heads = mha && this.attr(mha, "num_heads")
+    if (!heads) throw new Error("ONNX: the encoder's attention has no head count")
+    return heads
+  }
+
+  /** The side of a merger's blocks of patches, from its first projection's input. */
+  merge(linear1: LinearRef, width: number): number {
+    const merge = Math.round(Math.sqrt(linear1.w.K / width))
+    if (merge * merge * width !== linear1.w.K) throw new Error("ONNX: the merger's input isn't a square block of patches")
+    return merge
+  }
+}
+
+/** Qwen3.5's encoder (see the header). */
+function planQwen(g: VisionGraph): VisionPlan {
+  const { model } = g
+  const patch = g.linear("/model/embeddings/patch_embed/", true)
+  const table = g.nodes.find((n) => n.opType === "GatherBlockQuantized")
   if (!table) throw new Error("ONNX: no position table (GatherBlockQuantized)")
-  const attr = (n: OnnxNode, key: string) => n.attributes.get(key)?.i
-  if (attr(table, "bits") !== 4 || attr(table, "block_size") !== 32 || (attr(table, "quantize_axis") ?? 1) !== 1)
+  if (g.attr(table, "bits") !== 4 || g.attr(table, "block_size") !== 32 || (g.attr(table, "quantize_axis") ?? 1) !== 1)
     throw new Error("ONNX: the position table isn't 4-bit, blocks of 32 along its rows")
   const tableQuant = model.init(table.inputs[0])
   const tableScales = model.init(table.inputs[2])
@@ -135,107 +154,323 @@ export function planVision(graphBytes: Uint8Array) {
 
   // RoPE: the first block's cos table comes from a MatMul of positions by
   // the frequencies (an initializer).
-  const rope = nodes.find((n) => n.opType === "RotaryEmbedding")
+  const rope = g.nodes.find((n) => n.opType === "RotaryEmbedding")
   if (!rope) throw new Error("ONNX: no RotaryEmbedding")
-  if (attr(rope, "interleaved") === 1) throw new Error("ONNX: interleaved RoPE in the encoder")
-  const freqNode = nodes.find(
+  if (g.attr(rope, "interleaved") === 1) throw new Error("ONNX: interleaved RoPE in the encoder")
+  const freqNode = g.nodes.find(
     (n) => n.opType === "MatMul" && model.has(n.inputs[1]) && model.init(n.inputs[1]).dims.length === 2 && model.init(n.inputs[1]).dims[0] === 1
   )
   if (!freqNode) throw new Error("ONNX: no RoPE frequencies")
   const invFreqT = model.init(freqNode.inputs[1])
 
-  const blocks: Array<{
-    norm1: ReturnType<typeof normBefore>
-    qkv: ReturnType<typeof linear>
-    proj: ReturnType<typeof linear>
-    norm2: ReturnType<typeof normBefore>
-    fc1: ReturnType<typeof linear>
-    fc2: ReturnType<typeof linear>
-  }> = []
+  const blocks: Array<BlockRef> = []
+  let eps = 1e-6
   for (let i = 0; model.hasNBits(`/model/layers.${i}/attn/qkv/`); i++) {
     const p = `/model/layers.${i}/`
-    const qkv = linear(`${p}attn/qkv/`)
-    const proj = linear(`${p}attn/proj/`)
-    const fc1 = linear(`${p}mlp/linear_fc1/`)
-    const fc2 = linear(`${p}mlp/linear_fc2/`)
-    blocks.push({ norm1: normBefore(qkv.w), qkv, proj, norm2: normBefore(fc1.w), fc1, fc2 })
+    const qkv = g.linear(`${p}attn/qkv/`, true)
+    const fc1 = g.linear(`${p}mlp/linear_fc1/`, true)
+    const norm1 = g.normBefore(qkv.w, "LayerNormalization")
+    if (i === 0) eps = norm1.node.attributes.get("epsilon")?.f ?? eps
+    blocks.push({
+      type: "attention",
+      norm1,
+      qkv: [qkv],
+      proj: g.linear(`${p}attn/proj/`, true),
+      norm2: g.normBefore(fc1.w, "LayerNormalization"),
+      fc1: [fc1],
+      fc2: g.linear(`${p}mlp/linear_fc2/`, true)
+    })
   }
   if (!blocks.length) throw new Error("ONNX: no encoder blocks")
-  const linear1 = linear("/model/merger/linear1/")
-  const linear2 = linear("/model/merger/linear2/")
-  const mergerNorm = normBefore(linear1.w)
-  const mha = nodes.find((n) => n.opType === "MultiHeadAttention")
-  const heads = mha ? attr(mha, "num_heads") : attr(rope, "num_heads")
+  const linear1 = g.linear("/model/merger/linear1/", true)
+  const linear2 = g.linear("/model/merger/linear2/", true)
+  const mergerNorm = g.normBefore(linear1.w, "LayerNormalization")
+  const mha = g.nodes.find((n) => n.opType === "MultiHeadAttention")
+  const heads = mha ? g.attr(mha, "num_heads") : g.attr(rope, "num_heads")
   if (!heads) throw new Error("ONNX: the encoder's attention has no head count")
   const headDim = width / heads
-  // The shaders lay a head out as 16 texels (gpu/vision-kernels.ts).
-  if (headDim !== 64) throw new Error(`ONNX: the encoder's heads are ${headDim} wide; webgllm's encoder runs 64-wide heads`)
-  const rotary = attr(rope, "rotary_embedding_dim") ?? headDim
+  const rotary = g.attr(rope, "rotary_embedding_dim") ?? headDim
   if (rotary !== headDim || invFreqT.dims[1] * 4 !== headDim)
     throw new Error(`ONNX: the encoder's RoPE rotates ${rotary} of ${headDim} dims`)
-  const merge = Math.round(Math.sqrt(linear1.w.K / width))
-  if (merge * merge * width !== linear1.w.K) throw new Error("ONNX: the merger's input isn't a square block of patches")
-  const pixels = patch.w.K / 3
-  // temporal · patch²: 2 frames of 16 × 16 (the only build there is).
-  const patchSize = 16
-  const temporal = pixels / (patchSize * patchSize)
-  if (!Number.isInteger(temporal)) throw new Error(`ONNX: a patch of ${patch.w.K} values isn't 3 × t × 16 × 16`)
-  for (const b of blocks)
-    if (b.qkv.w.N !== 3 * width || b.qkv.w.K !== width || b.proj.w.N !== width || b.fc2.w.N !== width || b.fc1.w.N !== b.fc2.w.K)
-      throw new Error("ONNX: the encoder's blocks don't share one shape")
-
-  const config: VisionConfig = {
-    width,
-    heads,
-    headDim,
-    ffn: blocks[0].fc1.w.N,
-    depth: blocks.length,
-    outWidth: linear2.w.N,
-    patchSize,
-    temporal,
-    merge,
-    patchValues: patch.w.K,
-    grid,
-    eps: blocks[0].norm1.ln.attributes.get("epsilon")?.f ?? 1e-6,
-    act: activation(blocks[0].fc1.out),
-    mergerAct: activation(linear1.out)
+  return {
+    config: {
+      width,
+      heads,
+      kvHeads: heads,
+      headDim,
+      ffn: blocks[0].fc1[0].w.N,
+      mergerWidth: linear1.w.N,
+      outWidth: linear2.w.N,
+      patchValues: patch.w.K,
+      merge: g.merge(linear1, width),
+      layers: blocks.map(() => "attention"),
+      norm: "layer",
+      eps,
+      mergerEps: mergerNorm.node.attributes.get("epsilon")?.f ?? eps,
+      mlp: g.gelu(blocks[0].fc1[0].out),
+      mergerAct: g.gelu(linear1.out),
+      grid,
+      interpolation: "corners",
+      rope: true,
+      qkNorm: false,
+      positions: "grid"
+    },
+    patch,
+    table: { kind: "q4", quant: tableQuant, scales: tableScales, zp: tableZp },
+    invFreq: { kind: "values", tensor: invFreqT },
+    blocks,
+    merger: { norm: mergerNorm, linear1, linear2 }
   }
+}
 
-  const wantLinear = (l: ReturnType<typeof linear>) => {
+/** LFM2-VL's SigLIP2 encoder and projector (see the header). */
+function planSiglip(g: VisionGraph): VisionPlan {
+  const { model } = g
+  const patch = g.linear("/model/embeddings/patch_embedding/", true)
+  const width = patch.w.N
+  // The position table: the constant a Resize interpolates to the image's grid.
+  const resize = g.nodes.find((n) => n.opType === "Resize" && model.has(n.inputs[0]))
+  if (!resize) throw new Error("ONNX: no position table (a Resize of a constant)")
+  const table = model.init(resize.inputs[0])
+  const grid = table.dims[2]
+  if (table.dims.length !== 4 || table.dims[0] !== 1 || table.dims[1] !== width || table.dims[3] !== grid)
+    throw new Error(`ONNX: the position table is ${table.dims.join("×")}, expected 1×${width}× a square grid`)
+  const mode = resize.attributes.get("mode")?.s
+  const coordinates = resize.attributes.get("coordinate_transformation_mode")?.s ?? "half_pixel"
+  if (mode !== "linear" || coordinates !== "half_pixel")
+    throw new Error(`ONNX: the position table is resized ${mode}, ${coordinates}; the encoder interpolates linear, half_pixel`)
+
+  const blocks: Array<BlockRef> = []
+  const blockNorms = new Set<OnnxNode>()
+  let eps = 1e-6
+  for (let i = 0; model.hasNBits(`/model/layers.${i}/attn/q_proj/`); i++) {
+    const p = `/model/layers.${i}/`
+    const q = g.linear(`${p}attn/q_proj/`, true)
+    const fc1 = g.linear(`${p}mlp/fc1/`, true)
+    const norm1 = g.normBefore(q.w, "LayerNormalization")
+    const norm2 = g.normBefore(fc1.w, "LayerNormalization")
+    blockNorms.add(norm1.node).add(norm2.node)
+    if (i === 0) eps = norm1.node.attributes.get("epsilon")?.f ?? eps
+    blocks.push({
+      type: "attention",
+      norm1,
+      qkv: [q, g.linear(`${p}attn/k_proj/`, true), g.linear(`${p}attn/v_proj/`, true)],
+      proj: g.linear(`${p}attn/out_proj/`, true),
+      norm2,
+      fc1: [fc1],
+      fc2: g.linear(`${p}mlp/fc2/`, true)
+    })
+  }
+  if (!blocks.length) throw new Error("ONNX: no encoder blocks")
+  // The projector reads the one LayerNorm that isn't a block's.
+  const post = g.nodes.filter((n) => n.opType === "LayerNormalization" && !blockNorms.has(n))
+  if (post.length !== 1) throw new Error(`ONNX: ${post.length} LayerNorms after the encoder's blocks, expected the projector's one`)
+  const linear1 = g.linear("/model/multimodal_projector/linear_1/", true)
+  const linear2 = g.linear("/model/multimodal_projector/linear_2/", true)
+  const heads = g.heads()
+  return {
+    config: {
+      width,
+      heads,
+      kvHeads: heads,
+      headDim: width / heads,
+      ffn: blocks[0].fc1[0].w.N,
+      mergerWidth: linear1.w.N,
+      outWidth: linear2.w.N,
+      patchValues: patch.w.K,
+      merge: g.merge(linear1, width),
+      layers: blocks.map(() => "attention"),
+      norm: "layer",
+      eps,
+      mergerEps: post[0].attributes.get("epsilon")?.f ?? eps,
+      mlp: g.gelu(blocks[0].fc1[0].out),
+      mergerAct: g.gelu(linear1.out),
+      grid,
+      interpolation: g.attr(resize, "antialias") === 1 ? "antialias" : "half-pixel",
+      rope: false,
+      qkNorm: false,
+      positions: "sequence"
+    },
+    patch,
+    table: { kind: "float", values: table },
+    blocks,
+    merger: { norm: { weight: model.init(post[0].inputs[1]), bias: model.init(post[0].inputs[2]) }, linear1, linear2 }
+  }
+}
+
+/** LFM3-VL's tower and projector (see the header). */
+function planLfm3(g: VisionGraph): VisionPlan {
+  const { model } = g
+  const root = "/vision_encoder/"
+  const patch = g.linear(`${root}patchifier/`, false)
+  const width = patch.w.N
+  const rms = "SimplifiedLayerNormalization"
+  const embeddingNorm = model.consumersOf(patch.out).find((n) => n.opType === rms)
+  if (!embeddingNorm) throw new Error("ONNX: no norm after the patch projection")
+  // RoPE's sin table (positions × frequencies), which a Gather reads by row and by column.
+  const rotary = g.nodes.find((n) => n.opType === "RotaryEmbedding")
+  if (!rotary) throw new Error("ONNX: no RotaryEmbedding")
+  if (g.attr(rotary, "interleaved") === 1) throw new Error("ONNX: interleaved RoPE in the encoder")
+  const sinGather = g.nodes.find((n) => n.opType === "Gather" && n.name.includes("/rope/sin/") && model.has(n.inputs[0]))
+  if (!sinGather) throw new Error("ONNX: no RoPE sin table")
+  const sin = model.init(sinGather.inputs[0])
+  const heads = g.heads()
+  const headDim = width / heads
+  if (sin.dims.length !== 2 || sin.dims[0] < 2 || sin.dims[1] * 4 !== headDim)
+    throw new Error(`ONNX: the encoder's RoPE table is ${sin.dims.join("×")} for heads of ${headDim}`)
+
+  const blocks: Array<BlockRef> = []
+  let eps = 1e-5
+  let kvHeads = heads
+  for (let i = 0; ; i++) {
+    const p = `${root}layers.${i}/`
+    const conv = model.hasNBits(`${p}conv/in_proj/`)
+    if (!conv && !model.hasNBits(`${p}attn/q_proj/`)) break
+    const gateUp = g.linear(`${p}mlp/gate_up/`, false)
+    const mlp = { norm2: g.normBefore(gateUp.w, rms), fc1: [gateUp], fc2: g.linear(`${p}mlp/w2/`, false) }
+    if (conv) {
+      const inProj = g.linear(`${p}conv/in_proj/`, false)
+      const node = g.nodes.find((n) => n.opType === "Conv" && n.name.startsWith(p))
+      if (!node) throw new Error(`ONNX: no convolution in layer ${i}`)
+      const kernel = model.init(node.inputs[1])
+      const pads = node.attributes.get("pads")?.ints
+      if (kernel.dims.join() !== `${width},1,3,3` || g.attr(node, "group") !== width || !pads?.every((v) => v === 1))
+        throw new Error(`ONNX: layer ${i}'s convolution isn't 3 × 3 depthwise, padded by 1`)
+      // B, C, x: the Split's first and third parts multiply before the convolution, the second after.
+      const split = model.consumersOf(inProj.out).find((n) => n.opType === "Split")
+      const gated = split && model.consumersOf(split.outputs[0]).find((n) => n.opType === "Mul")
+      if (!split || split.outputs.length !== 3 || !gated?.inputs.includes(split.outputs[2]))
+        throw new Error(`ONNX: layer ${i}'s in-projection isn't split into B, C, x`)
+      const norm1 = g.normBefore(inProj.w, rms)
+      if (!blocks.length) eps = norm1.node.attributes.get("epsilon")?.f ?? eps
+      blocks.push({ type: "conv", norm1, inProj, kernel, outProj: g.linear(`${p}conv/out_proj/`, false), ...mlp })
+      continue
+    }
+    const q = g.linear(`${p}attn/q_proj/`, false)
+    const k = g.linear(`${p}attn/k_proj/`, false)
+    const headNorm = (part: string) => {
+      const node = g.nodes.find((n) => n.opType === rms && n.name.startsWith(`${p}attn/${part}_norm/`))
+      if (!node) throw new Error(`ONNX: layer ${i} has no ${part} norm`)
+      const weight = model.init(node.inputs[1])
+      checkShape(weight, weight.dataType, headDim)
+      return weight
+    }
+    kvHeads = k.w.N / headDim
+    const norm1 = g.normBefore(q.w, rms)
+    if (!blocks.length) eps = norm1.node.attributes.get("epsilon")?.f ?? eps
+    blocks.push({
+      type: "attention",
+      norm1,
+      qkv: [q, k, g.linear(`${p}attn/v_proj/`, false)],
+      qNorm: headNorm("q"),
+      kNorm: headNorm("k"),
+      proj: g.linear(`${p}attn/out_proj/`, false),
+      ...mlp
+    })
+  }
+  if (!blocks.length) throw new Error("ONNX: no encoder blocks")
+  const linear1 = g.linear("/vision_projector/linear_1/", true)
+  const linear2 = g.linear("/vision_projector/linear_2/", true)
+  const mergerNorm = g.normBefore(linear1.w, "LayerNormalization")
+  // The graph takes patches in raster order within each block of merge × merge.
+  return {
+    config: {
+      width,
+      heads,
+      kvHeads,
+      headDim,
+      ffn: blocks[0].fc2.w.K,
+      mergerWidth: linear1.w.N,
+      outWidth: linear2.w.N,
+      patchValues: patch.w.K,
+      merge: g.merge(linear1, width),
+      layers: blocks.map((b) => b.type),
+      norm: "rms",
+      eps,
+      mergerEps: mergerNorm.node.attributes.get("epsilon")?.f ?? 1e-6,
+      mlp: "swiglu",
+      mergerAct: g.gelu(linear1.out),
+      grid: 0,
+      interpolation: "corners",
+      rope: true,
+      qkNorm: true,
+      positions: "sequence"
+    },
+    patch,
+    patchNorm: { weight: model.init(embeddingNorm.inputs[1]), bias: null },
+    invFreq: { kind: "sin", tensor: sin },
+    blocks,
+    merger: { norm: mergerNorm, linear1, linear2 }
+  }
+}
+
+/** The encoder's graph, read: its config and every tensor the load takes, in order. */
+export function planVision(graphBytes: Uint8Array) {
+  const g = new VisionGraph(graphBytes)
+  const plan = g.model.hasNBits("/vision_encoder/patchifier/")
+    ? planLfm3(g)
+    : g.model.hasNBits("/model/embeddings/patch_embedding/")
+      ? planSiglip(g)
+      : planQwen(g)
+  checkVisionConfig(plan.config)
+  const { config } = plan
+  const kv = config.kvHeads * config.headDim
+  const swiglu = config.mlp === "swiglu"
+  for (const [i, b] of plan.blocks.entries()) {
+    const rows = (parts: Array<LinearRef>) => parts.reduce((sum, l) => sum + l.w.N, 0)
+    const shaped = (l: LinearRef, N: number, K: number) => l.w.N === N && l.w.K === K
+    const ok =
+      rows(b.fc1) === (swiglu ? 2 : 1) * config.ffn &&
+      b.fc1.every((l) => l.w.K === config.width) &&
+      shaped(b.fc2, config.width, config.ffn) &&
+      (b.type === "attention"
+        ? rows(b.qkv) === config.width + 2 * kv && b.qkv.every((l) => l.w.K === config.width) && shaped(b.proj, config.width, config.width)
+        : shaped(b.inProj, 3 * config.width, config.width) && shaped(b.outProj, config.width, config.width))
+    if (!ok) throw new Error(`ONNX: the encoder's block ${i} doesn't have the first one's shapes`)
+  }
+  const reads: Array<Read> = []
+  const want = (t: OnnxTensor | null | undefined) => {
+    if (t) reads.push({ key: t.name, tensor: t })
+  }
+  const wantLinear = (l: LinearRef) => {
     want(l.w.quant)
     want(l.w.scales)
     want(l.w.zp)
     want(l.bias)
   }
-  const wantNorm = (n: ReturnType<typeof normBefore>) => {
+  const wantNorm = (n: NormRef) => {
     want(n.weight)
     want(n.bias)
   }
-  wantLinear(patch)
-  want(tableQuant)
-  want(tableScales)
-  want(tableZp)
-  want(invFreqT)
-  for (const b of blocks) {
+  wantLinear(plan.patch)
+  if (plan.table?.kind === "q4") {
+    want(plan.table.quant)
+    want(plan.table.scales)
+    want(plan.table.zp)
+  } else want(plan.table?.values)
+  want(plan.invFreq?.tensor)
+  if (plan.patchNorm) wantNorm(plan.patchNorm)
+  for (const b of plan.blocks) {
     wantNorm(b.norm1)
-    wantLinear(b.qkv)
-    wantLinear(b.proj)
+    if (b.type === "attention") {
+      b.qkv.forEach(wantLinear)
+      want(b.qNorm)
+      want(b.kNorm)
+      wantLinear(b.proj)
+    } else {
+      wantLinear(b.inProj)
+      want(b.kernel)
+      wantLinear(b.outProj)
+    }
     wantNorm(b.norm2)
-    wantLinear(b.fc1)
+    b.fc1.forEach(wantLinear)
     wantLinear(b.fc2)
   }
-  wantNorm(mergerNorm)
-  wantLinear(linear1)
-  wantLinear(linear2)
-  return {
-    config,
-    reads,
-    patch,
-    table: { quant: tableQuant, scales: tableScales, zp: tableZp },
-    invFreq: invFreqT,
-    blocks,
-    merger: { norm: mergerNorm, linear1, linear2 }
-  }
+  wantNorm(plan.merger.norm)
+  wantLinear(plan.merger.linear1)
+  wantLinear(plan.merger.linear2)
+  // What the claim is sized by (vision.ts visionWeightBytes): the projections' bits, and whether they carry zero points.
+  return { ...plan, reads, bits: plan.blocks[0].fc2.w.bits, zeros: plan.blocks[0].fc2.w.zp !== null }
 }
 
 /** A tensor's values as float32 (float16 or float). */
@@ -288,44 +523,66 @@ export async function* loadVision(options: LoadVisionOptions): AsyncGenerator<Vi
     reads.add({ key, source: options.data, offset: tensor.external.offset, length })
   }
   const floats = async (t: OnnxTensor) => toFloats(t, await reads.take(t.name))
-  const linear = async (l: { w: NBits; bias: OnnxTensor }): Promise<VisionLinear> => {
+  const linear = async (l: LinearRef): Promise<VisionLinear> => {
     const { w } = l
-    const blocks = w.K / 32
-    const m: QuantMatrix = {
-      N: w.N,
-      K: w.K,
-      bits: 4,
-      quants: new Uint32Array(0),
-      scales: new Uint16Array(w.N * blocks),
-      zeros: w.zp ? new Uint8Array(w.N * blocks).fill(8) : null,
-      raw: (await reads.take(w.quant.name)).slice()
-    }
+    const quant = await reads.take(w.quant.name)
     const scales = await reads.take(w.scales.name)
     const zp = w.zp ? await reads.take(w.zp.name) : null
-    packMatMulNBitsScales(m, 0, scales, zp, w.N)
-    return { m, bias: await floats(l.bias) }
+    const m = matMulNBitsMatrix({ N: w.N, K: w.K, bits: w.bits, blockSize: w.blockSize, scaleBytes: w.scales.dataType === OnnxDataType.FLOAT16 ? 2 : 4 }, quant, scales, zp)
+    return { m, bias: l.bias ? await floats(l.bias) : null }
   }
-  const norm = async (n: { weight: OnnxTensor; bias: OnnxTensor }): Promise<VisionNorm> => ({
-    weight: await floats(n.weight),
-    bias: await floats(n.bias)
-  })
+  const stacked = async (parts: Array<LinearRef>) => {
+    const loaded: Array<VisionLinear> = []
+    for (const part of parts) loaded.push(await linear(part))
+    return stackLinears(loaded)
+  }
+  const norm = async (n: NormRef): Promise<VisionNorm> => ({ weight: await floats(n.weight), bias: n.bias ? await floats(n.bias) : null })
   const { config } = plan
   yield { kind: "config", config }
   const patch = await linear(plan.patch)
-  const quant = await reads.take(plan.table.quant.name)
-  const tableScales = await floats(plan.table.scales)
-  const zp = plan.table.zp ? await reads.take(plan.table.zp.name) : null
-  const positions = dequantizeTable(quant, tableScales, zp, config.grid * config.grid, config.width)
-  const invFreq = await floats(plan.invFreq)
-  yield { kind: "patch", patch, positions, invFreq }
+  let positions: Float32Array | undefined
+  if (plan.table?.kind === "q4") {
+    const quant = await reads.take(plan.table.quant.name)
+    const tableScales = await floats(plan.table.scales)
+    const zp = plan.table.zp ? await reads.take(plan.table.zp.name) : null
+    positions = dequantizeTable(quant, tableScales, zp, config.grid * config.grid, config.width)
+  } else if (plan.table) {
+    // [1, width, grid, grid] as grid² rows of `width`.
+    const values = await floats(plan.table.values)
+    const cells = config.grid * config.grid
+    positions = new Float32Array(cells * config.width)
+    for (let e = 0; e < config.width; e++) for (let p = 0; p < cells; p++) positions[p * config.width + e] = values[e * cells + p]
+  }
+  let invFreq: Float32Array | undefined
+  if (plan.invFreq) {
+    const values = await floats(plan.invFreq.tensor)
+    if (plan.invFreq.kind === "values") invFreq = values
+    else {
+      // Row p of the table is sin(p · frequency): row 1 gives each frequency (all at most 1).
+      const n = config.headDim / 4
+      invFreq = new Float32Array(n)
+      for (let j = 0; j < n; j++) {
+        if (values[j] !== 0 || !(values[n + j] > 0 && values[n + j] < 1)) throw new Error("ONNX: the encoder's RoPE table isn't sin(position · frequency)")
+        invFreq[j] = Math.asin(values[n + j])
+      }
+    }
+  }
+  const patchNorm = plan.patchNorm ? await norm(plan.patchNorm) : undefined
+  yield { kind: "patch", patch, ...(positions && { positions }), ...(invFreq && { invFreq }), ...(patchNorm && { norm: patchNorm }) }
   for (const [index, b] of plan.blocks.entries()) {
-    const value: VisionBlock = {
-      norm1: await norm(b.norm1),
-      qkv: await linear(b.qkv),
-      proj: await linear(b.proj),
-      norm2: await norm(b.norm2),
-      fc1: await linear(b.fc1),
-      fc2: await linear(b.fc2)
+    const norm1 = await norm(b.norm1)
+    let value: VisionBlock
+    if (b.type === "attention") {
+      const qkv = await stacked(b.qkv)
+      const qNorm = b.qNorm ? await floats(b.qNorm) : undefined
+      const kNorm = b.kNorm ? await floats(b.kNorm) : undefined
+      const proj = await linear(b.proj)
+      value = { type: "attention", norm1, qkv, ...(qNorm && { qNorm }), ...(kNorm && { kNorm }), proj, norm2: await norm(b.norm2), fc1: await stacked(b.fc1), fc2: await linear(b.fc2) }
+    } else {
+      const inProj = await linear(b.inProj)
+      const kernel = await floats(b.kernel)
+      const outProj = await linear(b.outProj)
+      value = { type: "conv", norm1, inProj, kernel, outProj, norm2: await norm(b.norm2), fc1: await stacked(b.fc1), fc2: await linear(b.fc2) }
     }
     yield { kind: "block", index, value }
   }
@@ -336,4 +593,3 @@ export async function* loadVision(options: LoadVisionOptions): AsyncGenerator<Vi
     linear2: await linear(plan.merger.linear2)
   }
 }
-

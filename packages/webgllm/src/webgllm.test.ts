@@ -213,10 +213,12 @@ test("models: the catalog with what's downloaded and loaded", async () => {
     downloaded: true,
     loaded: true,
     loadedContextLength: 4096,
-    supports: { tools: true, thinking: true, images: false }
+    // (Its repository has a vision projector webgllm runs.)
+    supports: { tools: true, thinking: true, images: true }
   })
-  // The ONNX build has a vision encoder.
+  // The ONNX build has a vision encoder; a text model has neither.
   assert.equal((await client.models.retrieve("onnx-community/Qwen3.5-2B-ONNX")).supports.images, true)
+  assert.equal((await client.models.retrieve("LiquidAI/LFM3-1.7B-GGUF")).supports.images, false)
   const lfm2 = await client.models.retrieve(LFM2)
   assert.equal(lfm2.downloaded, true)
   assert.equal(lfm2.loaded, false)

@@ -31,7 +31,7 @@ const isCatalogFile = (file: ModelFile) => {
   catalogFiles ??= new Set(
     Object.values(WEBGL_MODEL_META).flatMap((meta) => {
       const m = meta as WebGlModelMeta
-      const weights = m.files.kind === "gguf" ? [m.files.model] : [m.files.graph, m.files.data, m.files.config]
+      const weights = m.files.kind === "gguf" ? [m.files.model] : [m.files.graph, m.files.data, ...(m.files.moreData ?? []), m.files.config]
       return [...weights, m.tokenizer.tokenizer, m.tokenizer.config, ...(m.tokenizer.chatTemplate ? [m.tokenizer.chatTemplate] : [])]
     }).map((f) => `${f.repo}\n${f.path}`)
   )

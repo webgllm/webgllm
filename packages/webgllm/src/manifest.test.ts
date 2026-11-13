@@ -21,7 +21,9 @@ const ggufModel = (name: string): WebGlModelMeta => ({
   supports: { input: ["text"], output: ["text"], capabilities: ["tools"] },
   size: "350m",
   sampling: { temperature: 0, top_k: 1, repetition_penalty: 1 },
-  toolFormat: "lfm2"
+  toolFormat: "lfm2",
+  // (As the resolver stores one: it looked for a vision projector.)
+  projectorChecked: true
 })
 
 const ONE = ggufModel("someone/One-GGUF")

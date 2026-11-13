@@ -309,7 +309,7 @@ const models = [
     name: 'Qwen3.5',
     vendor: 'Qwen',
     note: '2B',
-    description: 'Gated DeltaNet layers, with thinking on request. Its ONNX build reads images.',
+    description: 'Gated DeltaNet layers, with thinking on request. Both builds read images.',
     ids: ['unsloth/Qwen3.5-2B-GGUF', 'onnx-community/Qwen3.5-2B-ONNX'],
   },
   {

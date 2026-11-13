@@ -619,6 +619,8 @@ export class Engine {
   position = 0
   /** The prompt's images, by cache position (see setImages). */
   private images: Array<EngineImage> = []
+  /** Whether image rows take Qwen2-VL's 3D positions ("grid") or their cache positions like any token. */
+  private imagePositions: "grid" | "sequence" = "grid"
   /**
    * The batch being read's rotary positions: from `pos0` on (text), or per
    * row in `positions` (rows t, h, w; a batch with image rows).
@@ -3051,13 +3053,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   /**
-   * The prompt's images (Qwen3.5: in place of its `<|image_pad|>` tokens),
-   * in order, not overlapping. Their rows read their features instead of the
-   * tokens' embeddings, with Qwen2-VL's 3D positions (see ropeAt); the text
-   * after an image continues from its largest position. Set before reading
-   * a prompt that has images, and again (empty) for one that has none.
+   * The prompt's images (in place of their placeholder tokens), in order,
+   * not overlapping. Their rows read their features instead of the tokens'
+   * embeddings. With `positions` "grid" (Qwen3.5) they take Qwen2-VL's 3D
+   * positions (see ropeAt), and the text after an image continues from its
+   * largest position; with "sequence" (LFM2-VL, LFM3-VL) every row keeps
+   * its cache position, like any token. Set before reading a prompt that
+   * has images, and again (empty) for one that has none.
    */
-  setImages(images: Array<EngineImage>) {
+  setImages(images: Array<EngineImage>, positions: "grid" | "sequence" = "grid") {
+    this.imagePositions = positions
     let end = 0
     for (const image of images) {
       const rows = image.height * image.width
@@ -3075,6 +3080,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    * max(h, w), not h · w). For an image's row, its t, h and w positions.
    */
   ropeAt(pos: number): [number, number, number] {
+    if (this.imagePositions === "sequence") return [pos, pos, pos]
     let shift = 0
     for (const image of this.images) {
       const rows = image.height * image.width
@@ -6104,7 +6110,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // rows, and the head passes read each row's 3D position (see ropeAt).
     const imageRuns = this.imageRuns(pos0, rows)
     if (imageRuns.some(({ image }) => !image.features)) throw new Error("An image's rows are read again without its features.")
-    this.batchRope = imageRuns.length ? { positions: this.writeRopePositions(pos0, rows) } : { pos0: this.ropeAt(pos0)[0] }
+    this.batchRope =
+      imageRuns.length && this.imagePositions === "grid" ? { positions: this.writeRopePositions(pos0, rows) } : { pos0: this.ropeAt(pos0)[0] }
     const e = this.embedding
     // A few rows: the split matmuls apply the norm to the residual as they
     // read it (no norm pass; see TUNING.foldNorm).

@@ -31,6 +31,9 @@ import {
   type GgufValue
 } from "./gguf.js"
 import { ReadPlan } from "./read-plan.js"
+import { headPermutation } from "./repack.js"
+
+export { headPermutation }
 import {
   dequantizeQ4_1,
   dequantizeQ5_K,
@@ -499,31 +502,6 @@ async function readNorm(
   info: GgufTensorInfo
 ): Promise<Float32Array> {
   return toFloats(info, await source.read(info.offset, info.byteLength))
-}
-
-/**
- * For each output row (head h, dim d), the HF row it comes from, so that
- * the rotated dims of each head come first (see the module comment).
- */
-export function headPermutation(
-  heads: number,
-  headDim: number,
-  ropeDims: number
-): Int32Array {
-  const R = ropeDims / 2
-  const H = headDim / 2
-  const perm = new Int32Array(heads * headDim)
-  for (let h = 0; h < heads; h++) {
-    for (let d = 0; d < headDim; d++) {
-      let src: number
-      if (d < R) src = d
-      else if (d < 2 * R) src = H + d - R
-      else if (d < H + R) src = d - R
-      else src = d
-      perm[h * headDim + d] = h * headDim + src
-    }
-  }
-  return perm
 }
 
 function permuteVector(values: Float32Array, perm: Int32Array): Float32Array {

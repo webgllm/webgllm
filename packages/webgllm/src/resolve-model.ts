@@ -11,8 +11,8 @@
  *   takes (Q4_1, Q5_K, Q6_K, F16), then unlabeled files. Otherwise an ONNX
  *   graph under `onnx/` that the ONNX loader takes, read before anything
  *   else downloads: its own checks (4-bit MatMulNBits in blocks of 32, the
- *   layer layout, config.json's shapes) pass, and its weights are in one
- *   external data file, which the graph names. Graphs are tried q4f16 first,
+ *   layer layout, config.json's shapes) pass, and its weights are in
+ *   external data files the graph names (one, or several). Graphs are tried q4f16 first,
  *   then q4, then the rest (decoders before other graphs).
  * - Architecture: the Hub's GGUF architecture, or config.json's model_type,
  *   must be one the loaders run, else the model fails before any download.
@@ -36,7 +36,7 @@
  * - Size: the name's parameter count ("1.2B", "350M"), else the Hub's.
  *
  * A model can also be given by URL: its `.gguf` file, or its ONNX graph
- * (`.onnx`, with config.json and its one external data file beside it), and
+ * (`.onnx`, with config.json and its external data files beside it), and
  * tokenizer.json and tokenizer_config.json (and chat_template.jinja and
  * generation_config.json, when there are) in the same folder. The same
  * rules apply to what's there.
@@ -45,39 +45,59 @@ import { chatTemplateOf } from "./chat-template.js"
 import { abortable, throwIfAborted, WebGLLMError } from "./errors.js"
 import { checkOnnxGraph } from "./load-onnx.js"
 import { planVision } from "./load-vision.js"
+import { planVisionGguf } from "./load-vision-gguf.js"
 import { fileUrl, inputsOf, knownModelMeta, rememberModel } from "./model-meta.js"
 import type { ModelFile, ModelReasoning, VisionFiles, WebGlModelMeta } from "./model-meta.js"
 import type { Sampling } from "./sampler.js"
 import { readManifest, saveManifest } from "./storage.js"
 import type { ToolFormat } from "./tool-calls.js"
+import type { ByteSource } from "./weights.js"
 
 const HUB = "https://huggingface.co"
 
 /** GGUF architectures the GGUF loader runs (load-gguf.ts). */
 export const GGUF_ARCHITECTURES = ["lfm2", "lfm3", "qwen35"] as const
 /** config.json model types the ONNX loader runs (load-onnx.ts). */
-export const ONNX_MODEL_TYPES = ["lfm2", "lfm3", "qwen3_5"] as const
+export const ONNX_MODEL_TYPES = ["lfm2", "lfm3", "qwen3_5", "lfm2_vl", "lfm3_vl"] as const
 
 /** config.json `vision_config.model_type`s the vision encoder runs (load-vision.ts). */
-export const VISION_MODEL_TYPES = ["qwen3_5"] as const
+export const VISION_MODEL_TYPES = ["qwen3_5", "siglip2_vision_model", "lfm3_vl_vision"] as const
 
-/** What the tests swap: the fetch the Hub is asked with, and the ONNX loaders' graph checks. */
+/** What the tests swap: the fetch the Hub is asked with, and the loaders' own checks of a file. */
 export const hub = {
   fetch: (input: string, init?: RequestInit) => fetch(input, init),
   checkGraph: checkOnnxGraph,
   /** The vision encoder graph's external data files (throws for one load-vision.ts doesn't take). */
   checkVisionGraph: (bytes: Uint8Array): Array<string> => [
     ...new Set(planVision(bytes).reads.flatMap((r) => (r.tensor.external ? [r.tensor.external.location] : [])))
-  ]
+  ],
+  /** Reads a GGUF projector's header (throws for one load-vision-gguf.ts doesn't take). */
+  checkProjector: async (source: ByteSource): Promise<void> => {
+    await planVisionGguf(source)
+  }
 }
 
+/** The image processor's config, where a repository has one: preprocessor_config.json, else processor_config.json. */
+const PROCESSOR_CONFIGS = ["preprocessor_config.json", "processor_config.json"]
+
 /**
- * A model's vision encoder, by one rule: its config has a vision_config of
- * a type the encoder runs, and beside the decoder graph (`<folder>/<name>
- * <suffix>.onnx`) is `<folder>/vision_encoder<suffix>.onnx`, a graph the
- * encoder loads, with its one data file, and a preprocessor_config.json.
- * `has` says whether a file is there (a repository listing; for a URL
- * model, whether it can be fetched).
+ * A vision encoder graph's names beside the decoder, and its quantizations
+ * by preference: 8-bit ones first (near the float encoder: LFM2.5-VL's
+ * 4-bit encoder's features are half off its float one's, its 8-bit one's
+ * 4%), then the decoder's own, then the 4-bit ones.
+ */
+const VISION_GRAPHS = ["vision_encoder", "embed_images"]
+const VISION_QUANTS = ["_q8", "_q8f16", "_q4f16", "_q4"]
+
+/**
+ * An ONNX model's vision encoder, by one rule: its config has a
+ * vision_config of a type the encoder runs, and beside the decoder graph
+ * (`<folder>/<name><suffix>.onnx`) is `<folder>/vision_encoder<quant>.onnx`
+ * (or `embed_images<quant>.onnx`), a graph the encoder loads, with its one
+ * data file, and an image processor config. The quantizations are tried
+ * 8-bit first (`_q8`, `_q8f16`), then the decoder's own suffix, then the
+ * 4-bit ones. `has` says whether a file is there (a repository listing;
+ * for a URL model, whether it can be fetched).
  */
 export async function visionFilesFor(
   at: (path: string) => ModelFile,
@@ -91,13 +111,14 @@ export async function visionFilesFor(
 }
 
 /**
- * visionFilesFor as an optional look: the text model resolves whatever it
- * finds (a server that refuses HEAD, a failed request), and `checked` says
- * whether the look got an answer, to look again later if it didn't.
+ * visionFilesFor (or projectorFilesFor) as an optional look: the text
+ * model resolves whatever it finds (a server that refuses HEAD, a failed
+ * request), and `checked` says whether the look got an answer, to look
+ * again later if it didn't.
  */
-async function lookForVision(...args: Parameters<typeof visionFilesFor>): Promise<{ vision?: VisionFiles; checked: boolean }> {
+async function lookForVision(look: () => Promise<VisionFiles | undefined>): Promise<{ vision?: VisionFiles; checked: boolean }> {
   try {
-    const vision = await visionFilesFor(...args)
+    const vision = await look()
     return { ...(vision && { vision }), checked: true }
   } catch {
     return { checked: false }
@@ -110,21 +131,85 @@ async function findVision(
   has: (path: string) => boolean | Promise<boolean>
 ): Promise<VisionFiles | undefined> {
   const slash = graph.lastIndexOf("/") + 1
+  const folder = graph.slice(0, slash)
   const suffix = /(_[a-z0-9]+)?\.onnx$/.exec(graph.slice(slash))?.[1] ?? ""
-  const visionGraph = `${graph.slice(0, slash)}vision_encoder${suffix}.onnx`
-  const preprocessor = "preprocessor_config.json"
-  if (!(await has(visionGraph)) || !(await has(preprocessor))) return undefined
-  const bytes = await fileBytes(at(visionGraph))
-  if (!bytes) return undefined
-  let dataFiles: Array<string>
-  try {
-    dataFiles = hub.checkVisionGraph(bytes)
-  } catch {
-    return undefined
+  // The image processor's config, looked for once a graph is there.
+  let preprocessor: string | undefined | null = null
+  const eight = VISION_QUANTS.filter((q) => q.startsWith("_q8"))
+  for (const quant of [...new Set([...eight, suffix, ...VISION_QUANTS])]) {
+    for (const name of VISION_GRAPHS) {
+      const visionGraph = `${folder}${name}${quant}.onnx`
+      if (!(await has(visionGraph))) continue
+      if (preprocessor === null) {
+        preprocessor = undefined
+        for (const config of PROCESSOR_CONFIGS) if (!preprocessor && (await has(config))) preprocessor = config
+      }
+      if (!preprocessor) return undefined
+      const bytes = await fileBytes(at(visionGraph))
+      if (!bytes) continue
+      let dataFiles: Array<string>
+      try {
+        dataFiles = hub.checkVisionGraph(bytes)
+      } catch {
+        continue
+      }
+      const data = `${folder}${dataFiles[0]}`
+      if (dataFiles.length !== 1 || !(await has(data))) continue
+      return { graph: at(visionGraph), data: at(data), preprocessor: at(preprocessor) }
+    }
   }
-  const data = `${graph.slice(0, slash)}${dataFiles[0]}`
-  if (dataFiles.length !== 1 || !(await has(data))) return undefined
-  return { graph: at(visionGraph), data: at(data), preprocessor: at(preprocessor) }
+  return undefined
+}
+
+/** GGUF projector types by preference: 8-bit, then floats; a file's type is the label ending its name. */
+const PROJECTOR_TYPES = ["Q8_0", "F16", "F32"]
+
+/** The repository's vision projectors (`mmproj…gguf`), most preferred first. */
+export function projectorCandidates(files: Iterable<string>): Array<string> {
+  const rank = (file: string) => {
+    const name = file.split("/").pop()!.replace(/\.gguf$/i, "")
+    const type = PROJECTOR_TYPES.findIndex((t) => new RegExp(`(^|[-_.])${t}$`, "i").test(name))
+    return type < 0 ? PROJECTOR_TYPES.length : type
+  }
+  // (BF16 isn't a type the loader reads.)
+  return [...files]
+    .filter((f) => /(^|\/)mmproj[^/]*\.gguf$/i.test(f) && !/-\d{5}-of-\d{5}\.gguf$/i.test(f) && !/(^|[-_.])BF16\.gguf$/i.test(f))
+    .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+}
+
+/**
+ * A GGUF model's vision encoder, by one rule: its repository has a
+ * projector (`mmproj-*.gguf`) of a type the encoder runs (its header is
+ * read: a range request), Q8_0 before float ones, and the repository its
+ * tokenizer comes from has an image processor config.
+ */
+export async function projectorFilesFor(repo: string, files: Set<string>, tokenizer: { repo: string; prefix: string; files: Set<string> }): Promise<VisionFiles | undefined> {
+  const preprocessor = PROCESSOR_CONFIGS.find((name) => tokenizer.files.has(`${tokenizer.prefix}${name}`))
+  if (!preprocessor) return undefined
+  for (const path of projectorCandidates(files)) {
+    const file = { repo, path }
+    const head = await fileResponse(file, "HEAD")
+    const size = Number(head?.headers.get("content-length") ?? Number.NaN)
+    if (!head || !(size > 0)) continue
+    const source: ByteSource = {
+      size,
+      read: async (offset, length) => {
+        const response = await hubGet(fileUrl(file), file.path, undefined, { Range: `bytes=${offset}-${offset + length - 1}` })
+        if (!response.ok) throw new WebGLLMError("download-failed", `The server answered ${response.status} for ${file.path}.`)
+        const bytes = new Uint8Array(await response.arrayBuffer())
+        // A server that ignores Range sends the whole file.
+        return bytes.length === length ? bytes : bytes.subarray(offset, offset + length)
+      }
+    }
+    try {
+      await hub.checkProjector(source)
+    } catch (error) {
+      if (error instanceof WebGLLMError) throw error
+      continue
+    }
+    return { projector: file, preprocessor: { repo: tokenizer.repo, path: `${tokenizer.prefix}${preprocessor}` } }
+  }
+  return undefined
 }
 
 /** The fields of the Hub's `/api/models/{repo}` this reads. */
@@ -180,10 +265,11 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
       const resolve = () => (url ? urlModelMeta(model) : hubModelMeta(model))
       const stored = await readManifest(model)
       if (!stored) return resolve()
-      // A stored ONNX meta whose look for a vision encoder never got an
-      // answer (saved before there was one, or the look failed) is looked
-      // at again; offline, it loads text as it did.
-      if (stored.files.kind !== "onnx" || stored.files.vision || stored.visionChecked) return stored
+      // A stored meta whose look for a vision encoder never got an answer
+      // (saved before there was one, or the look failed) is looked at
+      // again; offline, it loads text as it did.
+      const looked = stored.files.kind === "onnx" ? stored.visionChecked : stored.projectorChecked
+      if (stored.files.vision || looked) return stored
       const fresh = await resolve().catch(() => stored)
       if (fresh !== stored) await saveManifest(fresh)
       return fresh
@@ -198,10 +284,10 @@ export function resolveModel(model: unknown, signal?: AbortSignal): Promise<WebG
   return abortable(promise, signal)
 }
 
-async function hubGet(url: string, what: string, method?: "HEAD"): Promise<Response> {
+async function hubGet(url: string, what: string, method?: "HEAD", headers?: Record<string, string>): Promise<Response> {
   let response: Response
   try {
-    response = await hub.fetch(url, { referrerPolicy: "no-referrer", ...(method && { method }) })
+    response = await hub.fetch(url, { referrerPolicy: "no-referrer", ...(method && { method }), ...(headers && { headers }) })
   } catch (error) {
     throw new WebGLLMError("download-failed", `Couldn't reach Hugging Face for ${what}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
   }
@@ -283,25 +369,26 @@ const ONNX_QUANTS = ["q4f16", "q4"]
 
 /**
  * The ONNX graphs to try, in order: q4f16, then q4, then the rest, and
- * within each, decoders (`model*`, `decoder_model_merged*`) before other
- * graphs. Which one loads is decided by reading it (onnxWeights).
+ * within each, decoders (`model*`, `decoder*`, `decoder_model_merged*`)
+ * before other graphs. Which one loads is decided by reading it (onnxWeights).
  */
 export function onnxCandidates(files: Iterable<string>): Array<string> {
   const graphs = [...files].filter((f) => /^onnx\/.+\.onnx$/.test(f))
   const quant = (f: string) => /_([a-z0-9]+)\.onnx$/.exec(f)?.[1] ?? ""
   const rank = (f: string) => {
     const q = ONNX_QUANTS.indexOf(quant(f))
-    const decoder = /^onnx\/(model|decoder_model_merged)(_[a-z0-9]+)?\.onnx$/.test(f) ? 0 : 1
+    const decoder = /^onnx\/(model|decoder|decoder_model_merged)(_[a-z0-9]+)?\.onnx$/.test(f) ? 0 : 1
     return (q < 0 ? ONNX_QUANTS.length : q) * 2 + decoder
   }
   return graphs.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
 }
 
 /**
- * The first graph the ONNX loader takes, and its one external data file,
- * reading only graphs (small) and config.json: never a data file.
+ * The first graph the ONNX loader takes, and the external data files its
+ * weights are in (all in the repository), reading only graphs (small) and
+ * config.json: never a data file.
  */
-async function onnxWeights(repo: string, files: Set<string>, config: Record<string, unknown>): Promise<{ graph: string; data: string }> {
+async function onnxWeights(repo: string, files: Set<string>, config: Record<string, unknown>): Promise<{ graph: string; data: Array<string> }> {
   let reason = "none under onnx/"
   for (const graph of onnxCandidates(files)) {
     const bytes = await fileBytes({ repo, path: graph })
@@ -313,9 +400,10 @@ async function onnxWeights(repo: string, files: Set<string>, config: Record<stri
       reason = `${graph}: ${error instanceof Error ? error.message : String(error)}`
       continue
     }
-    const data = `${graph.slice(0, graph.lastIndexOf("/") + 1)}${dataFiles[0]}`
-    if (dataFiles.length !== 1) reason = `${graph} keeps its weights in ${dataFiles.length} files; webgllm reads one`
-    else if (!files.has(data)) reason = `${graph}'s weights are in ${data}, which the repository doesn't have`
+    const data = dataFiles.map((file) => `${graph.slice(0, graph.lastIndexOf("/") + 1)}${file}`)
+    const missing = data.find((file) => !files.has(file))
+    if (!data.length) reason = `${graph} keeps its weights in the graph itself; webgllm reads them from its data file`
+    else if (missing) reason = `${graph}'s weights are in ${missing}, which the repository doesn't have`
     else return { graph, data }
   }
   throw notSupported(`${repo} has no ONNX graph webgllm loads (${reason}).`)
@@ -446,18 +534,25 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
       throw notSupported(`${repo} is a "${String(type)}" model; webgllm runs ${ONNX_MODEL_TYPES.join(", ")} ONNX models.`)
     }
     const onnx = await onnxWeights(repo, files, config)
-    const look = await lookForVision((path) => ({ repo, path }), onnx.graph, config, (path) => files.has(path))
+    const look = await lookForVision(() => visionFilesFor((path) => ({ repo, path }), onnx.graph, config, (path) => files.has(path)))
     visionChecked = look.checked
     weights = {
       kind: "onnx",
       graph: { repo, path: onnx.graph },
-      data: { repo, path: onnx.data },
+      data: { repo, path: onnx.data[0]! },
+      ...(onnx.data.length > 1 && { moreData: onnx.data.slice(1).map((path) => ({ repo, path })) }),
       config: { repo, path: "config.json" },
       ...(look.vision && { vision: look.vision })
     }
     weightsFile = onnx.graph
   }
   const source = await tokenizerSource(repo, info, files, weightsFile)
+  let projectorChecked = true
+  if (weights.kind === "gguf" && projectorCandidates(files).length) {
+    const look = await lookForVision(() => projectorFilesFor(repo, files, source))
+    projectorChecked = look.checked
+    if (look.vision) weights = { ...weights, vision: look.vision }
+  }
   const at = (path: string): ModelFile => ({ repo: source.repo, path: `${source.prefix}${path}` })
   const listed: WebGlModelMeta["tokenizer"] = {
     tokenizer: at("tokenizer.json"),
@@ -472,6 +567,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
   const base = info.cardData?.base_model
   return metaFrom({
     visionChecked,
+    projectorChecked,
     name: repo,
     weights,
     listed,
@@ -508,13 +604,22 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
     } catch (error) {
       throw notSupported(`${url} isn't a graph webgllm loads: ${error instanceof Error ? error.message : String(error)}`)
     }
-    if (dataFiles.length !== 1) throw notSupported(`${url} keeps its weights in ${dataFiles.length} files; webgllm reads one.`)
-    const look = await lookForVision(here, file, config, async (path) => (await fileResponse(here(path), "HEAD")) !== undefined)
+    if (!dataFiles.length) throw notSupported(`${url} keeps its weights in the graph itself; webgllm reads them from its data file.`)
+    const look = await lookForVision(() => visionFilesFor(here, file, config, async (path) => (await fileResponse(here(path), "HEAD")) !== undefined))
     visionChecked = look.checked
-    weights = { kind: "onnx", graph: here(file), data: here(dataFiles[0]!), config: here("config.json"), ...(look.vision && { vision: look.vision }) }
+    weights = {
+      kind: "onnx",
+      graph: here(file),
+      data: here(dataFiles[0]!),
+      ...(dataFiles.length > 1 && { moreData: dataFiles.slice(1).map(here) }),
+      config: here("config.json"),
+      ...(look.vision && { vision: look.vision })
+    }
   }
   return metaFrom({
     visionChecked,
+    // (A model by URL has no repository to find a projector in.)
+    projectorChecked: true,
     name: url,
     weights,
     listed: { tokenizer: here("tokenizer.json"), config: here("tokenizer_config.json"), chatTemplate: here("chat_template.jinja") },
@@ -528,6 +633,8 @@ export async function urlModelMeta(url: string): Promise<WebGlModelMeta> {
 async function metaFrom(model: {
   /** Whether the look for a vision encoder got an answer (see lookForVision). */
   visionChecked: boolean
+  /** The same for a GGUF model's projector. */
+  projectorChecked: boolean
   name: string
   weights: WebGlModelMeta["files"]
   listed: WebGlModelMeta["tokenizer"]
@@ -553,6 +660,6 @@ async function metaFrom(model: {
     ...(reasoning && { reasoning }),
     sampling: samplingFrom(generationConfig),
     toolFormat: toolFormatFrom(template),
-    visionChecked: model.visionChecked
+    ...(model.weights.kind === "onnx" ? { visionChecked: model.visionChecked } : { projectorChecked: model.projectorChecked })
   }
 }
