@@ -9,6 +9,7 @@ import type { GpuNote } from "./storage.js"
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource } from "./byte-source.js"
+import { ggufShape, readGgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
@@ -23,7 +24,7 @@ import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
-import { download, previousGpuTuning, readGpuNotes, saveManifest, storedFile, writeGpuNote } from "./storage.js"
+import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -413,20 +414,23 @@ async function load(
       >,
       ...(templateFile && { chatTemplate: await templateFile.text() })
     })
-    const scope = [
-      engine.gpu.limits.renderer,
-      navigator.userAgent,
-      model,
-      plain ? "plain" : "mrt"
-    ].join("|") + "|"
+    const gpuScope = `${engine.gpu.limits.renderer}|${navigator.userAgent}|`
+    const passes = plain ? "plain" : "mrt"
+    const scope = `${gpuScope}${model}|${passes}|`
     const settings = hash(JSON.stringify(TUNING))
-    const noteKey = `${scope}${Engine.fingerprint}.${settings}`
+    const code = `${Engine.fingerprint}.${settings}`
+    const noteKey = `${scope}${code}`
     const notes = await readGpuNotes()
     const checkedNote = notes[noteKey]
+    // The weights' shape, from their header: a model of the same shape as
+    // one already tuned here starts from its tuning.
+    const shape = meta.files.kind === "gguf" ? ggufShape(await readGgufHeader(blobSource(weightFiles[0]))) : undefined
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
+    // Likewise another model's with the same weights' shape.
     const note = checkedNote ?? (reuseTuning
-      ? previousGpuTuning(notes, scope, settings, SELF_CHECK_MAX)
+      ? previousGpuTuning(notes, scope, settings, SELF_CHECK_MAX) ??
+        (shape ? sharedGpuTuning(notes, gpuScope, `|${passes}|${code}`, shape, SELF_CHECK_MAX) : undefined)
       : undefined)
     reusedTuning = !checkedNote && !!note
     timings.calibrationCached = checkedNote ? 1 : 0
@@ -545,7 +549,8 @@ async function load(
             calibrated: true,
             pacing: note?.pacing,
             head: engine.headChoice ?? undefined,
-            tuned: { ...engine.tuned }
+            tuned: { ...engine.tuned },
+            ...(shape && { shape })
           }
         : null
     timings.total = Math.round(performance.now() - t0)
