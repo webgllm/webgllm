@@ -192,28 +192,27 @@ export class SubmissionBudget {
         )
         this.growAfter = now + 1000
       }
-      this.smoothFrames = 0
-      if (severe && (!decodeRecovery || sustained || intervalMs > 100)) {
-        this.ahead = Math.max(0, this.ahead - 1)
-        this.layers = Math.max(
-          1,
-          Math.floor(this.layers / (intervalMs > 100 ? 4 : 2))
-        )
-      }
-      this.decodeSmooth = 0
-    } else if (intervalMs < severeMs) {
-      if (now - this.decodeAt < 250) {
-        this.decodeSmooth += frames
-        if (this.decodeSmooth >= 96) {
-          this.layers = Math.max(this.layers, 2)
-          this.decodeSmooth = 0
-        }
-      }
-      this.smoothFrames += frames
-      if (this.smoothFrames >= 96) {
-        this.ahead = Math.min(2, this.ahead + 1)
+      if (decodeRecovery && !severe) {
+        // A slow mean with no long frame says nothing against the queue's
+        // depth, so it still earns the queue back. Else a page that paints
+        // most of a high-refresh display's frames (Firefox on a Pixel 10
+        // Pro: about 100 of 120) never does: one burst of long frames left
+        // writing at a wait a layer with nothing queued, 2.4 tokens/s
+        // where it writes 10, for the rest of the session.
+        this.earnBack(frames, now)
+      } else {
         this.smoothFrames = 0
+        if (severe && (!decodeRecovery || sustained || intervalMs > 100)) {
+          this.ahead = Math.max(0, this.ahead - 1)
+          this.layers = Math.max(
+            1,
+            Math.floor(this.layers / (intervalMs > 100 ? 4 : 2))
+          )
+        }
+        this.decodeSmooth = 0
       }
+    } else if (intervalMs < severeMs) {
+      this.earnBack(frames, now)
       if (now - this.activeWorkAt > 250) return
       this.computeFrames += frames
       this.recoveryFrames += frames
@@ -244,6 +243,22 @@ export class SubmissionBudget {
           this.reads = Math.min(2 ** 34, Math.round(this.reads * 1.25))
         this.presentationSmooth = 0
       }
+    }
+  }
+
+  /** Frames without a long one: after 96, writing's layers per wait and the chunks queued ahead come back a step. */
+  private earnBack(frames: number, now: number) {
+    if (now - this.decodeAt < 250) {
+      this.decodeSmooth += frames
+      if (this.decodeSmooth >= 96) {
+        this.layers = Math.max(this.layers, 2)
+        this.decodeSmooth = 0
+      }
+    }
+    this.smoothFrames += frames
+    if (this.smoothFrames >= 96) {
+      this.ahead = Math.min(2, this.ahead + 1)
+      this.smoothFrames = 0
     }
   }
 

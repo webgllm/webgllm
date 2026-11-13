@@ -332,6 +332,10 @@ export const TUNING = {
   fencePolls: 32,
   /** Reading a prompt, how long a wait polls before it sleeps on timers (see Gpu.promptSpinMs; -1: as writing). */
   promptFenceSpinMs: 0.25,
+  /** 1: fence polls wait inside the call where the browser allows it (see Gpu.timedPolls); 0: never. */
+  timedFencePolls: 1,
+  /** The frame rate a prompt's pacing defends where fences are slow to report (see Gpu.slowFencePromptFps). */
+  slowFencePromptFps: 40,
   /** A full compute-queue drain after this many display frames (0 disables). */
   presentationFrames: 4,
   /** Decode layers per fenced submission (0 disables). */
@@ -649,6 +653,8 @@ export class Engine {
     this.gpu.configurePacing(this.tuned.submissionReads ?? TUNING.submissionReads, TUNING.submissionMs)
     this.gpu.pollsBeforeSleep = TUNING.fencePolls
     this.gpu.promptSpinMs = TUNING.promptFenceSpinMs
+    this.gpu.timedPolls = TUNING.timedFencePolls > 0
+    this.gpu.slowFencePromptFps = TUNING.slowFencePromptFps
     this.gpu.presentationFrames = TUNING.presentationFrames
     this.bytes = (options.weightTexels ?? "bytes") === "bytes"
     this.ringCache = options.ringCache ?? true
@@ -6080,6 +6086,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     )
     this.gpu.pollsBeforeSleep = TUNING.fencePolls
     this.gpu.promptSpinMs = TUNING.promptFenceSpinMs
+    this.gpu.timedPolls = TUNING.timedFencePolls > 0
+    this.gpu.slowFencePromptFps = TUNING.slowFencePromptFps
     this.gpu.presentationFrames = TUNING.presentationFrames
     // (Writing: room past the batch for its queries too, see queryInCache.)
     await this.reserve(

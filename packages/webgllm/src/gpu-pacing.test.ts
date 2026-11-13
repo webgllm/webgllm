@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { Gpu, type Pass } from "./gpu/gl.js"
+import { SubmissionBudget } from "./gpu/submission-budget.js"
 
 function harness(readsPerSlice: number) {
   const gpu = Object.create(Gpu.prototype) as Gpu
@@ -184,4 +185,32 @@ test("prompt pacing calibrates only a high-refresh session with repeated slow em
       assert.equal(gpu.calibratePromptPacing(), undefined)
     }
   }
+})
+
+test("writing earns its queue back on frames that are slow on average but have no long one", () => {
+  const budget = new SubmissionBudget(true)
+  budget.configure(2 ** 28, 4, 2)
+  budget.enableRecovery()
+  // Backed off as far as it goes, by an earlier burst of long frames.
+  budget.ahead = 0
+  budget.layers = 1
+  budget.waiting(0)
+  let now = 1000
+  const report = (worstMs: number, meanMs: number) => {
+    budget.decode(now)
+    budget.frame(worstMs, 8.3, 24, now, meanMs, now - meanMs * 24)
+    now += meanMs * 24
+  }
+  // A 120 Hz page painting about 100 frames a second: no frame over 32 ms.
+  for (let i = 0; i < 4; i++) report(25, 10)
+  assert.equal(budget.ahead, 1)
+  assert.equal(budget.layers, 2)
+  for (let i = 0; i < 4; i++) report(25, 10)
+  assert.equal(budget.ahead, 2)
+  // Long frames one after another still back it off.
+  for (let i = 0; i < 2; i++) {
+    budget.frame(60, 8.3, 1, now, 60, now - 60)
+    now += 60
+  }
+  assert.equal(budget.ahead, 1)
 })

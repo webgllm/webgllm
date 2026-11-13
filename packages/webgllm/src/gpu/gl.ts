@@ -22,6 +22,9 @@ export type PendingRead = (() => Promise<Float32Array>) & { cancel: () => void }
 
 export class GpuError extends Error {}
 
+/** gl.MAX_CLIENT_WAIT_TIMEOUT_WEBGL: the longest clientWaitSync may wait, in nanoseconds. */
+const MAX_CLIENT_WAIT_TIMEOUT_WEBGL = 0x9247
+
 /**
  * The WebGL 2 enums used here, as numbers: `WebGL2RenderingContext` isn't
  * defined where the module may also be imported (a server rendering pages).
@@ -202,6 +205,9 @@ export class Gpu {
           : gl.getParameter(gl.RENDERER)
       )
     }
+    // (Only a worker's thread may wait inside a call.)
+    if (typeof document === "undefined")
+      this.maxPollNs = Math.min(Number(gl.getParameter(MAX_CLIENT_WAIT_TIMEOUT_WEBGL)) || 0, 1e6)
     this.vertexShader = this.shader(gl.VERTEX_SHADER, VERTEX_SHADER)
     gl.disable(gl.DITHER)
     gl.disable(gl.BLEND)
@@ -738,6 +744,17 @@ export class Gpu {
   private canRecoverPacing = false
   private sampledPromptPacing = false
   private promptFrameBudgetMs = 0
+  /**
+   * The frame rate the pacing defends where an idle GPU's fence is slow to
+   * report (see measurePromptPacing: Firefox on Android, about 7 ms).
+   * There every slice of work costs frames, far more than in Chrome on the
+   * same GPU: Firefox on a Pixel 10 Pro read 57 to 67 tokens/s holding 80
+   * frames a second and 68 to 72 at 36, where Chrome reads 100 at its 60;
+   * and its odd 50 ms frame while writing, taken for a failing queue,
+   * halved its speed. So it defends 40, which keeps the page above 30,
+   * not the display's rate (75 for prompts, before).
+   */
+  slowFencePromptFps = 40
 
   /** The same feedback controller is used on every GPU. Zero ms fixes the quota. */
   configurePacing(reads: number, targetMs: number) {
@@ -773,7 +790,7 @@ export class Gpu {
     if (slow < 2) return
     // Budget for presentation during prefill on high-refresh displays.
     // A real long stall still triggers the controller's immediate backoff.
-    this.promptFrameBudgetMs = 1000 / 75
+    this.promptFrameBudgetMs = 1000 / this.slowFencePromptFps
     this.budgets.prompt.enableRecovery(160 * 2 ** 20)
     this.budgets.decode.enableRecovery()
   }
@@ -836,7 +853,9 @@ export class Gpu {
       return
     const now = performance.now()
     this.lastObservedFrame = now
-    if (this.phase === "prompt")
+    // (Where fences are slow to report, reading and writing are both judged
+    // against the frame rate the pacing defends there: see slowFencePromptFps.)
+    if (this.phase !== "load")
       expectedMs = Math.max(expectedMs, this.promptFrameBudgetMs || 0)
     this.expectedFrameMs = expectedMs
     this.lastFrameHealthy =
@@ -1155,9 +1174,28 @@ export class Gpu {
   promptSpinMs = 0.25
   private polls = 0
 
-  /** A zero-timeout fence check avoids a synchronous parameter-query round trip. */
-  private fenceReady(sync: WebGLSync) {
-    const gl = this.gl, status = gl.clientWaitSync(sync, 0, 0)
+  /**
+   * Whether a prompt's waits poll their fence with a timeout where the
+   * browser allows one (MAX_CLIENT_WAIT_TIMEOUT_WEBGL above zero: Firefox;
+   * Chrome and Safari report 0). Firefox answers a zero-timeout poll from
+   * a status it refreshes about every 7 ms, so no fence reports sooner
+   * than that; with any timeout the poll asks the GPU's side, and returns
+   * in a millisecond or two. Firefox on a Pixel 10 Pro read prompts 20 to
+   * 60% faster for it, with fewer missed frames.
+   */
+  timedPolls = true
+  /** The longest a fence poll may wait inside the call, in nanoseconds (0: it can't). */
+  private maxPollNs = 0
+
+  /**
+   * Whether the GPU is past `sync`: one poll. `waiting` polls (a wait's,
+   * between turns of the event loop) are the timed ones (see timedPolls):
+   * a look in passing stays free, since a timed poll is a round trip of a
+   * millisecond or two even when the fence has long reported.
+   */
+  private fenceReady(sync: WebGLSync, waiting = false) {
+    const gl = this.gl
+    const status = gl.clientWaitSync(sync, 0, waiting && this.timedPolls ? this.maxPollNs || 0 : 0)
     if (status === gl.WAIT_FAILED) throw new GpuError("Waiting on the GPU failed.")
     return status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED
   }
@@ -1201,7 +1239,10 @@ export class Gpu {
             this.throttledUntil = performance.now() + 2000
         }
         if (this.isLost) throw new GpuError("The GPU context was lost.")
-        if (this.fenceReady(sync)) return
+        // (Timed polls while reading a prompt, where sleeps space them out:
+        // each is a round trip to the browser's GPU side, and writing's
+        // back-to-back polls, hundreds a token, cost Firefox frames.)
+        if (this.fenceReady(sync, this.phase === "prompt")) return
       }
     } finally {
       budget.completed(performance.now())
