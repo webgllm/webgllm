@@ -54,7 +54,7 @@ export type RunTimings = {
    * the ones not encoded before, the vision encoder's load included.
    */
   imagesMs?: number
-  /** Of imagesMs, loading the vision encoder (its download included; 0 when no image needed it). */
+  /** Of imagesMs, getting the vision encoder's files (their download included; 0 when no image needed it). */
   visionLoadMs?: number
   /** CPU prefix matching and restore-command submission, without a GPU synchronization. */
   cacheRestoreMs?: number

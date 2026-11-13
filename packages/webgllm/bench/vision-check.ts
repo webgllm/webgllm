@@ -34,16 +34,20 @@ try {
   log(navigator.userAgent)
   const gpu = new Gpu(document.getElementById("gl") as HTMLCanvasElement)
   const encoder = new VisionEncoder(gpu)
-  let t = performance.now()
+  // The encoder's pieces, from its file each time they're asked for.
+  let pieces: () => ReturnType<typeof loadVision>
   if (/\.gguf$/i.test(encoderPath)) {
-    await encoder.load(loadVisionGguf(blobSource(await (await fetch(`/models/${encoderPath}`)).blob())))
+    const source = blobSource(await (await fetch(`/models/${encoderPath}`)).blob())
+    pieces = () => loadVisionGguf(source)
   } else {
     const graph = await bytes(`/models/${encoderPath}`)
     const dataFile = planVision(graph).reads.find((r) => r.tensor.external)?.tensor.external?.location
     const folder = encoderPath.slice(0, encoderPath.lastIndexOf("/") + 1)
     const data = blobSource(await (await fetch(`/models/${folder}${dataFile}`)).blob())
-    await encoder.load(loadVision({ graph, data }))
+    pieces = () => loadVision({ graph, data })
   }
+  let t = performance.now()
+  await encoder.load(pieces())
   await gpu.finish()
   log(`loaded in ${Math.round(performance.now() - t)} ms: ${(encoder.bytes / 2 ** 20).toFixed(1)} MiB of textures; ${JSON.stringify(encoder.config)}`)
   const pixels = new Float32Array((await bytes(`/models/${image}.pixels`)).buffer)
@@ -53,9 +57,11 @@ try {
     throw new Error(`${image}.pixels has ${pixels.length} values; a ${gridH}×${gridW} grid needs ${gridH * gridW * encoder.config.patchValues}`)
   if (ref.length !== tokens * encoder.config.outWidth)
     throw new Error(`${image}.features has ${ref.length} values; ${tokens} tokens need ${tokens * encoder.config.outWidth}`)
+  let whole: Float32Array | null = null
   for (let r = 0; r < rounds; r++) {
     t = performance.now()
     const got = await encoder.encode({ pixels, gridH, gridW })
+    whole = got
     const ms = performance.now() - t
     let maxAbs = 0, num = 0, den = 0, worstCos = 1
     const cosines: Array<[number, number]> = []
@@ -79,6 +85,25 @@ try {
     log(`round ${r}: ${got.length / W} tokens in ${ms.toFixed(0)} ms; max abs ${maxAbs.toFixed(4)}, relative L2 ${Math.sqrt(num / den).toFixed(5)}, worst row cosine ${worstCos.toFixed(6)}; first ${Array.from(got.slice(0, 4), (v) => v.toFixed(4)).join(" ")} vs ${Array.from(ref.slice(0, 4), (v) => v.toFixed(4)).join(" ")}; worst rows ${cosines.sort((a, b) => a[1] - b[1]).slice(0, 6).map(([r, c]) => `${r}:${c.toFixed(5)}`).join(" ")}`)
   }
   encoder.dispose()
+  // The same view as a request encodes it: the encoder's weights a piece
+  // at a time (encodeStream), against the loaded encoder's rows, and
+  // against loading and encoding one after the other for time.
+  for (let r = 0; r < rounds; r++) {
+    t = performance.now()
+    const loaded = new VisionEncoder(gpu)
+    await loaded.load(pieces())
+    await loaded.encode({ pixels, gridH, gridW })
+    loaded.dispose()
+    const wholeMs = performance.now() - t
+    const before = gpu.bytes
+    t = performance.now()
+    const [streamed] = await new VisionEncoder(gpu).encodeStream(pieces(), [{ pixels, gridH, gridW }])
+    const streamMs = performance.now() - t
+    let differ = 0
+    for (let i = 0; i < streamed.length; i++) if (streamed[i] !== whole![i]) differ++
+    log(`streamed ${r}: ${streamMs.toFixed(0)} ms (load then encode: ${wholeMs.toFixed(0)} ms); ${differ} of ${streamed.length} values differ from the loaded encoder's; textures back to ${gpu.bytes === before ? "where they were" : `${gpu.bytes - before} bytes more`}`)
+    if (differ) throw new Error("The streamed encode's rows aren't the loaded encoder's.")
+  }
   log("ALL DONE")
 } catch (error) {
   log(`ERROR: ${error instanceof Error ? `${error.message}\n${error.stack}` : String(error)}`)

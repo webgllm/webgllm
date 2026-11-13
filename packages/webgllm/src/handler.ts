@@ -56,7 +56,7 @@ import {
   type ImageView,
   type PreparedImage
 } from "./prompt-images.js"
-import { VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
+import { VisionEncoder, visionStreamBytes } from "./vision.js"
 import type { VisionConfig, VisionPiece } from "./vision-weights.js"
 
 const post = (message: WorkerResponse) => postMessage({ ...message, [WEBGLLM]: true })
@@ -833,9 +833,10 @@ async function promptImages(model: Loaded, prompt: Array<number>, chat: Generate
 
 /**
  * Encodes the image views whose rows the prompt reads from `start` on (the
- * cache holds the rest), loading the vision encoder for them and freeing
- * it after: text-only prompts never load it. Returns the ms the load took
- * (its download included; 0 without one).
+ * cache holds the rest), reading the vision encoder's weights for them a
+ * piece at a time: text-only prompts never read them. Returns the ms it
+ * took to have the encoder's files (their download included; 0 with no
+ * view to encode).
  */
 async function encodeImages(model: Loaded, images: Array<PromptView>, start: number, signal: AbortSignal) {
   const needed = images.filter(({ start: at, view }) => at + view.height * view.width > start && !view.features)
@@ -862,26 +863,30 @@ async function encodeImages(model: Loaded, images: Array<PromptView>, start: num
   if (config.outWidth !== engine.config.hiddenSize)
     throw new Error(`The vision encoder writes ${config.outWidth}-wide rows; the model reads ${engine.config.hiddenSize}.`)
   model.imagePositions = config.positions
-  // Room for the encoder's weights and its largest view's work while it's
-  // loaded, sized as the encoder allocates them.
-  const maxTexture = engine.gpu.limits.maxTextureSize
-  const work = Math.max(
-    ...needed.map(({ view }) => visionWorkBytes(config, view.height * config.merge, view.width * config.merge, maxTexture))
-  )
+  // The views to encode (one the prompt has twice is encoded once), as the encoder's patches.
+  const views = [...new Set(needed.map(({ view }) => view))]
+  const patches = views.map((view) => patchesOf(view, model.imageConfig!))
+  // Room for what the encode holds at once: the views' work and one piece
+  // of the encoder (its weights pass through a block at a time, so the
+  // whole tower is never on the GPU beside the model).
   const encoder = new VisionEncoder(engine.gpu)
   try {
     signal.throwIfAborted()
-    await claimMemory(model.model, engine.gpu.bytes + visionWeightBytes(config, bits, zeros) + work, signal)
+    const most = visionStreamBytes(
+      config,
+      bits,
+      zeros,
+      patches.map(({ gridH, gridW }): [number, number] => [gridH, gridW]),
+      engine.gpu.limits.maxTextureSize
+    )
+    await claimMemory(model.model, engine.gpu.bytes + most, signal)
     signal.throwIfAborted()
-    await encoder.load(pieces(), signal)
     const loadMs = performance.now() - loadAt
-    for (const { view } of needed) {
-      signal.throwIfAborted()
-      // (A view the prompt has twice is encoded once.)
-      if (view.features) continue
-      view.features = await encoder.encode(patchesOf(view, model.imageConfig!), signal)
+    const features = await encoder.encodeStream(pieces(), patches, signal)
+    views.forEach((view, i) => {
+      view.features = features[i]
       view.pixels = null
-    }
+    })
     return loadMs
   } finally {
     encoder.dispose()

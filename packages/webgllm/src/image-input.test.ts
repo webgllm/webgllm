@@ -7,7 +7,7 @@ import { imageProcessorConfig, patchPlace, pixelBudget, planViews, smartResize, 
 import { dequantizeTable } from "./load-vision.js"
 import { chatImages, countImageSlots, expandImageTokens, fetchImage, ImageCache, imageKey, imageTokenCount, type PreparedImage } from "./prompt-images.js"
 import { hubModelMeta } from "./resolve-model.js"
-import { positionEmbeddings, ropeTable, VisionEncoder, visionWeightBytes, visionWorkBytes } from "./vision.js"
+import { positionEmbeddings, ropeTable, VisionEncoder, visionStreamBytes, visionWeightBytes, visionWorkBytes } from "./vision.js"
 import { newVisionMatrix, type VisionConfig, type VisionLinear, type VisionPiece } from "./vision-weights.js"
 
 /** An image read as one view of height × width tokens. */
@@ -381,6 +381,7 @@ function countingGpu() {
   let id = 0
   const bytesPer: Record<number, number> = { 0x8d70: 16, 0x8814: 16, 0x881a: 8, 0x8d7c: 4 }
   const textures = new Set<Texture>()
+  const draws: Array<string> = []
   const gpu = {
     limits: { maxTextureSize: 16384 },
     texture(internal: number, width: number, height: number) {
@@ -395,11 +396,13 @@ function countingGpu() {
     },
     program: (source: string) => ({ source }),
     run: () => undefined,
-    runAsync: async () => undefined,
+    runAsync: async (pass: { program: { source: string }; rect: unknown; uniforms: unknown }) => {
+      draws.push(JSON.stringify([pass.program.source.length, pass.rect, pass.uniforms]))
+    },
     pace: async () => undefined,
     read: async (t: Texture) => new Float32Array(t.width * t.height * 4)
   }
-  return { gpu: gpu as unknown as Gpu, live: () => live, peak: () => peak, resetPeak: () => (peak = live) }
+  return { gpu: gpu as unknown as Gpu, live: () => live, peak: () => peak, resetPeak: () => (peak = live), draws }
 }
 
 const linear = (N: number, K: number, bits: 4 | 8 = 4, bias = true): VisionLinear => ({ m: newVisionMatrix(N, K, bits, false), bias: bias ? new Float32Array(N) : null })
@@ -445,6 +448,47 @@ function tinyTower(): Array<VisionPiece> {
 async function* piecesOf(pieces: Array<VisionPiece>) {
   yield* pieces
 }
+
+test("a streamed encode holds one piece of the encoder at a time: its claim is what it allocates, and its draws are the loaded encoder's", async () => {
+  for (const [name, pieces, bits] of [["a ViT, 4-bit", tinyEncoder(), 4], ["a conv and attention tower, 8-bit", tinyTower(), 8]] as const) {
+    const config = (pieces[0] as { config: VisionConfig }).config
+    const view = (gridH: number, gridW: number) => ({ pixels: new Float32Array(gridH * gridW * 1536), gridH, gridW })
+    for (const grids of [[[4, 4]], [[40, 40]], [[8, 12], [8, 12], [4, 4]], [[4, 4], [40, 40]]] as Array<Array<[number, number]>>) {
+      const counter = countingGpu()
+      const rows = await new VisionEncoder(counter.gpu).encodeStream(piecesOf(pieces), grids.map(([h, w]) => view(h, w)))
+      const label = `${name}, ${grids.map((g) => g.join("×")).join(" ")}`
+      assert.deepEqual(rows.map((r) => r.length), grids.map(([h, w]) => ((h * w) / 4) * config.outWidth), label)
+      assert.equal(counter.peak(), visionStreamBytes(config, bits, bits === 4, grids, 16384), label)
+      assert.equal(counter.live(), 0, "nothing is left on the GPU")
+      // Less than the loaded encoder and its largest view's work.
+      const loaded = visionWeightBytes(config, bits) + Math.max(...grids.map(([h, w]) => visionWorkBytes(config, h, w, 16384)))
+      if (grids.length === 1) assert.ok(counter.peak() < loaded, label)
+      if (grids.length > 1) continue
+      // One view: the same draws, in the same order, as the encoder loaded whole.
+      const whole = countingGpu()
+      const encoder = new VisionEncoder(whole.gpu)
+      await encoder.load(piecesOf(pieces))
+      await encoder.encode(view(grids[0][0], grids[0][1]))
+      assert.deepEqual(counter.draws, whole.draws, label)
+      assert.ok(whole.draws.length > 0)
+    }
+  }
+})
+
+test("a streamed encode refuses pieces out of the encoder's order, and frees what it made", async () => {
+  const pieces = tinyTower()
+  const view = { pixels: new Float32Array(16 * 1536), gridH: 4, gridW: 4 }
+  for (const [order, message] of [
+    [[0, 2, 1, 3, 4], /incomplete|out of order/],
+    [[0, 1, 2, 4], /incomplete/],
+    [[0, 1, 2, 3], /incomplete/],
+    [[1, 2, 3, 4], /before its config/]
+  ] as const) {
+    const counter = countingGpu()
+    await assert.rejects(new VisionEncoder(counter.gpu).encodeStream(piecesOf(order.map((i) => pieces[i])), [view]), message)
+    assert.equal(counter.live(), 0)
+  }
+})
 
 test("the vision claim is what the encoder allocates: its weights, and its largest image's work at once", async () => {
   for (const [name, pieces, bits] of [["a ViT, 4-bit", tinyEncoder(), 4], ["a conv and attention tower, 8-bit", tinyTower(), 8]] as const) {

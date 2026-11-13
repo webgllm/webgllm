@@ -52,12 +52,28 @@ index plus a delta (max(gh, gw) − gh · gw per image before it).
    painting. The interpolated position embedding and the RoPE angles are
    computed on the CPU (a few MB). `load-vision.ts` finds the weights by
    the graph's structure, as `load-onnx.ts` does the text model's.
-2. **Loaded only for images.** The first request with an image downloads
-   the encoder (and `preprocessor_config.json`); a request whose prompt
-   reads an image's rows loads it, encodes the images it hasn't encoded
-   before, reads the rows back (tokens × hidden floats) and frees the
-   encoder. Text chats never touch any of it. The rows are kept for 8
-   recent images per model.
+2. **Read only for images, a piece at a time.** The first request with an
+   image downloads the encoder (and `preprocessor_config.json`); a request
+   whose prompt reads an image's rows encodes the images it hasn't encoded
+   before and reads the rows back (tokens × hidden floats). Text chats
+   never touch any of it. The rows are kept for 8 recent images per model.
+   The encoder is never on the GPU whole (`VisionEncoder.encodeStream`):
+   its file is read in the tower's order (the patch projection, each
+   block, the merger), and each piece's weights are uploaded, every view
+   of the request is passed through that piece, and the weights are freed
+   before the next piece is read. Each view keeps its residual stream
+   between pieces (4 MB a megapixel-sized view); the blocks' tensors are
+   one set, sized for the largest view. So the most held beside the model
+   is one block's weights and a view's work (`visionStreamBytes`, which
+   the memory claim is made from and a test holds to the byte), not the
+   tower: 204 MiB of weights for LFM3-VL's, 354 for Qwen3.5's GGUF
+   projector, 459 for LFM2.5-VL's so400m. The bytes read and the draws
+   are the ones loading the encoder and then encoding made, in the same
+   order for a view, so the rows are bit for bit the same
+   (`vision-check.html` compares them: 0 of 524,288 values differ for
+   each of the three towers) and the time is the same or less (LFM3-VL
+   409 against 478 ms, so400m 4.1 against 4.9 s, Qwen3.5's float
+   projector 3.1 s either way, load included, alternated in one page).
 3. **Into the prompt.** The chat template writes `<|vision_start|>
    <|image_pad|><|vision_end|>` per image part; the worker expands each
    `<|image_pad|>` to the image's gh · gw tokens. `Engine.setImages` takes
@@ -132,12 +148,12 @@ as it loads: about twice the ONNX build's `q4f16` encoder in textures, and
 `Qwen/Qwen3.5-2B`, where the tokenizer does.
 
 Measured on an M3 Ultra (8,192-token context, `vl.html`): 1,494 MiB of
-textures loaded, 1,948 MiB while it reads a 512 × 384 image (354 MiB of
-that is the encoder's weights) and 1,989 MiB for 1024 × 768. A new image
-takes about 8 s, nearly all of it the encoder's load (the encode is 0.46 s
-for 256 tokens): the 334 M float weights are read and quantized again for
-each image, about 3 s of it the quantization, where a Q8_0 projector is
-taken as it is.
+textures loaded, 1,608 MiB while it reads a 512 × 384 image and 1,648 MiB
+for 1024 × 768 (1,948 and 1,989 MiB when the whole encoder, 354 MiB of
+weights, was held). A new image takes 2 to 3 s, nearly all of it reading
+the encoder's weights (the encode is 0.4 s for 256 tokens): the 334 M
+float weights are quantized again for each image, where a Q8_0 projector
+is taken as it is.
 
 What the 8 bits cost, at 512 × 512 against onnxruntime's fp16 encoder
 (`vision-check.html?encoder=Qwen3.5-2B-GGUF/mmproj-F16.gguf`): relative
@@ -281,43 +297,47 @@ than the table; the ONNX graph resizes without it).
   build in a load of its own, files in storage, the pane on screen; a game
   was open on the Mac, so speeds are lower bounds). Textures are the
   engine's own count (its memory claim): once loaded, and the most while an
-  image is read (the encoder's weights and work beside the model's). The
-  process column is how much the browser's GPU process grew (macOS
-  `footprint`) from before the load to after an image was read.
+  image is read (a piece of the encoder and the views' work beside the
+  model's; in brackets, what it was when the whole encoder was held).
 
-  | Build | Load | Textures loaded | While reading an image | GPU process | Prompt (≈520 tokens) | Writing | An image, one view | 1024 × 768 |
-  |---|---|---|---|---|---|---|---|---|
-  | LFM2.5-VL-450M GGUF | 0.4 s | 446 MiB | 603 to 618 MiB | +0.58 GB | 9,200 tok/s | 167 tok/s | 0.31 s | 1.3 s (1,807 tokens) |
-  | LFM2.5-VL-450M ONNX | 0.9 s | 479 MiB | 640 to 654 MiB | +0.64 GB | 3,400 tok/s | 139 tok/s | 0.29 s | 1.5 s |
-  | LFM2.5-VL-1.6B GGUF | 0.7 s | 973 MiB | 1,507 to 1,521 MiB | +1.07 GB | 1,770 tok/s | 127 tok/s | 1.7 s | 5.8 s |
-  | LFM2.5-VL-1.6B ONNX | 1.9 s | 1,064 MiB | 1,611 to 1,625 MiB | +1.24 GB | 2,870 tok/s | 124 tok/s | 0.9 s | 4.7 s |
-  | LFM3-VL-2B GGUF | 1.0 s | 1,285 MiB | 1,569 to 1,619 MiB | +1.42 GB | 1,650 tok/s | 73 tok/s | 0.54 s | 0.7 s (423 tokens) |
-  | LFM3-VL-2B ONNX | 4.5 s | 1,549 MiB | 1,833 to 1,883 MiB | +1.71 GB | 510 tok/s | 70 tok/s | 0.36 s | 0.6 s |
-  | LFM2.5-VL-3B GGUF | 1.2 s | 1,886 MiB | 2,420 to 2,434 MiB | +1.99 GB | 670 tok/s | 49 tok/s | 1.8 s | 6.1 s |
-  | LFM2.5-VL-3B ONNX | 4.2 s | 1,990 MiB | 2,537 to 2,551 MiB | +2.13 GB | 1,390 tok/s | 58 tok/s | 0.9 s | 4.9 s |
+  | Build | Load | Textures loaded | While reading an image | Prompt (≈520 tokens) | Writing | An image, one view | 1024 × 768 |
+  |---|---|---|---|---|---|---|---|
+  | LFM2.5-VL-450M GGUF | 0.4 s | 446 MiB | 510 to 545 MiB (603 to 618) | 9,200 tok/s | 167 tok/s | 0.25 s | 1.1 s (1,807 tokens) |
+  | LFM2.5-VL-450M ONNX | 0.9 s | 479 MiB | 543 to 579 MiB (640 to 654) | 3,400 tok/s | 139 tok/s | 0.28 s | 1.5 s |
+  | LFM2.5-VL-1.6B GGUF | 0.7 s | 973 MiB | 1,065 to 1,110 MiB (1,507 to 1,521) | 1,770 tok/s | 127 tok/s | 1.7 s | 5.4 s |
+  | LFM2.5-VL-1.6B ONNX | 1.9 s | 1,064 MiB | 1,156 to 1,201 MiB (1,611 to 1,625) | 2,870 tok/s | 124 tok/s | 1.2 s | 5.5 s |
+  | LFM3-VL-2B GGUF | 1.0 s | 1,285 MiB | 1,377 to 1,427 MiB (1,569 to 1,619) | 1,650 tok/s | 73 tok/s | 0.54 s | 0.7 s (423 tokens) |
+  | LFM3-VL-2B ONNX | 4.5 s | 1,549 MiB | 1,641 to 1,691 MiB (1,833 to 1,883) | 510 tok/s | 70 tok/s | 0.6 s | 0.9 s |
+  | LFM2.5-VL-3B GGUF | 1.2 s | 1,886 MiB | 1,977 to 2,022 MiB (2,420 to 2,434) | 670 tok/s | 49 tok/s | 1.8 s | 6.1 s |
+  | LFM2.5-VL-3B ONNX | 4.2 s | 1,990 MiB | 2,082 to 2,128 MiB (2,537 to 2,551) | 1,390 tok/s | 58 tok/s | 0.8 s | 4.1 s |
+  | Qwen3.5-2B GGUF | 2.5 s | 1,494 MiB | 1,608 to 1,648 MiB (1,948 to 1,989) | 740 tok/s | 66 tok/s | 2.1 s | 2.8 s |
 
-  An image's time is mostly loading the encoder for it (a GGUF projector's
-  float rows are quantized as they load: so400m's take about a second
-  more than the ONNX encoder's); a warm 512 × 512 view encodes in 0.16 s
-  (450M, LFM3-VL) to 0.5 s (so400m).
+  An image's time is mostly reading the encoder's weights for it (a float
+  GGUF projector's rows are quantized as they are read: Qwen3.5's take
+  about 2.5 s of its 3.1); a warm 512 × 512 view encodes in 0.16 s (450M,
+  LFM3-VL) to 0.5 s (so400m).
 
 - **On an iPhone** (16 Pro Max, Safari, the GGUF builds, the same page with
   `len=512&reply=32&rounds=1`, one after another without a rest, each
   model just downloaded). iOS ends a tab at 2 GiB (`per-process-limit` in
-  the device's log, 2,097,666 KB when it took Qwen's):
+  the device's log, 2,097,666 KB when it took one). In brackets, the
+  textures while an image was read when the whole encoder was held:
 
   | Build | Result | Load | Textures loaded | While reading an image | Prompt (≈520 tokens) | Writing | An image, one view (first, another) | 1024 × 768 |
   |---|---|---|---|---|---|---|---|---|
-  | LFM2.5-VL-450M GGUF | answers text and images | 8 s | 436 MiB | 594 to 608 MiB | 1,530 tok/s | 120 tok/s | 6.4 s, 0.9 s | 6.1 s |
-  | LFM2.5-VL-1.6B GGUF | answers text and images | 23 s | 974 MiB | 1,507 to 1,522 MiB | 460 tok/s | 44 tok/s | 21 s, 3.8 s | 31 s |
-  | LFM3-VL-2B GGUF | answers text and images | 33 s | 1,285 MiB | 1,570 to 1,619 MiB | 310 tok/s | 32 tok/s | 8.6 s, 1.3 s | 2.6 s |
+  | LFM2.5-VL-450M GGUF | answers text and images | 8 s | 436 MiB | 500 to 535 MiB (594 to 608) | 1,240 to 1,530 tok/s | 101 to 120 tok/s | 4.0 s, 0.75 s | 6.6 s |
+  | LFM2.5-VL-1.6B GGUF | answers text and images | 22 s | 974 MiB | 1,065 to 1,110 MiB (1,507 to 1,522) | 460 tok/s | 44 tok/s | 20 s, 3.6 s | 33 s |
+  | LFM3-VL-2B GGUF | answers text and images | 31 s | 1,285 MiB | 1,377 to 1,427 MiB (1,570 to 1,619) | 310 tok/s | 32 tok/s | 7.3 s, 1.2 s | 2.4 s |
+  | Qwen3.5-2B GGUF | answers text and images | 39 s | 1,510 MiB | 1,613 to 1,654 MiB (killed reading its first image) | 240 tok/s | 27 tok/s | 22 s, 3.7 s | 7.2 s |
   | LFM2.5-VL-3B GGUF | loads, then iOS ends the tab at its first prompt | 51 s | 1,874 MiB | | | | | |
-  | Qwen3.5-2B GGUF | answers text; iOS ends the tab while it reads an image | 41 s | 1,510 MiB | | 240 tok/s | 27 tok/s | | |
 
-  The three that fit read "HELLO 2026" and the colours right in all three
-  images. So a tab holds about 1.6 GiB of textures and not 1.9: Qwen's
-  float projector (354 MiB of encoder weights beside 1.5 GiB of model) is
-  what puts its image over, and the 3B is over with its text alone.
+  (A first image's time has the projector's download in it.) The Liquid
+  builds read "HELLO 2026" and the colours right in all three images, the
+  same replies as with the whole encoder held; Qwen3.5 reads the 1024 ×
+  768 one right and misreads the small text ("WEBLZ" for "WEBGL 77"), as
+  on the Mac. Before the encoder's weights went through a piece at a
+  time, Qwen3.5's image took the tab past 2 GiB (its 354 MiB projector
+  beside 1.5 GiB of model); the 3B is over with its text alone.
 
 ## Left
 
@@ -326,10 +346,10 @@ than the table; the ONNX graph resizes without it).
   patches per fragment, as the text path's 4-token matmuls) is the next
   step if `high` matters.
 - Float (`fp16`) ONNX encoders aren't read, only MatMulNBits ones.
-- The encoder is loaded for each request with a new image and freed after
-  it. For so400m that load is most of an image's time (and 0.5 GiB of
-  textures): keeping it loaded where memory allows would make a second
-  image several times quicker.
+- The encoder's weights are read again for each request with a new image.
+  For so400m that is most of an image's time: keeping the tower loaded
+  where memory allows (0.5 GiB of textures) would make a second image
+  several times quicker.
 - LFM3-VL's ONNX decoder reads prompts at a third of its GGUF's speed: its
   8-bit projections take the 8-bit kernels.
 - Video parts.
@@ -337,5 +357,5 @@ than the table; the ONNX graph resizes without it).
   of textures, freed after each request's images) hasn't been measured on
   the device; its GGUF build's image doesn't fit there (above).
 - A GGUF projector in float (Qwen3.5's) is quantized again for every new
-  image, about 8 s on a Mac. Keeping the quantized rows, or the encoder,
-  between images would remove most of it.
+  image, 2 to 3 s on a Mac. Keeping the quantized rows between images
+  would remove most of it.
