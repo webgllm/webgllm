@@ -424,7 +424,9 @@ async function load(
     const checkedNote = notes[noteKey]
     // The weights' shape, from their header: a model of the same shape as
     // one already tuned here starts from its tuning.
-    const shape = meta.files.kind === "gguf" ? ggufShape(await readGgufHeader(blobSource(weightFiles[0]))) : undefined
+    // (The header is read once: the load below takes it too.)
+    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(blobSource(weightFiles[0])) : undefined
+    const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
     // Likewise another model's with the same weights' shape.
@@ -439,7 +441,9 @@ async function load(
     // A stored timing past two frames is taken once more (a GPU busy with
     // something else at the first load times a fast pipeline slow, and the
     // pacing stored from that would slow every later session's prompts),
-    // and so is one stored before timings were kept (see timesAgain).
+    // and so is one stored before timings were kept (see timesAgain). A
+    // marked one keeps its kernels and has them alone timed, so its pacing
+    // is always a timing of the pipeline it runs (see retimedTuning).
     const retime = note?.tuned && timesAgain(note.tuned) ? note.tuned : undefined
     if (note) {
       engine.preferLayout = note.layout
@@ -449,6 +453,7 @@ async function load(
     const pieces =
       meta.files.kind === "gguf"
         ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
+            header: ggufHeader,
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
             readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
             releaseReadBuffers: canReleaseStaging
@@ -461,6 +466,7 @@ async function load(
             graph: blobSource(weightFiles[1]),
             data: onnxData(meta.files, weightFiles.slice(2))
           })
+    ggufHeader = undefined
     let layers = 0
     await engine.load(pieces, (piece) => {
       if (signal.aborted) throw new Superseded()

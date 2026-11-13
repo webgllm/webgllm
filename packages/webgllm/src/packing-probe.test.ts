@@ -283,13 +283,13 @@ test("the pacing stored from the probe's timing: whole within two frames, graded
   assert.deepEqual([slow.submissionWindow, slow.submissionMs, slow.submissionRetime], [TUNING.presentationFrames, 70, 1])
 })
 
-test("a second timing keeps the faster one's pacing and the stored kernels, and isn't taken a third time", () => {
+test("a second timing keeps the faster one's pacing where both are of the same kernels, and isn't taken a third time", () => {
   const first: Tuned = { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 3e8, submissionOverlap: 2 ** 29, submissionWindow: 4, submissionMs: 70, submissionRetime: 1 }
-  // What the load that times again starts from: all but the timing's own values, so the probe runs.
-  assert.deepEqual(tuningToRetime(first), { shortSplit: 2, f16Pack: null, f16Matmul: null, flashDecode: 1, rmsParts: 64 })
-  // The second timing was quiet: its pacing, the first's kernels.
-  const second: Tuned = { shortSplit: 2, f16Pack: 3, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 1e10, submissionOverlap: 2 ** 29, submissionWindow: 24, submissionMs: 26, submissionRetime: 0 }
-  assert.deepEqual(retimedTuning(first, second), { ...second, f16Pack: 0 })
+  // What the load that times again starts from: the kernels and the mark, without the timing's own values, so the probe runs on those kernels.
+  assert.deepEqual(tuningToRetime(first), { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionRetime: 1 })
+  // The second timing was quiet: its pacing.
+  const second: Tuned = { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 1e10, submissionOverlap: 2 ** 29, submissionWindow: 24, submissionMs: 26, submissionRetime: 0 }
+  assert.deepEqual(retimedTuning(first, second), second)
   // The second was the held-up one: the first's pacing stays, and it's settled.
   const worse: Tuned = { ...second, submissionReads: 2.7e8, submissionWindow: 4, submissionMs: 90, submissionRetime: 1 }
   assert.deepEqual(retimedTuning(first, worse), { ...first, submissionRetime: 0 })
@@ -297,7 +297,12 @@ test("a second timing keeps the faster one's pacing and the stored kernels, and 
   assert.equal(retimedTuning(first, { ...second, submissionMs: 71, submissionWindow: 4, submissionReads: 3e8, submissionRetime: 1 }).submissionRetime, 0)
   // The second timing found larger submissions miss frames: that stands, whichever was faster.
   const missed: Tuned = { ...second, submissionOverlap: 0, submissionWindow: 4, submissionMs: 90 }
-  assert.deepEqual(retimedTuning(first, missed), { ...missed, f16Pack: 0, submissionRetime: 0 })
+  assert.deepEqual(retimedTuning(first, missed), { ...missed, submissionRetime: 0 })
+  // A load that timed nothing (no probe for this model): the stored pacing stays.
+  assert.deepEqual(retimedTuning(first, tuningToRetime(first)), { ...first, submissionRetime: 0 })
+  // A timing of other kernels is never paired with the stored ones: kernels and pacing go together, faster or slower.
+  for (const other of [{ ...second, f16Pack: 3 }, { ...worse, f16Pack: 3 }, { ...second, f16Matmul: 1 }])
+    assert.deepEqual(retimedTuning(first, other), { ...other, submissionRetime: 0 })
   // Which stored tunings are timed again: one marked for it, and one from before timings were kept.
   const before: Tuned = { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 2 ** 28, submissionOverlap: 2 ** 29, submissionWindow: 4 }
   assert.equal(timesAgain(first), true)
@@ -305,7 +310,10 @@ test("a second timing keeps the faster one's pacing and the stored kernels, and 
   assert.equal(timesAgain(before), true)
   // (One with no pacing at all was never timed for it: nothing to take again.)
   assert.equal(timesAgain({ shortSplit: null }), false)
-  // An older tuning has no timing to compare: the new one's pacing and packing are taken (its packing was two pairs' pick).
+  // An older tuning has no timing to compare and its packing was two pairs' pick: the packing is chosen again, and the new timing's pacing goes with it.
+  assert.deepEqual(tuningToRetime(before), { shortSplit: 2, f16Pack: null, f16Matmul: null, flashDecode: 1, rmsParts: 64 })
+  const chosen: Tuned = { ...second, f16Pack: 3 }
+  assert.deepEqual(retimedTuning(before, chosen), chosen)
   assert.deepEqual(retimedTuning(before, second), second)
   assert.deepEqual(retimedTuning(before, worse), { ...worse, submissionRetime: 0 })
   assert.equal(timesAgain(retimedTuning(before, worse)), false)
@@ -354,4 +362,44 @@ test("a fast pipeline is timed in more pairs, all of which the other packing mus
     assert.deepEqual(slow.order, [3, 0, 0, 3])
     assert.deepEqual(slow.report.map((r) => (r as { rounds?: Array<number> }).rounds), [timings[3], timings[0]])
   }
+})
+
+test("a second timing times the stored kernels only: the pacing kept is of the pipeline prompts run", async (t) => {
+  // A stored tuning marked for one more timing, and each kernel's full-batch time at this load.
+  const again = async (native: boolean, stored: Tuned, ms: (tuned: Tuned) => number) => {
+    const { state } = fixture(native)
+    let clock = 0
+    const now = t.mock.method(performance, "now", () => clock)
+    const timed: Array<string> = []
+    const forward = state.forwardHidden.bind(state)
+    state.forwardHidden = async (...args) => {
+      await forward(...args)
+      if (args[0].length !== 512) return
+      timed.push(`${state.tuned.f16Pack}/${state.tuned.f16Matmul}`)
+      clock += ms(state.tuned as Tuned)
+    }
+    Object.assign(state, { tuned: tuningToRetime(stored) })
+    await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
+    now.mock.restore()
+    return { tuned: retimedTuning(stored, state.tuned as Tuned), timed: [...new Set(timed)] }
+  }
+  const first = { shortSplit: null, rmsParts: 64, submissionReads: 2.7e8, submissionOverlap: 2 ** 29, submissionWindow: 4, submissionMs: 90, submissionRetime: 1 }
+  // RGBA4 weights whose stored matmul is 2: the other one would time 25 ms now, the stored one 80 ms.
+  const matmul = await again(true, { ...first, f16Pack: 3, f16Matmul: 2 }, (tuned) => (tuned.f16Matmul === 1 ? 25 : 80))
+  assert.deepEqual(matmul.timed, ["3/2"])
+  assert.deepEqual(
+    [matmul.tuned.f16Pack, matmul.tuned.f16Matmul, matmul.tuned.submissionMs, matmul.tuned.submissionWindow, matmul.tuned.submissionRetime],
+    [3, 2, 80, TUNING.presentationFrames, 0]
+  )
+  // The same for a stored packing of 0 where packing 3 would time 26 ms and it 60 ms.
+  const pack = await again(false, { ...first, f16Pack: 0, f16Matmul: null }, (tuned) => (tuned.f16Pack === 3 ? 26 : 60))
+  assert.deepEqual(pack.timed, ["0/null"])
+  assert.deepEqual([pack.tuned.f16Pack, pack.tuned.submissionMs, pack.tuned.submissionRetime], [0, 60, 0])
+  assert.ok(pack.tuned.submissionWindow! < 12, `window ${pack.tuned.submissionWindow}`)
+  // A quiet second timing of the stored kernel: its pacing, in full.
+  const quiet = await again(false, { ...first, f16Pack: 0, f16Matmul: null }, (tuned) => (tuned.f16Pack === 3 ? 26 : 27))
+  assert.deepEqual([quiet.tuned.f16Pack, quiet.tuned.submissionMs, quiet.tuned.submissionWindow], [0, 27, 24])
+  // A held-up one (slower than the stored timing): the stored pacing stays.
+  const held = await again(false, { ...first, f16Pack: 0, f16Matmul: null }, () => 120)
+  assert.deepEqual([held.tuned.f16Pack, held.tuned.submissionMs, held.tuned.submissionReads, held.tuned.submissionWindow], [0, 90, 2.7e8, 4])
 })
