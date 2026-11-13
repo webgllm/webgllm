@@ -211,7 +211,8 @@ test("new full-batch compilation retains complete warm-up and full reversed pair
   const forward=state.forwardHidden.bind(state)
   state.forwardHidden=async (...args)=>{await forward(...args);clock+=10;if(args[0].length===512&&!compiled){state.gpu.compiled.count++;compiled=true}}
   await Reflect.get(Engine.prototype,"choosePromptPacking").call(state)
-  assert.equal(calls(),10)
+  // (And two more pairs: at 10 ms a timing they fit the probe's quarter second.)
+  assert.equal(calls(),14)
   assert.equal(state.tuned.f16Pack,3)
 })
 
@@ -297,4 +298,49 @@ test("a second timing keeps the faster one's pacing and the stored kernels, and 
   // The second timing found larger submissions miss frames: that stands, whichever was faster.
   const missed: Tuned = { ...second, submissionOverlap: 0, submissionWindow: 4, submissionMs: 90 }
   assert.deepEqual(retimedTuning(first, missed), { ...missed, f16Pack: 0, submissionRetime: 0 })
+})
+
+test("a fast pipeline is timed in more pairs, all of which the other packing must win; a slow one in two, as before", async (t) => {
+  // Each way's full-batch timings (ms) in the order the probe takes them.
+  const pick = async (timings: { 3: Array<number>; 0: Array<number> }) => {
+    const { state } = fixture()
+    let clock = 0
+    const now = t.mock.method(performance, "now", () => clock)
+    const taken: Record<number, number> = { 3: 0, 0: 0 }
+    const order: Array<number> = []
+    const forward = state.forwardHidden.bind(state)
+    state.forwardHidden = async (...args) => {
+      await forward(...args)
+      const pack = state.tuned.f16Pack as 3 | 0
+      if (args[0].length !== 512) return
+      order.push(pack)
+      const ms = timings[pack][taken[pack]++]
+      assert.ok(ms !== undefined, `a ${taken[pack]}th timing of packing ${pack}`)
+      clock += ms
+    }
+    await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
+    now.mock.restore()
+    return { pack: state.tuned.f16Pack, order, report: state.packingReport }
+  }
+  // Measured on an M3 Ultra beside a game: packing 0 won the first two pairs by 2% (38.2 and 42.7 against 37.1 and
+  // 40.1 ms), which used to settle it. A third pair fits the quarter second, in the first's order, and it loses it.
+  const busy = await pick({ 3: [38.2, 42.7, 26.1], 0: [37.1, 40.1, 28.9] })
+  assert.equal(busy.pack, 3)
+  assert.deepEqual(busy.order, [3, 0, 0, 3, 3, 0], JSON.stringify(busy.order))
+  // On a quiet GPU (26 ms a timing) four pairs fit, each in the reverse order of the last.
+  const quiet = await pick({ 3: [26.0, 27.4, 25.4, 26.1], 0: [25.4, 26.1, 25.9, 25.7] })
+  assert.equal(quiet.pack, 3)
+  assert.deepEqual(quiet.order, [3, 0, 0, 3, 3, 0, 0, 3], JSON.stringify(quiet.order))
+  // Winning every pair still takes it: all four, or all three where a fourth doesn't fit.
+  assert.equal((await pick({ 3: [30, 31, 30, 32], 0: [26, 27, 26, 27] })).pack, 0)
+  const three = await pick({ 3: [36, 36, 36], 0: [34, 34, 34] })
+  assert.equal(three.pack, 0)
+  assert.deepEqual(three.order, [3, 0, 0, 3, 3, 0], JSON.stringify(three.order))
+  // Measured on a Pixel 10 Pro: half a second a timing. Two pairs, as before, and packing 0's lead is taken.
+  for (const timings of [{ 3: [569.8, 570.6], 0: [474.7, 497.5] }, { 3: [517.9, 572.6], 0: [498.9, 481.5] }]) {
+    const slow = await pick(timings)
+    assert.equal(slow.pack, 0)
+    assert.deepEqual(slow.order, [3, 0, 0, 3])
+    assert.deepEqual(slow.report.map((r) => (r as { rounds?: Array<number> }).rounds), [timings[3], timings[0]])
+  }
 })

@@ -391,6 +391,10 @@ export const TUNING = {
  */
 type HeadOut = { logits: Texture; split: number; stride: number }
 
+/** The time the load's packing probe may spend on timing pairs past its first two, and the most pairs it takes (see choosePromptPacking). */
+const PACKING_PROBE_MS = 250
+const PACKING_PROBE_PAIRS = 4
+
 /** See Engine.tuned. */
 export type Tuned = {
   shortSplit: number | null
@@ -2004,7 +2008,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   rmsReport: Array<{ parts: number; ms: number }> = []
   private packingMeasured = false
   private promptMatmulMeasured = false
-  packingReport: Array<{pack:number;rows:number;ms:number;matmul?:number;verificationRows?:number;verificationMs?:number}> = []
+  packingReport: Array<{pack:number;rows:number;ms:number;rounds?:Array<number>;matmul?:number;verificationRows?:number;verificationMs?:number}> = []
 
   private legacyF16: { bytes: number; kMax: number; half: boolean } | null = null
 
@@ -2275,12 +2279,29 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             verifiedWinner = winner
         }
       }
-      if (verifiedWinner < 0)
+      if (verifiedWinner < 0) {
         for (let i = options.length - 1; i >= 0; i--) await timed(i)
+        // Two pairs settle it where a timing is long (a phone's pipeline is
+        // half a second, its two ways a tenth apart). On a fast GPU it is
+        // 26 ms, timed to within a few ms, and the ways are a millisecond
+        // apart: winning both pairs was a coin's toss there (1 fresh
+        // tuning in 4 on an M3 Ultra), kept for every later session, and
+        // real prompts read 9% slower with the one they are slower with.
+        // So more pairs, each in the reverse order of the last, while the
+        // timings so far and one more pair fit PACKING_PROBE_MS, up to
+        // PACKING_PROBE_PAIRS: the other way must win them all.
+        const spent = () => samples.reduce((sum, row) => sum + row.reduce((a, ms) => a + ms, 0), 0)
+        const pair = () => samples.reduce((sum, row) => sum + row[row.length - 1], 0)
+        while (samples[0].length < PACKING_PROBE_PAIRS && spent() + pair() <= PACKING_PROBE_MS) {
+          const forward = samples[0].length % 2 === 0
+          for (let k = 0; k < options.length; k++) await timed(forward ? k : options.length - 1 - k)
+        }
+      }
       this.packingReport = options.map((setting, i) => ({
         ...setting,
         rows: probeRows,
         ms: Math.min(...samples[i]),
+        rounds: samples[i].map((ms) => Math.round(ms * 10) / 10),
         ...(Number.isFinite(verification[i]) && { verificationRows, verificationMs: verification[i] })
       }))
       // A clock or compiler transition must not pick the next session's
