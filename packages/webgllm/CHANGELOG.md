@@ -1,3 +1,17 @@
+## 0.3.3 (2026-11-13)
+
+### 🚀 Features
+
+- **webgllm:** image input for LFM3-VL and LFM2.5-VL (GGUF and ONNX), and Qwen3.5's GGUF ([#12](https://github.com/webgllm/webgllm/pull/12))
+
+### 🔥 Performance
+
+- **webgllm:** Firefox on Android no longer stuck writing at 2 tokens/s, and reads prompts twice as fast ([41e907d](https://github.com/webgllm/webgllm/commit/41e907d))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.2 (2026-11-12)
 
 ### 🔥 Performance
