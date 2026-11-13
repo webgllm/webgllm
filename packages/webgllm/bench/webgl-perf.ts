@@ -179,7 +179,11 @@ function finish(extra: object = {}) {
         : undefined
   })
 }
-const isModelNote = (key: string) => key.includes("|LiquidAI/LFM3-1.7B-GGUF|")
+// Every model's tuning notes: a model starts from the tuning of any other
+// with the same weights' shape (storage.ts sharedGpuTuning), so a cold run
+// needs them all gone, not only its own. (It was LFM3 1.7B's alone: other
+// models' "cold" runs kept their notes.)
+const isModelNote = (_key: string) => true
 async function calibrationStore(
   action: "cold" | "save" | "restore",
   name = ""

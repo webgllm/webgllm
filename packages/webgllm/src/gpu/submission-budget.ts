@@ -385,6 +385,21 @@ export class SubmissionBudget {
   }
 }
 
+/**
+ * How fast a complete pipeline ran, from 1 (within two frames) down to 0
+ * (four frames or more): what its stored quota and presentation window
+ * are scaled by. It falls steadily between the two, in the pipeline's
+ * time on a log scale, so a few milliseconds either side of two frames
+ * store nearly the same, where a step there stored eight times the quota
+ * for 26 ms and an eighth for 35 (the same GPU, quiet and beside a game).
+ */
+export function pipelineSpeed(elapsedMs: number, frameMs: number) {
+  const frames = elapsedMs / frameMs
+  if (!(frames > 2)) return 1
+  if (frames >= 4) return 0
+  return 1 - Math.log2(frames / 2)
+}
+
 /** Scale fast devices from a complete, observed matrix workload, not a tiny draw. */
 export function calibratedReadQuota(
   base: number,
@@ -393,10 +408,26 @@ export function calibratedReadQuota(
   frameMs: number
 ) {
   // A complete pipeline that finishes within two frames can queue two frames
-  // of work. Slower pipelines keep the quarter-frame starting budget.
-  const frameShare = elapsedMs <= frameMs * 2 ? 2 : 0.25
+  // of work. One that takes four or more keeps the quarter-frame starting
+  // budget, and between them the share falls from one to the other.
+  const frameShare = 0.25 * 8 ** pipelineSpeed(elapsedMs, frameMs)
   const estimate = (work / elapsedMs) * frameMs * frameShare
   return work > 0 && elapsedMs > 0 && frameMs >= 4 && Number.isFinite(estimate)
     ? Math.max(base, Math.min(2 ** 34, Math.round(estimate)))
     : base
+}
+
+/**
+ * The presentation window stored with that quota: all of `cap` frames
+ * where the pipeline finished within two, `base` where it took four or
+ * more, and between them as the quota's share falls.
+ */
+export function calibratedWindow(
+  base: number,
+  cap: number,
+  elapsedMs: number,
+  frameMs: number
+) {
+  if (!(elapsedMs > 0) || !Number.isFinite(elapsedMs) || !(frameMs >= 4) || cap <= base) return base
+  return Math.round(base + (cap - base) * pipelineSpeed(elapsedMs, frameMs))
 }

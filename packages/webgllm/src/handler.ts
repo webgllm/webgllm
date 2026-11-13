@@ -9,7 +9,8 @@ import type { GpuNote } from "./storage.js"
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource } from "./byte-source.js"
-import { Engine, MAX_CHUNKS, TUNING } from "./engine.js"
+import { ggufShape, readGgufHeader } from "./gguf.js"
+import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
@@ -23,7 +24,7 @@ import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
-import { download, previousGpuTuning, readGpuNotes, saveManifest, storedFile, writeGpuNote } from "./storage.js"
+import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { THINK_OPEN } from "./reply.js"
@@ -413,33 +414,46 @@ async function load(
       >,
       ...(templateFile && { chatTemplate: await templateFile.text() })
     })
-    const scope = [
-      engine.gpu.limits.renderer,
-      navigator.userAgent,
-      model,
-      plain ? "plain" : "mrt"
-    ].join("|") + "|"
+    const gpuScope = `${engine.gpu.limits.renderer}|${navigator.userAgent}|`
+    const passes = plain ? "plain" : "mrt"
+    const scope = `${gpuScope}${model}|${passes}|`
     const settings = hash(JSON.stringify(TUNING))
-    const noteKey = `${scope}${Engine.fingerprint}.${settings}`
+    const code = `${Engine.fingerprint}.${settings}`
+    const noteKey = `${scope}${code}`
     const notes = await readGpuNotes()
     const checkedNote = notes[noteKey]
+    // The weights' shape, from their header: a model of the same shape as
+    // one already tuned here starts from its tuning.
+    // (The header is read once: the load below takes it too.)
+    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(blobSource(weightFiles[0])) : undefined
+    const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
+    // Likewise another model's with the same weights' shape.
     const note = checkedNote ?? (reuseTuning
-      ? previousGpuTuning(notes, scope, settings, SELF_CHECK_MAX)
+      ? previousGpuTuning(notes, scope, settings, SELF_CHECK_MAX) ??
+        (shape ? sharedGpuTuning(notes, gpuScope, `|${passes}|${code}`, shape, SELF_CHECK_MAX) : undefined)
       : undefined)
     reusedTuning = !checkedNote && !!note
     timings.calibrationCached = checkedNote ? 1 : 0
     timings.calibrationReused = reusedTuning ? 1 : 0
     timings.engineCode = parseInt(Engine.fingerprint, 16)
+    // A stored timing past two frames is taken once more (a GPU busy with
+    // something else at the first load times a fast pipeline slow, and the
+    // pacing stored from that would slow every later session's prompts),
+    // and so is one stored before timings were kept (see timesAgain). A
+    // marked one keeps its kernels and has them alone timed, so its pacing
+    // is always a timing of the pipeline it runs (see retimedTuning).
+    const retime = note?.tuned && timesAgain(note.tuned) ? note.tuned : undefined
     if (note) {
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
-      if (note.tuned) engine.tuned = { ...note.tuned }
+      if (note.tuned) engine.tuned = retime ? tuningToRetime(note.tuned) : { ...note.tuned }
     }
     const pieces =
       meta.files.kind === "gguf"
         ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
+            header: ggufHeader,
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
             readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
             releaseReadBuffers: canReleaseStaging
@@ -452,6 +466,7 @@ async function load(
             graph: blobSource(weightFiles[1]),
             data: onnxData(meta.files, weightFiles.slice(2))
           })
+    ggufHeader = undefined
     let layers = 0
     await engine.load(pieces, (piece) => {
       if (signal.aborted) throw new Superseded()
@@ -473,6 +488,7 @@ async function load(
       }
     }, signal)
     if (signal.aborted) throw new Superseded()
+    if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
     timings.headSplit = engine.headChoice?.split ?? TUNING.q6HeadSplit
@@ -540,7 +556,8 @@ async function load(
             calibrated: true,
             pacing: note?.pacing,
             head: engine.headChoice ?? undefined,
-            tuned: { ...engine.tuned }
+            tuned: { ...engine.tuned },
+            ...(shape && { shape })
           }
         : null
     timings.total = Math.round(performance.now() - t0)

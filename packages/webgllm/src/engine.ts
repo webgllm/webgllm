@@ -4,7 +4,7 @@
  * the convolutions' state on the GPU between calls.
  */
 import { expandQ6, fitsExpandedHead, headScratchBytes, fundedF16Scratch } from "./q6-expanded.js"
-import { SubmissionBudget, calibratedReadQuota } from "./gpu/submission-budget.js"
+import { SubmissionBudget, calibratedReadQuota, calibratedWindow, pipelineSpeed } from "./gpu/submission-budget.js"
 import { releaseOwnedBuffer } from "./upload-staging.js"
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
@@ -391,6 +391,10 @@ export const TUNING = {
  */
 type HeadOut = { logits: Texture; split: number; stride: number }
 
+/** The time the load's packing probe may spend on timing pairs past its first two, and the most pairs it takes (see choosePromptPacking). */
+const PACKING_PROBE_MS = 250
+const PACKING_PROBE_PAIRS = 4
+
 /** See Engine.tuned. */
 export type Tuned = {
   shortSplit: number | null
@@ -400,6 +404,10 @@ export type Tuned = {
   submissionOverlap?: number
   /** Startup validated a larger presentation window on a fast complete pipeline. */
   submissionWindow?: number
+  /** How long the load timed its pipeline at, for those: what a second timing is compared with (see retimedTuning). */
+  submissionMs?: number
+  /** 1: that timing was past two frames, where a GPU busy with something else puts a fast one too: the next load times it once more and keeps the better (see retimedTuning). */
+  submissionRetime?: number
   rmsParts?: number
   f16Matmul?: number | null
   f16Pack?: number | null
@@ -407,6 +415,63 @@ export type Tuned = {
   flashDecode?: number | null
   /** Context length at which the attention variant was actually measured. */
   flashDecodeFrom?: number
+}
+
+/**
+ * The stored tuning as a load that times the prompt pipeline once more
+ * starts from: without what that timing sets, so it runs again. One marked
+ * for it (Tuned.submissionRetime) keeps the mark and its kernels: the probe
+ * then times those alone (see choosePromptPacking). One stored before
+ * timings were kept has its packing chosen again too: it was two pairs'
+ * pick on a fast GPU.
+ */
+export function tuningToRetime(stored: Tuned): Tuned {
+  const { submissionReads: _reads, submissionOverlap: _overlap, submissionWindow: _window, submissionMs: _ms, submissionRetime: _retime, ...rest } = stored
+  return stored.submissionMs === undefined ? { ...rest, f16Pack: null } : { ...rest, submissionRetime: 1 }
+}
+
+/**
+ * Whether a stored tuning's prompt timing is taken once more at this load:
+ * one marked for it (Tuned.submissionRetime), or one stored before
+ * timings were kept (no submissionMs), whose pacing may be from the step
+ * at two frames and whose packing from two pairs on a fast GPU.
+ */
+export function timesAgain(stored: Tuned): boolean {
+  return !!stored.submissionRetime || (stored.submissionMs === undefined && stored.submissionReads !== undefined)
+}
+
+/** Whether two tunings run prompts through the same kernels, so that a timing of one is a timing of the other. */
+function sameKernels(a: Tuned, b: Tuned) {
+  return (a.f16Pack ?? null) === (b.f16Pack ?? null) && (a.f16Matmul ?? null) === (b.f16Matmul ?? null)
+}
+
+/**
+ * The tuning to keep after a second timing: `now` is what the load just
+ * measured, `previous` what was stored. The kernels are `now`'s, which are
+ * the stored ones where the stored tuning was marked for this (the probe
+ * timed those alone), and the pacing is a timing of those kernels, never
+ * of others: the faster of the two timings where both are of the same
+ * kernels (the same pipeline, timed the same way: the slower one was held
+ * up), unless the new one found larger submissions miss frames, which
+ * stands. Otherwise (a tuning stored before timings were kept, or kernels
+ * chosen afresh) it is the new timing's. It isn't timed a third time.
+ */
+export function retimedTuning(previous: Tuned, now: Tuned): Tuned {
+  const stored =
+    sameKernels(previous, now) &&
+    now.submissionOverlap !== 0 &&
+    previous.submissionMs !== undefined &&
+    previous.submissionMs <= (now.submissionMs ?? Infinity)
+  const pacing = stored ? previous : now
+  return {
+    ...now,
+    rmsParts: previous.rmsParts ?? now.rmsParts,
+    submissionReads: pacing.submissionReads,
+    submissionOverlap: pacing.submissionOverlap,
+    submissionWindow: pacing.submissionWindow,
+    submissionMs: pacing.submissionMs,
+    submissionRetime: 0
+  }
 }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
@@ -1282,7 +1347,7 @@ export class Engine {
         .join("\n") + Engine.toString() +
       Gpu.toString() +
       weightPanelSource.toString() +
-      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + SubmissionBudget.toString() + q4WordsToRgba4.toString()
+      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + pipelineSpeed.toString() + `${PACKING_PROBE_MS},${PACKING_PROBE_PAIRS}` + SubmissionBudget.toString() + q4WordsToRgba4.toString()
     // FNV-1a.
     let h = 0x811c9dc5
     for (let i = 0; i < text.length; i++) {
@@ -1330,7 +1395,9 @@ export class Engine {
       flashDecode: null,
       streamMatvec: before.streamMatvec,
       submissionReads: before.submissionReads,
-      submissionOverlap: before.submissionOverlap
+      submissionOverlap: before.submissionOverlap,
+      submissionMs: before.submissionMs,
+      submissionRetime: before.submissionRetime
     }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
@@ -1550,6 +1617,8 @@ export class Engine {
         submissionReads: before.submissionReads,
         submissionOverlap: before.submissionOverlap,
         submissionWindow: before.submissionWindow,
+        submissionMs: before.submissionMs,
+        submissionRetime: before.submissionRetime,
         rmsParts: before.rmsParts
       }
     } catch (error) {
@@ -1962,7 +2031,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   rmsReport: Array<{ parts: number; ms: number }> = []
   private packingMeasured = false
   private promptMatmulMeasured = false
-  packingReport: Array<{pack:number;rows:number;ms:number;matmul?:number;verificationRows?:number;verificationMs?:number}> = []
+  packingReport: Array<{pack:number;rows:number;ms:number;rounds?:Array<number>;matmul?:number;verificationRows?:number;verificationMs?:number}> = []
 
   private legacyF16: { bytes: number; kMax: number; half: boolean } | null = null
 
@@ -2086,7 +2155,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     signal?.throwIfAborted()
     if (!this.quadMatmuls) return
     const native = this.layerMats().some((m) => m.rgba4)
+    // A stored tuning timed once more (Tuned.submissionRetime) keeps its
+    // kernels: they alone are timed, so the pacing stored from this is of
+    // the pipeline prompts run, not of another that timed faster here.
+    const retained =
+      !!this.tuned.submissionRetime &&
+      this.tuned.f16Pack != null &&
+      (!native || this.tuned.f16Matmul != null)
     if (
+      !retained &&
       this.tuned.f16Pack != null &&
       (!native || this.tuned.f16Matmul !== undefined)
     ) {
@@ -2108,7 +2185,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         : Infinity
     )
     if (probeRows < Math.max(SPLIT_ROWS + 1, TUNING.f16MinRows)) return
-    const options: Array<{ pack: number; matmul?: number }> = native
+    const options: Array<{ pack: number; matmul?: number }> = retained
+      ? [{ pack: this.tuned.f16Pack!, ...(native && { matmul: this.tuned.f16Matmul! }) }]
+      : native
       ? [
           {
             pack: TUNING.f16Pack >= 0 ? TUNING.f16Pack & 3 : 3,
@@ -2118,11 +2197,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       : this.activationCopyFits()
         ? [{ pack: 3 }, { pack: 0 }]
         : [{ pack: 3 }, { pack: 1 }]
-    if (native && TUNING.f16Matmul > 0) {
+    if (!retained && native && TUNING.f16Matmul > 0) {
       const alternate = TUNING.f16Matmul === 2 ? 1 : 2
       options.push({ pack: options[0].pack, matmul: alternate })
     }
-    if (options.length === 1) return
+    if (options.length === 1 && !retained) return
     const all = this.layers,
       previous = this.tuned.f16Pack,
       previousMatmul = this.tuned.f16Matmul,
@@ -2233,12 +2312,29 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             verifiedWinner = winner
         }
       }
-      if (verifiedWinner < 0)
+      if (verifiedWinner < 0) {
         for (let i = options.length - 1; i >= 0; i--) await timed(i)
+        // Two pairs settle it where a timing is long (a phone's pipeline is
+        // half a second, its two ways a tenth apart). On a fast GPU it is
+        // 26 ms, timed to within a few ms, and the ways are a millisecond
+        // apart: winning both pairs was a coin's toss there (1 fresh
+        // tuning in 4 on an M3 Ultra), kept for every later session, and
+        // real prompts read 9% slower with the one they are slower with.
+        // So more pairs, each in the reverse order of the last, while the
+        // timings so far and one more pair fit PACKING_PROBE_MS, up to
+        // PACKING_PROBE_PAIRS: the other way must win them all.
+        const spent = () => samples.reduce((sum, row) => sum + row.reduce((a, ms) => a + ms, 0), 0)
+        const pair = () => samples.reduce((sum, row) => sum + row[row.length - 1], 0)
+        while (samples[0].length < PACKING_PROBE_PAIRS && spent() + pair() <= PACKING_PROBE_MS) {
+          const forward = samples[0].length % 2 === 0
+          for (let k = 0; k < options.length; k++) await timed(forward ? k : options.length - 1 - k)
+        }
+      }
       this.packingReport = options.map((setting, i) => ({
         ...setting,
         rows: probeRows,
         ms: Math.min(...samples[i]),
+        rounds: samples[i].map((ms) => Math.round(ms * 10) / 10),
         ...(Number.isFinite(verification[i]) && { verificationRows, verificationMs: verification[i] })
       }))
       // A clock or compiler transition must not pick the next session's
@@ -2257,14 +2353,19 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // consistently, and repeating four complete pipelines delayed ready.
       this.tuned.rmsParts = this.parts
       this.tuned.submissionOverlap = allowOverlap ? overlap : 0
-      this.tuned.submissionWindow = allowOverlap && this.packingReport[selected].ms <= this.gpu.expectedFrameMs * 2
-        ? this.gpu.presentationAdvice.cap : TUNING.presentationFrames
+      this.tuned.submissionWindow = allowOverlap
+        ? calibratedWindow(TUNING.presentationFrames, this.gpu.presentationAdvice.cap, this.packingReport[selected].ms, this.gpu.expectedFrameMs)
+        : TUNING.presentationFrames
       this.tuned.submissionReads = calibratedReadQuota(
         TUNING.submissionReads,
         Math.min(...work[selected]),
         this.packingReport[selected].ms,
         this.gpu.expectedFrameMs
       )
+      // A timing past two frames may be a fast GPU held up by other work
+      // (a game beside the page): the next load times it once more.
+      this.tuned.submissionMs = this.packingReport[selected].ms
+      this.tuned.submissionRetime = allowOverlap && this.packingReport[selected].ms > this.gpu.expectedFrameMs * 2 ? 1 : 0
       this.packingMeasured = true
       this.promptMatmulMeasured = native
     } catch (error) {

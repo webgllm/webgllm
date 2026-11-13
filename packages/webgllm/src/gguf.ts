@@ -353,3 +353,30 @@ export async function readGgufArray(
   }
   return values
 }
+
+/**
+ * A GGUF's weights as a shape: every tensor's name, dimensions and type,
+ * and the architecture's own settings (its heads, its kernel) other than
+ * the context length, hashed. Two files with the same one are the same
+ * network to the GPU, whatever their names and their weights' values.
+ */
+export function ggufShape(header: GgufHeader): string {
+  const arch = header.metadata.get("general.architecture")
+  const prefix = typeof arch === "string" ? `${arch}.` : "\0"
+  const settings = [...header.metadata]
+    .filter(([key, value]) => key.startsWith(prefix) && !key.endsWith(".context_length") && !(typeof value === "object" && value !== null && "lazy" in value))
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(",") : String(value)}`)
+    .sort()
+  const tensors = [...header.tensors.values()].map((t) => `${t.name}:${t.dims.join("x")}:${t.type}`).sort()
+  const text = `${String(arch)}\n${settings.join("\n")}\n${tensors.join("\n")}`
+  // Two FNV-1a hashes from different seeds: 64 bits between them.
+  let a = 0x811c9dc5
+  let b = 0x9747b28c
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    a = Math.imul(a ^ c, 0x01000193)
+    b = Math.imul(b ^ c, 0x5bd1e995)
+    b ^= b >>> 15
+  }
+  return (a >>> 0).toString(16).padStart(8, "0") + (b >>> 0).toString(16).padStart(8, "0")
+}

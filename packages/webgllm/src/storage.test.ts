@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { diskName, download, isOldVersion, previousGpuTuning, readGpuNotes, storedFile, writeGpuNote, type GpuNote } from "./storage.js"
+import { ggufShape, type GgufHeader, type GgufValue } from "./gguf.js"
+import { diskName, download, isOldVersion, previousGpuTuning, readGpuNotes, sharedGpuTuning, storedFile, writeGpuNote, type GpuNote } from "./storage.js"
 
 const repo = "onnx-community/LFM3-1.7B-ONNX"
 const commit = "ac2586a34f1a1c03329dbdcdefabd8b6478ddaa7"
@@ -60,6 +61,59 @@ test("a new engine can reuse checked tuning from the same GPU, model and setting
   assert.equal(previousGpuTuning(notes, scope, "settings", 0.01), note)
   assert.equal(previousGpuTuning(notes, scope, "missing", 0.01), undefined)
   assert.equal(previousGpuTuning(notes, scope, "settings", 0.0001), undefined)
+})
+
+test("a model starts from the tuning of another with the same weights' shape, on the same GPU, browser and code", () => {
+  const tuned = { shortSplit: null, f16Pack: 3, submissionReads: 1e10 }
+  const note: GpuNote = { layout: "bytes", selfCheck: 0.001, calibrated: true, tuned, shape: "aaaa0000bbbb1111" }
+  const notes: Record<string, GpuNote> = {
+    "gpu|browser|LiquidAI/LFM3-1.7B-GGUF|mrt|code.settings": note,
+    // Another shape, another GPU, other passes, older code, and one that isn't calibrated.
+    "gpu|browser|unsloth/Qwen3.5-2B-GGUF|mrt|code.settings": { ...note, shape: "cccc" },
+    "other gpu|browser|LiquidAI/LFM3-1.7B-GGUF|mrt|code.settings": { ...note, tuned: { ...tuned, f16Pack: 0 } },
+    "gpu|browser|LiquidAI/LFM3-1.7B-GGUF|plain|code.settings": { ...note, tuned: { ...tuned, f16Pack: 0 } },
+    "gpu|browser|LiquidAI/LFM3-1.7B-ONNX|mrt|old.settings": { ...note, tuned: { ...tuned, f16Pack: 0 } }
+  }
+  // LFM3-VL 2B has LFM3 1.7B's tensors: it takes its tuning.
+  assert.equal(sharedGpuTuning(notes, "gpu|browser|", "|mrt|code.settings", "aaaa0000bbbb1111", 0.01), note)
+  assert.equal(sharedGpuTuning(notes, "gpu|browser|", "|mrt|code.settings", "dddd", 0.01), undefined)
+  assert.equal(sharedGpuTuning(notes, "gpu|other browser|", "|mrt|code.settings", "aaaa0000bbbb1111", 0.01), undefined)
+  assert.equal(sharedGpuTuning(notes, "gpu|browser|", "|mrt|new.settings", "aaaa0000bbbb1111", 0.01), undefined)
+  assert.equal(sharedGpuTuning(notes, "gpu|browser|", "|mrt|code.settings", "aaaa0000bbbb1111", 0.0001), undefined)
+  assert.equal(sharedGpuTuning({ k: { ...note, calibrated: false } }, "", "", "aaaa0000bbbb1111", 0.01), undefined)
+  // A note from before shapes were kept shares nothing.
+  assert.equal(sharedGpuTuning({ "gpu|browser|m|mrt|code.settings": { ...note, shape: undefined } }, "gpu|browser|", "|mrt|code.settings", "aaaa0000bbbb1111", 0.01), undefined)
+})
+
+test("a GGUF's shape is its tensors and its architecture's settings, not its name, its values or its context length", () => {
+  const header = (o: { name?: string; context?: number; heads?: number; dims?: Array<number>; type?: number; extra?: boolean } = {}): GgufHeader => ({
+    version: 3,
+    dataOffset: 0,
+    headerLength: 0,
+    metadata: new Map<string, GgufValue>([
+      ["general.architecture", "lfm3"],
+      ["general.name", o.name ?? "LFM3 1.7B QAD"],
+      ["general.size_label", o.name ? "2B" : "1.7B"],
+      ["lfm3.context_length", o.context ?? 262144],
+      ["lfm3.embedding_length", 2048],
+      ["lfm3.attention.head_count", o.heads ?? 16],
+      ["lfm3.attention.head_count_kv", [16, 16, 8]],
+      ["tokenizer.ggml.tokens", { lazy: true, type: 8, length: 128000, offset: 100 }]
+    ]),
+    tensors: new Map(
+      [
+        { name: "token_embd.weight", dims: [2048, 128000], type: 14 },
+        { name: "blk.0.ffn.weight", dims: o.dims ?? [2048, 7680], type: o.type ?? 2 },
+        ...(o.extra ? [{ name: "blk.1.ffn.weight", dims: [2048, 7680], type: 2 }] : [])
+      ].map((t, i) => [t.name, { ...t, offset: 4096 * (i + (o.name ? 7 : 1)), byteLength: 1 }])
+    )
+  })
+  const lfm3 = ggufShape(header())
+  assert.match(lfm3, /^[0-9a-f]{16}$/)
+  // LFM3-VL 2B beside LFM3 1.7B: another name, size label, context length, and offsets.
+  assert.equal(ggufShape(header({ name: "LFM3 VL 2B", context: 128000 })), lfm3)
+  // Another tensor shape or type, another tensor, or another head count is another network.
+  for (const other of [{ dims: [2048, 8192] }, { type: 7 }, { extra: true }, { heads: 8 }]) assert.notEqual(ggufShape(header(other)), lfm3, JSON.stringify(other))
 })
 
 test("locked calibration writes stop after one retry and release the next queued write", async (t) => {

@@ -309,7 +309,16 @@ raw query metadata and must be omitted from primary comparisons.
 
 For an existing desktop Chrome profile, use its single benchmark tab and the page's
 `Release model` button before navigating. `restoreCalibration` and `saveCalibration`
-snapshot only this model's notes; `cold=1` removes only these derived notes.
+snapshot the tuning notes (`gpu-notes.json`), and `cold=1` removes them: every
+model's, since a model starts from the tuning of another with the same weights'
+shape (LFM3-VL 2B from LFM3 1.7B's).
+
+Comparing two models or builds, compare their stored tuning first: each run's
+load timings give `tunedF16Pack`, `calibrationCached` and `calibrationReused`,
+and its `memory` result the prompt quota and window (`pacing.prompt`). A model
+read prompts 5 to 40% slower than another of the same shape from that alone.
+`tune=` overrides change the notes' key and the pacing, so their speeds don't
+compare with plain `production=1` runs.
 `uaMemory=1` measures retained page plus worker memory after GC, separately from
 natural throughput. It is not a CPU peak measurement. The helpers never create or
 close browser tabs.

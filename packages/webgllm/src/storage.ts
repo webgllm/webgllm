@@ -180,6 +180,8 @@ export type GpuNote = {
   head?: { expanded: boolean; split: number }
   /** Engine.tune's picks (older notes have none: tuned again). */
   tuned?: Tuned
+  /** The weights' shape (see gguf.ts ggufShape): a model with the same one starts from this tuning (see sharedGpuTuning). */
+  shape?: string
 }
 
 const NOTES = "gpu-notes.json"
@@ -204,6 +206,30 @@ export function previousGpuTuning(
   return Object.entries(notes).find(([key, note]) =>
     key.startsWith(scope) && key.endsWith(`.${settings}`) &&
     note?.calibrated === true && note.tuned &&
+    note.selfCheck >= 0 && note.selfCheck <= maxError
+  )?.[1]
+}
+
+/**
+ * Tuning choices from another model whose weights have the same shape
+ * (`shape`: every tensor's name, dimensions and type, and the
+ * architecture's settings), on the same GPU and browser (`gpu`: the
+ * key's start), with the same passes, engine code and settings (`code`:
+ * its end). What the load times depends on those, not on the model's
+ * name or its weights' values: LFM3 1.7B and LFM3-VL 2B are the same
+ * 287 tensors, and each used to be timed on its own, differently.
+ */
+export function sharedGpuTuning(
+  notes: Record<string, GpuNote>,
+  gpu: string,
+  code: string,
+  shape: string,
+  maxError: number
+): GpuNote | undefined {
+  return Object.entries(notes).find(([key, note]) =>
+    key.startsWith(gpu) && key.endsWith(code) &&
+    note?.shape === shape &&
+    note.calibrated === true && note.tuned &&
     note.selfCheck >= 0 && note.selfCheck <= maxError
   )?.[1]
 }

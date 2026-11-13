@@ -2,7 +2,8 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import {
   SubmissionBudget,
-  calibratedReadQuota
+  calibratedReadQuota,
+  calibratedWindow
 } from "./gpu/submission-budget.js"
 
 test("fence fallback adjusts unobserved work within its calibrated quota", () => {
@@ -105,6 +106,41 @@ test("whole-workload calibration bounds invalid estimates and scales fast worklo
   assert.equal(calibratedReadQuota(base, 3e9, 0.01, 16.7), 2 ** 34)
   for (const ms of [0, NaN, Infinity])
     assert.equal(calibratedReadQuota(base, 3e9, ms, 16.7), base)
+})
+
+test("the stored quota and window fall steadily between two and four frames: no step at two", () => {
+  const base = 2 ** 28, frame = 16.67
+  // Measured on an M3 Ultra: the same pipeline took 26 ms on a quiet GPU and 35 ms beside a game.
+  const work = 8.1e9
+  const quiet = calibratedReadQuota(base, work, 26, frame), busy = calibratedReadQuota(base, work, 35, frame)
+  assert.equal(quiet, Math.round((work / 26) * frame * 2))
+  assert.ok(quiet / busy < 2, `26 ms and 35 ms store ${(quiet / busy).toFixed(1)} times apart`)
+  // Two frames' worth up to two frames, a quarter frame's from four on, as before.
+  assert.equal(calibratedReadQuota(base, work, 2 * frame, frame), Math.round((work / (2 * frame)) * frame * 2))
+  assert.equal(calibratedReadQuota(base, work, 4 * frame, frame), Math.round((work / (4 * frame)) * frame * 0.25))
+  assert.equal(calibratedReadQuota(base, work, 5 * frame, frame), Math.round((work / (5 * frame)) * frame * 0.25))
+  // Between them, no jump and never more for a slower pipeline.
+  let last = Infinity
+  for (let ms = 20; ms <= 80; ms += 0.25) {
+    const quota = calibratedReadQuota(base, work, ms, frame)
+    assert.ok(quota <= last, `${ms} ms`)
+    if (last !== Infinity) assert.ok(last / quota < 1.05, `a quarter millisecond at ${ms} ms changes the quota ${(last / quota).toFixed(2)} times`)
+    last = quota
+  }
+  // The presentation window with it: the whole of it up to two frames, the base from four on.
+  assert.equal(calibratedWindow(4, 24, 26, frame), 24)
+  assert.equal(calibratedWindow(4, 24, 2 * frame, frame), 24)
+  assert.equal(calibratedWindow(4, 24, 4 * frame, frame), 4)
+  assert.equal(calibratedWindow(4, 24, 200, frame), 4)
+  assert.ok(calibratedWindow(4, 24, 35, frame) >= 20)
+  let window = Infinity
+  for (let ms = 20; ms <= 80; ms += 0.25) {
+    const w = calibratedWindow(4, 24, ms, frame)
+    assert.ok(w <= window && window - w <= 1 || window === Infinity, `${ms} ms`)
+    window = w
+  }
+  for (const ms of [0, NaN, Infinity]) assert.equal(calibratedWindow(4, 24, ms, frame), 4)
+  assert.equal(calibratedWindow(4, 2, 10, frame), 4)
 })
 
 test("240 Hz cadence lowers the four-millisecond completion target", () => {
