@@ -115,6 +115,22 @@ index plus a delta (max(gh, gw) − gh · gw per image before it).
   866.0 MiB loaded to 1016.4 MiB at 8,120 tokens; nothing is allocated for
   images until a prompt has one).
 
+## Qwen3.5's GGUF build
+
+`unsloth/Qwen3.5-2B-GGUF` reads images too, from the repository's vision
+projector (`mmproj-F16.gguf`, type `qwen3vl_merger`; `load-vision-gguf.ts`).
+It holds the same encoder as the ONNX export, under llama.cpp's names: a
+patch kernel per frame with a bias, the 48 × 48 position table, blocks
+with a fused `attn_qkv`, `v.post_ln` (the merger's LayerNorm) and the
+merger's `mm.0` and `mm.2`. The loader refuses a file with a pre-norm or
+Qwen3-VL's deepstack layers, which the encoder has no pass for. RoPE's
+frequencies aren't in the file: 1e4^(-j/16), the ONNX graph's `inv_freq`
+(and llama.cpp's base). The repository has only float projectors (F16 668
+MB, BF16, F32), so every projection is quantized to 8 bits per block of 32
+as it loads: about twice the ONNX build's `q4f16` encoder in textures, and
+3.4 times its download. The image processor's config comes from
+`Qwen/Qwen3.5-2B`, where the tokenizer does.
+
 # Liquid AI's vision-language models
 
 `LiquidAI/LFM2.5-VL-450M`, `-1.6B` and `-3B` and `LiquidAI/LFM3-VL-2B`,
@@ -273,8 +289,6 @@ than the table; the ONNX graph resizes without it).
   1024 × 1024 takes seconds on a Mac, more on a phone. Tiling (several
   patches per fragment, as the text path's 4-token matmuls) is the next
   step if `high` matters.
-- Qwen3.5's GGUF vision projectors (`mmproj`, unsloth's) aren't read: only
-  Liquid AI's types are.
 - Float (`fp16`) ONNX encoders aren't read, only MatMulNBits ones.
 - The encoder is loaded for each request with a new image and freed after
   it. For so400m that load is most of an image's time (and 0.5 GiB of

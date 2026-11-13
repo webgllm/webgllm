@@ -3,7 +3,7 @@ title: Models
 description: The models webgllm runs.
 ---
 
-Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, and Liquid AI's vision-language LFM2.5-VL and LFM3-VL, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX graph, checked before its weights download), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template), sampling (its `generation_config.json`) and whether it reads images (an ONNX build with a vision encoder webgllm runs beside its decoder, or a GGUF repository with a vision projector, `mmproj-*.gguf`, of a type it runs: LFM2.5-VL's and LFM3-VL's) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
+Pass a Hugging Face repository as `model`: any one whose architecture webgllm runs loads by name (LFM2 and LFM2.5, LFM3 and Qwen3.5, and Liquid AI's vision-language LFM2.5-VL and LFM3-VL, as a GGUF or an ONNX export). webgllm picks its weights (a Q4_0 GGUF first, or a 4-bit ONNX graph, checked before its weights download), tokenizer and chat template (the repository's, else its base model's), thinking and tool-call format (from the chat template), sampling (its `generation_config.json`) and whether it reads images (an ONNX build with a vision encoder webgllm runs beside its decoder, or a GGUF repository with a vision projector, `mmproj-*.gguf`, of a type it runs: LFM2.5-VL's, LFM3-VL's and Qwen3.5's) from the Hub. Another architecture, or a repository without weights webgllm loads, throws `model-not-supported` before anything downloads.
 
 A model hosted elsewhere loads by URL: pass the URL of its `.gguf` file or its `.onnx` graph as `model`. Its tokenizer files go in the same folder, as in a Hugging Face repository: `tokenizer.json` and `tokenizer_config.json`, and `chat_template.jinja` and `generation_config.json` where there are; an ONNX graph also needs `config.json` and its one data file beside it. The same rules pick its thinking, tool-call format and sampling.
 
@@ -17,7 +17,7 @@ The catalog below holds known defaults for the models webgllm is tuned and teste
 | --- | --- | --- |
 | `LiquidAI/LFM3-1.7B-GGUF` | Liquid AI's QAD Q4_0 GGUF (quantization-aware trained) | By default |
 | `onnx-community/LFM3-1.7B-ONNX` | onnx-community's q4f16 export | By default |
-| `unsloth/Qwen3.5-2B-GGUF` | unsloth's Q4_0 GGUF | When asked |
+| `unsloth/Qwen3.5-2B-GGUF` | unsloth's Q4_0 GGUF and float16 vision projector (reads images) | When asked |
 | `onnx-community/Qwen3.5-2B-ONNX` | onnx-community's q4f16 decoder and vision encoder (reads images) | When asked |
 | `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` | Official QAD Q4_0 | No |
 | `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` | Official Q4_0 | Always |
@@ -41,7 +41,7 @@ Sampling defaults come from each model card. See [Thinking](/docs/guides/thinkin
 ## Choosing one
 
 - **LFM3 1.7B** is the default choice: it thinks, and has a 262,144-token context.
-- **Qwen3.5 2B** answers directly unless asked to think. Its ONNX build reads [images](/docs/guides/chat-and-streaming#images).
+- **Qwen3.5 2B** answers directly unless asked to think. Both builds read [images](/docs/guides/chat-and-streaming#images).
 - **LFM3-VL 2B** and **LFM2.5-VL** (3B, 1.6B, 450M) are Liquid AI's vision-language models: both builds of each read [images](/docs/guides/chat-and-streaming#images). LFM2.5-VL 450M is the smallest that does.
 - **LFM2.5 350M** is the smallest, for weak devices.
 
