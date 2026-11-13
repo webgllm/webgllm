@@ -1,5 +1,6 @@
 import type { JsonGuidanceRuntime } from "llguidance/json-schema"
 import { canonicalAsciiObject, canonicalTokenMask } from "./canonical-mask.js"
+import { FixedStrings, fixedStringTokens } from "./fixed-strings.js"
 import { jsonTokens, nextStringState, type JsonTokens, type StringState } from "./whitespace.js"
 
 /** Exact model tokenizer, not token strings decoded independently. */
@@ -84,7 +85,9 @@ class JsonConstraint implements Constraint {
     /** Whitespace-only tokens, when the layout takes whitespace (see MAX_WHITESPACE_RUN). */
     private readonly whitespace?: Uint32Array,
     /** How tokens move in and out of strings, with whitespace. */
-    private readonly tokens?: JsonTokens
+    private readonly tokens?: JsonTokens,
+    /** Holds keys and values the schema fixes to their plain spelling (see fixed-strings.ts). */
+    private readonly fixed?: FixedStrings
   ) {}
 
   /** Whitespace-only tokens accepted in a row outside strings. */
@@ -127,9 +130,10 @@ class JsonConstraint implements Constraint {
     }
     const canonical = this.canonicalMask
     const whitespace = this.whitespace && this.whitespaceRun >= MAX_WHITESPACE_RUN ? this.whitespace : undefined
-    const allowed = canonical || whitespace
+    const narrowed = canonical || whitespace
       ? result.mask.map((word, index) => word & (canonical ? canonical[index] : ~0) & (whitespace ? ~whitespace[index] : ~0))
       : result.mask
+    const allowed = this.fixed ? this.fixed.filter(narrowed) : narrowed
     // The looser mask may end a value the full schema refuses: keep generating, or fail fast.
     if (this.shadow && tokenAllowed(allowed, this.eosTokenId) && !this.fullSchemaAccepts()) {
       allowed[this.eosTokenId >>> 5] &= ~(1 << (this.eosTokenId & 31))
@@ -157,6 +161,7 @@ class JsonConstraint implements Constraint {
     const result = this.interpreter.commitToken(token)
     if (result.backtrack || result.ffTokens.length) throw new StructuredOutputError("constraint-violation", "Unexpected constraint backtracking or token insertion.")
     this.mask = undefined
+    this.fixed?.accept(token)
     if (this.whitespace && this.tokens) {
       // Whitespace inside a string doesn't change the state, so the run is all outside strings.
       this.whitespaceRun = this.stringState === 0 && tokenAllowed(this.whitespace, token) ? this.whitespaceRun + 1 : 0
@@ -175,7 +180,7 @@ class JsonConstraint implements Constraint {
 
   clone(): Constraint {
     this.check()
-    const copy = new JsonConstraint(this.interpreter.clone(), this.vocabSize, this.eosTokenId, this.endAtAcceptance, this.canonicalMask, this.shadow?.clone(), this.whitespace, this.tokens)
+    const copy = new JsonConstraint(this.interpreter.clone(), this.vocabSize, this.eosTokenId, this.endAtAcceptance, this.canonicalMask, this.shadow?.clone(), this.whitespace, this.tokens, this.fixed?.clone())
     copy.shadowEnded = this.shadowEnded
     copy.whitespaceRun = this.whitespaceRun
     copy.stringState = this.stringState
@@ -346,8 +351,10 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
     whitespace = new Uint32Array(Math.ceil(vocabSize / 32))
     for (const id of tokens.whitespace) if (id >= 0 && id < vocabSize) whitespace[id >>> 5] |= 1 << (id & 31)
   }
+  const fixedTokens = fixedStringTokens(source, vocabSize)
   return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(options.schema),
-    canonicalAsciiObject(options.schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined)
+    canonicalAsciiObject(options.schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined,
+    fixedTokens ? new FixedStrings(fixedTokens, options.schema) : undefined)
 }
 const VALIDATION_EOS = 256
 const validationTokenizer = {
