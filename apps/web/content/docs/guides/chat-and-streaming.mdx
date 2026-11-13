@@ -52,7 +52,7 @@ Unset sampling fields take the model card's values. `logprobs` (with `top_logpro
 
 ## Images
 
-Models with a vision encoder (Qwen3.5's ONNX builds, such as `onnx-community/Qwen3.5-2B-ONNX`; `supports.images` in `models.list()`) read OpenAI `image_url` parts in user messages, as http(s) or base64 data URLs:
+Models with a vision encoder (`supports.images` in `models.list()`) read OpenAI `image_url` parts in user messages, as http(s) or base64 data URLs: Liquid AI's LFM3-VL and LFM2.5-VL in both their GGUF and ONNX builds (such as `LiquidAI/LFM2.5-VL-450M-GGUF`), and Qwen3.5's ONNX builds (such as `onnx-community/Qwen3.5-2B-ONNX`).
 
 ```ts
 await webgllm.chat.completions.create({
@@ -69,7 +69,12 @@ await webgllm.chat.completions.create({
 })
 ```
 
-`detail` sets the image's pixel budget: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image. The vision encoder downloads with the first request that has an image and is loaded only while a request's new images are read, so text chats don't pay for it. A follow-up about an image already in the chat doesn't read it again.
+An image is resized as the model's own processor does it, and `detail` sets how much of it the model reads:
+
+- **Qwen3.5 and LFM3-VL** read an image whole, within a pixel budget: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image.
+- **LFM2.5-VL** reads an image of up to about 512 × 512 pixels whole, as 64 to 256 tokens. A larger one is read as LFM2.5-VL's processor cuts it: a grid of 512-pixel tiles (up to 10, 256 tokens each) and the whole image again as a thumbnail, so a photo takes about 1,800 tokens. `"low"` reads any image whole, as one view of at most 256 tokens.
+
+The vision encoder downloads with the first request that has an image and is loaded only while a request's new images are read, so text chats don't pay for it. A follow-up about an image already in the chat doesn't read it again.
 
 ## Usage and timings
 
