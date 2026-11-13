@@ -4,7 +4,7 @@
  * the convolutions' state on the GPU between calls.
  */
 import { expandQ6, fitsExpandedHead, headScratchBytes, fundedF16Scratch } from "./q6-expanded.js"
-import { SubmissionBudget, calibratedReadQuota, calibratedWindow } from "./gpu/submission-budget.js"
+import { SubmissionBudget, calibratedReadQuota, calibratedWindow, pipelineSpeed } from "./gpu/submission-budget.js"
 import { releaseOwnedBuffer } from "./upload-staging.js"
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
@@ -428,20 +428,33 @@ export function tuningToRetime(stored: Tuned): Tuned {
 }
 
 /**
+ * Whether a stored tuning's prompt timing is taken once more at this load:
+ * one marked for it (Tuned.submissionRetime), or one stored before
+ * timings were kept (no submissionMs), whose pacing may be from the step
+ * at two frames and whose packing from two pairs on a fast GPU.
+ */
+export function timesAgain(stored: Tuned): boolean {
+  return !!stored.submissionRetime || (stored.submissionMs === undefined && stored.submissionReads !== undefined)
+}
+
+/**
  * The tuning to keep after a second timing: `now` is what the load just
  * measured, `previous` what was stored. The pacing is the faster timing's
  * (the same pipeline, timed the same way: the slower one was held up),
  * unless the new one found larger submissions miss frames, which stands.
  * The kernels are the stored ones: a second look at two that time within
- * each other's noise shouldn't flip them. It isn't timed a third time.
+ * each other's noise shouldn't flip them. Except from a tuning stored
+ * before timings were kept, which has nothing to compare: its pacing and
+ * its packing are the new timing's. It isn't timed a third time.
  */
 export function retimedTuning(previous: Tuned, now: Tuned): Tuned {
+  const old = previous.submissionMs === undefined
   const failed = now.submissionOverlap === 0
-  const faster = !failed && (previous.submissionMs ?? Infinity) <= (now.submissionMs ?? Infinity) ? previous : now
+  const faster = !old && !failed && previous.submissionMs! <= (now.submissionMs ?? Infinity) ? previous : now
   return {
     ...now,
-    f16Pack: previous.f16Pack ?? now.f16Pack,
-    f16Matmul: previous.f16Matmul === undefined ? now.f16Matmul : previous.f16Matmul,
+    f16Pack: old ? now.f16Pack : previous.f16Pack ?? now.f16Pack,
+    f16Matmul: old || previous.f16Matmul === undefined ? now.f16Matmul : previous.f16Matmul,
     rmsParts: previous.rmsParts ?? now.rmsParts,
     submissionReads: faster.submissionReads,
     submissionOverlap: faster.submissionOverlap,
@@ -1324,7 +1337,7 @@ export class Engine {
         .join("\n") + Engine.toString() +
       Gpu.toString() +
       weightPanelSource.toString() +
-      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + SubmissionBudget.toString() + q4WordsToRgba4.toString()
+      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + pipelineSpeed.toString() + `${PACKING_PROBE_MS},${PACKING_PROBE_PAIRS}` + SubmissionBudget.toString() + q4WordsToRgba4.toString()
     // FNV-1a.
     let h = 0x811c9dc5
     for (let i = 0; i < text.length; i++) {

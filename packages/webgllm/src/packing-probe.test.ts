@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { Engine, retimedTuning, TUNING, tuningToRetime, type Tuned } from "./engine.js"
+import { Engine, retimedTuning, timesAgain, TUNING, tuningToRetime, type Tuned } from "./engine.js"
 
 function fixture(native = false, fail = false) {
   const layers = [
@@ -298,6 +298,17 @@ test("a second timing keeps the faster one's pacing and the stored kernels, and 
   // The second timing found larger submissions miss frames: that stands, whichever was faster.
   const missed: Tuned = { ...second, submissionOverlap: 0, submissionWindow: 4, submissionMs: 90 }
   assert.deepEqual(retimedTuning(first, missed), { ...missed, f16Pack: 0, submissionRetime: 0 })
+  // Which stored tunings are timed again: one marked for it, and one from before timings were kept.
+  const before: Tuned = { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 2 ** 28, submissionOverlap: 2 ** 29, submissionWindow: 4 }
+  assert.equal(timesAgain(first), true)
+  assert.equal(timesAgain({ ...first, submissionRetime: 0 }), false)
+  assert.equal(timesAgain(before), true)
+  // (One with no pacing at all was never timed for it: nothing to take again.)
+  assert.equal(timesAgain({ shortSplit: null }), false)
+  // An older tuning has no timing to compare: the new one's pacing and packing are taken (its packing was two pairs' pick).
+  assert.deepEqual(retimedTuning(before, second), second)
+  assert.deepEqual(retimedTuning(before, worse), { ...worse, submissionRetime: 0 })
+  assert.equal(timesAgain(retimedTuning(before, worse)), false)
 })
 
 test("a fast pipeline is timed in more pairs, all of which the other packing must win; a slow one in two, as before", async (t) => {

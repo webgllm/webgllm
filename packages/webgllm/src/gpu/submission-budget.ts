@@ -393,7 +393,7 @@ export class SubmissionBudget {
  * store nearly the same, where a step there stored eight times the quota
  * for 26 ms and an eighth for 35 (the same GPU, quiet and beside a game).
  */
-function pipelineSpeed(elapsedMs: number, frameMs: number) {
+export function pipelineSpeed(elapsedMs: number, frameMs: number) {
   const frames = elapsedMs / frameMs
   if (!(frames > 2)) return 1
   if (frames >= 4) return 0

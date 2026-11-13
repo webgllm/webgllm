@@ -10,7 +10,7 @@ import type { GpuNote } from "./storage.js"
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource } from "./byte-source.js"
 import { ggufShape, readGgufHeader } from "./gguf.js"
-import { Engine, MAX_CHUNKS, retimedTuning, TUNING, tuningToRetime } from "./engine.js"
+import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
@@ -438,8 +438,9 @@ async function load(
     timings.engineCode = parseInt(Engine.fingerprint, 16)
     // A stored timing past two frames is taken once more (a GPU busy with
     // something else at the first load times a fast pipeline slow, and the
-    // pacing stored from that would slow every later session's prompts).
-    const retime = note?.tuned?.submissionRetime ? note.tuned : undefined
+    // pacing stored from that would slow every later session's prompts),
+    // and so is one stored before timings were kept (see timesAgain).
+    const retime = note?.tuned && timesAgain(note.tuned) ? note.tuned : undefined
     if (note) {
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
