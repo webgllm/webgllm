@@ -1,3 +1,13 @@
+## 0.3.4 (2026-11-13)
+
+### 🔥 Performance
+
+- **webgllm:** first-load tuning that survives a busy GPU, and is shared by models of one shape ([#13](https://github.com/webgllm/webgllm/pull/13))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.3 (2026-11-13)
 
 ### 🚀 Features
