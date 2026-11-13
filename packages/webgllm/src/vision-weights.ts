@@ -209,7 +209,11 @@ export function floatMatrix(values: Float32Array, N: number, K: number): VisionM
       m.scales[scaleIndex(n, b, blocks)] = scale
       if (!(scale > 0)) continue
       const to = (n * blocks + b) * 32
-      for (let j = 0; j < count; j++) m.data[to + j] = Math.max(-127, Math.min(127, Math.round(values[from + j] / scale))) + 128
+      // q + 128, q = floor(w / scale + 0.5) in -127..127 (without Math.round: several times quicker over a float projector).
+      for (let j = 0; j < count; j++) {
+        const u = (values[from + j] / scale + 128.5) | 0
+        m.data[to + j] = u < 1 ? 1 : u > 255 ? 255 : u
+      }
     }
   }
   return m

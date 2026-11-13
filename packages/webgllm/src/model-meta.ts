@@ -324,22 +324,30 @@ const QWEN_3_5_2B_REPO = { repo: "Qwen/Qwen3.5-2B" }
 /**
  * Qwen3.5 2B in unsloth's Q4_0 GGUF (1.21 GB): Gated DeltaNet layers with
  * full attention every fourth. Its projections are Q4_0; a few matrices
- * (Q4_1, Q5_K) load as 8-bit. Tokenizer and chat template from Qwen's own
- * repository. Thinking is off unless turned on.
+ * (Q4_1, Q5_K) load as 8-bit. Tokenizer, chat template and the image
+ * processor's config from Qwen's own repository. Its vision projector is
+ * the repository's float16 one (668 MB: there is no smaller), stored at 8
+ * bits. Thinking is off unless turned on.
  */
+const QWEN_3_5_2B_GGUF_FILES = {
+  kind: "gguf",
+  model: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" },
+  vision: {
+    projector: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "mmproj-F16.gguf" },
+    preprocessor: { ...QWEN_3_5_2B_REPO, path: "preprocessor_config.json" }
+  }
+} as const
+
 const QWEN_3_5_2B_GGUF = {
   name: "unsloth/Qwen3.5-2B-GGUF",
   format: "gguf",
-  files: {
-    kind: "gguf",
-    model: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "Qwen3.5-2B-Q4_0.gguf" }
-  },
+  files: QWEN_3_5_2B_GGUF_FILES,
   tokenizer: {
     tokenizer: { ...QWEN_3_5_2B_REPO, path: "tokenizer.json" },
     config: { ...QWEN_3_5_2B_REPO, path: "tokenizer_config.json" },
     chatTemplate: { ...QWEN_3_5_2B_REPO, path: "chat_template.jinja" }
   },
-  supports: TOOLS_AND_THINKING,
+  supports: { ...TOOLS_AND_THINKING, input: inputsOf(QWEN_3_5_2B_GGUF_FILES) },
   size: "2b",
   reasoning: THINKING_SWITCH,
   sampling: QWEN_3_5_SAMPLING,

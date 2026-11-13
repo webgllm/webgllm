@@ -414,6 +414,53 @@ test("a GGUF lfm3vl projector loads as LFM3-VL's tower: a kernel per frame, conv
   assert.deepEqual([attention.qkv.m.N, attention.qNorm?.[5], attention.kNorm?.[5], attention.qkv.bias], [W + 16 + 16, 5, -5, null])
 })
 
+test("a GGUF qwen3vl_merger projector loads as Qwen3.5's ViT: fused q|k|v, a corner-aligned position table, RoPE at base 1e4", async () => {
+  const W = 32
+  const linear = (name: string, K: number, N: number, value: number) => [f16(`${name}.weight`, [K, N], () => value), f32(`${name}.bias`, [N], (i) => i)]
+  const norm = (name: string) => [f32(`${name}.weight`, [W], () => 1), f32(`${name}.bias`, [W])]
+  const meta = {
+    ...clip, "clip.projector_type": "qwen3vl_merger", "clip.vision.block_count": 1, "clip.vision.attention.head_count": 2,
+    "clip.vision.attention.layer_norm_epsilon": 1e-6, "clip.vision.spatial_merge_size": 2
+  }
+  const tensors = [
+    f16("v.patch_embd.weight", [16, 16, 3, W], () => 1),
+    f16("v.patch_embd.weight.1", [16, 16, 3, W], () => 2),
+    f32("v.patch_embd.bias", [W], (i) => i),
+    f32("v.position_embd.weight", [W, 9], (i) => i),
+    ...norm("v.blk.0.ln1"),
+    // (q rows 0.5, k rows 1, v rows 2.)
+    f16("v.blk.0.attn_qkv.weight", [W, 3 * W], (i) => [0.5, 1, 2][Math.floor(i / (W * W))]),
+    f32("v.blk.0.attn_qkv.bias", [3 * W], (i) => i),
+    ...linear("v.blk.0.attn_out", W, W, 0.25),
+    ...norm("v.blk.0.ln2"),
+    ...linear("v.blk.0.ffn_up", W, 64, 0.5),
+    ...linear("v.blk.0.ffn_down", 64, W, 0.75),
+    ...norm("v.post_ln"),
+    ...linear("mm.0", 4 * W, 128, 1),
+    ...linear("mm.2", 128, W, 1)
+  ]
+  const file = ggufFile(meta, tensors)
+  const { config, bits } = await planVisionGguf(source(file))
+  assert.deepEqual(
+    [config.width, config.heads, config.kvHeads, config.headDim, config.ffn, config.mergerWidth, config.outWidth, config.patchValues, config.merge, config.grid, bits],
+    [32, 2, 2, 16, 64, 128, 32, 1536, 2, 3, 8]
+  )
+  assert.deepEqual([config.norm, config.mlp, config.mergerAct, config.interpolation, config.rope, config.qkNorm, config.positions], ["layer", "tanh", "erf", "corners", true, false, "grid"])
+  const pieces = await piecesOf(file)
+  assert.deepEqual(pieces.map((p) => p.kind), ["config", "patch", "block", "merger"])
+  const patch = pieces[1] as Extract<VisionPiece, { kind: "patch" }>
+  assert.ok(Math.abs(weightOf(patch.patch.m, 3, ((2 * 2 + 0) * 16 + 4) * 16 + 9) - 1) < 0.01 && Math.abs(weightOf(patch.patch.m, 3, ((2 * 2 + 1) * 16 + 4) * 16 + 9) - 2) < 0.01)
+  assert.deepEqual([patch.patch.bias?.[5], patch.positions?.length, patch.norm], [5, 9 * W, undefined])
+  assert.deepEqual(Array.from(patch.invFreq!).map((v) => Number(v.toPrecision(5))), [1, 0.1, 0.01, 0.001])
+  const block = (pieces[2] as Extract<VisionPiece, { kind: "block" }>).value
+  assert.ok(block.type === "attention")
+  assert.deepEqual([block.qkv.m.N, block.qkv.m.K, block.qkv.bias?.[2 * W + 1], block.qNorm], [3 * W, W, 2 * W + 1, undefined])
+  assert.ok(Math.abs(weightOf(block.qkv.m, 1, 5) - 0.5) < 1e-6 && Math.abs(weightOf(block.qkv.m, W + 1, 5) - 1) < 1e-6 && Math.abs(weightOf(block.qkv.m, 2 * W + 1, 5) - 2) < 1e-6)
+  assert.deepEqual([block.fc1.m.N, block.fc2.m.N], [64, W])
+  // Qwen3-VL's deepstack features aren't run: refused with the header.
+  await assert.rejects(planVisionGguf(source(ggufFile(meta, [...tensors, f32("v.deepstack.0.norm.weight", [W])]))), /deepstack/)
+})
+
 test("a repository's projectors by preference: Q8_0, then floats", () => {
   const files = ["LFM2.5-VL-450M-Q4_0.gguf", "mmproj-LFM2.5-VL-450m-BF16.gguf", "mmproj-LFM2.5-VL-450m-F16.gguf", "mmproj-LFM2.5-VL-450m-F32.gguf", "mmproj-LFM2.5-VL-450m-Q8_0.gguf", "README.md"]
   // (BF16 isn't a type the loader reads.)

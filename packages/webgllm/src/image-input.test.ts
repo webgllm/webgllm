@@ -293,10 +293,21 @@ test("image input is declared by the rule: a vision encoder beside the decoder, 
     "https://huggingface.co/someone/Qwen3.5-2B-text/resolve/main/config.json": { status: 200, body: { model_type: "qwen3_5" } }
   })
   assert.deepEqual((await hubModelMeta("someone/Qwen3.5-2B-text")).supports.input, ["text"])
-  // GGUF and LFM builds: text only.
+  // A GGUF build: the repository's projector (the float16 one where there's no Q8_0), and the processor config where its tokenizer is.
   fakeHub()
-  for (const name of ["unsloth/Qwen3.5-2B-GGUF", "onnx-community/LFM3-1.7B-ONNX"])
-    assert.deepEqual((await hubModelMeta(name)).supports.input, ["text"], name)
+  const gguf = await hubModelMeta("unsloth/Qwen3.5-2B-GGUF")
+  assert.deepEqual(gguf.supports.input, ["text", "image"])
+  assert.deepEqual(gguf.files.vision, {
+    projector: { repo: "unsloth/Qwen3.5-2B-GGUF", path: "mmproj-F16.gguf" },
+    preprocessor: { repo: "Qwen/Qwen3.5-2B", path: "preprocessor_config.json" }
+  })
+  assert.equal(gguf.projectorChecked, true)
+  // A projector of a type the encoder doesn't run, and a build without one: text only.
+  fakeHub(asRepo("unsloth/Qwen3.5-2B-GGUF", "someone/Other-Qwen3.5-2B-GGUF"))
+  const other = await hubModelMeta("someone/Other-Qwen3.5-2B-GGUF")
+  assert.deepEqual([other.supports.input, other.files.vision, other.projectorChecked], [["text"], undefined, true])
+  fakeHub()
+  assert.deepEqual((await hubModelMeta("onnx-community/LFM3-1.7B-ONNX")).supports.input, ["text"])
 })
 
 test("the position table dequantizes nibble by nibble, low first, minus its block's zero point", () => {
