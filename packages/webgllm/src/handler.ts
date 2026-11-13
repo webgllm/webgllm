@@ -9,7 +9,7 @@ import type { GpuNote } from "./storage.js"
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource } from "./byte-source.js"
-import { Engine, MAX_CHUNKS, TUNING } from "./engine.js"
+import { Engine, MAX_CHUNKS, retimedTuning, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
 import { loadGguf } from "./load-gguf.js"
@@ -432,10 +432,14 @@ async function load(
     timings.calibrationCached = checkedNote ? 1 : 0
     timings.calibrationReused = reusedTuning ? 1 : 0
     timings.engineCode = parseInt(Engine.fingerprint, 16)
+    // A stored timing past two frames is taken once more (a GPU busy with
+    // something else at the first load times a fast pipeline slow, and the
+    // pacing stored from that would slow every later session's prompts).
+    const retime = note?.tuned?.submissionRetime ? note.tuned : undefined
     if (note) {
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
-      if (note.tuned) engine.tuned = { ...note.tuned }
+      if (note.tuned) engine.tuned = retime ? tuningToRetime(note.tuned) : { ...note.tuned }
     }
     const pieces =
       meta.files.kind === "gguf"
@@ -473,6 +477,7 @@ async function load(
       }
     }, signal)
     if (signal.aborted) throw new Superseded()
+    if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
     timings.headSplit = engine.headChoice?.split ?? TUNING.q6HeadSplit

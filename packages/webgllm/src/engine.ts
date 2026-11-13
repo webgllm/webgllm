@@ -4,7 +4,7 @@
  * the convolutions' state on the GPU between calls.
  */
 import { expandQ6, fitsExpandedHead, headScratchBytes, fundedF16Scratch } from "./q6-expanded.js"
-import { SubmissionBudget, calibratedReadQuota } from "./gpu/submission-budget.js"
+import { SubmissionBudget, calibratedReadQuota, calibratedWindow } from "./gpu/submission-budget.js"
 import { releaseOwnedBuffer } from "./upload-staging.js"
 import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
@@ -400,6 +400,10 @@ export type Tuned = {
   submissionOverlap?: number
   /** Startup validated a larger presentation window on a fast complete pipeline. */
   submissionWindow?: number
+  /** How long the load timed its pipeline at, for those: what a second timing is compared with (see retimedTuning). */
+  submissionMs?: number
+  /** 1: that timing was past two frames, where a GPU busy with something else puts a fast one too: the next load times it once more and keeps the better (see retimedTuning). */
+  submissionRetime?: number
   rmsParts?: number
   f16Matmul?: number | null
   f16Pack?: number | null
@@ -407,6 +411,40 @@ export type Tuned = {
   flashDecode?: number | null
   /** Context length at which the attention variant was actually measured. */
   flashDecodeFrom?: number
+}
+
+/**
+ * The stored tuning as a load that times the prompt pipeline once more
+ * starts from: everything but what that timing sets, so it runs again
+ * (see Tuned.submissionRetime).
+ */
+export function tuningToRetime(stored: Tuned): Tuned {
+  const { submissionReads: _reads, submissionOverlap: _overlap, submissionWindow: _window, submissionMs: _ms, submissionRetime: _retime, ...rest } = stored
+  return { ...rest, f16Pack: null }
+}
+
+/**
+ * The tuning to keep after a second timing: `now` is what the load just
+ * measured, `previous` what was stored. The pacing is the faster timing's
+ * (the same pipeline, timed the same way: the slower one was held up),
+ * unless the new one found larger submissions miss frames, which stands.
+ * The kernels are the stored ones: a second look at two that time within
+ * each other's noise shouldn't flip them. It isn't timed a third time.
+ */
+export function retimedTuning(previous: Tuned, now: Tuned): Tuned {
+  const failed = now.submissionOverlap === 0
+  const faster = !failed && (previous.submissionMs ?? Infinity) <= (now.submissionMs ?? Infinity) ? previous : now
+  return {
+    ...now,
+    f16Pack: previous.f16Pack ?? now.f16Pack,
+    f16Matmul: previous.f16Matmul === undefined ? now.f16Matmul : previous.f16Matmul,
+    rmsParts: previous.rmsParts ?? now.rmsParts,
+    submissionReads: faster.submissionReads,
+    submissionOverlap: faster.submissionOverlap,
+    submissionWindow: faster.submissionWindow,
+    submissionMs: faster.submissionMs,
+    submissionRetime: 0
+  }
 }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
@@ -1282,7 +1320,7 @@ export class Engine {
         .join("\n") + Engine.toString() +
       Gpu.toString() +
       weightPanelSource.toString() +
-      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + SubmissionBudget.toString() + q4WordsToRgba4.toString()
+      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + SubmissionBudget.toString() + q4WordsToRgba4.toString()
     // FNV-1a.
     let h = 0x811c9dc5
     for (let i = 0; i < text.length; i++) {
@@ -1330,7 +1368,9 @@ export class Engine {
       flashDecode: null,
       streamMatvec: before.streamMatvec,
       submissionReads: before.submissionReads,
-      submissionOverlap: before.submissionOverlap
+      submissionOverlap: before.submissionOverlap,
+      submissionMs: before.submissionMs,
+      submissionRetime: before.submissionRetime
     }
     const b = this.buffers
     // A layer's prompt matmuls as the forward runs them: a conv block's,
@@ -1550,6 +1590,8 @@ export class Engine {
         submissionReads: before.submissionReads,
         submissionOverlap: before.submissionOverlap,
         submissionWindow: before.submissionWindow,
+        submissionMs: before.submissionMs,
+        submissionRetime: before.submissionRetime,
         rmsParts: before.rmsParts
       }
     } catch (error) {
@@ -2257,14 +2299,19 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // consistently, and repeating four complete pipelines delayed ready.
       this.tuned.rmsParts = this.parts
       this.tuned.submissionOverlap = allowOverlap ? overlap : 0
-      this.tuned.submissionWindow = allowOverlap && this.packingReport[selected].ms <= this.gpu.expectedFrameMs * 2
-        ? this.gpu.presentationAdvice.cap : TUNING.presentationFrames
+      this.tuned.submissionWindow = allowOverlap
+        ? calibratedWindow(TUNING.presentationFrames, this.gpu.presentationAdvice.cap, this.packingReport[selected].ms, this.gpu.expectedFrameMs)
+        : TUNING.presentationFrames
       this.tuned.submissionReads = calibratedReadQuota(
         TUNING.submissionReads,
         Math.min(...work[selected]),
         this.packingReport[selected].ms,
         this.gpu.expectedFrameMs
       )
+      // A timing past two frames may be a fast GPU held up by other work
+      // (a game beside the page): the next load times it once more.
+      this.tuned.submissionMs = this.packingReport[selected].ms
+      this.tuned.submissionRetime = allowOverlap && this.packingReport[selected].ms > this.gpu.expectedFrameMs * 2 ? 1 : 0
       this.packingMeasured = true
       this.promptMatmulMeasured = native
     } catch (error) {

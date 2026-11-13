@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { Engine, TUNING } from "./engine.js"
+import { Engine, retimedTuning, TUNING, tuningToRetime, type Tuned } from "./engine.js"
 
 function fixture(native = false, fail = false) {
   const layers = [
@@ -250,4 +250,51 @@ test("a superseded packing probe leaves a concurrent load and global tuning alon
   assert.equal(first.packingReport.length, 0)
   assert.ok(second.packingReport.length > 0)
   assert.equal(TUNING.lastRowOnly, before)
+})
+
+test("the pacing stored from the probe's timing: whole within two frames, graded past them, and marked for one more timing there", async (t) => {
+  const stored = async (ms: number) => {
+    const { state } = fixture()
+    let clock = 0
+    const now = t.mock.method(performance, "now", () => clock)
+    const forward = state.forwardHidden.bind(state)
+    // Both packings take the same time: the first (the default) is kept.
+    state.forwardHidden = async (...args) => {
+      await forward(...args)
+      if (args[0].length === 512) clock += ms
+    }
+    await Reflect.get(Engine.prototype, "choosePromptPacking").call(state)
+    now.mock.restore()
+    return state.tuned as Tuned
+  }
+  // 16.7 ms a frame, a window of up to 24 frames, 512,000 of work a full batch.
+  const quiet = await stored(26)
+  assert.deepEqual(
+    [quiet.submissionWindow, quiet.submissionMs, quiet.submissionRetime, quiet.f16Pack],
+    [24, 26, 0, 3]
+  )
+  // Beside a game the same GPU timed 35 ms: nearly the same pacing (it was a twelfth of the quota and a window of 4), and one more timing.
+  const busy = await stored(35)
+  assert.deepEqual([busy.submissionMs, busy.submissionRetime], [35, 1])
+  assert.ok(busy.submissionWindow! >= 20, `window ${busy.submissionWindow}`)
+  // Four frames or more: the starting window, as before, and one more timing too.
+  const slow = await stored(70)
+  assert.deepEqual([slow.submissionWindow, slow.submissionMs, slow.submissionRetime], [TUNING.presentationFrames, 70, 1])
+})
+
+test("a second timing keeps the faster one's pacing and the stored kernels, and isn't taken a third time", () => {
+  const first: Tuned = { shortSplit: 2, f16Pack: 0, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 3e8, submissionOverlap: 2 ** 29, submissionWindow: 4, submissionMs: 70, submissionRetime: 1 }
+  // What the load that times again starts from: all but the timing's own values, so the probe runs.
+  assert.deepEqual(tuningToRetime(first), { shortSplit: 2, f16Pack: null, f16Matmul: null, flashDecode: 1, rmsParts: 64 })
+  // The second timing was quiet: its pacing, the first's kernels.
+  const second: Tuned = { shortSplit: 2, f16Pack: 3, f16Matmul: null, flashDecode: 1, rmsParts: 64, submissionReads: 1e10, submissionOverlap: 2 ** 29, submissionWindow: 24, submissionMs: 26, submissionRetime: 0 }
+  assert.deepEqual(retimedTuning(first, second), { ...second, f16Pack: 0 })
+  // The second was the held-up one: the first's pacing stays, and it's settled.
+  const worse: Tuned = { ...second, submissionReads: 2.7e8, submissionWindow: 4, submissionMs: 90, submissionRetime: 1 }
+  assert.deepEqual(retimedTuning(first, worse), { ...first, submissionRetime: 0 })
+  // A GPU that is honestly past two frames times about the same again: settled either way.
+  assert.equal(retimedTuning(first, { ...second, submissionMs: 71, submissionWindow: 4, submissionReads: 3e8, submissionRetime: 1 }).submissionRetime, 0)
+  // The second timing found larger submissions miss frames: that stands, whichever was faster.
+  const missed: Tuned = { ...second, submissionOverlap: 0, submissionWindow: 4, submissionMs: 90 }
+  assert.deepEqual(retimedTuning(first, missed), { ...missed, f16Pack: 0, submissionRetime: 0 })
 })
