@@ -22,9 +22,10 @@
     // another image (the encoder warm in storage), and a larger image
     // (LFM2.5-VL reads it in tiles). The model's memory claims are logged as
     // they come (onMemoryClaim: its textures once loaded, and the room the
-    // vision encoder takes while it reads an image). At each CHECKPOINT the
-    // page posts a /result line and waits `hold` seconds, for a driver to
-    // measure the browser's processes.
+    // vision encoder takes while it reads an image). Every line also goes
+    // to the server's results file (POST /result), with the end ("done") or
+    // the error; at each CHECKPOINT the page waits `hold` seconds, for a
+    // driver to measure the browser's processes.
     const { WebGLLM } = await import("/bundle/src/index.js")
     const out = document.getElementById("out")
     const log = (...parts) => {
@@ -40,9 +41,10 @@
     const rounds = Number(params.get("rounds") ?? 2)
     const hold = Number(params.get("hold") ?? 0)
     const MiB = (bytes) => `${(bytes / 2 ** 20).toFixed(1)} MiB`
+    const post = (line) => fetch("/result", { method: "POST", body: JSON.stringify({ page: "vl", model, at: Date.now(), ...line }) }).catch(() => {})
     const checkpoint = async (name) => {
       log(`CHECKPOINT ${name}`)
-      await fetch("/result", { method: "POST", body: JSON.stringify({ page: "vl", model, checkpoint: name, at: Date.now() }) }).catch(() => {})
+      await post({ checkpoint: name })
       if (hold) await new Promise((resolve) => setTimeout(resolve, hold * 1000))
     }
     /** A width × height scene: a sun, a red house with a blue roof, and a line of text. */
@@ -90,7 +92,9 @@
       await checkpoint("start")
       let t = performance.now()
       await webgllm.loadModel(model, { contextLength })
-      log("loaded", model, `${Math.round(performance.now() - t)} ms; textures ${MiB(claimed)}`)
+      const loadMs = Math.round(performance.now() - t)
+      log("loaded", model, `${loadMs} ms; textures ${MiB(claimed)}`)
+      await post({ label: "load", ms: loadMs, textures: MiB(claimed) })
       const info = await webgllm.models.retrieve(model)
       if (!info.supports.images) throw new Error(`${model} doesn't read images`)
       const ask = async (label, content, maxTokens) => {
@@ -105,21 +109,21 @@
           cache_prompt: false
         })
         const g = r.timings
-        log(
-          JSON.stringify({
-            label,
-            prompt_tokens: r.usage.prompt_tokens,
-            completion_tokens: r.usage.completion_tokens,
-            ms: Math.round(performance.now() - t),
-            images_ms: g.images_ms === undefined ? undefined : Math.round(g.images_ms),
-            prompt_ms: Math.round(g.prompt_ms),
-            prompt_tps: Math.round(g.prompt_tokens_per_second),
-            decode_tps: Number(g.decode_tokens_per_second.toFixed(1)),
-            textures: MiB(claimed),
-            peak: MiB(peak),
-            reply: (r.choices[0].message.content ?? "").slice(0, 160)
-          })
-        )
+        const line = {
+          label,
+          prompt_tokens: r.usage.prompt_tokens,
+          completion_tokens: r.usage.completion_tokens,
+          ms: Math.round(performance.now() - t),
+          images_ms: g.images_ms === undefined ? undefined : Math.round(g.images_ms),
+          prompt_ms: Math.round(g.prompt_ms),
+          prompt_tps: Math.round(g.prompt_tokens_per_second),
+          decode_tps: Number(g.decode_tokens_per_second.toFixed(1)),
+          textures: MiB(claimed),
+          peak: MiB(peak),
+          reply: (r.choices[0].message.content ?? "").slice(0, 160)
+        }
+        log(JSON.stringify(line))
+        await post(line)
         return r
       }
       await checkpoint("loaded")
@@ -137,9 +141,12 @@
       await ask("image 512x384 (another)", image(scene(512, 384, "WEBGL 77")), 48)
       await ask("image 1024x768", image(scene(1024, 768, "HELLO 2026")), 48)
       await checkpoint("large image")
+      await post({ checkpoint: "done" })
       log("ALL DONE")
     } catch (error) {
-      log("ERROR:", error instanceof Error ? `${error.message}\n${error.stack}` : String(error))
+      const message = error instanceof Error ? `${error.message}\n${error.stack}` : String(error)
+      await post({ checkpoint: "error", message })
+      log("ERROR:", message)
     }
   </script>
 </html>

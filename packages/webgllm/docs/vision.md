@@ -131,6 +131,28 @@ as it loads: about twice the ONNX build's `q4f16` encoder in textures, and
 3.4 times its download. The image processor's config comes from
 `Qwen/Qwen3.5-2B`, where the tokenizer does.
 
+Measured on an M3 Ultra (8,192-token context, `vl.html`): 1,494 MiB of
+textures loaded, 1,948 MiB while it reads a 512 × 384 image (354 MiB of
+that is the encoder's weights) and 1,989 MiB for 1024 × 768. A new image
+takes about 8 s, nearly all of it the encoder's load (the encode is 0.46 s
+for 256 tokens): the 334 M float weights are read and quantized again for
+each image, about 3 s of it the quantization, where a Q8_0 projector is
+taken as it is.
+
+What the 8 bits cost, at 512 × 512 against onnxruntime's fp16 encoder
+(`vision-check.html?encoder=Qwen3.5-2B-GGUF/mmproj-F16.gguf`): relative
+L2 0.093, worst token's cosine 0.67. The same encoder in float32 numpy,
+from the same file, is at 0.012 (worst 0.98), and with its matrices
+quantized as the loader does at 0.094 (worst 0.67, the same token): the
+structure is right and the rest is the quantization. For scale, the ONNX
+build's `q4` encoder is 0.64 from float. Answers agree with llama.cpp's
+on the same two files (`llama-mtmd-cli`, temperature 0) except on a
+borderline glyph: on the 512 × 384 house scene the engine reads "HELLO
+2023" for "HELLO 2026", and so does llama.cpp once its projector holds
+the loader's 8-bit values (in float it reads 2026). More bits per weight
+don't settle that digit (9 bits reads 2026, 10 bits 2023, 12 bits 2026);
+only the float weights do, which would take twice the textures.
+
 # Liquid AI's vision-language models
 
 `LiquidAI/LFM2.5-VL-450M`, `-1.6B` and `-3B` and `LiquidAI/LFM3-VL-2B`,
@@ -277,11 +299,25 @@ than the table; the ONNX graph resizes without it).
   An image's time is mostly loading the encoder for it (a GGUF projector's
   float rows are quantized as they load: so400m's take about a second
   more than the ONNX encoder's); a warm 512 × 512 view encodes in 0.16 s
-  (450M, LFM3-VL) to 0.5 s (so400m). Against an iPhone's 2 GB a tab (not
-  measured on one): 450M is far under; 1.6B is under while loaded and
-  within 1.5 to 1.6 GiB of textures while it reads an image; LFM3-VL's GGUF
-  loads like LFM3 1.7B (1.3 GiB) and reaches 1.6 GiB reading an image, its
-  ONNX build 1.9 GiB; 3B is at 1.9 to 2.0 GiB before any image.
+  (450M, LFM3-VL) to 0.5 s (so400m).
+
+- **On an iPhone** (16 Pro Max, Safari, the GGUF builds, the same page with
+  `len=512&reply=32&rounds=1`, one after another without a rest, each
+  model just downloaded). iOS ends a tab at 2 GiB (`per-process-limit` in
+  the device's log, 2,097,666 KB when it took Qwen's):
+
+  | Build | Result | Load | Textures loaded | While reading an image | Prompt (≈520 tokens) | Writing | An image, one view (first, another) | 1024 × 768 |
+  |---|---|---|---|---|---|---|---|---|
+  | LFM2.5-VL-450M GGUF | answers text and images | 8 s | 436 MiB | 594 to 608 MiB | 1,530 tok/s | 120 tok/s | 6.4 s, 0.9 s | 6.1 s |
+  | LFM2.5-VL-1.6B GGUF | answers text and images | 23 s | 974 MiB | 1,507 to 1,522 MiB | 460 tok/s | 44 tok/s | 21 s, 3.8 s | 31 s |
+  | LFM3-VL-2B GGUF | answers text and images | 33 s | 1,285 MiB | 1,570 to 1,619 MiB | 310 tok/s | 32 tok/s | 8.6 s, 1.3 s | 2.6 s |
+  | LFM2.5-VL-3B GGUF | loads, then iOS ends the tab at its first prompt | 51 s | 1,874 MiB | | | | | |
+  | Qwen3.5-2B GGUF | answers text; iOS ends the tab while it reads an image | 41 s | 1,510 MiB | | 240 tok/s | 27 tok/s | | |
+
+  The three that fit read "HELLO 2026" and the colours right in all three
+  images. So a tab holds about 1.6 GiB of textures and not 1.9: Qwen's
+  float projector (354 MiB of encoder weights beside 1.5 GiB of model) is
+  what puts its image over, and the 3B is over with its text alone.
 
 ## Left
 
@@ -297,5 +333,9 @@ than the table; the ONNX graph resizes without it).
 - LFM3-VL's ONNX decoder reads prompts at a third of its GGUF's speed: its
   8-bit projections take the 8-bit kernels.
 - Video parts.
-- iPhone memory with the 2B encoder loaded (its 187 MiB of textures, freed
-  after each request's images) hasn't been measured on the device.
+- Qwen3.5 2B's ONNX build on an iPhone with its encoder loaded (187 MiB
+  of textures, freed after each request's images) hasn't been measured on
+  the device; its GGUF build's image doesn't fit there (above).
+- A GGUF projector in float (Qwen3.5's) is quantized again for every new
+  image, about 8 s on a Mac. Keeping the quantized rows, or the encoder,
+  between images would remove most of it.
