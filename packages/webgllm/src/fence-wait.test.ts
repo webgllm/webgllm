@@ -70,3 +70,30 @@ test("a prompt's wait sleeps on timers once it isn't a short one", async (t) => 
   assert.equal(yields + sleeps, 11)
   assert.ok(sleeps >= 6)
 })
+
+test("a wait's fence polls wait inside the call where the browser allows a timeout, and not where it doesn't", () => {
+  const timeouts: number[] = []
+  const gpu = Object.create(Gpu.prototype) as Gpu
+  Object.assign(gpu, {
+    timedPolls: true,
+    maxPollNs: 1e6,
+    gl: {
+      WAIT_FAILED: 1,
+      TIMEOUT_EXPIRED: 2,
+      ALREADY_SIGNALED: 3,
+      CONDITION_SATISFIED: 4,
+      clientWaitSync: (_sync: object, _flags: number, timeout: number) => (timeouts.push(timeout), 4)
+    }
+  })
+  const ready = Reflect.get(Gpu.prototype, "fenceReady")
+  // A wait's poll, then a look in passing.
+  assert.equal(ready.call(gpu, {}, true), true)
+  ready.call(gpu, {})
+  // A browser that allows no timeout (Chrome, Safari).
+  Object.assign(gpu, { maxPollNs: 0 })
+  ready.call(gpu, {}, true)
+  // Switched off (TUNING.timedFencePolls 0).
+  Object.assign(gpu, { maxPollNs: 1e6, timedPolls: false })
+  ready.call(gpu, {}, true)
+  assert.deepEqual(timeouts, [1e6, 0, 0, 0])
+})
