@@ -1245,8 +1245,8 @@ async function generate(request: GenerateRequest) {
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
   // The penalties look at the last tokens read or written, the prompt's
-  // included, as llama.cpp's do (see penalty-window.ts; the presence penalty
-  // only at the reply's). setSeen also bans the padding ids.
+  // included, as llama.cpp's do (see penalty-window.ts). setSeen also bans
+  // the padding ids.
   const seen = new PenaltyWindow(sampling.repeat_last_n ?? DEFAULT_REPEAT_LAST_N)
   if (onGpu) {
     seen.push(prompt)

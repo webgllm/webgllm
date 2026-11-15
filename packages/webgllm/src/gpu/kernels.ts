@@ -3086,10 +3086,10 @@ float penalized(float v, uint m, int id, int r) {
     ivec4 s = uSeenRows[k];
     if (s.x == id && r >= s.z && r < s.w) state = s.y;
   }
-  bool generated = state == 3;
-  bool seen = state == 1 || generated;
+  bool seen = state == 1 || state == 3;
   if (seen) v = v < 0.0 ? v * uPenalty : v / uPenalty;
-  return generated ? v - uPresencePenalty : v;
+  /* The presence penalty on every token in the window, the prompt's too, as llama.cpp applies it. */
+  return seen ? v - uPresencePenalty : v;
 }
 vec4 chunkTexel(int c, int t, int r) {
   int texel = c * 64 + t;

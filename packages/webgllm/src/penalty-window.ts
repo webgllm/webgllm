@@ -7,7 +7,8 @@
  *
  * `push` returns the tokens whose state changed, for the GPU's copy of the
  * set (see Engine.setSeenState): 1 in the window from the prompt only, 3
- * written in this reply (the presence penalty's too), 0 out of it.
+ * written in this reply, 0 out of it. Both penalties apply to 1 and 3
+ * alike, as llama.cpp's do.
  */
 export const DEFAULT_REPEAT_LAST_N = 64
 

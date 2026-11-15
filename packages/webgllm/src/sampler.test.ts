@@ -31,20 +31,20 @@ describe("createSampler", () => {
     assert.equal(logits[2], -2)
   })
 
-  test("presence penalty applies once to generated tokens, without penalizing prompt-only tokens", () => {
+  test("presence penalty applies once to every token in the window, the prompt's too, as llama.cpp applies it", () => {
     const s = createSampler({ temperature: 0, top_k: 0, repetition_penalty: 2, presence_penalty: 1.5 })
     s.see([0, 1])
     s.see([1, 1, 2], true)
     const logits = Float32Array.of(4, 6, -1, 1)
     s.distribution(logits)
-    assert.deepEqual([...logits], [2, 1.5, -3.5, 1])
+    assert.deepEqual([...logits], [0.5, 1.5, -3.5, 1])
     const fresh = createSampler({ temperature: 0, top_k: 0, repetition_penalty: 1, presence_penalty: 2 })
     const next = Float32Array.of(4, 6, -1, 1)
     fresh.distribution(next)
-    assert.deepEqual([...next], [4, 6, -1, 1], "generated history resets for every reply")
+    assert.deepEqual([...next], [4, 6, -1, 1], "the window starts empty for every reply")
   })
 
-  test("min_p filters relative to the highest probability and renormalizes before top_p", () => {
+  test("top_p, then min_p relative to the highest probability, as llama.cpp orders them", () => {
     const s = createSampler({ temperature: 1, top_k: 0, repetition_penalty: 1, min_p: 0.5, top_p: 0.9 })
     const d = s.distribution(Float32Array.of(0, Math.log(0.6), Math.log(0.1)))
     assert.equal(d.p[2], 0)
@@ -152,33 +152,29 @@ function reference(s: { temperature: number; top_k: number; top_p: number; min_p
   }
   let best = 0
   for (let j = 1; j < k; j++) if (kept[j] > kept[best]) best = j
+  // llama.cpp's order: top-p, then min-p, at temperature 1; the temperature on what's left.
   const max = kept[best]
-  let total = 0
-  for (let j = 0; j < k; j++) {
-    kept[j] = Math.exp((kept[j] - max) / s.temperature)
-    total += kept[j]
-  }
-  for (let j = 0; j < k; j++) {
-    if (kept[j] < s.min_p) {
-      total -= kept[j]
-      kept[j] = 0
-    }
-  }
+  const weight = Array.from(kept, (x) => Math.exp(x - max))
+  const total = weight.reduce((a, b) => a + b, 0)
   if (s.top_p < 1) {
-    const order = Array.from({ length: k }, (_, j) => j).sort((a, b) => kept[b] - kept[a])
+    const order = Array.from({ length: k }, (_, j) => j).sort((a, b) => weight[b] - weight[a])
     let share = 0
     let cut = false
     for (const j of order) {
-      if (cut) {
-        total -= kept[j]
-        kept[j] = 0
-      } else {
-        share += kept[j] / total
+      if (cut) weight[j] = 0
+      else {
+        share += weight[j] / total
         cut = share >= s.top_p
       }
     }
   }
-  for (let j = 0; j < k; j++) kept[j] /= total
+  for (let j = 0; j < k; j++) if (weight[j] < s.min_p) weight[j] = 0
+  let left = 0
+  for (let j = 0; j < k; j++) {
+    kept[j] = weight[j] > 0 ? Math.exp((kept[j] - max) / s.temperature) : 0
+    left += kept[j]
+  }
+  for (let j = 0; j < k; j++) kept[j] /= left
   return { ids, p: kept }
 }
 
@@ -229,4 +225,14 @@ test("log probabilities: the model's distribution, with only tokens that can be 
   assert.ok(entry.top_logprobs.every((a) => Number.isFinite(a.logprob)))
   assert.deepEqual(logits, before)
   assert.deepEqual(logprobsOf(logits, 0, (token, logprob) => ({ token, logprob }))(0).top_logprobs, [])
+})
+
+describe("temperature after top_p and min_p, as llama.cpp applies it", () => {
+  test("a low temperature doesn't change which tokens top_p keeps", () => {
+    // At temperature 1 the top two make 0.9; at 0.1 the first alone would. llama.cpp cuts first, then sharpens.
+    const logits = () => Float32Array.of(Math.log(0.5), Math.log(0.4), Math.log(0.1))
+    const d = createSampler({ temperature: 0.1, top_k: 0, repetition_penalty: 1, top_p: 0.85 }).distribution(logits())
+    assert.ok(d.p[1] > 0, "the second is kept")
+    assert.equal(d.p[2], 0)
+  })
 })
