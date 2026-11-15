@@ -5799,27 +5799,29 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     })
   }
 
-  /** Generated-token bits. The GPU mask also tracks prompt tokens and padding. */
-  private maskData: Uint8Array | null = null
+  /** Each token's seen state, as the GPU's mask has it (see setSeenState); padding isn't in it. */
+  private maskStates: Uint8Array | null = null
   private maskLimit = 0
   private maskUpdate: Uint8Array | null = null
 
   /**
-   * Sets which tokens the repetition penalty applies to, and bans every id
-   * from `vocabLimit` on (padding rows the tokenizer has no token for).
+   * Sets which tokens the repetition penalty applies to (state 1: see
+   * penalty-window.ts), and bans every id from `vocabLimit` on (padding rows
+   * the tokenizer has no token for).
    */
   setSeen(tokens: Iterable<number>, vocabLimit: number) {
     const mask = this.buffers.mask
-    const size = mask.width * mask.height, bytes = Math.ceil(size / 8)
-    const bits = this.maskData?.length === bytes ? this.maskData : new Uint8Array(bytes)
-    bits.fill(0)
+    const size = mask.width * mask.height
     this.maskLimit = Math.min(vocabLimit, size)
+    const states = this.maskStates?.length === this.maskLimit ? this.maskStates : new Uint8Array(this.maskLimit)
+    states.fill(0)
     const data = new Uint8Array(size)
     data.fill(2, this.maskLimit)
     for (const t of tokens) if (Number.isInteger(t) && t >= 0 && t < this.maskLimit) {
       data[t] = 1
+      states[t] = 1
     }
-    this.maskData = bits
+    this.maskStates = states
     this.gpu.write(
       mask,
       { x: 0, y: 0, width: mask.width, height: mask.height },
@@ -5832,14 +5834,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     releaseOwnedBuffer(data.buffer)
   }
 
-  /** Marks a generated token for repetition and presence penalties. */
-  markSeen(token: number) {
-    const data = this.maskData
-    if (!data || !Number.isInteger(token) || token < 0 || token >= this.maskLimit) return
-    const index = token >> 3, bit = 1 << (token & 7)
-    if (data[index] & bit) return
-    data[index] |= bit
-    const update = this.maskUpdate ??= new Uint8Array([3])
+  /**
+   * A token's state for the repetition and presence penalties: 0 not
+   * penalized, 1 in the window from the prompt, 3 written in this reply.
+   */
+  setSeenState(token: number, state: 0 | 1 | 3) {
+    const states = this.maskStates
+    if (!states || !Number.isInteger(token) || token < 0 || token >= this.maskLimit || states[token] === state) return
+    states[token] = state
+    const update = this.maskUpdate ??= new Uint8Array(1)
+    update[0] = state
     const width = this.buffers.mask.width
     this.gpu.write(
       this.buffers.mask,
@@ -5850,6 +5854,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         pixels: update
       }
     )
+  }
+
+  /** Marks a generated token for repetition and presence penalties (with no window: see setSeenState). */
+  markSeen(token: number) {
+    this.setSeenState(token, 3)
   }
 
   /**

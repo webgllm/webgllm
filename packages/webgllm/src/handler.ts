@@ -39,6 +39,7 @@ import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
 import type { ToolCall } from "./tool-choice.js"
 import { createStopFilter } from "./stop-sequences.js"
+import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
 import { seededUniforms } from "./seeded-random.js"
 import { CodedError, downloadError, errorCode } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
@@ -1236,11 +1237,14 @@ async function generate(request: GenerateRequest) {
   const sampler = createSampler(
     onGpu ? { ...sampling, repetition_penalty: 1, presence_penalty: 0 } : sampling
   )
-  // The repetition penalty counts the prompt's tokens and the reply's, as
-  // Transformers.js does: the model cards' values assume it. (The presence
-  // penalty counts only the reply's.) setSeen also bans the padding ids.
-  if (onGpu) engine.setSeen(prompt, vocab)
-  else sampler.see(prompt)
+  // The penalties look at the last tokens read or written, the prompt's
+  // included, as llama.cpp's do (see penalty-window.ts; the presence penalty
+  // only at the reply's). setSeen also bans the padding ids.
+  const seen = new PenaltyWindow(sampling.repeat_last_n ?? DEFAULT_REPEAT_LAST_N)
+  if (onGpu) {
+    seen.push(prompt)
+    engine.setSeen(seen.entries().map(([token]) => token), vocab)
+  } else sampler.see(prompt)
   // With a seed, the number each token is drawn with comes from the seed
   // and the token's place in the reply (see seeded-random.ts); else
   // Math.random, as before. Greedy picks don't depend on either.
@@ -1319,9 +1323,12 @@ async function generate(request: GenerateRequest) {
     appliedMask = mask
     return mask ?? undefined
   }
-  // No penalties inside a constrained answer: its quotes, keys and the values
-  // it copies from the prompt repeat by design.
-  const penalize = () => !structured?.answering
+  // Penalties inside a constrained answer too, as llama.cpp applies them:
+  // its grammar keeps the JSON valid, and a window of the last tokens (see
+  // penalty-window.ts) keeps quotes and keys from being penalized for long.
+  // Without them LFM3 went on copying the prompt's examples into an array
+  // that llama.cpp ended after the one item asked for.
+  const penalize = () => true
   const penalty = () => penalize() ? sampling.repetition_penalty : 1
   const presence = () => penalize() ? sampling.presence_penalty : 0
   const distribution = async (r: number, guess = false) => {
@@ -1464,7 +1471,7 @@ async function generate(request: GenerateRequest) {
       return false
     }
     thinkingBudget?.observe(t)
-    if (onGpu) engine.markSeen(t)
+    if (onGpu) for (const [token, state] of seen.push([t], true)) engine.setSeenState(token, state)
     else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
@@ -1701,8 +1708,7 @@ async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }
   if (logits.length > vocab) logits = logits.subarray(0, vocab)
   const processor = logitProcessors?.get(request.model)
   if (processor) logits = processor.processLogits(logits)
-  // The repetition penalty counts every token the cache holds, as a reply's
-  // counts its prompt's.
+  // The penalties look at the last tokens the cache holds, as a reply's look at its prompt's.
   const sampler = createSampler(request.sampling)
   sampler.see(model.cached)
   const token = draw(sampler.distribution(logits))

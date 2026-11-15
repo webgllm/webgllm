@@ -1,5 +1,7 @@
 /** Picking the next token from logits, as the package's other runtimes do. */
 
+import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
+
 /** Sampling settings, from the model card unless the caller overrides them. */
 export type Sampling = {
   temperature: number
@@ -11,13 +13,18 @@ export type Sampling = {
   min_p?: number
   /** Subtract once for tokens generated in this reply (not prompt-only tokens). */
   presence_penalty?: number
+  /**
+   * How many of the last tokens the penalties look at, prompt included
+   * (llama.cpp's repeat_last_n): 64 by default, 0 for none, -1 for all.
+   */
+  repeat_last_n?: number
 }
 
 /**
- * A sampler for one reply. It applies the repetition penalty to the tokens
- * it's told it has seen (the prompt's and the reply's, as Transformers.js
- * does), keeps the top_k likeliest tokens, and draws one at the temperature
- * (greedy at 0).
+ * A sampler for one reply. It applies the repetition penalty to the last
+ * tokens it's told it has seen (the prompt's, then the reply's: see
+ * penalty-window.ts), keeps the top_k likeliest tokens, and draws one at
+ * the temperature (greedy at 0).
  */
 export function createSampler({
   temperature,
@@ -25,35 +32,30 @@ export function createSampler({
   repetition_penalty,
   top_p = 1,
   min_p = 0,
-  presence_penalty = 0
+  presence_penalty = 0,
+  repeat_last_n = DEFAULT_REPEAT_LAST_N
 }: Sampling) {
-  const seen = new Set<number>()
-  const generated = new Set<number>()
+  const window = new PenaltyWindow(repeat_last_n)
   return {
-    /** Tokens to penalize from now on: the prompt, then each one drawn. */
+    /** Tokens read or written, in order: the prompt, then each one drawn. */
     see(tokens: Iterable<number>, output = false) {
-      for (const t of tokens) {
-        seen.add(t)
-        if (output) generated.add(t)
-      }
+      window.push(tokens, output)
     },
     /**
      * The distribution the next token is drawn from: the kept tokens
      * (indices into `logits`) and their probabilities, after the penalty,
      * top-k, temperature and top-p (one token at probability 1 when
      * greedy). Changes `logits`. `penalize` false leaves out the repetition
-     * and presence penalties (a constrained answer repeats tokens by design).
+     * and presence penalties (for logits a GPU already penalized).
      */
     distribution(logits: Float32Array, penalize = true): { ids: Int32Array; p: Float32Array } {
-      if (penalize && repetition_penalty !== 1) {
-        for (const token of seen) {
+      if (penalize && (repetition_penalty !== 1 || presence_penalty !== 0)) {
+        for (const [token, state] of window.entries()) {
+          if (token < 0 || token >= logits.length) continue
           const x = logits[token]
-          logits[token] =
-            x < 0 ? x * repetition_penalty : x / repetition_penalty
+          if (repetition_penalty !== 1) logits[token] = x < 0 ? x * repetition_penalty : x / repetition_penalty
+          if (presence_penalty !== 0 && state === 3) logits[token] -= presence_penalty
         }
-      }
-      if (penalize && presence_penalty !== 0) {
-        for (const token of generated) logits[token] -= presence_penalty
       }
       const k = Math.max(
         1,

@@ -34,6 +34,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
+  import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';
   import { CodedError } from './worker-errors.js';
   import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from './sampler.js';
@@ -100,7 +101,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     preparePrompt: async () => undefined,
     setImages() {},
     async forwardHidden(batch: number[]) { position += batch.length; return batch.length - 1 },
-    setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {},
+    setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {}, setSeenState() {},
     async argmax(_row: number, _rows: number, penalty: number, _drafts: number[], _guess: boolean, presence = 0) {
       penalties.push([penalty, presence])
       return Int32Array.of(queue.shift() ?? EOS)
@@ -280,23 +281,21 @@ test("stop sequences don't apply inside a structured answer: it stays valid JSON
   assert.equal(text(t.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
 })
 
-test("the repetition penalty counts the prompt's tokens, as Transformers.js does", async () => {
+test("the repetition penalty counts the prompt's last tokens, as llama.cpp does", async () => {
   const s = scripted([id("Oslo")])
   await s.generate(request({ sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 } }))
   assert.equal(s.seen.length, 1)
   assert.ok(s.seen[0].length > 0, "the prompt's tokens are penalized")
 })
 
-test("no repetition or presence penalty inside a constrained answer", async () => {
+test("the penalties apply inside a constrained answer too, as llama.cpp's do", async () => {
   const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
   const j = jsonConstraint(id("}"))
   const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
   await s.generate(request({ outputSchema: schema, thinking: true, sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1, presence_penalty: 1.5 } }))
   assert.equal(text(s.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
-  // Thinking: the request's penalties. The answer: none (its quotes, keys and
-  // copied values repeat by design).
-  assert.deepEqual(s.penalties.slice(0, 2), [[1.1, 1.5], [1.1, 1.5]])
-  assert.deepEqual(new Set(s.penalties.slice(2).map(String)), new Set(["1,0"]))
+  // Thinking and the answer alike: the request's penalties (the grammar keeps the JSON valid).
+  assert.deepEqual(new Set(s.penalties.map(String)), new Set(["1.1,1.5"]))
 })
 
 test("with thinking switched off, the reply can't open or close thinking", async () => {

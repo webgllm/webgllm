@@ -115,6 +115,8 @@ export type ChatCompletionCreateParamsBase = {
   temperature?: number | null
   top_p?: number | null
   presence_penalty?: number | null
+  /** How many of the last tokens the repetition and presence penalties look at, prompt included (llama.cpp's repeat_last_n): 64 by default, 0 for none, -1 for all. */
+  repeat_last_n?: number | null
   /** Only 0 (or unset) is supported. */
   frequency_penalty?: number | null
   stop?: string | Array<string> | null
@@ -337,6 +339,8 @@ export type CompletionCreateParamsBase = {
   top_k?: number | null
   min_p?: number | null
   presence_penalty?: number | null
+  /** How many of the last tokens the repetition and presence penalties look at, prompt included (llama.cpp's repeat_last_n): 64 by default, 0 for none, -1 for all. */
+  repeat_last_n?: number | null
   repetition_penalty?: number | null
   /** Unsupported unless 0. */
   frequency_penalty?: number | null

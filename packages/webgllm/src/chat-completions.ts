@@ -304,13 +304,16 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
   const top_p = numberField(body, "top_p", { min: 0, max: 1 }) ?? base.top_p
   const min_p = numberField(body, "min_p", { min: 0, max: 1 }) ?? base.min_p
   const presence_penalty = numberField(body, "presence_penalty", { min: -2, max: 2 }) ?? base.presence_penalty
+  // llama.cpp's name: how many of the last tokens the penalties look at (64 by default, -1 for all).
+  const repeat_last_n = numberField(body, "repeat_last_n", { min: -1, integer: true })
   return {
     temperature: numberField(body, "temperature", { min: 0, max: 2 }) ?? base.temperature,
     top_k: numberField(body, "top_k", { min: 0, integer: true }) ?? base.top_k,
     repetition_penalty: numberField(body, "repetition_penalty", { positive: true }) ?? base.repetition_penalty,
     ...(top_p !== undefined && { top_p }),
     ...(min_p !== undefined && { min_p }),
-    ...(presence_penalty !== undefined && { presence_penalty })
+    ...(presence_penalty !== undefined && { presence_penalty }),
+    ...(repeat_last_n !== undefined && { repeat_last_n })
   }
 }
 
