@@ -199,6 +199,12 @@ test("tools and tool_choice", () => {
   assert.deepEqual(named.generate.toolChoice, { name: "get_weather" })
   assert.equal(named.parseTools, false)
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).generate.toolChoice, "required")
+  // A required or named call can't share the reply with a JSON answer: refused, not one dropped.
+  const json = { type: "json_schema", json_schema: { name: "x", schema: { type: "object" } } }
+  for (const tool_choice of ["required", { type: "function", function: { name: "get_weather" } }]) {
+    assert.throws(() => planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice, response_format: json } as never), /response_format can't be combined/)
+  }
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], response_format: json } as never).generate.outputSchema !== undefined, true, "auto with a JSON answer stays")
   // Its call comes as markup, read like auto's (and repaired like it).
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).parseTools, true)
   assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, tool_choice: "required" })), "TypeError")

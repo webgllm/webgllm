@@ -28,7 +28,7 @@ import type { FinishReason as WorkerFinishReason, RunTimings, TokenLogprob, Tool
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
-import { createToolCallSplitter, formatLfm2ToolCalls, lastCallOpen, parseToolCalls } from "./tool-calls.js"
+import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
@@ -400,6 +400,10 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   }
   const stops = (stop ?? []).filter(Boolean) as Array<string>
   const outputSchema = outputSchemaFor(body.response_format)
+  // A required or named call and a JSON answer can't both be the reply: refused, not one quietly dropped.
+  if (outputSchema && tools.length && toolChoice !== "auto" && toolChoice !== "none") {
+    throw new TypeError("response_format can't be combined with a required or named tool_choice: the reply is either the call or the JSON.")
+  }
   if (body.cache_prompt !== undefined && body.cache_prompt !== null && typeof body.cache_prompt !== "boolean") {
     throw new TypeError("cache_prompt must be a boolean.")
   }
@@ -503,15 +507,11 @@ export function createReplyReader(options: {
       if (tools) {
         const { text, markup } = tools.flush()
         if (text) deltas.push({ content: text })
-        calls = markup ? parseToolCalls(markup) : []
-        // Out of tokens inside a call: it's sent as written, as llama.cpp sends it, with
-        // the reply's finish reason "length" (see finishReasonOf), and isn't repaired.
-        const cut = !!markup && end.finishReason === "length" && lastCallOpen(markup)
-        if (cut && calls.length) {
-          const call = calls[calls.length - 1]
-          calls[calls.length - 1] = { ...call, partial: JSON.stringify(call.args).slice(0, -1) }
-        }
-        if (markup && calls.length === 0) malformed = markup
+        // Out of tokens: a call it cut off is sent as written, as llama.cpp sends it (see
+        // finishReasonOf), and nothing in the reply is repaired (see planRepairs).
+        const cut = end.finishReason === "length"
+        calls = markup ? parseToolCalls(markup, cut) : []
+        if (markup && calls.length === 0 && !cut) malformed = markup
       }
       if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
       return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }
@@ -543,11 +543,11 @@ export function usageOf(stats: RunTimings, repairs: ReadonlyArray<RunTimings> = 
 }
 
 /**
- * A reply's finish reason: "tool_calls" for one with calls, unless the last
- * was cut off by the token limit ("length", as llama.cpp says).
+ * A reply's finish reason as llama-server gives it: "length" for one that
+ * ran out of tokens (its calls too), otherwise "tool_calls" for one with calls.
  */
-export function finishReasonOf(calls: ReadonlyArray<{ partial?: string }>, finishReason: WorkerFinishReason): WorkerFinishReason | "tool_calls" {
-  if (calls.some((call) => call.partial !== undefined)) return "length"
+export function finishReasonOf(calls: ReadonlyArray<unknown>, finishReason: WorkerFinishReason): WorkerFinishReason | "tool_calls" {
+  if (finishReason === "length") return "length"
   return calls.length ? "tool_calls" : finishReason
 }
 

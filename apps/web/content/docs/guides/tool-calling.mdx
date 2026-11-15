@@ -46,6 +46,10 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 `parallel_tool_calls: false` keeps only the first call.
 
+A required or named `tool_choice` can't be combined with a JSON `response_format`: the reply is either the call or the JSON, so the request is refused.
+
+A reply that runs out of `max_tokens` finishes with `"length"`, as llama.cpp's does, even when it holds calls. A call it cut off comes back with its arguments as far as they were written (`{"city":"Tok`), and nothing in the reply is repaired.
+
 ## Repair
 
 Automatic and required calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.

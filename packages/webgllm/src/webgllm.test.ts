@@ -710,9 +710,29 @@ test("a call cut off by max_tokens comes back as written, with finish_reason len
   // Streamed alike.
   const chunks = await collect(await client.chat.completions.create({ model: QWEN, messages: hi, tools, tool_choice: "required", stream: true }))
   assert.equal(chunks.at(-1)?.choices[0]?.finish_reason, "length")
-  // A closed call at the token limit is a call.
+  // A closed call at the token limit stands as written; the reply still ran out ("length", as llama-server says).
   const closed = llm({ reply: () => ({ tokens: ["<tool_call>\n<function=edit_cards>\n<parameter=n>\n2\n</parameter>\n</function>\n</tool_call>"], done: { finishReason: "length" } }) })
   const whole = await closed.llm.chat.completions.create({ model: QWEN, messages: hi, tools, tool_choice: "required" })
-  assert.equal(whole.choices[0]?.finish_reason, "tool_calls")
+  assert.equal(whole.choices[0]?.finish_reason, "length")
   assert.equal(whole.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"n":2}')
+})
+
+test("out of tokens after a finished call, inside a second one's opener: the finished call stands whole", async () => {
+  const weather = [{ type: "function" as const, function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }]
+  const tokyo = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>"
+  for (const parallel of [true, false]) {
+    const { llm: client } = llm({ reply: () => ({ tokens: [tokyo, "<tool_call>\n<func"], done: { finishReason: "length" } }) })
+    const body = { model: QWEN, messages: hi, tools: weather, tool_choice: "required" as const, parallel_tool_calls: parallel }
+    const completion = await client.chat.completions.create(body)
+    assert.equal(completion.choices[0]?.finish_reason, "length")
+    assert.deepEqual(completion.choices[0]?.message.tool_calls?.map((c) => c.function), [{ name: "get_weather", arguments: '{"city":"Tokyo"}' }])
+    const chunks = await collect(await client.chat.completions.create({ ...body, stream: true }))
+    const streamed = chunks.flatMap((c) => c.choices[0]?.delta.tool_calls ?? []).map((c) => c.function)
+    assert.deepEqual(streamed, [{ name: "get_weather", arguments: '{"city":"Tokyo"}' }])
+    assert.equal(chunks.at(-1)?.choices[0]?.finish_reason, "length")
+  }
+  // Cut inside a value: the value so far, as an open string.
+  const { llm: inValue } = llm({ reply: () => ({ tokens: ["<tool_call>\n<function=get_weather>\n<parameter=city>\nTok"], done: { finishReason: "length" } }) })
+  const cut = await inValue.chat.completions.create({ model: QWEN, messages: hi, tools: weather, tool_choice: "required" })
+  assert.equal(cut.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"city":"Tok')
 })

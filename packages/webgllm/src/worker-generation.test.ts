@@ -75,6 +75,9 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const queue = script.slice()
   const stopped = new Set<string>(), messages: WorkerResponse[] = []
   const masks: Array<Uint32Array | null> = []
+  // The mask in force at each pick.
+  const stepMasks: Array<Uint32Array | null> = []
+  let current: Uint32Array | null = null
   // What the penalties were given: the tokens set as seen, and each pick's penalties.
   const seen: number[][] = [], penalties: Array<[number, number]> = []
   let position = 0
@@ -94,7 +97,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     gpu: { compiled: { count: 0, times: new Map() }, bytes: 0, presentationAdvice: { relaxation: true }, validatedPresentation: undefined,
       calibratePromptPacing: () => undefined },
     tuned: { submissionOverlap: 0 },
-    setAllowedTokens(mask: Uint32Array | null) { masks.push(mask) }, setAllowedTokenRows() {},
+    setAllowedTokens(mask: Uint32Array | null) { masks.push(mask); current = mask }, setAllowedTokenRows() {},
     dropGuess() {}, keepGuess() {}, accept() {}, reset() {}, canResume() { return false },
     rewind() { position = 0; return 0 }, rewindPosition() { return 0 }, snapshotPosition() { return undefined }, snapshot() { return undefined },
     batchSizes(count: number) { return [count] },
@@ -104,6 +107,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {}, setSeenState() {},
     async argmax(_row: number, _rows: number, penalty: number, _seenRows: unknown[], _guess: boolean, presence = 0) {
       penalties.push([penalty, presence])
+      stepMasks.push(current)
       return Int32Array.of(queue.shift() ?? EOS)
     },
     // Every logit read back: the scripted token at 4, the one after it in the script at 2, the rest at 0.
@@ -139,7 +143,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const model = { model: "LiquidAI/LFM3-1.7B-GGUF", engine, tokenizer, cached: [] as number[], claimed: 0, prefixes: new PrefixStore(() => {}) }
   const state = { stopped, messages, model, constraint: options.constraint, processors: options.processors, claims, reclaimBytes: options.growBy === undefined ? undefined : 32 * 2 ** 20 }
   const generate = makeGenerate(state) as ((r: Request) => Promise<void>) & { forward: (r: Forward) => Promise<void>; reset: (r: Extract<WorkerRequest, { type: "reset" }>) => void }
-  return { generate, messages, masks, seen, penalties, reads, claims, model }
+  return { generate, messages, masks, stepMasks, seen, penalties, reads, claims, model }
 }
 
 type Request = Extract<WorkerRequest, { type: "generate" }>
@@ -265,6 +269,29 @@ test("required, as llama.cpp has it: the call in the model's own format, text be
   assert.equal(blocksEnd(set[1]), false)
   assert.equal(text(s.messages), "Hello<tool_call>a</tool_call>")
   assert.equal(done(s.messages).toolCall, undefined, "parsed from the text on the main thread, like auto's")
+})
+
+test("required: a closing marker with no call opened, or a call written in the thinking, doesn't let the reply end", async () => {
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // "Hello</tool_call>": every mask after it still refuses the end.
+  const unmatched = scripted([id("Hello"), TOOL_CALL_END, id("a")])
+  await unmatched.generate(request({ tools: [weather], toolChoice: "required" }))
+  assert.ok(unmatched.masks.filter((m) => m !== null).every(blocksEnd))
+  // A whole call inside the thinking: still refused after it, until one in the answer.
+  const script = [THINK, TOOL_CALL, id("a"), TOOL_CALL_END, THINK_END, TOOL_CALL, id("b"), TOOL_CALL_END]
+  const thought = scripted(script)
+  await thought.generate(request({ tools: [weather], toolChoice: "required", thinking: true }))
+  // Pick i draws token i+1 (pick 0 drew the first). The end is refused through the answer's call, then open.
+  const refused = thought.stepMasks.map(blocksEnd)
+  assert.deepEqual(refused.slice(0, script.length), Array(script.length).fill(true))
+  assert.equal(refused[script.length], false, "open once the answer's call is closed")
+})
+
+test("an output schema with a required or named call is refused", async () => {
+  for (const toolChoice of ["required", { name: "get_weather" }] as const) {
+    const s = scripted([])
+    await assert.rejects(s.generate(request({ tools: [weather], toolChoice, outputSchema: { type: "object" } })), /can't be combined/)
+  }
 })
 
 test("toolChoice naming an unknown tool fails", async () => {

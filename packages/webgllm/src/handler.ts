@@ -976,6 +976,10 @@ async function generate(request: GenerateRequest) {
     ? [tokenizer.specialTokens.toolCallEnd, tokenizer.tokenToId("<|tool_call_end|>")].filter((t): t is number => typeof t === "number" && t >= 0)
     : []
   let called = toolPlan.mode !== "required"
+  // A required or forced call and a JSON answer can't both be the reply (chat-completions refuses it too).
+  if (request.outputSchema && (toolPlan.mode === "required" || toolPlan.mode === "forced")) {
+    throw new Error("An output schema can't be combined with a required or named tool choice.")
+  }
   // A forced call is the reply: its arguments' schema takes the answer's place.
   const answerSchema = forced ? forced.schema : request.outputSchema
   const tokenizeAt = performance.now()
@@ -1450,8 +1454,11 @@ async function generate(request: GenerateRequest) {
   let stopHit = false
   let sawEos = false
   let callText = ""
-  // The reply's last characters while a "required" call isn't written yet.
+  // The answer's last characters while a "required" call isn't written yet,
+  // whether its opening marker is written, and whether the reply is in its thinking.
   let callTail = ""
+  let callOpen = false
+  let answerThinking = startsInThinking
   let unfiltered = false
   /** Sends reply text; false once a stop sequence ended the reply. */
   const send = (text: string, constrained = false) => {
@@ -1509,12 +1516,26 @@ async function generate(request: GenerateRequest) {
     else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
-    if (!called && callEnds.includes(t)) called = true
     const text = decoder.push(t)
-    // (A closing marker written as text, not its token, closes the call too.)
-    if (!called && text) {
-      callTail = (callTail + text).slice(-32)
-      if (callTail.includes("</tool_call>") || callTail.includes("<|tool_call_end|>")) called = true
+    // A "required" call is written once the answer (not the thinking) has a
+    // call's opening marker and then its closing one, as tokens or as text.
+    if (!called) {
+      if (t === think) answerThinking = true
+      else if (t === tokenizer.specialTokens.thinkEnd) {
+        answerThinking = false
+        callTail = ""
+      } else if (!answerThinking && text) {
+        callTail += text
+        if (!callOpen) {
+          const at = Math.max(callTail.lastIndexOf("<tool_call>"), callTail.lastIndexOf("<|tool_call_start|>"))
+          if (at >= 0) {
+            callOpen = true
+            callTail = callTail.slice(at)
+          }
+        }
+        if (callOpen && (callTail.includes("</tool_call>") || callTail.includes("<|tool_call_end|>"))) called = true
+        callTail = callTail.slice(-32)
+      }
     }
     if (text) {
       if (calling) {
