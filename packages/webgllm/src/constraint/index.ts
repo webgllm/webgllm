@@ -1,6 +1,6 @@
 import type { JsonGuidanceRuntime } from "llguidance/json-schema"
 import { canonicalAsciiObject, canonicalTokenMask } from "./canonical-mask.js"
-import { FixedStrings, fixedStringTokens, lengthBounds } from "./fixed-strings.js"
+import { FixedStrings, fixedStringTokens, lengthBounds, plain, walked } from "./fixed-strings.js"
 import { jsonTokens, nextStringState, type JsonTokens, type StringState } from "./whitespace.js"
 
 /** Exact model tokenizer, not token strings decoded independently. */
@@ -263,16 +263,12 @@ const jsonType = (value: unknown) =>
  * In llguidance 0.2.1 a string's minLength or maxLength makes every mask
  * slow, whatever the length: 112-131 ms a token with LFM3's vocabulary,
  * against 3 ms for the same string without it (9x the whole answer). Where
- * the schema can be followed plainly as the document is written (see
- * fixed-strings.ts: properties, items, prefixItems), webgllm holds strings
- * to their lengths itself, and the masks run without them; elsewhere they
- * stay with llguidance.
+ * the document walker reads the schema as the document is written (see
+ * fixed-strings.ts: walked, through properties of plain names, items and
+ * prefixItems), webgllm holds strings to their lengths itself, and the
+ * masks run without them; elsewhere they stay with llguidance.
  */
 const LENGTHS = new Set(["minLength", "maxLength"])
-/** Children the document walker follows plainly (and how: a map of schemas, or one, or a list). */
-const FOLLOWED_MAPS = new Set(["properties"])
-const FOLLOWED_VALUES = new Set(["items"])
-const FOLLOWED_LISTS = new Set(["prefixItems"])
 
 /**
  * The schema with what llguidance doesn't prune taken out, and whether
@@ -286,18 +282,18 @@ export function prunableSchema(schema: unknown, options: { lengths?: boolean } =
   const visit = (node: unknown, followed = false): unknown => {
     if (Array.isArray(node)) return node.map((item) => visit(item))
     if (!isRecord(node)) return node
-    // A choice of null or one schema is followed through to that schema.
-    const choice = (["anyOf", "oneOf"] as const).find((key) => Array.isArray(node[key]))
-    const throughChoice = followed && choice !== undefined && (node[choice] as unknown[]).filter((b) => !(isRecord(b) && b.type === "null")).length === 1
+    // Only what the walker reads, as it reads it: the node itself, or a lone choice's one branch.
+    const how = followed && options.lengths ? walked(node) : null
+    const self = how === "self"
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(node)) {
-      if (UNPRUNED.has(key) || (options.lengths && followed && LENGTHS.has(key))) {
+      if (UNPRUNED.has(key) || (self && LENGTHS.has(key))) {
         loosened = true
         continue
       }
-      if (SCHEMA_MAPS.includes(key) && isRecord(value)) out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, visit(v, followed && FOLLOWED_MAPS.has(key))]))
-      else if (SCHEMA_LISTS.includes(key) && Array.isArray(value)) out[key] = value.map((v) => visit(v, (followed && FOLLOWED_LISTS.has(key)) || (throughChoice && key === choice)))
-      else if (SCHEMA_VALUES.includes(key)) out[key] = visit(value, followed && FOLLOWED_VALUES.has(key))
+      if (SCHEMA_MAPS.includes(key) && isRecord(value)) out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, visit(v, self && key === "properties" && plain(k))]))
+      else if (SCHEMA_LISTS.includes(key) && Array.isArray(value)) out[key] = value.map((v, i) => visit(v, (self && key === "prefixItems") || (how !== null && typeof how === "object" && how.key === key && how.branch === i)))
+      else if (SCHEMA_VALUES.includes(key)) out[key] = visit(value, self && key === "items")
       else if (key === "not" || key === "if" || key === "then" || key === "else") {
         const before = loosened
         loosened = false
@@ -350,7 +346,9 @@ export function inlineRefs(schema: unknown): unknown {
   const target = (ref: string): unknown => {
     const match = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(ref)
     const defs = match ? root[match[1]] : undefined
-    return match && isRecord(defs) ? defs[decodeURIComponent(match[2]).replace(/~1/g, "/").replace(/~0/g, "~")] : undefined
+    const name = match ? decodeURIComponent(match[2]).replace(/~1/g, "/").replace(/~0/g, "~") : ""
+    // Only the schema's own definitions: never Object.prototype's (a $ref to "__proto__" stays, and fails to compile as before).
+    return match && isRecord(defs) && Object.hasOwn(defs, name) ? defs[name] : undefined
   }
   let size = 0
   let left = false

@@ -111,3 +111,59 @@ test("inlineRefs writes local references in place; recursive ones, and ones with
   const values = { properties: { x: { enum: [{ $ref: "#/$defs/tag" }], default: { $ref: "#/$defs/tag" } } }, $defs: { tag } }
   assert.deepEqual(inlineRefs(values), { properties: values.properties })
 })
+
+test("where the walker can't read the schema, lengths stay with llguidance: allOf beside, allOf above, a key not spelled plainly", async () => {
+  const cases = [
+    closed({ s: { type: "string", maxLength: 2, allOf: [{}] } }),
+    { ...closed({ s: { type: "string", maxLength: 2 } }), allOf: [{}] },
+    closed({ é: { type: "string", maxLength: 2 } })
+  ]
+  for (const schema of cases) {
+    assert.equal(JSON.stringify(prunableSchema(schema, { lengths: true }).schema).includes('"maxLength":2'), true, JSON.stringify(schema))
+  }
+  // And the mask still holds them: the base's behavior, a third character refused.
+  const c = await createConstraint({ schema: cases[0], tokenizer })
+  accept(c, '{"s": "ab')
+  assert.equal(allows(c, byte("c")), false)
+  c.dispose()
+})
+
+test("a surrogate pair of \\u escapes is one character, also written a byte at a time; raw UTF-8 too", async () => {
+  const c = await createConstraint({ schema: closed({ s: { type: "string", maxLength: 1 } }), tokenizer })
+  accept(c, '{"s": "\\uD83D')
+  // At maxLength, only the low half may follow.
+  accept(c, "\\u")
+  assert.equal(allows(c, byte("0")), false, "\\u0… isn't a low surrogate")
+  accept(c, "DE00")
+  assert.equal(allows(c, byte("a")), false)
+  accept(c, '"}')
+  assert.equal(c.complete, true)
+  c.dispose()
+
+  const raw = await createConstraint({ schema: closed({ s: { type: "string", maxLength: 1 } }), tokenizer })
+  accept(raw, '{"s": "😀"}')
+  assert.equal(raw.complete, true)
+  raw.dispose()
+
+  // After one ordinary character at maxLength, no escape fits at all.
+  const full = await createConstraint({ schema: closed({ s: { type: "string", maxLength: 1 } }), tokenizer })
+  accept(full, '{"s": "a')
+  assert.equal(allows(full, byte("\\")), false)
+  full.dispose()
+})
+
+test("minLength counts a surrogate pair once", async () => {
+  const c = await createConstraint({ schema: closed({ s: { type: "string", minLength: 2 } }), tokenizer })
+  accept(c, '{"s": "\\ud83d\\ude00')
+  assert.equal(allows(c, byte('"')), false, "one character so far")
+  accept(c, "x")
+  assert.equal(allows(c, byte('"')), true)
+  c.dispose()
+})
+
+test("a $ref to what isn't the schema's own definition (Object.prototype's) stays, and fails to compile as before", async () => {
+  const schema = closed({ x: { $ref: "#/$defs/__proto__" } })
+  const withDefs = { ...schema, $defs: {} }
+  assert.deepEqual((inlineRefs(withDefs) as { properties: unknown }).properties, { x: { $ref: "#/$defs/__proto__" } })
+  await assert.rejects(createConstraint({ schema: withDefs, tokenizer }), (e: Error & { code?: string }) => e.code === "unsupported-schema")
+})

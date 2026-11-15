@@ -29,7 +29,7 @@ const HIGH = 0x80
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value)
 /** Printable ASCII that JSON writes as itself: one spelling without escapes. */
-const plain = (value: unknown): value is string => typeof value === "string" && /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/.test(value)
+export const plain = (value: unknown): value is string => typeof value === "string" && /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/.test(value)
 const ANNOTATIONS = new Set(["description", "title", "$comment", "default", "examples", "deprecated", "readOnly", "writeOnly"])
 /** Keywords under which a value's shape isn't the node's own to read. */
 const INDIRECT = ["allOf", "not", "if", "then", "else", "dependentSchemas"]
@@ -178,6 +178,25 @@ function resolve(root: unknown, node: unknown, depth = 0): Record<string, unknow
   return INDIRECT.some((key) => key in node) ? null : node
 }
 
+/**
+ * How the document walker reads a node (see resolve): as itself, through
+ * its one branch that isn't null (a choice with nothing else beside it but
+ * annotations), or not at all (a $ref, composition, or a choice of several).
+ * What it can't read, it holds nothing in (see prunableSchema).
+ */
+export function walked(node: unknown): "self" | { branch: number; key: "anyOf" | "oneOf" } | null {
+  if (!isRecord(node)) return null
+  if ("$ref" in node || INDIRECT.some((key) => key in node)) return null
+  for (const key of ["anyOf", "oneOf"] as const) {
+    if (!(key in node)) continue
+    const branches = node[key]
+    if (!Array.isArray(branches) || !Object.keys(node).every((other) => other === key || ANNOTATIONS.has(other))) return null
+    const rest = branches.map((branch, i) => ({ branch, i })).filter(({ branch }) => !(isRecord(branch) && branch.type === "null"))
+    return rest.length === 1 ? { branch: rest[0].i, key } : null
+  }
+  return "self"
+}
+
 /** An object whose keys are its listed properties, all plain. */
 const fixedKeys = (node: Record<string, unknown> | null): boolean =>
   !!node && node.additionalProperties === false && !("patternProperties" in node) &&
@@ -241,10 +260,13 @@ class Position {
   /** The open value string's minLength and maxLength, when the schema gives them (see filter). */
   min: number | undefined
   max: number | undefined
-  /** Characters the open string holds so far (an escape is one). */
+  /** Characters the open string holds so far (an escape is one, a surrogate pair of \u escapes one). */
   chars = 0
-  /** Hex digits left of a \u escape. */
+  /** Hex digits left of a \u escape, and its value so far. */
   hex = 0
+  hexValue = 0
+  /** The last character was a \u escape of a high surrogate: a low one next pairs with it. */
+  high = false
 
   /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder): generation, not checking. */
   constructor(private readonly root: unknown, private readonly ordered = false) {}
@@ -260,7 +282,14 @@ class Position {
     copy.max = this.max
     copy.chars = this.chars
     copy.hex = this.hex
+    copy.hexValue = this.hexValue
+    copy.high = this.high
     return copy
+  }
+
+  /** The open string holds more characters than its maxLength. */
+  private long() {
+    return this.max !== undefined && this.chars > this.max
   }
 
   /** The schema of the value that comes next. */
@@ -287,14 +316,34 @@ class Position {
     if (this.inString) {
       if (this.escaped) {
         this.escaped = false
-        if (code === 0x75) this.hex = 4
-        return this.fixed
+        if (code === 0x75) {
+          // A \u escape: counted once its digits say what it is.
+          this.hex = 4
+          this.hexValue = 0
+          return this.fixed
+        }
+        this.high = false
+        this.chars++
+        return this.fixed || this.long()
       }
       if (this.hex > 0) {
-        // A \u escape's digits: part of the one character its backslash counted.
         this.hex--
-        if (this.isKey && top && top.key !== null) top.key += String.fromCharCode(code)
-        return false
+        const digit = code >= 0x30 && code <= 0x39 ? code - 0x30 : (code | 0x20) >= 0x61 && (code | 0x20) <= 0x66 ? (code | 0x20) - 0x57 : 0
+        this.hexValue = this.hexValue * 16 + digit
+        // At maxLength only a low surrogate may follow a high one: \udc00 to \udfff.
+        const pairing = this.high && this.max !== undefined && this.chars >= this.max
+        if (pairing && this.hex === 3 && digit !== 0xd) return true
+        if (pairing && this.hex === 2 && digit < 0xc) return true
+        if (this.hex > 0) return false
+        const v = this.hexValue
+        if (this.high && v >= 0xdc00 && v <= 0xdfff) {
+          // The second half of a pair: one character with the first.
+          this.high = false
+          return false
+        }
+        this.high = v >= 0xd800 && v <= 0xdbff
+        this.chars++
+        return this.long()
       }
       if (code === QUOTE) {
         this.inString = false
@@ -308,11 +357,20 @@ class Position {
         }
         return this.min !== undefined && this.chars < this.min
       }
+      if (code === BACKSLASH) {
+        // An escape: counted at its next byte (see above). At maxLength, only one
+        // that can be the second half of a surrogate pair fits.
+        this.escaped = true
+        if (this.isKey && top) top.key = null
+        return this.fixed || (this.max !== undefined && this.chars >= this.max && !this.high)
+      }
       // A character starts at any byte but a UTF-8 continuation byte (10xxxxxx).
-      if (code < 0x80 || code >= 0xc0) this.chars++
-      const long = this.max !== undefined && this.chars > this.max
-      if (code === BACKSLASH || code >= HIGH) {
-        this.escaped = code === BACKSLASH
+      if (code < 0x80 || code >= 0xc0) {
+        this.chars++
+        this.high = false
+      }
+      const long = this.long()
+      if (code >= HIGH) {
         // (A key written with them isn't looked up: what follows it is left alone.)
         if (this.isKey && top) top.key = null
         return this.fixed || long
@@ -331,6 +389,7 @@ class Position {
         this.isKey = !!top && top.object && top.expectKey
         this.chars = 0
         this.hex = 0
+        this.high = false
         this.min = undefined
         this.max = undefined
         if (this.isKey) {

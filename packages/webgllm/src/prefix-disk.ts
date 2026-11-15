@@ -129,15 +129,21 @@ export function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Prom
   })
 }
 
-/** A file's name: its tokens' count and their hash (compared in full when read). */
-function nameOf(keys: ArrayLike<number>) {
+/**
+ * A file's name: its tokens' count and their hash (compared in full when
+ * read), and its identity's hash, so two identities' files of the same
+ * tokens never share a name.
+ */
+function nameOf(keys: ArrayLike<number>, identity: string) {
   let a = 0x811c9dc5
   let b = 0x01000193
   for (let i = 0; i < keys.length; i++) {
     a = Math.imul(a ^ keys[i], 0x01000193)
     b = Math.imul(b ^ keys[i], 0x5bd1e995) ^ (b >>> 15)
   }
-  return `${keys.length}-${(a >>> 0).toString(16)}${(b >>> 0).toString(16)}${SUFFIX}`
+  let c = 0x811c9dc5
+  for (let i = 0; i < identity.length; i++) c = Math.imul(c ^ identity.charCodeAt(i), 0x01000193)
+  return `${keys.length}-${(a >>> 0).toString(16)}${(b >>> 0).toString(16)}-${(c >>> 0).toString(16)}${SUFFIX}`
 }
 
 /** A last-use time as the file holds it (f64, little-endian). */
@@ -241,7 +247,12 @@ export class PrefixDisk {
     if (!best) return undefined
     try {
       const found = await this.readHeader(best.name)
-      if (!found || found.entry.foreign) throw new Error("The file changed.")
+      if (found?.entry.foreign) {
+        // Another identity's now (rewritten since this index read it): left for it.
+        index.set(best.name, found.entry)
+        return undefined
+      }
+      if (!found) throw new Error("The file changed.")
       const { header, dataAt } = found
       const file = await this.folder.read(best.name, dataAt)
       const textures: Array<PrefixTexture> = []
@@ -264,7 +275,7 @@ export class PrefixDisk {
 
   /** Marks the file holding exactly `keys`, if there's one, as used now (a hit in memory counts too). */
   async touch(keys: ArrayLike<number>) {
-    const entry = (await this.entries()).get(nameOf(keys))
+    const entry = (await this.entries()).get(nameOf(keys, this.identity))
     if (!entry || entry.foreign || entry.keys.length !== keys.length || !startsWith(keys, entry.keys)) return
     entry.used = this.stamp()
     await this.folder.writeAt(entry.name, 8, usedBytes(entry.used)).catch(() => undefined)
@@ -272,7 +283,7 @@ export class PrefixDisk {
 
   /** Whether a file holds exactly `keys`. */
   async has(keys: ArrayLike<number>) {
-    const entry = (await this.entries()).get(nameOf(keys))
+    const entry = (await this.entries()).get(nameOf(keys, this.identity))
     return !!entry && !entry.foreign && entry.keys.length === keys.length && startsWith(keys, entry.keys)
   }
 
@@ -297,7 +308,7 @@ export class PrefixDisk {
     const total = HEAD + head.byteLength + 4 * keys.length + data
     if (total > this.limit) return
     const index = await this.entries()
-    const name = nameOf(keys)
+    const name = nameOf(keys, this.identity)
     await this.evict(total, name)
     const used = this.stamp()
     const start = new Uint8Array(HEAD)

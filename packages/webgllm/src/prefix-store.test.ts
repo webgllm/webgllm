@@ -592,3 +592,23 @@ test("untilAborted stops waiting when the signal aborts", async () => {
   assert.equal(await untilAborted(Promise.resolve("now"), new AbortController().signal), "now")
   assert.equal(await untilAborted(Promise.resolve("no signal")), "no signal")
 })
+
+test("two identities saving the same tokens keep a file each; a stale index never deletes the other's", async () => {
+  const { files, folder } = memoryFolder()
+  const a = new PrefixDisk(folder, "bundle a")
+  const b = new PrefixDisk(folder, "bundle b")
+  await a.save([1, 2], [texture(1)])
+  assert.ok(await a.has([1, 2]))
+  await b.save([1, 2], [texture(2)])
+  assert.equal(files.size, 2, "a file each")
+  // a's index, read before b saved, still finds its own file, and b's stays.
+  const found = await a.match([1, 2, 3], 2)
+  assert.ok(found?.textures[0].bytes.every((x) => x === 1))
+  assert.equal(files.size, 2)
+  assert.ok((await b.match([1, 2, 3], 2))?.textures[0].bytes.every((x) => x === 2))
+  // A file rewritten under a's name by another identity: a leaves it.
+  const [name] = [...files.keys()].filter((n) => new TextDecoder().decode(files.get(n)!.bytes).includes('"identity":"bundle a"'))
+  files.set(name, { bytes: files.get([...files.keys()].find((n) => n !== name)!)!.bytes.slice() })
+  assert.equal(await a.match([1, 2, 3], 2), undefined)
+  assert.equal(files.size, 2, "not deleted")
+})
