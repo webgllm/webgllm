@@ -1,3 +1,30 @@
+## 0.3.6 (2026-11-15)
+
+### 🩹 Fixes
+
+- a required call is read from the answer as the reply reader reads it, thinking tags split across tokens too ([11acde2](https://github.com/webgllm/webgllm/commit/11acde2))
+- cut-off calls by their own text, required calls only from a matched call in the answer, and no JSON answer beside a required call ([9c60d80](https://github.com/webgllm/webgllm/commit/9c60d80))
+- top-p and min-p before the temperature, and the presence penalty on the whole window, as llama.cpp samples ([b68d7ce](https://github.com/webgllm/webgllm/commit/b68d7ce))
+- **constraint:** whitespace runs as llama.cpp's grammar takes them; no stray-colon rule of webgllm's own ([c7ad450](https://github.com/webgllm/webgllm/commit/c7ad450))
+- a call cut off by max_tokens comes back as written, with finish_reason length, as llama.cpp sends it ([71265a7](https://github.com/webgllm/webgllm/commit/71265a7))
+- tool_choice required as llama.cpp has it: the call in the model's own format, and no end before it ([b9ec50b](https://github.com/webgllm/webgllm/commit/b9ec50b))
+- **constraint:** whitespace after a value only before the end of what holds it, as llama.cpp's grammar takes it ([f968908](https://github.com/webgllm/webgllm/commit/f968908))
+- **constraint:** an object with rules over its keys as a whole isn't held to an order ([b55cf08](https://github.com/webgllm/webgllm/commit/b55cf08))
+- a batch of drafts checks each row with the penalties drawing them one by one would apply ([f94a19f](https://github.com/webgllm/webgllm/commit/f94a19f))
+- **constraint:** whitespace optional after a key's colon, as in llama.cpp's grammar; a value right after it can't open with a stray colon ([f89e80d](https://github.com/webgllm/webgllm/commit/f89e80d))
+- lengths pruned only where the walker reads the schema; a surrogate pair counts once; only own definitions inlined; identity in prefix file names ([88f1c14](https://github.com/webgllm/webgllm/commit/88f1c14))
+- **constraint:** closed objects' keys in llama.cpp's order when generating (required as declared, then optional as declared); checking a parsed value takes any order ([26f8e34](https://github.com/webgllm/webgllm/commit/26f8e34))
+- repetition and presence penalties as llama.cpp applies them: the last 64 tokens (repeat_last_n), prompt included, inside structured answers too ([1cdc75c](https://github.com/webgllm/webgllm/commit/1cdc75c))
+
+### 🔥 Performance
+
+- warm the constraint compiler when idle after a load; leave another identity's prefix files on disk instead of deleting them ([2c1aeb1](https://github.com/webgllm/webgllm/commit/2c1aeb1))
+- **constraint:** $refs written in place, and string lengths held outside llguidance, where its masks were 27-34x slower ([0b06b9a](https://github.com/webgllm/webgllm/commit/0b06b9a))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.5 (2026-11-15)
 
 ### 🚀 Features
