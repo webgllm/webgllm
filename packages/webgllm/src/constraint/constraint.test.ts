@@ -107,7 +107,9 @@ test("JSON takes whitespace where models write it, in runs of at most MAX_WHITES
   accept(c, "{\n  ")
   accept(c, '"answer"')
   accept(c, ":")
-  assert.equal(tokenAllowed(c.computeMask(), 34), false, "the key separator's space comes first")
+  // Whitespace after the colon is optional, as in llama.cpp's grammar: the model lays it out.
+  assert.equal(tokenAllowed(c.computeMask(), 34), true, "the value right away")
+  assert.equal(tokenAllowed(c.computeMask(), 32), true, "or a space first")
   accept(c, " ")
   accept(c, '"a b"\n}')
   assert.equal(c.complete, true)

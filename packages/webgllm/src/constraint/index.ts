@@ -219,14 +219,20 @@ type Layout = { whitespace_flexible: boolean; key_separator: string; item_separa
 /** JSON.stringify's layout. */
 const COMPACT: Layout = { whitespace_flexible: false, key_separator: ":", item_separator: "," }
 /**
- * Whitespace between any two tokens, and the key separator's space required
- * (flexible alone also takes `":` again after a key's colon). Items stay ","
- * apart: llguidance 0.2.1 takes a comma after a closed object's last key when
- * items are ", " apart, then dead-ends
- * (https://github.com/nico-martin/llguidance-js/issues/6). Use ", " once that
- * is fixed.
+ * Whitespace optional between any two tokens, after a key's colon too, as
+ * llama.cpp's JSON Schema grammar has it: the model lays the JSON out as it
+ * would. A required space after the colon held LFM3 to a layout its
+ * prompt's examples didn't use: on DeckGen's add step (13 compact examples)
+ * it went on adding copies of them after the one item asked for, where
+ * llama.cpp, and webgllm with the space optional, write the one item
+ * compactly, the same answer in the same 45 tokens. Without examples LFM3
+ * still writes its spaces. (After a key's colon llguidance 0.2.1 then takes
+ * whitespace or the value's start, nothing else.) Items stay "," apart:
+ * llguidance 0.2.1 takes a comma after a closed object's last key when items
+ * are ", " apart, then dead-ends
+ * (https://github.com/nico-martin/llguidance-js/issues/6).
  */
-const MODEL: Layout = { whitespace_flexible: true, key_separator: ": ", item_separator: "," }
+const MODEL: Layout = { whitespace_flexible: true, key_separator: ":", item_separator: "," }
 /** MODEL when the tokenizer's whitespace tokens can't be read to cap their runs. */
 const MODEL_FIXED: Layout = { whitespace_flexible: false, key_separator: ": ", item_separator: "," }
 

@@ -267,8 +267,17 @@ class Position {
   hexValue = 0
   /** The last character was a \u escape of a high surrogate: a low one next pairs with it. */
   high = false
+  /** The last byte was a key's colon, with nothing after it yet (see `tight`). */
+  colon = false
+  /**
+   * The open value string began right after its key's colon, no whitespace
+   * between: its first character can't be a colon. That's LFM3's `":` token
+   * taken again after the key's own `":`, a value opened with a stray colon
+   * (a value starting with one is still written after a space).
+   */
+  tight = false
 
-  /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder): generation, not checking. */
+  /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder), and no value opens with a stray colon (see tight): generation, not checking. */
   constructor(private readonly root: unknown, private readonly ordered = false) {}
 
   clone(): Position {
@@ -284,6 +293,8 @@ class Position {
     copy.hex = this.hex
     copy.hexValue = this.hexValue
     copy.high = this.high
+    copy.colon = this.colon
+    copy.tight = this.tight
     return copy
   }
 
@@ -345,6 +356,10 @@ class Position {
         this.chars++
         return this.long()
       }
+      if (this.tight) {
+        this.tight = false
+        if (code === 0x3a && this.chars === 0) return true
+      }
       if (code === QUOTE) {
         this.inString = false
         if (this.isKey && top) {
@@ -383,8 +398,12 @@ class Position {
       }
       return long
     }
+    const afterColon = this.colon
+    this.colon = false
     switch (code) {
       case QUOTE:
+        // (When generating: checking a parsed value takes any string.)
+        this.tight = this.ordered && afterColon && !(!!top && top.object && top.expectKey)
         this.inString = true
         this.isKey = !!top && top.object && top.expectKey
         this.chars = 0
@@ -427,6 +446,7 @@ class Position {
         break
       case 0x3a:
         if (top) top.expectKey = false
+        this.colon = !!top?.object
         break
     }
     return false
@@ -486,7 +506,7 @@ export class FixedStrings {
     // Inside an ordered object's key, any token may start a key it may not write yet; between
     // its keys and values (a few tokens: whitespace, comma, brace, quote), any may add a key after its last.
     const top = p.frames[p.frames.length - 1]
-    const ordering = !!top?.order && (p.inString ? p.isKey : true)
+    const ordering = (!!top?.order && (p.inString ? p.isKey : true)) || (!p.inString && p.colon) || (p.inString && p.tight)
     const near = left < this.tokens.longest || ordering
     let out: Uint32Array | undefined
     for (let word = 0; word < mask.length; word++) {

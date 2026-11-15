@@ -219,3 +219,16 @@ test("HF ByteLevel vocabularies: the same, from their pieces", async () => {
   assert.equal(c.complete, true)
   c.dispose()
 })
+
+test("a value may start with a colon after a space; checking a parsed value takes one anywhere", async () => {
+  const schema = closed({ a: { type: "string" }, b: { type: "string" } })
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"a":"')
+  assert.equal(allows(c, byte(":")), false, "right after the key's colon: LFM3's stray colon")
+  c.dispose()
+  const spaced = await createConstraint({ schema, tokenizer })
+  accept(spaced, '{"a": ":)", "b":"x"}')
+  assert.equal(spaced.complete, true)
+  spaced.dispose()
+  assert.equal(await validateStructuredValue(schema, { a: ":)", b: "x" }), true)
+})
