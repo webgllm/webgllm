@@ -212,6 +212,11 @@ const fixedKeys = (node: Record<string, unknown> | null): boolean =>
  */
 const ORDERABLE = new Set(["type", "properties", "required", "additionalProperties", ...ANNOTATIONS])
 
+/** What an array may hold for the walker to know when it can end: its items' one schema, and bounds on how many. */
+const COUNTABLE = new Set(["type", "items", "minItems", "maxItems", ...ANNOTATIONS])
+
+const isSpace = (code: number) => code === 0x20 || code === 0x0a || code === 0x0d || code === 0x09
+
 /**
  * A closed object's keys in llama.cpp's order (see Frame.order), and how
  * many of them are required; undefined unless it has two or more, and
@@ -288,9 +293,19 @@ class Position {
    * (a value starting with one is still written after a space).
    */
   tight = false
+  /** A value just ended (its closing quote, brace or bracket), or a number or literal is being written. */
+  ended = false
+  /**
+   * Whitespace followed a value in an object or array that may end there:
+   * what comes next is its end, not a comma. llama.cpp's grammar takes
+   * whitespace after a value only before the end of what holds it (a
+   * comma comes right after the value), so a value that's followed by more
+   * is written `"a",` and never `"a"\n  ,` (see closable).
+   */
+  spaced = false
 
   /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder), and no value opens with a stray colon (see tight): generation, not checking. */
-  constructor(private readonly root: unknown, private readonly ordered = false) {}
+  constructor(private readonly root: unknown, readonly ordered = false) {}
 
   clone(): Position {
     const copy = new Position(this.root, this.ordered)
@@ -307,7 +322,25 @@ class Position {
     copy.high = this.high
     copy.colon = this.colon
     copy.tight = this.tight
+    copy.ended = this.ended
+    copy.spaced = this.spaced
     return copy
+  }
+
+  /**
+   * Whether the object or array the last value is in may end now: an
+   * ordered object (see keyOrder) once its required keys are written, an
+   * array of items once it holds minItems. Undefined where the walker can't
+   * tell (other rules over it, or no container): there whitespace and
+   * commas are left as llguidance takes them.
+   */
+  private closable(): boolean | undefined {
+    const top = this.frames[this.frames.length - 1]
+    if (!top) return undefined
+    if (top.object) return top.order ? (top.next ?? 0) >= (top.required ?? 0) : undefined
+    const schema = top.schema
+    if (!schema || !Object.keys(schema).every((key) => COUNTABLE.has(key))) return undefined
+    return top.index + 1 >= (typeof schema.minItems === "number" ? schema.minItems : 0)
   }
 
   /** The open string holds more characters than its maxLength. */
@@ -374,6 +407,7 @@ class Position {
       }
       if (code === QUOTE) {
         this.inString = false
+        this.ended = !this.isKey
         if (this.isKey && top) {
           // An ordered object's key: one of those it may write next, after which only the later ones are.
           const keys = nextKeys(top)
@@ -412,6 +446,22 @@ class Position {
     }
     const afterColon = this.colon
     this.colon = false
+    // Whitespace after a value only before the end of what holds it (see spaced): when generating.
+    if (this.ordered && isSpace(code)) {
+      if (this.ended) {
+        this.ended = false
+        const close = this.closable()
+        if (close === false) return true
+        this.spaced = close === true
+      }
+      return false
+    }
+    if (this.ordered) {
+      if (code === 0x2c && this.spaced) return true
+      this.spaced = false
+      // A number or literal being written: whitespace after it follows a value.
+      this.ended = (code >= 0x30 && code <= 0x39) || ((code | 0x20) >= 0x61 && (code | 0x20) <= 0x7a) || code === 0x2e || code === 0x2b || code === 0x2d
+    }
     switch (code) {
       case QUOTE:
         // (When generating: checking a parsed value takes any string.)
@@ -447,6 +497,7 @@ class Position {
       case 0x7d:
       case 0x5d:
         this.frames.pop()
+        this.ended = this.ordered
         break
       case 0x2c:
         if (top?.object) {
@@ -518,17 +569,20 @@ export class FixedStrings {
     // Inside an ordered object's key, any token may start a key it may not write yet; between
     // its keys and values (a few tokens: whitespace, comma, brace, quote), any may add a key after its last.
     const top = p.frames[p.frames.length - 1]
-    const ordering = (!!top?.order && (p.inString ? p.isKey : true)) || (!p.inString && p.colon) || (p.inString && p.tight)
+    // After a value (or in a string that ends in one), when generating: whitespace and commas (see Position.spaced).
+    const spacing = p.ordered && (p.inString ? !p.isKey : p.ended || p.spaced)
+    const ordering = (!!top?.order && (p.inString ? p.isKey : true)) || (!p.inString && (p.colon || spacing)) || (p.inString && p.tight)
+    const closing = spacing && p.inString
     const near = left < this.tokens.longest || ordering
     let out: Uint32Array | undefined
     for (let word = 0; word < mask.length; word++) {
-      let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (near ? ~0 : 0))
+      let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (closing ? quotes[word] : 0) | (near ? ~0 : 0))
       while (bits !== 0) {
         const bit = bits & -bits
         bits ^= bit
         const token = (word << 5) + 31 - Math.clz32(bit)
         // (Near maxLength, a token no longer than what's left can't run past it, unless it's suspect anyway.)
-        if (near && !ordering && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !((short ? quotes[word] : 0) & bit)) continue
+        if (near && !ordering && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !(((short || closing) ? quotes[word] : 0) & bit)) continue
         if (!this.spoils(token)) continue
         out ??= mask.slice()
         out[word] &= ~bit

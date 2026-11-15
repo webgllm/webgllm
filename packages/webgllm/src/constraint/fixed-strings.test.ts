@@ -125,6 +125,53 @@ test("an object with rules over its keys as a whole (property counts, dependenci
   }
 })
 
+test("whitespace after a value only before the end of what holds it, as in llama.cpp's grammar: a comma comes right after the value", async () => {
+  // Both required: after "a"'s value only a comma, no whitespace; after "b"'s, whitespace and then the end, no comma.
+  const c = await createConstraint({ schema: closed({ a: { type: "string" }, b: { type: "string" } }), tokenizer })
+  accept(c, '{"a": "x')
+  assert.equal(allows(c, extra('"\n')), false, "no newline after a value a comma must follow")
+  accept(c, '"')
+  assert.equal(allows(c, byte(" ")), false)
+  assert.equal(allows(c, byte(",")), true)
+  accept(c, ',"b": "y"')
+  assert.equal(allows(c, byte(" ")), true, "whitespace before the end")
+  accept(c, " ")
+  assert.equal(allows(c, byte(",")), false, "no comma after it")
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("an optional key may follow a value directly, or whitespace and the end", async () => {
+  const schema = { type: "object", properties: { a: { type: "string" }, b: { type: "string" } }, required: ["a"], additionalProperties: false }
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"a": "x"')
+  assert.equal(allows(c, byte(",")), true)
+  accept(c, "\n")
+  assert.equal(allows(c, byte(",")), false)
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("in an array, whitespace after an item only once it may end; numbers and nested objects are values too", async () => {
+  const schema = closed({ n: { type: "array", items: { type: "number" }, minItems: 2 }, o: closed({ k: { type: "boolean" }, j: { type: "boolean" } }) })
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"n": [1')
+  assert.equal(allows(c, byte(" ")), false, "one item of two: a comma next")
+  accept(c, ",2")
+  assert.equal(allows(c, byte(" ")), true)
+  accept(c, " ")
+  assert.equal(allows(c, byte(",")), false)
+  accept(c, ']')
+  assert.equal(allows(c, byte("\n")), false, "after the array, more keys: a comma next")
+  accept(c, ',"o": {"k": true,"j": false}')
+  assert.equal(allows(c, byte(" ")), true)
+  accept(c, " }")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
 test("checking a parsed value takes its keys in any order", async () => {
   const schema = closed({ op: { type: "string" }, at: { type: "string" } })
   assert.equal(await validateStructuredValue(schema, { at: "b", op: "a" }), true)
