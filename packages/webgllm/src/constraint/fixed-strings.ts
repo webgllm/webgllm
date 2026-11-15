@@ -183,6 +183,26 @@ const fixedKeys = (node: Record<string, unknown> | null): boolean =>
   !!node && node.additionalProperties === false && !("patternProperties" in node) &&
   (node.properties === undefined || (isRecord(node.properties) && Object.keys(node.properties).every(plain)))
 
+/**
+ * A closed object's keys in llama.cpp's order (see Frame.order), and how
+ * many of them are required; undefined unless it has two or more.
+ */
+function keyOrder(node: Record<string, unknown> | null): { order: Array<string>; required: number } | undefined {
+  if (!fixedKeys(node) || !isRecord(node!.properties)) return undefined
+  const names = Object.keys(node!.properties)
+  if (names.length < 2) return undefined
+  const required = Array.isArray(node!.required) ? node!.required : []
+  const first = names.filter((name) => required.includes(name))
+  return { order: [...first, ...names.filter((name) => !required.includes(name))], required: first.length }
+}
+
+/** The keys an ordered object may write next: the next required one, or once those are written, any optional one after the last. */
+function nextKeys(frame: Frame): Array<string> | undefined {
+  if (!frame.order) return undefined
+  const next = frame.next ?? 0
+  return next < (frame.required ?? 0) ? [frame.order[next]] : frame.order.slice(next)
+}
+
 /** A value whose strings are the const's or the enum's, all plain. */
 const fixedValue = (node: Record<string, unknown> | null): boolean => {
   if (!node) return false
@@ -193,6 +213,14 @@ const fixedValue = (node: Record<string, unknown> | null): boolean => {
 type Frame = {
   object: boolean
   schema: Record<string, unknown> | null
+  /**
+   * A closed object's keys in the order llama.cpp's grammar writes them
+   * (required ones as declared, then optional ones as declared), and the
+   * place of the next one; undefined for any other object.
+   */
+  order?: Array<string>
+  required?: number
+  next?: number
   /** An object's key being written or last written; null when it isn't plain text. */
   key: string | null
   /** An object's next string is a key. */
@@ -218,10 +246,11 @@ class Position {
   /** Hex digits left of a \u escape. */
   hex = 0
 
-  constructor(private readonly root: unknown) {}
+  /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder): generation, not checking. */
+  constructor(private readonly root: unknown, private readonly ordered = false) {}
 
   clone(): Position {
-    const copy = new Position(this.root)
+    const copy = new Position(this.root, this.ordered)
     copy.frames = this.frames.map((frame) => ({ ...frame }))
     copy.inString = this.inString
     copy.escaped = this.escaped
@@ -269,6 +298,14 @@ class Position {
       }
       if (code === QUOTE) {
         this.inString = false
+        if (this.isKey && top) {
+          // An ordered object's key: one of those it may write next, after which only the later ones are.
+          const keys = nextKeys(top)
+          if (!keys) return false
+          if (top.key === null || !keys.includes(top.key)) return true
+          top.next = top.order!.indexOf(top.key) + 1
+          return false
+        }
         return this.min !== undefined && this.chars < this.min
       }
       // A character starts at any byte but a UTF-8 continuation byte (10xxxxxx).
@@ -280,7 +317,12 @@ class Position {
         if (this.isKey && top) top.key = null
         return this.fixed || long
       }
-      if (this.isKey && top && top.key !== null) top.key += String.fromCharCode(code)
+      if (this.isKey && top && top.key !== null) {
+        top.key += String.fromCharCode(code)
+        // Nothing but the start of a key the object may write next.
+        const keys = nextKeys(top)
+        if (keys && !keys.some((key) => key.startsWith(top.key!))) return true
+      }
       return long
     }
     switch (code) {
@@ -303,9 +345,12 @@ class Position {
           }
         }
         break
-      case 0x7b:
-        this.frames.push({ object: true, schema: this.valueSchema(), key: null, expectKey: true, index: 0 })
+      case 0x7b: {
+        const schema = this.valueSchema()
+        const order = this.ordered ? keyOrder(schema) : undefined
+        this.frames.push({ object: true, schema, key: null, expectKey: true, index: 0, ...(order && { order: order.order, required: order.required, next: 0 }) })
         break
+      }
       case 0x5b:
         this.frames.push({ object: false, schema: this.valueSchema(), key: null, expectKey: false, index: 0 })
         break
@@ -314,8 +359,12 @@ class Position {
         this.frames.pop()
         break
       case 0x2c:
-        if (top?.object) top.expectKey = true
-        else if (top) top.index++
+        if (top?.object) {
+          top.expectKey = true
+          // No key may follow the last one an ordered object may write: no comma either.
+          const keys = nextKeys(top)
+          if (keys && keys.length === 0) return true
+        } else if (top) top.index++
         break
       case 0x3a:
         if (top) top.expectKey = false
@@ -323,6 +372,15 @@ class Position {
     }
     return false
   }
+}
+
+/** Whether a schema has a closed object of two or more plain keys anywhere (whose order is held: see keyOrder). */
+export function orderedKeys(schema: unknown, depth = 0): boolean {
+  if (depth > 64) return false
+  if (Array.isArray(schema)) return schema.some((item) => orderedKeys(item, depth + 1))
+  if (!isRecord(schema)) return false
+  if (keyOrder(schema)) return true
+  return Object.entries(schema).some(([key, value]) => key !== "enum" && key !== "const" && key !== "default" && key !== "examples" && orderedKeys(value, depth + 1))
 }
 
 /** Whether a schema has a minLength or maxLength anywhere. */
@@ -341,11 +399,13 @@ export class FixedStrings {
   constructor(
     private readonly tokens: FixedStringTokens,
     schema: unknown,
+    /** Whether closed objects' keys are held to their order (see keyOrder). */
+    ordered = false,
     position?: Position,
-    /** Whether the schema has string lengths to hold (see lengthBounds). */
-    private readonly bounded = schema !== undefined && lengthBounds(schema)
+    /** Whether the schema has string lengths, or keys in an order, to hold (see lengthBounds, keyOrder). */
+    private readonly bounded = schema !== undefined && (lengthBounds(schema) || (ordered && orderedKeys(schema)))
   ) {
-    this.position = position ?? new Position(schema)
+    this.position = position ?? new Position(schema, ordered)
   }
 
   /**
@@ -364,7 +424,11 @@ export class FixedStrings {
     // token with more bytes than characters left (a character is at least one byte).
     const short = p.inString && p.min !== undefined && p.chars < p.min
     const left = p.inString && p.max !== undefined ? p.max - p.chars : Infinity
-    const near = left < this.tokens.longest
+    // Inside an ordered object's key, any token may start a key it may not write yet; between
+    // its keys and values (a few tokens: whitespace, comma, brace, quote), any may add a key after its last.
+    const top = p.frames[p.frames.length - 1]
+    const ordering = !!top?.order && (p.inString ? p.isKey : true)
+    const near = left < this.tokens.longest || ordering
     let out: Uint32Array | undefined
     for (let word = 0; word < mask.length; word++) {
       let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (near ? ~0 : 0))
@@ -373,7 +437,7 @@ export class FixedStrings {
         bits ^= bit
         const token = (word << 5) + 31 - Math.clz32(bit)
         // (Near maxLength, a token no longer than what's left can't run past it, unless it's suspect anyway.)
-        if (near && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !((short ? quotes[word] : 0) & bit)) continue
+        if (near && !ordering && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !((short ? quotes[word] : 0) & bit)) continue
         if (!this.spoils(token)) continue
         out ??= mask.slice()
         out[word] &= ~bit
@@ -396,6 +460,6 @@ export class FixedStrings {
   }
 
   clone(): FixedStrings {
-    return new FixedStrings(this.tokens, undefined, this.position.clone(), this.bounded)
+    return new FixedStrings(this.tokens, undefined, false, this.position.clone(), this.bounded)
   }
 }

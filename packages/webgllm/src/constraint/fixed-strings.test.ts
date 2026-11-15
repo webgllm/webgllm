@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { createConstraint, tokenAllowed, type Constraint } from "./index.js"
+import { createConstraint, tokenAllowed, validateStructuredValue, type Constraint } from "./index.js"
 
 const EOS = 256
 // Every byte as a token, then tokens of several bytes as models have them.
@@ -79,18 +79,40 @@ test("an enum or const value beside free strings is fixed too, in objects and ar
   c.dispose()
 })
 
-test("a required key the model skipped is still added, and nothing else is", async () => {
-  // Reported: "replace": []\n \t \t, "m\n\n\n… without ever closing.
+test("keys come in llama.cpp's order: a required key can't be skipped, so it's never missing", async () => {
+  // Reported: "replace": []\n \t \t, "m\n\n\n… without ever closing, after the model skipped "merge".
   const c = await createConstraint({ schema: closed({ keep: strings, merge: strings, replace: strings }), tokenizer })
-  accept(c, '{"keep": [],"replace": []')
-  assert.equal(allows(c, byte("}")), false)
-  accept(c, ' , "')
-  assert.equal(allowed(c), "m")
-  accept(c, "m")
-  assert.equal(allowed(c), "e")
-  accept(c, 'erge": []}')
+  accept(c, '{"')
+  assert.equal(allowed(c), "k")
+  accept(c, 'keep": [],"')
+  assert.equal(allowed(c), "m", "merge, not replace")
+  accept(c, 'merge": [],"')
+  assert.equal(allowed(c), "r")
+  accept(c, 'replace": []}')
   assert.equal(c.complete, true)
   c.dispose()
+})
+
+test("required keys first as declared, then optional ones as declared, any of them skipped", async () => {
+  const schema = { type: "object", properties: { note: strings, op: { type: "string" }, extra: strings, at: { type: "string" } }, required: ["op", "at"], additionalProperties: false }
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"')
+  assert.equal(allowed(c), "o", "op, the first required")
+  accept(c, 'op": "a","')
+  assert.equal(allowed(c), "a")
+  accept(c, 'at": "b","')
+  // Then the optional ones: note or extra, in that order.
+  assert.equal(allowed(c), "en")
+  accept(c, 'extra": []')
+  assert.equal(allows(c, byte(",")), false, "nothing after the last optional key")
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("checking a parsed value takes its keys in any order", async () => {
+  const schema = closed({ op: { type: "string" }, at: { type: "string" } })
+  assert.equal(await validateStructuredValue(schema, { at: "b", op: "a" }), true)
 })
 
 test("a token of several bytes is judged by where each byte lands", async () => {
@@ -119,7 +141,7 @@ test("nested objects, nullable values and local references are followed", async 
   }
   const c = await createConstraint({ schema, tokenizer })
   accept(c, '{"steps": [{"')
-  assert.equal(allowed(c), "ao")
+  assert.equal(allowed(c), "o", "op comes before at")
   accept(c, 'op": "')
   assert.equal(allowed(c), "ck")
   accept(c, 'keep","at": "')

@@ -12,7 +12,11 @@ export type ConstraintOptions = {
   eosTokenId?: number
   maxTokens?: number
   /**
-   * How the JSON may be laid out. "model" (the default) takes whitespace
+   * How the JSON may be laid out, and whether keys are in order. "model"
+   * (the default, for generation) holds a closed object's keys to the order
+   * llama.cpp's grammar writes them in: required ones as declared, then
+   * optional ones as declared. Small models depend on it: LFM3 writing a
+   * `request` before its `operation` wrote the request worse. It also takes whitespace
    * where models write it, as they write it: held to compact JSON, a model
    * that writes `"key": "value"` (LFM3) gets no ` "` token after the colon
    * or a comma, picks `":` instead and starts a value (or, in an open
@@ -446,7 +450,8 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
   const strings = fixedStringTokens(source, vocabSize)
   return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(schema),
     canonicalAsciiObject(schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined,
-    strings ? new FixedStrings(strings, schema) : undefined)
+    // Keys in llama.cpp's order when generating; checking a parsed value takes them in any order.
+    strings ? new FixedStrings(strings, schema, layout !== COMPACT) : undefined)
 }
 const VALIDATION_EOS = 256
 const validationTokenizer = {
