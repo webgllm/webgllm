@@ -110,6 +110,21 @@ test("required keys first as declared, then optional ones as declared, any of th
   c.dispose()
 })
 
+test("an object with rules over its keys as a whole (property counts, dependencies) isn't held to an order: a valid object can always be finished", async () => {
+  // Ordered, "c" first left no key to follow it, and minProperties no way to close: a dead end.
+  const three = { a: { type: "string" }, b: { type: "string" }, c: { type: "string" } }
+  for (const rule of [{ minProperties: 2 }, { dependentRequired: { c: ["a"] } }]) {
+    const schema = { type: "object", properties: three, additionalProperties: false, ...rule }
+    const c = await createConstraint({ schema, tokenizer })
+    accept(c, '{"c": "x"')
+    assert.equal(allows(c, byte(",")), true, JSON.stringify(rule))
+    accept(c, ',"a": "y"}')
+    assert.equal(c.complete, true)
+    assert.equal(await validateStructuredValue(schema, { c: "x", a: "y" }), true)
+    c.dispose()
+  }
+})
+
 test("checking a parsed value takes its keys in any order", async () => {
   const schema = closed({ op: { type: "string" }, at: { type: "string" } })
   assert.equal(await validateStructuredValue(schema, { at: "b", op: "a" }), true)

@@ -203,11 +203,23 @@ const fixedKeys = (node: Record<string, unknown> | null): boolean =>
   (node.properties === undefined || (isRecord(node.properties) && Object.keys(node.properties).every(plain)))
 
 /**
+ * What an ordered object may hold: its keys and which are required, and
+ * annotations. A rule over its keys as a whole (minProperties,
+ * dependentRequired, …) can need a key the order has already passed, or
+ * forbid closing where the order allows nothing else: a valid object left
+ * with no way to finish. Those objects' keys go in any order (llguidance
+ * still holds them to their rules).
+ */
+const ORDERABLE = new Set(["type", "properties", "required", "additionalProperties", ...ANNOTATIONS])
+
+/**
  * A closed object's keys in llama.cpp's order (see Frame.order), and how
- * many of them are required; undefined unless it has two or more.
+ * many of them are required; undefined unless it has two or more, and
+ * nothing beside them but annotations (see ORDERABLE).
  */
 function keyOrder(node: Record<string, unknown> | null): { order: Array<string>; required: number } | undefined {
   if (!fixedKeys(node) || !isRecord(node!.properties)) return undefined
+  if (!Object.keys(node!).every((key) => ORDERABLE.has(key))) return undefined
   const names = Object.keys(node!.properties)
   if (names.length < 2) return undefined
   const required = Array.isArray(node!.required) ? node!.required : []
