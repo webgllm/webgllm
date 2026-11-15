@@ -28,7 +28,7 @@ import type { FinishReason as WorkerFinishReason, RunTimings, TokenLogprob, Tool
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
-import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
+import { createToolCallSplitter, formatLfm2ToolCalls, lastCallOpen, parseToolCalls } from "./tool-calls.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
@@ -504,6 +504,13 @@ export function createReplyReader(options: {
         const { text, markup } = tools.flush()
         if (text) deltas.push({ content: text })
         calls = markup ? parseToolCalls(markup) : []
+        // Out of tokens inside a call: it's sent as written, as llama.cpp sends it, with
+        // the reply's finish reason "length" (see finishReasonOf), and isn't repaired.
+        const cut = !!markup && end.finishReason === "length" && lastCallOpen(markup)
+        if (cut && calls.length) {
+          const call = calls[calls.length - 1]
+          calls[calls.length - 1] = { ...call, partial: JSON.stringify(call.args).slice(0, -1) }
+        }
         if (markup && calls.length === 0) malformed = markup
       }
       if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
@@ -514,7 +521,7 @@ export function createReplyReader(options: {
       return (options.parallelToolCalls === false ? calls.slice(0, 1) : calls).map((call) => ({
         id: newId(),
         type: "function" as const,
-        function: { name: call.name, arguments: JSON.stringify(call.args) }
+        function: { name: call.name, arguments: call.partial ?? JSON.stringify(call.args) }
       }))
     }
   }
@@ -533,6 +540,15 @@ export function usageOf(stats: RunTimings, repairs: ReadonlyArray<RunTimings> = 
     prompt_tokens_details: { cached_tokens: sum((s) => s.cachedTokens) },
     completion_tokens_details: { reasoning_tokens: sum((s) => s.thinkingTokens ?? 0) }
   }
+}
+
+/**
+ * A reply's finish reason: "tool_calls" for one with calls, unless the last
+ * was cut off by the token limit ("length", as llama.cpp says).
+ */
+export function finishReasonOf(calls: ReadonlyArray<{ partial?: string }>, finishReason: WorkerFinishReason): WorkerFinishReason | "tool_calls" {
+  if (calls.some((call) => call.partial !== undefined)) return "length"
+  return calls.length ? "tool_calls" : finishReason
 }
 
 /**
@@ -555,9 +571,12 @@ const EMPTY_ARGUMENTS = { type: "object", properties: {}, additionalProperties: 
 export async function planRepairs(
   calls: ReadonlyArray<ParsedToolCall>,
   malformed: string | undefined,
-  tools: ReadonlyArray<ChatTool>
+  tools: ReadonlyArray<ChatTool>,
+  finishReason?: WorkerFinishReason
 ): Promise<Array<ToolRepair>> {
   const repairs: Array<ToolRepair> = []
+  // A reply cut off by its token limit is sent as written (see finishReasonOf): nothing in it is repaired.
+  if (finishReason === "length") return repairs
   for (const [index, call] of calls.entries()) {
     const tool = tools.find((t) => t.function.name === call.name)
     if (!tool) {

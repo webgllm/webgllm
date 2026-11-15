@@ -5,7 +5,18 @@
  * - LFM3 and Qwen3.5: `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
  */
 
-export type ParsedToolCall = { name: string; args: Record<string, unknown> }
+/**
+ * A call as parsed. `partial`: the call was cut off (the reply ran out of
+ * tokens before its closing marker), and these are its arguments as far as
+ * they were written, as llama.cpp reports them (`{` for none yet).
+ */
+export type ParsedToolCall = { name: string; args: Record<string, unknown>; partial?: string }
+
+/** Whether the last call in `markup` has no closing marker: it was cut off. */
+export function lastCallOpen(markup: string) {
+  return markup.lastIndexOf("<tool_call>") > markup.lastIndexOf("</tool_call>") ||
+    markup.lastIndexOf("<|tool_call_start|>") > markup.lastIndexOf("<|tool_call_end|>")
+}
 
 /**
  * How a model writes tool calls. Qwen3.5 writes LFM3's XML; its template

@@ -697,3 +697,22 @@ test("log probabilities reach whole and streamed replies as the worker reports t
     assert.deepEqual(entries, [hello])
   }
 })
+
+test("a call cut off by max_tokens comes back as written, with finish_reason length, as llama.cpp sends it; it isn't repaired", async () => {
+  const cut = ["Done.", "<tool_call>\n<function=edit_cards>\n"]
+  const tools = [{ type: "function" as const, function: { name: "edit_cards", parameters: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] } } }]
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: cut, done: { finishReason: "length" } }) })
+  const completion = await client.chat.completions.create({ model: QWEN, messages: hi, tools, tool_choice: "required" })
+  assert.equal(completion.choices[0]?.finish_reason, "length")
+  assert.equal(completion.choices[0]?.message.content, "Done.")
+  assert.deepEqual(completion.choices[0]?.message.tool_calls?.[0]?.function, { name: "edit_cards", arguments: "{" })
+  assert.equal(workers.of(QWEN)!.generations().length, 1, "no repair")
+  // Streamed alike.
+  const chunks = await collect(await client.chat.completions.create({ model: QWEN, messages: hi, tools, tool_choice: "required", stream: true }))
+  assert.equal(chunks.at(-1)?.choices[0]?.finish_reason, "length")
+  // A closed call at the token limit is a call.
+  const closed = llm({ reply: () => ({ tokens: ["<tool_call>\n<function=edit_cards>\n<parameter=n>\n2\n</parameter>\n</function>\n</tool_call>"], done: { finishReason: "length" } }) })
+  const whole = await closed.llm.chat.completions.create({ model: QWEN, messages: hi, tools, tool_choice: "required" })
+  assert.equal(whole.choices[0]?.finish_reason, "tool_calls")
+  assert.equal(whole.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"n":2}')
+})

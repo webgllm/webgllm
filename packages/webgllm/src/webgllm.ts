@@ -7,6 +7,7 @@ import {
   createChunkWriter,
   createReplyReader,
   planCompletion,
+  finishReasonOf,
   planRepairs,
   planTextCompletion,
   randomId,
@@ -17,7 +18,7 @@ import {
 } from "./chat-completions.js"
 import type { CompletionPlan, ReplyDelta } from "./chat-completions.js"
 import type { ParsedToolCall } from "./tool-calls.js"
-import type { RunTimings, TokenLogprob } from "./protocol.js"
+import type { FinishReason, RunTimings, TokenLogprob } from "./protocol.js"
 import { defaultWorker, hasWebGl2 } from "./client.js"
 import type { OnToken } from "./client.js"
 import { abortable, abortError, throwIfAborted, WebGLLMError } from "./errors.js"
@@ -420,7 +421,7 @@ class Completions {
     const settled = await this.settleToolCalls(plan, last, options.signal)
     for (const d of settled.deltas) deltas.push(d)
     const toolCalls = reader.toolCalls(settled.calls)
-    return buildCompletion(meta, deltas, toolCalls, toolCalls.length ? "tool_calls" : last.finishReason, end.stats, settled.repairs, plan.logprobs ? logprobs : undefined)
+    return buildCompletion(meta, deltas, toolCalls, finishReasonOf(settled.calls, last.finishReason), end.stats, settled.repairs, plan.logprobs ? logprobs : undefined)
   }
 
   /**
@@ -430,14 +431,14 @@ class Completions {
    */
   private async settleToolCalls(
     plan: CompletionPlan,
-    last: { calls: Array<ParsedToolCall>; malformed?: string },
+    last: { calls: Array<ParsedToolCall>; malformed?: string; finishReason: FinishReason },
     signal: AbortSignal | undefined
   ): Promise<{ calls: Array<ParsedToolCall>; deltas: Array<ReplyDelta>; repairs: Array<RunTimings> }> {
     const calls = [...last.calls]
     const repairs: Array<RunTimings> = []
     let malformed = last.malformed
     if (plan.parseTools && plan.repairToolCalls) {
-      for (const repair of await planRepairs(calls, malformed, plan.generate.tools)) {
+      for (const repair of await planRepairs(calls, malformed, plan.generate.tools, last.finishReason)) {
         throwIfAborted(signal)
         const end = await abortable(
           this.pool.generate(plan.model, repairRequest(plan, repair), {
@@ -482,7 +483,7 @@ class Completions {
       const toolCalls = reader.toolCalls(settled.calls)
       emit(...writer.toolCalls(toolCalls))
       const timings = timingsOf(ended.stats)
-      emit(writer.finish(toolCalls.length ? "tool_calls" : last.finishReason, plan.includeUsage ? undefined : timings))
+      emit(writer.finish(finishReasonOf(settled.calls, last.finishReason), plan.includeUsage ? undefined : timings))
       if (plan.includeUsage) emit(writer.usage(usageOf(ended.stats, settled.repairs), timings))
     })
   }
