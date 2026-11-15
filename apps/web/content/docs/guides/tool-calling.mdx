@@ -41,9 +41,10 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 - `"auto"` (default): the model decides.
 - `"none"`: no tool calls.
-- `"required"` or `{ type: "function", function: { name } }`: a forced call.
+- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
+- `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
 
-A forced call is constrained to the tool's JSON Schema while it's written, so its arguments are always valid. `parallel_tool_calls: false` keeps only the first call.
+`parallel_tool_calls: false` keeps only the first call.
 
 ## Repair
 
