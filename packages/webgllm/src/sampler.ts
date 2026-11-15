@@ -1,5 +1,7 @@
 /** Picking the next token from logits, as the package's other runtimes do. */
 
+import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
+
 /** Sampling settings, from the model card unless the caller overrides them. */
 export type Sampling = {
   temperature: number
@@ -11,13 +13,18 @@ export type Sampling = {
   min_p?: number
   /** Subtract once for tokens generated in this reply (not prompt-only tokens). */
   presence_penalty?: number
+  /**
+   * How many of the last tokens the penalties look at, prompt included
+   * (llama.cpp's repeat_last_n): 64 by default, 0 for none, -1 for all.
+   */
+  repeat_last_n?: number
 }
 
 /**
- * A sampler for one reply. It applies the repetition penalty to the tokens
- * it's told it has seen (the prompt's and the reply's, as Transformers.js
- * does), keeps the top_k likeliest tokens, and draws one at the temperature
- * (greedy at 0).
+ * A sampler for one reply. It applies the repetition penalty to the last
+ * tokens it's told it has seen (the prompt's, then the reply's: see
+ * penalty-window.ts), keeps the top_k likeliest tokens, cuts them with
+ * top_p and min_p, and draws one at the temperature (greedy at 0).
  */
 export function createSampler({
   temperature,
@@ -25,35 +32,31 @@ export function createSampler({
   repetition_penalty,
   top_p = 1,
   min_p = 0,
-  presence_penalty = 0
+  presence_penalty = 0,
+  repeat_last_n = DEFAULT_REPEAT_LAST_N
 }: Sampling) {
-  const seen = new Set<number>()
-  const generated = new Set<number>()
+  const window = new PenaltyWindow(repeat_last_n)
   return {
-    /** Tokens to penalize from now on: the prompt, then each one drawn. */
+    /** Tokens read or written, in order: the prompt, then each one drawn. */
     see(tokens: Iterable<number>, output = false) {
-      for (const t of tokens) {
-        seen.add(t)
-        if (output) generated.add(t)
-      }
+      window.push(tokens, output)
     },
     /**
      * The distribution the next token is drawn from: the kept tokens
-     * (indices into `logits`) and their probabilities, after the penalty,
-     * top-k, temperature and top-p (one token at probability 1 when
-     * greedy). Changes `logits`. `penalize` false leaves out the repetition
-     * and presence penalties (a constrained answer repeats tokens by design).
+     * (indices into `logits`) and their probabilities, after the penalties,
+     * top-k, top-p, min-p and the temperature, in llama.cpp's order (one
+     * token at probability 1 when greedy). Changes `logits`. `penalize` false leaves out the repetition
+     * and presence penalties (for logits a GPU already penalized).
      */
     distribution(logits: Float32Array, penalize = true): { ids: Int32Array; p: Float32Array } {
-      if (penalize && repetition_penalty !== 1) {
-        for (const token of seen) {
+      if (penalize && (repetition_penalty !== 1 || presence_penalty !== 0)) {
+        for (const [token] of window.entries()) {
+          if (token < 0 || token >= logits.length) continue
           const x = logits[token]
-          logits[token] =
-            x < 0 ? x * repetition_penalty : x / repetition_penalty
+          if (repetition_penalty !== 1) logits[token] = x < 0 ? x * repetition_penalty : x / repetition_penalty
+          // (Every token in the window, the prompt's too, as llama.cpp applies it.)
+          if (presence_penalty !== 0) logits[token] -= presence_penalty
         }
-      }
-      if (penalize && presence_penalty !== 0) {
-        for (const token of generated) logits[token] -= presence_penalty
       }
       const k = Math.max(
         1,
@@ -99,37 +102,36 @@ export function createSampler({
         return { ids: Int32Array.of(keptIds[best]), p: Float32Array.of(1) }
       }
       const max = kept[best]
+      // llama.cpp's order: top-p, then min-p, on the distribution as it is,
+      // and the temperature last, on the tokens they leave.
+      const weight = new Float32Array(k)
       let total = 0
       for (let j = 0; j < k; j++) {
-        kept[j] = Math.exp((kept[j] - max) / temperature)
-        total += kept[j]
-      }
-      if (min_p > 0) {
-        // Softmax weights are relative to the largest logit, whose weight is 1.
-        for (let j = 0; j < k; j++) {
-          if (kept[j] < min_p) {
-            total -= kept[j]
-            kept[j] = 0
-          }
-        }
+        weight[j] = Math.exp(kept[j] - max)
+        total += weight[j]
       }
       if (top_p < 1) {
         // Zero weights change neither the share nor the total: skipped.
-        const order = descending(kept)
+        const order = descending(weight)
         let share = 0
         let cut = false
         for (let o = 0; o < order.length; o++) {
           const j = order[o]
-          if (cut) {
-            total -= kept[j]
-            kept[j] = 0
-          } else {
-            share += kept[j] / total
+          if (cut) weight[j] = 0
+          else {
+            share += weight[j] / total
             cut = share >= top_p
           }
         }
       }
-      for (let j = 0; j < k; j++) kept[j] /= total
+      // Softmax weights are relative to the largest logit, whose weight is 1.
+      if (min_p > 0) for (let j = 0; j < k; j++) if (weight[j] < min_p) weight[j] = 0
+      let left = 0
+      for (let j = 0; j < k; j++) {
+        kept[j] = weight[j] > 0 ? Math.exp((kept[j] - max) / temperature) : 0
+        left += kept[j]
+      }
+      for (let j = 0; j < k; j++) kept[j] /= left
       return { ids: keptIds, p: kept }
     },
     /** The next token. Changes `logits`. */

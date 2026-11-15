@@ -3052,8 +3052,12 @@ uniform int uLogitRows;
 /* The head's K-slices to add up (1: summed already), uHeadStride rows apart. */
 uniform int uHeadSplit;
 uniform int uHeadStride;
-uniform ivec4 uExtra;
-uniform ivec4 uExtra2;
+/*
+ * Where the batch's rows see tokens otherwise than the mask: (token, state,
+ * first row, end row), state 0, 1 or 3 as the mask's (see PenaltyWindow.ahead).
+ */
+uniform ivec4 uSeenRows[16];
+uniform int uSeenRowCount;
 /* The batch row that logits row 0 is (when rows are picked one at a time). */
 uniform int uPenaltyRow0;
 uniform usampler2D uAllowed;
@@ -3064,8 +3068,8 @@ uniform int uAllowedStride;
 uniform float uPresencePenalty;
 /*
  * Token id's logit with the repetition penalty for row r of a batch: the
- * mask's seen tokens, and the batch's drafts before row r (uExtra, then
- * uExtra2: draft i is row i + 1's input, so rows after it have seen it).
+ * mask's seen tokens, as uSeenRows changes them for that row (the drafts
+ * it has read, and what they pushed out of the penalty window).
  */
 float penalized(float v, uint m, int id, int r) {
   if (uAllowedEnabled != 0) {
@@ -3076,12 +3080,16 @@ float penalized(float v, uint m, int id, int r) {
     if ((bits & (1u << uint(id & 31))) == 0u) return -1e30;
   }
   if (m == 2u) return -1e30;
-  bool generated = m == 3u;
-  for (int k = 0; k < 4; k++) if (k < r && uExtra[k] == id) generated = true;
-  for (int k = 0; k < 4; k++) if (k + 4 < r && uExtra2[k] == id) generated = true;
-  bool seen = m == 1u || generated;
+  int state = int(m);
+  for (int k = 0; k < 16; k++) {
+    if (k >= uSeenRowCount) break;
+    ivec4 s = uSeenRows[k];
+    if (s.x == id && r >= s.z && r < s.w) state = s.y;
+  }
+  bool seen = state == 1 || state == 3;
   if (seen) v = v < 0.0 ? v * uPenalty : v / uPenalty;
-  return generated ? v - uPresencePenalty : v;
+  /* The presence penalty on every token in the window, the prompt's too, as llama.cpp applies it. */
+  return seen ? v - uPresencePenalty : v;
 }
 vec4 chunkTexel(int c, int t, int r) {
   int texel = c * 64 + t;

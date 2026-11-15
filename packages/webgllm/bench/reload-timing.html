@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>First call after a reload</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>First call after a reload</h1>
+  <p>
+    A structured request with a 2,400-token system prompt, three times on a freshly loaded page, with the worker's own
+    timings for each (read from its messages: a worker of the page's own). Run it once to save the prefix, then again
+    to see a reload. <code>?model=&lt;id&gt;</code>, <code>&amp;idle=&lt;ms&gt;</code> to wait that long after the load first.
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+    const subjects = ["slide", "title", "chart", "caption", "outline", "speaker note", "table", "image", "theme", "section"]
+    const verbs = ["keeps", "names", "shows", "lists", "matches", "shortens", "orders", "groups", "explains", "highlights"]
+    const objects = ["the main point", "one idea", "the audience's question", "a number with its unit", "the next step"]
+    const parts = ["You turn deck edits into actions. Follow every rule below."]
+    for (let i = 0; parts.join(" ").split(" ").length < 1700; i++) parts.push(`Rule ${i + 1}: each ${subjects[(i * 7) % 10]} ${verbs[(i * 3) % 10]} ${objects[i % 5]}, never more than ${3 + (i % 5)} lines.`)
+    const system = parts.join(" ")
+    const schema = {
+      type: "object",
+      properties: { actions: { type: "array", maxItems: 6, items: { type: "object", properties: {
+        operation: { type: "string", enum: ["add", "remove", "replace", "swap", "cut", "keep", "move", "sort"] },
+        request: { type: "string", maxLength: 160 }
+      }, required: ["operation", "request"], additionalProperties: false } } },
+      required: ["actions"], additionalProperties: false
+    }
+    try {
+      const worker = new Worker("/bundle/bench/own-worker.js", { type: "module", name: "timing" })
+      const done = []
+      worker.addEventListener("message", ({ data }) => { if (data?.type === "done") done.push(data.stats) })
+      const webgllm = new WebGLLM({ worker })
+      let t = performance.now()
+      await webgllm.loadModel(model, { contextLength: 8192 })
+      log(`loaded ${Math.round(performance.now() - t)} ms`)
+      // &idle=<ms>: time before the first request, as an app's user takes to type.
+      const idle = Number(params.get("idle") ?? 0)
+      if (idle > 0) await new Promise((resolve) => setTimeout(resolve, idle))
+      for (let i = 1; i <= 3; i++) {
+        t = performance.now()
+        const reply = await webgllm.chat.completions.create({
+          model, temperature: 0, reasoning_effort: "none", max_tokens: 120,
+          messages: [{ role: "system", content: system }, { role: "user", content: "add 4 lightning bolts" }],
+          response_format: { type: "json_schema", json_schema: { name: "actions", schema } }
+        })
+        const s = done.at(-1) ?? {}
+        const pick = ["inputTokens", "cachedTokens", "firstTokenMs", "tokenizeMs", "schemaMs", "cacheRestoreMs", "promptMs", "decodeMs", "outputTokens"]
+        log(`STEP call ${i}: wall ${Math.round(performance.now() - t)} ms | ` + pick.map((k) => `${k}=${typeof s[k] === "number" ? Math.round(s[k]) : s[k]}`).join(" ") + ` | ${JSON.stringify(JSON.parse(reply.choices[0].message.content))}`)
+      }
+      log("ALL DONE")
+    } catch (error) {
+      log("ERROR:", String(error?.stack ?? error))
+    }
+  </script>
+</html>

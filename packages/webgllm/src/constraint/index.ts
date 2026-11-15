@@ -1,6 +1,6 @@
 import type { JsonGuidanceRuntime } from "llguidance/json-schema"
 import { canonicalAsciiObject, canonicalTokenMask } from "./canonical-mask.js"
-import { FixedStrings, fixedStringTokens } from "./fixed-strings.js"
+import { FixedStrings, fixedStringTokens, lengthBounds, plain, walked } from "./fixed-strings.js"
 import { jsonTokens, nextStringState, type JsonTokens, type StringState } from "./whitespace.js"
 
 /** Exact model tokenizer, not token strings decoded independently. */
@@ -12,7 +12,11 @@ export type ConstraintOptions = {
   eosTokenId?: number
   maxTokens?: number
   /**
-   * How the JSON may be laid out. "model" (the default) takes whitespace
+   * How the JSON may be laid out, and whether keys are in order. "model"
+   * (the default, for generation) holds a closed object's keys to the order
+   * llama.cpp's grammar writes them in: required ones as declared, then
+   * optional ones as declared. Small models depend on it: LFM3 writing a
+   * `request` before its `operation` wrote the request worse. It also takes whitespace
    * where models write it, as they write it: held to compact JSON, a model
    * that writes `"key": "value"` (LFM3) gets no ` "` token after the colon
    * or a comma, picks `":` instead and starts a value (or, in an open
@@ -27,6 +31,9 @@ export type ConstraintOptions = {
  * refused until the JSON goes on: a laid-out document needs a few between
  * two tokens, and a model stuck writing whitespace would otherwise run to
  * its output limit. Whitespace inside strings is content and isn't capped.
+ * Only for a tokenizer the document walker can't follow: where it can,
+ * runs are held to llama.cpp's own rule instead (see Position.run in
+ * fixed-strings.ts), which bounds them too.
  */
 export const MAX_WHITESPACE_RUN = 8
 
@@ -215,14 +222,20 @@ type Layout = { whitespace_flexible: boolean; key_separator: string; item_separa
 /** JSON.stringify's layout. */
 const COMPACT: Layout = { whitespace_flexible: false, key_separator: ":", item_separator: "," }
 /**
- * Whitespace between any two tokens, and the key separator's space required
- * (flexible alone also takes `":` again after a key's colon). Items stay ","
- * apart: llguidance 0.2.1 takes a comma after a closed object's last key when
- * items are ", " apart, then dead-ends
- * (https://github.com/nico-martin/llguidance-js/issues/6). Use ", " once that
- * is fixed.
+ * Whitespace optional between any two tokens, after a key's colon too, as
+ * llama.cpp's JSON Schema grammar has it: the model lays the JSON out as it
+ * would. A required space after the colon held LFM3 to a layout its
+ * prompt's examples didn't use: on DeckGen's add step (13 compact examples)
+ * it went on adding copies of them after the one item asked for, where
+ * llama.cpp, and webgllm with the space optional, write the one item
+ * compactly, the same answer in the same 45 tokens. Without examples LFM3
+ * still writes its spaces. (After a key's colon llguidance 0.2.1 then takes
+ * whitespace or the value's start, nothing else.) Items stay "," apart:
+ * llguidance 0.2.1 takes a comma after a closed object's last key when items
+ * are ", " apart, then dead-ends
+ * (https://github.com/nico-martin/llguidance-js/issues/6).
  */
-const MODEL: Layout = { whitespace_flexible: true, key_separator: ": ", item_separator: "," }
+const MODEL: Layout = { whitespace_flexible: true, key_separator: ":", item_separator: "," }
 /** MODEL when the tokenizer's whitespace tokens can't be read to cap their runs. */
 const MODEL_FIXED: Layout = { whitespace_flexible: false, key_separator: ": ", item_separator: "," }
 
@@ -250,28 +263,46 @@ const UNPRUNED = new Set(["pattern", "format", "minimum", "maximum", "exclusiveM
 const SCHEMA_MAPS = ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"]
 const SCHEMA_VALUES = ["items", "additionalItems", "additionalProperties", "contains", "propertyNames", "unevaluatedItems", "unevaluatedProperties"]
 const SCHEMA_LISTS = ["prefixItems", "anyOf", "oneOf", "allOf"]
+const SCHEMA_CONDITIONS = ["not", "if", "then", "else"]
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
 const jsonType = (value: unknown) =>
   value === null ? "null" : Array.isArray(value) ? "array" : typeof value === "number" ? (Number.isInteger(value) ? "integer" : "number") : typeof value
 
+/*
+ * In llguidance 0.2.1 a string's minLength or maxLength makes every mask
+ * slow, whatever the length: 112-131 ms a token with LFM3's vocabulary,
+ * against 3 ms for the same string without it (9x the whole answer). Where
+ * the document walker reads the schema as the document is written (see
+ * fixed-strings.ts: walked, through properties of plain names, items and
+ * prefixItems), webgllm holds strings to their lengths itself, and the
+ * masks run without them; elsewhere they stay with llguidance.
+ */
+const LENGTHS = new Set(["minLength", "maxLength"])
+
 /**
  * The schema with what llguidance doesn't prune taken out, and whether
  * anything was. Only ever looser than the original: a `not` or `if` that
- * would change meaning without those keywords is left out whole.
+ * would change meaning without those keywords is left out whole. With
+ * `lengths`, string lengths go too where they are held outside llguidance
+ * (see LENGTHS).
  */
-export function prunableSchema(schema: unknown): { schema: unknown; loosened: boolean } {
+export function prunableSchema(schema: unknown, options: { lengths?: boolean } = {}): { schema: unknown; loosened: boolean } {
   let loosened = false
-  const visit = (node: unknown): unknown => {
-    if (Array.isArray(node)) return node.map(visit)
+  const visit = (node: unknown, followed = false): unknown => {
+    if (Array.isArray(node)) return node.map((item) => visit(item))
     if (!isRecord(node)) return node
+    // Only what the walker reads, as it reads it: the node itself, or a lone choice's one branch.
+    const how = followed && options.lengths ? walked(node) : null
+    const self = how === "self"
     const out: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(node)) {
-      if (UNPRUNED.has(key)) {
+      if (UNPRUNED.has(key) || (self && LENGTHS.has(key))) {
         loosened = true
         continue
       }
-      if (SCHEMA_MAPS.includes(key) && isRecord(value)) out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, visit(v)]))
-      else if (SCHEMA_VALUES.includes(key) || SCHEMA_LISTS.includes(key)) out[key] = visit(value)
+      if (SCHEMA_MAPS.includes(key) && isRecord(value)) out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, visit(v, self && key === "properties" && plain(k))]))
+      else if (SCHEMA_LISTS.includes(key) && Array.isArray(value)) out[key] = value.map((v, i) => visit(v, (self && key === "prefixItems") || (how !== null && typeof how === "object" && how.key === key && how.branch === i)))
+      else if (SCHEMA_VALUES.includes(key)) out[key] = visit(value, self && key === "items")
       else if (key === "not" || key === "if" || key === "then" || key === "else") {
         const before = loosened
         loosened = false
@@ -303,8 +334,77 @@ export function prunableSchema(schema: unknown): { schema: unknown; loosened: bo
     }
     return out
   }
-  const result = visit(schema)
+  const result = visit(schema, true)
   return { schema: result, loosened }
+}
+
+/*
+ * In llguidance 0.2.1 a `$ref` makes every mask slow: 162 ms a token with
+ * LFM3's vocabulary for an enum reached through one, against 6 ms for the
+ * same enum written in place (7x the whole answer). So a local reference
+ * that isn't recursive, with nothing beside it but annotations, is written
+ * in place before the schema is compiled; any other stays a reference.
+ */
+const REF_ANNOTATIONS = new Set(["description", "title", "$comment", "default", "examples", "deprecated", "readOnly", "writeOnly"])
+/** Past this many JSON characters written out, the rest stays referenced. */
+const INLINE_LIMIT = 1 << 20
+
+export function inlineRefs(schema: unknown): unknown {
+  if (!isRecord(schema)) return schema
+  const root = schema
+  const target = (ref: string): unknown => {
+    const match = /^#\/(\$defs|definitions)\/([^/]+)$/.exec(ref)
+    const defs = match ? root[match[1]] : undefined
+    const name = match ? decodeURIComponent(match[2]).replace(/~1/g, "/").replace(/~0/g, "~") : ""
+    // Only the schema's own definitions: never Object.prototype's (a $ref to "__proto__" stays, and fails to compile as before).
+    return match && isRecord(defs) && Object.hasOwn(defs, name) ? defs[name] : undefined
+  }
+  let size = 0
+  let left = false
+  const visit = (node: unknown, through: Set<string>): unknown => {
+    if (Array.isArray(node)) return node.map((item) => visit(item, through))
+    if (!isRecord(node)) return node
+    const ref = node.$ref
+    if (typeof ref === "string") {
+      const def = target(ref)
+      const alone = Object.keys(node).every((key) => key === "$ref" || REF_ANNOTATIONS.has(key))
+      if (isRecord(def) && alone && !through.has(ref) && size < INLINE_LIMIT) {
+        size += JSON.stringify(def).length
+        const { $ref: _ref, ...annotations } = node
+        return { ...(visit(def, new Set([...through, ref])) as Record<string, unknown>), ...annotations }
+      }
+      left = true
+      return node
+    }
+    // Only what holds schemas: a property named like a keyword is still a schema, and values stay as given.
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(node)) {
+      if (node === root && (key === "$defs" || key === "definitions")) continue
+      out[key] = SCHEMA_MAPS.includes(key) && isRecord(value)
+        ? Object.fromEntries(Object.entries(value).map(([name, sub]) => [name, visit(sub, through)]))
+        : SCHEMA_LISTS.includes(key) || SCHEMA_VALUES.includes(key) || SCHEMA_CONDITIONS.includes(key)
+          ? visit(value, through)
+          : value
+    }
+    return out
+  }
+  const out = visit(root, new Set()) as Record<string, unknown>
+  // The definitions stay only for the references left.
+  if (left) {
+    if ("$defs" in root) out.$defs = root.$defs
+    if ("definitions" in root) out.definitions = root.definitions
+  }
+  return out
+}
+
+/** How many tokens a tokenizer source names: its byte list's, or its tokenizer.json's highest id and one. */
+function tokenizerSize(source: object): number {
+  const s = source as { tokens?: unknown[]; tokenizerJSON?: { model?: { vocab?: Record<string, number> }; added_tokens?: Array<{ id?: number }> } }
+  if (Array.isArray(s.tokens)) return s.tokens.length
+  let most = -1
+  for (const id of Object.values(s.tokenizerJSON?.model?.vocab ?? {})) if (typeof id === "number" && id > most) most = id
+  for (const token of s.tokenizerJSON?.added_tokens ?? []) if (typeof token.id === "number" && token.id > most) most = token.id
+  return most + 1
 }
 
 /** Compile a fresh, generation-local schema matcher. No inference or upstream patches. */
@@ -313,14 +413,17 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
   // Preserve identity so repeated generations reuse converted tokenizer bytes.
   const source = withEos(options.tokenizer, options.eosTokenId)
   const limits = { maxTokens: options.maxTokens ?? Number.MAX_SAFE_INTEGER, maxOutputBytes: Number.MAX_SAFE_INTEGER }
-  const prunable = prunableSchema(options.schema)
+  const schema = inlineRefs(options.schema)
+  // String lengths are held outside llguidance only where the tokens' bytes can be read (see LENGTHS).
+  const readable = lengthBounds(schema) && !!fixedStringTokens(source, tokenizerSize(source))
+  const prunable = prunableSchema(schema, { lengths: readable })
   const tokens = options.layout === "compact" ? null : jsonTokens(source)
   const layout = options.layout === "compact" ? COMPACT : tokens?.whitespace.length ? MODEL : MODEL_FIXED
   let interpreter: Interpreter
   let shadow: Interpreter | undefined
   try {
     // The full schema first, so what it doesn't support still fails here.
-    const full = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(options.schema, layout) }, limits })
+    const full = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(schema, layout) }, limits })
     if (prunable.loosened) {
       shadow = full
       interpreter = runtime.createInterpreter({ tokenizer: source, response_format: { type: "json_schema", json_schema: compactSchema(prunable.schema, layout) }, limits })
@@ -346,15 +449,16 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
     if (cause instanceof StructuredOutputError) throw cause
     throw new StructuredOutputError("invalid-tokenizer", cause instanceof Error ? cause.message : String(cause), { cause })
   }
+  const strings = fixedStringTokens(source, vocabSize)
   let whitespace: Uint32Array | undefined
-  if (layout === MODEL && tokens) {
+  if (layout === MODEL && tokens && !strings) {
     whitespace = new Uint32Array(Math.ceil(vocabSize / 32))
     for (const id of tokens.whitespace) if (id >= 0 && id < vocabSize) whitespace[id >>> 5] |= 1 << (id & 31)
   }
-  const fixedTokens = fixedStringTokens(source, vocabSize)
-  return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(options.schema),
-    canonicalAsciiObject(options.schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined,
-    fixedTokens ? new FixedStrings(fixedTokens, options.schema) : undefined)
+  return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(schema),
+    canonicalAsciiObject(schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined,
+    // Keys in llama.cpp's order when generating; checking a parsed value takes them in any order.
+    strings ? new FixedStrings(strings, schema, layout !== COMPACT) : undefined)
 }
 const VALIDATION_EOS = 256
 const validationTokenizer = {

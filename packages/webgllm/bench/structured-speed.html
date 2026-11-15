@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Structured output speed</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Structured output speed</h1>
+  <p>
+    The same answer under schemas that differ in one keyword: an enum reached through <code>$ref</code> or written in
+    place, a string with and without <code>maxLength</code>. Greedy, three runs each, after a warm-up.
+    <code>?model=&lt;id&gt;</code> (LFM3 1.7B GGUF by default).
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const { WebGLLM } = await import(new URLSearchParams(location.search).get("baseline") === "1" ? "/bundle/bench/baseline-src/index.js" : "/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+    const tags = ["cost", "color", "effect", "type", "power", "toughness", "rarity", "set", "artist", "keyword", "creature", "spell",
+      "land", "artifact", "enchantment", "planeswalker", "instant", "sorcery", "tribal", "format", "price", "name", "flavor", "loyalty",
+      "mana", "ability", "other"]
+    const words = ["cheap", "green", "pump", "spells"]
+    const tagged = (inline) => ({
+      type: "object",
+      properties: { words: { type: "object", properties: Object.fromEntries(words.map((w) => [w, inline ? { type: "string", enum: tags } : { $ref: "#/$defs/tag" }])), required: words, additionalProperties: false } },
+      required: ["words"], additionalProperties: false,
+      ...(!inline && { $defs: { tag: { type: "string", enum: tags } } })
+    })
+    const actions = (maxLength) => ({
+      type: "object",
+      properties: { actions: { type: "array", maxItems: 6, items: { type: "object", properties: {
+        operation: { type: "string", enum: ["add", "remove", "replace", "swap", "cut", "keep", "move", "sort"] },
+        request: { type: "string", ...(maxLength && { maxLength }) }
+      }, required: ["operation", "request"], additionalProperties: false } } },
+      required: ["actions"], additionalProperties: false
+    })
+    const cases = [
+      ["tags, $ref", tagged(false), "Tag each word of this card search with what it says about the card: cheap green pump spells"],
+      ["tags, inline", tagged(true), "Tag each word of this card search with what it says about the card: cheap green pump spells"],
+      ["actions, maxLength 160", actions(160), "Turn this deck edit into actions: add 4 lightning bolts"],
+      ["actions, no maxLength", actions(undefined), "Turn this deck edit into actions: add 4 lightning bolts"]
+    ]
+    try {
+      const webgllm = new WebGLLM()
+      await webgllm.loadModel(model, { contextLength: 8192 })
+      const ask = async (schema, content) => {
+        const t = performance.now()
+        const reply = await webgllm.chat.completions.create({
+          model, messages: [{ role: "user", content }], temperature: 0, reasoning_effort: "none", max_tokens: 200,
+          response_format: { type: "json_schema", json_schema: { name: "answer", schema } }
+        })
+        return { ms: Math.round(performance.now() - t), text: reply.choices[0].message.content, tokens: reply.usage.completion_tokens }
+      }
+      await ask(cases[1][1], cases[1][2])
+      for (const [name, schema, content] of cases) {
+        const runs = []
+        for (let i = 0; i < 3; i++) runs.push(await ask(schema, content))
+        const ms = runs.map((r) => r.ms).sort((a, b) => a - b)
+        log(`STEP ${name}: ${ms.join(" / ")} ms, ${runs[0].tokens} tokens, ${JSON.stringify(JSON.parse(runs[0].text))}`)
+      }
+      log("ALL DONE")
+    } catch (error) {
+      log("ERROR:", String(error?.stack ?? error))
+    }
+  </script>
+</html>

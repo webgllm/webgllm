@@ -34,11 +34,12 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
+  import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';
   import { CodedError } from './worker-errors.js';
   import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from './sampler.js';
   import { DraftPolicy, lookupDraft } from './draft.js';
-  import { THINK_OPEN } from './reply.js';
+  import { createThinkingSplitter, THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
   const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16;
   // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
@@ -60,9 +61,9 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
 const { makeGenerate } = await import(pathToFileURL(outfile).href)
 
 /** Token ids 0–9 are control tokens; the rest are words of TEXT. */
-const EOS = 1, THINK = 3, THINK_END = 4
-const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>" }
-const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d"]
+const EOS = 1, THINK = 3, THINK_END = 4, TOOL_CALL = 5, TOOL_CALL_END = 6
+const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>", [TOOL_CALL]: "<tool_call>", [TOOL_CALL_END]: "</tool_call>" }
+const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d", "<thi", "nk>", "</thi"]
 words.forEach((w, i) => { TEXT[10 + i] = w })
 const id = (w: string) => 10 + words.indexOf(w)
 
@@ -74,6 +75,9 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const queue = script.slice()
   const stopped = new Set<string>(), messages: WorkerResponse[] = []
   const masks: Array<Uint32Array | null> = []
+  // The mask in force at each pick.
+  const stepMasks: Array<Uint32Array | null> = []
+  let current: Uint32Array | null = null
   // What the penalties were given: the tokens set as seen, and each pick's penalties.
   const seen: number[][] = [], penalties: Array<[number, number]> = []
   let position = 0
@@ -93,16 +97,17 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     gpu: { compiled: { count: 0, times: new Map() }, bytes: 0, presentationAdvice: { relaxation: true }, validatedPresentation: undefined,
       calibratePromptPacing: () => undefined },
     tuned: { submissionOverlap: 0 },
-    setAllowedTokens(mask: Uint32Array | null) { masks.push(mask) }, setAllowedTokenRows() {},
+    setAllowedTokens(mask: Uint32Array | null) { masks.push(mask); current = mask }, setAllowedTokenRows() {},
     dropGuess() {}, keepGuess() {}, accept() {}, reset() {}, canResume() { return false },
     rewind() { position = 0; return 0 }, rewindPosition() { return 0 }, snapshotPosition() { return undefined }, snapshot() { return undefined },
     batchSizes(count: number) { return [count] },
     preparePrompt: async () => undefined,
     setImages() {},
     async forwardHidden(batch: number[]) { position += batch.length; return batch.length - 1 },
-    setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {},
-    async argmax(_row: number, _rows: number, penalty: number, _drafts: number[], _guess: boolean, presence = 0) {
+    setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {}, setSeenState() {},
+    async argmax(_row: number, _rows: number, penalty: number, _seenRows: unknown[], _guess: boolean, presence = 0) {
       penalties.push([penalty, presence])
+      stepMasks.push(current)
       return Int32Array.of(queue.shift() ?? EOS)
     },
     // Every logit read back: the scripted token at 4, the one after it in the script at 2, the rest at 0.
@@ -128,7 +133,8 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
       return prompt === "" ? [] : prompt.endsWith("<think>") ? [2, 20, THINK] : [2, 20, 21]
     },
     vocabSize: 64,
-    specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2 },
+    specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2, toolCall: TOOL_CALL, toolCallEnd: TOOL_CALL_END },
+    tokenToId: (token: string) => Object.entries(TEXT).find(([, text]) => text === token)?.[0] as number | undefined,
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),
     tokenBytes: (t: number) => new TextEncoder().encode(TEXT[t] ?? ""),
@@ -137,7 +143,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
   const model = { model: "LiquidAI/LFM3-1.7B-GGUF", engine, tokenizer, cached: [] as number[], claimed: 0, prefixes: new PrefixStore(() => {}) }
   const state = { stopped, messages, model, constraint: options.constraint, processors: options.processors, claims, reclaimBytes: options.growBy === undefined ? undefined : 32 * 2 ** 20 }
   const generate = makeGenerate(state) as ((r: Request) => Promise<void>) & { forward: (r: Forward) => Promise<void>; reset: (r: Extract<WorkerRequest, { type: "reset" }>) => void }
-  return { generate, messages, masks, seen, penalties, reads, claims, model }
+  return { generate, messages, masks, stepMasks, seen, penalties, reads, claims, model }
 }
 
 type Request = Extract<WorkerRequest, { type: "generate" }>
@@ -245,11 +251,64 @@ test("a forced tool call is sent as toolCall on done, not as text", async () => 
 test("thinking comes before a forced call, and is sent as text", async () => {
   const j = jsonConstraint(id("}"))
   const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
-  await s.generate(request({ tools: [weather], toolChoice: "required", thinking: true, stop: ["{"] }))
+  await s.generate(request({ tools: [weather], toolChoice: { name: "get_weather" }, thinking: true, stop: ["{"] }))
   // The template ended the prompt outside the thinking: it's opened first.
   assert.equal(text(s.messages), "<think> hm</think>")
   assert.deepEqual(done(s.messages).toolCall, { name: "get_weather", arguments: { city: "Oslo" } })
   assert.deepEqual(j.accepted, [...json, EOS])
+})
+
+test("required, as llama.cpp has it: the call in the model's own format, text before it allowed, and no end before the call is closed", async () => {
+  const s = scripted([id("Hello"), TOOL_CALL, id("a"), TOOL_CALL_END])
+  await s.generate(request({ tools: [weather], toolChoice: "required" }))
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // The steps before the closing marker refused the end; after it, the end is open again.
+  const set = s.masks.filter((m) => m !== null)
+  assert.equal(set.length, 2)
+  assert.equal(blocksEnd(set[0]), true)
+  assert.equal(blocksEnd(set[1]), false)
+  assert.equal(text(s.messages), "Hello<tool_call>a</tool_call>")
+  assert.equal(done(s.messages).toolCall, undefined, "parsed from the text on the main thread, like auto's")
+})
+
+test("required: a closing marker with no call opened, or a call written in the thinking, doesn't let the reply end", async () => {
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // "Hello</tool_call>": every mask after it still refuses the end.
+  const unmatched = scripted([id("Hello"), TOOL_CALL_END, id("a")])
+  await unmatched.generate(request({ tools: [weather], toolChoice: "required" }))
+  assert.ok(unmatched.masks.filter((m) => m !== null).every(blocksEnd))
+  // A whole call inside the thinking: still refused after it, until one in the answer.
+  const script = [THINK, TOOL_CALL, id("a"), TOOL_CALL_END, THINK_END, TOOL_CALL, id("b"), TOOL_CALL_END]
+  const thought = scripted(script)
+  await thought.generate(request({ tools: [weather], toolChoice: "required", thinking: true }))
+  // Pick i draws token i+1 (pick 0 drew the first). The end is refused through the answer's call, then open.
+  const refused = thought.stepMasks.map(blocksEnd)
+  assert.deepEqual(refused.slice(0, script.length), Array(script.length).fill(true))
+  assert.equal(refused[script.length], false, "open once the answer's call is closed")
+})
+
+test("required: thinking tags split across ordinary tokens are read as the reply reader reads them", async () => {
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // A call inside "<thi"+"nk>" … "</thi"+"nk>" is thinking: the end stays refused after it.
+  const inside = [id("<thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END, id("</thi"), id("nk>"), id("Hello")]
+  const thought = scripted(inside)
+  await thought.generate(request({ tools: [weather], toolChoice: "required" }))
+  assert.equal(thought.stepMasks.length, inside.length + 1)
+  assert.ok(thought.stepMasks.every(blocksEnd), "no pick could end the reply")
+  // The same call after the split close is the answer's: the end opens after it.
+  const after = [id("<thi"), id("nk>"), id(" hm"), id("</thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END]
+  const answered = scripted(after)
+  await answered.generate(request({ tools: [weather], toolChoice: "required" }))
+  const refused = answered.stepMasks.map(blocksEnd)
+  assert.deepEqual(refused.slice(0, after.length), Array(after.length).fill(true))
+  assert.equal(refused[after.length], false)
+})
+
+test("an output schema with a required or named call is refused", async () => {
+  for (const toolChoice of ["required", { name: "get_weather" }] as const) {
+    const s = scripted([])
+    await assert.rejects(s.generate(request({ tools: [weather], toolChoice, outputSchema: { type: "object" } })), /can't be combined/)
+  }
 })
 
 test("toolChoice naming an unknown tool fails", async () => {
@@ -280,23 +339,21 @@ test("stop sequences don't apply inside a structured answer: it stays valid JSON
   assert.equal(text(t.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
 })
 
-test("the repetition penalty counts the prompt's tokens, as Transformers.js does", async () => {
+test("the repetition penalty counts the prompt's last tokens, as llama.cpp does", async () => {
   const s = scripted([id("Oslo")])
   await s.generate(request({ sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1 } }))
   assert.equal(s.seen.length, 1)
   assert.ok(s.seen[0].length > 0, "the prompt's tokens are penalized")
 })
 
-test("no repetition or presence penalty inside a constrained answer", async () => {
+test("the penalties apply inside a constrained answer too, as llama.cpp's do", async () => {
   const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"] }
   const j = jsonConstraint(id("}"))
   const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
   await s.generate(request({ outputSchema: schema, thinking: true, sampling: { temperature: 0, top_k: 1, repetition_penalty: 1.1, presence_penalty: 1.5 } }))
   assert.equal(text(s.messages), "<think> hm</think>{\"city\":\"Oslo\"}")
-  // Thinking: the request's penalties. The answer: none (its quotes, keys and
-  // copied values repeat by design).
-  assert.deepEqual(s.penalties.slice(0, 2), [[1.1, 1.5], [1.1, 1.5]])
-  assert.deepEqual(new Set(s.penalties.slice(2).map(String)), new Set(["1,0"]))
+  // Thinking and the answer alike: the request's penalties (the grammar keeps the JSON valid).
+  assert.deepEqual(new Set(s.penalties.map(String)), new Set(["1.1,1.5"]))
 })
 
 test("with thinking switched off, the reply can't open or close thinking", async () => {

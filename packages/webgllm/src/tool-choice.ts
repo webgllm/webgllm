@@ -9,7 +9,7 @@ import { CodedError } from "./worker-errors.js"
 export type ToolCall = { name: string; arguments: Record<string, unknown> }
 
 export type ToolPlan =
-  | { mode: "auto" | "none"; tools: Array<ChatTool> }
+  | { mode: "auto" | "none" | "required"; tools: Array<ChatTool> }
   | {
       mode: "forced"
       tools: Array<ChatTool>
@@ -252,12 +252,20 @@ export function planToolChoice(tools: Array<ChatTool>, choice: ToolChoice = "aut
   // call markup instead would need each format's markers in the worker, and
   // a model that meant to call would write the call some other way.
   if (choice === "none") return { mode: "none", tools: [] }
+  // "required" as llama.cpp has it: the model writes its call in its own
+  // template's format, as with "auto" (text may come first), and the reply
+  // can't end before one (see the handler). Its arguments aren't held to a
+  // schema while it writes them: a bad call is repaired (see planRepairs).
+  if (choice === "required") {
+    if (!tools.length) throw new Error('toolChoice "required" needs at least one tool.')
+    return { mode: "required", tools }
+  }
   // Forced calls keep every tool in the prompt, exactly as "auto" renders
   // it: the model reads the tools in its own template's words, and the
   // prompt stays the same for the cache across auto and forced turns.
   let chosen: Array<ChatTool>
-  if (choice === "required") {
-    if (!tools.length) throw new Error('toolChoice "required" needs at least one tool.')
+  if (choice === "any") {
+    if (!tools.length) throw new Error('toolChoice "any" needs at least one tool.')
     chosen = tools
   } else {
     const named = tools.find((t) => t.function.name === choice.name)

@@ -386,20 +386,43 @@ test("a prefix saved to disk is found again by a page loaded later, byte for byt
   assert.equal(await later.match([1, 2, 9, 4], 3), undefined)
 })
 
-test("files for other weights or kernels, and files cut short, are deleted when found", async () => {
+test("another identity's files are left for it, never matched; files cut short are deleted when found", async () => {
   const { files, folder } = memoryFolder()
-  await new PrefixDisk(folder, "old weights").save([1, 2], [texture(1)])
+  await new PrefixDisk(folder, "another bundle").save([1, 2], [texture(1)])
   await new PrefixDisk(folder, "id").save([5, 6], [texture(2)])
-  // A write that never finished.
-  const [cut] = [...files.keys()].filter((name) => name.startsWith("2-")).slice(-1)
+  // A write that never finished: this identity's file, a byte short.
+  const cut = [...files.keys()].find((name) => name.startsWith("2-") && new TextDecoder().decode(files.get(name)!.bytes).includes('"identity":"id"'))!
   const whole = files.get(cut)!
   files.set(cut, { ...whole, bytes: whole.bytes.slice(0, whole.bytes.byteLength - 1) })
   await folder.write("notes.txt", [new Uint8Array([1])])
   const disk = new PrefixDisk(folder, "id")
-  assert.equal(await disk.match([1, 2, 3], 2), undefined)
-  assert.equal(await disk.match([5, 6, 7], 2), undefined)
-  // (Only the prefix files are looked at.)
-  assert.deepEqual([...files.keys()], ["notes.txt"])
+  assert.equal(await disk.match([1, 2, 3], 2), undefined, "another identity's")
+  assert.equal(await disk.has([1, 2]), false)
+  assert.equal(await disk.match([5, 6, 7], 2), undefined, "cut short")
+  // The cut one went; the other identity's is still there, and still its own (and notes.txt is left alone).
+  assert.equal(files.size, 2)
+  assert.ok(files.has("notes.txt"))
+  assert.ok(await new PrefixDisk(folder, "another bundle").match([1, 2, 3], 2))
+})
+
+test("another identity's files count toward the budget, and go least recently used first like any", async () => {
+  const { files, folder } = memoryFolder()
+  const size = await (async () => {
+    const probe = memoryFolder()
+    await new PrefixDisk(probe.folder, "id").save([1], [texture(1)])
+    return [...probe.files.values()][0].bytes.byteLength
+  })()
+  await new PrefixDisk(folder, "another bundle", 2 * size).save([9], [texture(9)])
+  const disk = new PrefixDisk(folder, "id", 2 * size)
+  await disk.save([1], [texture(1)])
+  await disk.save([2], [texture(2)])
+  assert.equal(files.size, 2)
+  assert.equal(await new PrefixDisk(folder, "another bundle").has([9]), false, "the oldest went")
+  // clear() deletes only its own.
+  await new PrefixDisk(folder, "another bundle", 4 * size).save([8], [texture(8)])
+  await new PrefixDisk(folder, "id", 4 * size).clear()
+  assert.equal(files.size, 1)
+  assert.ok(await new PrefixDisk(folder, "another bundle").has([8]))
 })
 
 test("files past the disk budget go least recently used first; 0 deletes them all", async () => {
@@ -568,4 +591,24 @@ test("untilAborted stops waiting when the signal aborts", async () => {
   release("late")
   assert.equal(await untilAborted(Promise.resolve("now"), new AbortController().signal), "now")
   assert.equal(await untilAborted(Promise.resolve("no signal")), "no signal")
+})
+
+test("two identities saving the same tokens keep a file each; a stale index never deletes the other's", async () => {
+  const { files, folder } = memoryFolder()
+  const a = new PrefixDisk(folder, "bundle a")
+  const b = new PrefixDisk(folder, "bundle b")
+  await a.save([1, 2], [texture(1)])
+  assert.ok(await a.has([1, 2]))
+  await b.save([1, 2], [texture(2)])
+  assert.equal(files.size, 2, "a file each")
+  // a's index, read before b saved, still finds its own file, and b's stays.
+  const found = await a.match([1, 2, 3], 2)
+  assert.ok(found?.textures[0].bytes.every((x) => x === 1))
+  assert.equal(files.size, 2)
+  assert.ok((await b.match([1, 2, 3], 2))?.textures[0].bytes.every((x) => x === 2))
+  // A file rewritten under a's name by another identity: a leaves it.
+  const [name] = [...files.keys()].filter((n) => new TextDecoder().decode(files.get(n)!.bytes).includes('"identity":"bundle a"'))
+  files.set(name, { bytes: files.get([...files.keys()].find((n) => n !== name)!)!.bytes.slice() })
+  assert.equal(await a.match([1, 2, 3], 2), undefined)
+  assert.equal(files.size, 2, "not deleted")
 })

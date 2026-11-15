@@ -31,7 +31,9 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
+  import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';
+  import { createThinkingSplitter, THINK_OPEN } from './reply.js';
   import { CodedError } from './worker-errors.js';
   export function makeGenerate(state) {
     const stopped=state.stopped,post=m=>state.messages.push(m),logitProcessors=undefined;

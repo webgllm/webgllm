@@ -5,7 +5,13 @@
  * - LFM3 and Qwen3.5: `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
  */
 
-export type ParsedToolCall = { name: string; args: Record<string, unknown> }
+/**
+ * A call as parsed. `partial`: the call was cut off (the reply ran out of
+ * tokens inside it), and this is its arguments' JSON as far as they were
+ * written, as llama.cpp sends a cut-off call: the parameters finished, then
+ * the open one's value as an open string, `{` for none yet.
+ */
+export type ParsedToolCall = { name: string; args: Record<string, unknown>; partial?: string }
 
 /**
  * How a model writes tool calls. Qwen3.5 writes LFM3's XML; its template
@@ -173,32 +179,55 @@ function parsePythonic(body: string) {
   return calls
 }
 
-/** `<function=name><parameter=k>v</parameter></function>` → calls. */
-function parseXmlish(body: string) {
+/**
+ * `<function=name><parameter=k>v</parameter></function>` → calls. With
+ * `cut`, the text ends where the reply ran out of tokens: a function with
+ * no closing tag is the call it cut off (see ParsedToolCall.partial).
+ */
+function parseXmlish(body: string, cut = false) {
   const calls: Array<ParsedToolCall> = []
   for (const f of body.matchAll(
-    /<function=([^>\n]+)>([\s\S]*?)(?:<\/function>|$)/g
+    /<function=([^>\n]+)>([\s\S]*?)(<\/function>|$)/g
   )) {
     const args: Record<string, unknown> = {}
+    const written: Array<string> = []
+    let end = 0
     for (const p of f[2].matchAll(
       /<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g
     )) {
-      args[p[1].trim()] = parseXmlValue(p[2])
+      const value = parseXmlValue(p[2])
+      args[p[1].trim()] = value
+      written.push(`${JSON.stringify(p[1].trim())}:${JSON.stringify(value)}`)
+      end = (p.index ?? 0) + p[0].length
     }
-    calls.push({ name: f[1].trim(), args })
+    const call: ParsedToolCall = { name: f[1].trim(), args }
+    if (cut && !f[3]) {
+      // The parameter it was writing, if any: its value so far, as an open string.
+      const open = /<parameter=([^>\n]+)>\n?([\s\S]*)$/.exec(f[2].slice(end))
+      if (open) written.push(`${JSON.stringify(open[1].trim())}:${JSON.stringify(open[2]).slice(0, -1)}`)
+      call.partial = `{${written.join(",")}`
+    }
+    calls.push(call)
   }
   return calls
 }
 
-/** Every tool call in `text`, in LFM3's or LFM2's format. */
-export function parseToolCalls(text: string): Array<ParsedToolCall> {
+/**
+ * Every tool call in `text`, in LFM3's or LFM2's format. With `cut`, the
+ * text ends where the reply ran out of tokens: a call it ends inside is
+ * marked `partial` (LFM3's markup), or left out where its format can't say
+ * what of it was written (the calls before it stand).
+ */
+export function parseToolCalls(text: string, cut = false): Array<ParsedToolCall> {
   const calls: Array<ParsedToolCall> = []
-  for (const m of text.matchAll(/<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g)) {
-    const body = m[1].trim()
+  for (const m of text.matchAll(/<tool_call>([\s\S]*?)(<\/tool_call>|$)/g)) {
+    const open = cut && !m[2]
+    const body = open ? m[1].trimStart() : m[1].trim()
     if (body.includes("<function=")) {
-      calls.push(...parseXmlish(body))
+      calls.push(...parseXmlish(body, open))
       continue
     }
+    if (open) continue
     // A `<tool_call>` that isn't LFM3's markup: JSON, or a Python-style call.
     try {
       const json = JSON.parse(body) as {
@@ -216,8 +245,9 @@ export function parseToolCalls(text: string): Array<ParsedToolCall> {
     }
   }
   for (const m of text.matchAll(
-    /<\|tool_call_start\|>([\s\S]*?)(?:<\|tool_call_end\|>|$)/g
+    /<\|tool_call_start\|>([\s\S]*?)(<\|tool_call_end\|>|$)/g
   )) {
+    if (cut && !m[2]) continue
     calls.push(...parsePythonic(m[1]))
   }
   return calls

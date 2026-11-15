@@ -304,13 +304,16 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
   const top_p = numberField(body, "top_p", { min: 0, max: 1 }) ?? base.top_p
   const min_p = numberField(body, "min_p", { min: 0, max: 1 }) ?? base.min_p
   const presence_penalty = numberField(body, "presence_penalty", { min: -2, max: 2 }) ?? base.presence_penalty
+  // llama.cpp's name: how many of the last tokens the penalties look at (64 by default, -1 for all).
+  const repeat_last_n = numberField(body, "repeat_last_n", { min: -1, integer: true })
   return {
     temperature: numberField(body, "temperature", { min: 0, max: 2 }) ?? base.temperature,
     top_k: numberField(body, "top_k", { min: 0, integer: true }) ?? base.top_k,
     repetition_penalty: numberField(body, "repetition_penalty", { positive: true }) ?? base.repetition_penalty,
     ...(top_p !== undefined && { top_p }),
     ...(min_p !== undefined && { min_p }),
-    ...(presence_penalty !== undefined && { presence_penalty })
+    ...(presence_penalty !== undefined && { presence_penalty }),
+    ...(repeat_last_n !== undefined && { repeat_last_n })
   }
 }
 
@@ -397,6 +400,10 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   }
   const stops = (stop ?? []).filter(Boolean) as Array<string>
   const outputSchema = outputSchemaFor(body.response_format)
+  // A required or named call and a JSON answer can't both be the reply: refused, not one quietly dropped.
+  if (outputSchema && tools.length && toolChoice !== "auto" && toolChoice !== "none") {
+    throw new TypeError("response_format can't be combined with a required or named tool_choice: the reply is either the call or the JSON.")
+  }
   if (body.cache_prompt !== undefined && body.cache_prompt !== null && typeof body.cache_prompt !== "boolean") {
     throw new TypeError("cache_prompt must be a boolean.")
   }
@@ -427,7 +434,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     logprobs,
     generate,
     // A JSON answer can't hold markup; a forced call comes back in "done".
-    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto"),
+    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto" || toolChoice === "required"),
     parallelToolCalls: body.parallel_tool_calls !== false,
     repairToolCalls: body.repair_tool_calls !== false
   }
@@ -500,8 +507,11 @@ export function createReplyReader(options: {
       if (tools) {
         const { text, markup } = tools.flush()
         if (text) deltas.push({ content: text })
-        calls = markup ? parseToolCalls(markup) : []
-        if (markup && calls.length === 0) malformed = markup
+        // Out of tokens: a call it cut off is sent as written, as llama.cpp sends it (see
+        // finishReasonOf), and nothing in the reply is repaired (see planRepairs).
+        const cut = end.finishReason === "length"
+        calls = markup ? parseToolCalls(markup, cut) : []
+        if (markup && calls.length === 0 && !cut) malformed = markup
       }
       if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
       return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }
@@ -511,7 +521,7 @@ export function createReplyReader(options: {
       return (options.parallelToolCalls === false ? calls.slice(0, 1) : calls).map((call) => ({
         id: newId(),
         type: "function" as const,
-        function: { name: call.name, arguments: JSON.stringify(call.args) }
+        function: { name: call.name, arguments: call.partial ?? JSON.stringify(call.args) }
       }))
     }
   }
@@ -530,6 +540,15 @@ export function usageOf(stats: RunTimings, repairs: ReadonlyArray<RunTimings> = 
     prompt_tokens_details: { cached_tokens: sum((s) => s.cachedTokens) },
     completion_tokens_details: { reasoning_tokens: sum((s) => s.thinkingTokens ?? 0) }
   }
+}
+
+/**
+ * A reply's finish reason as llama-server gives it: "length" for one that
+ * ran out of tokens (its calls too), otherwise "tool_calls" for one with calls.
+ */
+export function finishReasonOf(calls: ReadonlyArray<unknown>, finishReason: WorkerFinishReason): WorkerFinishReason | "tool_calls" {
+  if (finishReason === "length") return "length"
+  return calls.length ? "tool_calls" : finishReason
 }
 
 /**
@@ -552,13 +571,16 @@ const EMPTY_ARGUMENTS = { type: "object", properties: {}, additionalProperties: 
 export async function planRepairs(
   calls: ReadonlyArray<ParsedToolCall>,
   malformed: string | undefined,
-  tools: ReadonlyArray<ChatTool>
+  tools: ReadonlyArray<ChatTool>,
+  finishReason?: WorkerFinishReason
 ): Promise<Array<ToolRepair>> {
   const repairs: Array<ToolRepair> = []
+  // A reply cut off by its token limit is sent as written (see finishReasonOf): nothing in it is repaired.
+  if (finishReason === "length") return repairs
   for (const [index, call] of calls.entries()) {
     const tool = tools.find((t) => t.function.name === call.name)
     if (!tool) {
-      repairs.push({ index, problem: "unknown-tool", choice: "required", draft: call })
+      repairs.push({ index, problem: "unknown-tool", choice: "any", draft: call })
       continue
     }
     let valid = true
@@ -570,7 +592,7 @@ export async function planRepairs(
     if (!valid) repairs.push({ index, problem: "invalid-arguments", choice: { name: call.name }, draft: call })
   }
   if (malformed !== undefined && calls.length === 0 && tools.length > 0) {
-    repairs.push({ index: 0, problem: "malformed", choice: "required", markup: malformed })
+    repairs.push({ index: 0, problem: "malformed", choice: "any", markup: malformed })
   }
   return repairs
 }

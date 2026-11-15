@@ -1,10 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { createConstraint, tokenAllowed, type Constraint } from "./index.js"
+import { createConstraint, tokenAllowed, validateStructuredValue, type Constraint } from "./index.js"
 
 const EOS = 256
 // Every byte as a token, then tokens of several bytes as models have them.
-const EXTRA = ['{"', "cut", "cuts", '\\"', '":', '","\\', '": "é', "\\n", '"}']
+const EXTRA = ['{"', "cut", "cuts", '\\"', '":', '","\\', '": "é', "\\n", '"}', "  ", " \n", "\n\n\n", "\n\n\t ", "\n" + " ".repeat(20), "\n" + " ".repeat(21), '"\n']
 const encoder = new TextEncoder()
 const tokenizer = {
   tokens: [...Array.from({ length: 257 }, (_, id) => (id === EOS ? [] : [id])), ...EXTRA.map((text) => [...encoder.encode(text)])],
@@ -79,18 +79,121 @@ test("an enum or const value beside free strings is fixed too, in objects and ar
   c.dispose()
 })
 
-test("a required key the model skipped is still added, and nothing else is", async () => {
-  // Reported: "replace": []\n \t \t, "m\n\n\n… without ever closing.
+test("keys come in llama.cpp's order: a required key can't be skipped, so it's never missing", async () => {
+  // Reported: "replace": []\n \t \t, "m\n\n\n… without ever closing, after the model skipped "merge".
   const c = await createConstraint({ schema: closed({ keep: strings, merge: strings, replace: strings }), tokenizer })
-  accept(c, '{"keep": [],"replace": []')
-  assert.equal(allows(c, byte("}")), false)
-  accept(c, ' , "')
-  assert.equal(allowed(c), "m")
-  accept(c, "m")
-  assert.equal(allowed(c), "e")
-  accept(c, 'erge": []}')
+  accept(c, '{"')
+  assert.equal(allowed(c), "k")
+  accept(c, 'keep": [],"')
+  assert.equal(allowed(c), "m", "merge, not replace")
+  accept(c, 'merge": [],"')
+  assert.equal(allowed(c), "r")
+  accept(c, 'replace": []}')
   assert.equal(c.complete, true)
   c.dispose()
+})
+
+test("required keys first as declared, then optional ones as declared, any of them skipped", async () => {
+  const schema = { type: "object", properties: { note: strings, op: { type: "string" }, extra: strings, at: { type: "string" } }, required: ["op", "at"], additionalProperties: false }
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"')
+  assert.equal(allowed(c), "o", "op, the first required")
+  accept(c, 'op": "a","')
+  assert.equal(allowed(c), "a")
+  accept(c, 'at": "b","')
+  // Then the optional ones: note or extra, in that order.
+  assert.equal(allowed(c), "en")
+  accept(c, 'extra": []')
+  assert.equal(allows(c, byte(",")), false, "nothing after the last optional key")
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("an object with rules over its keys as a whole (property counts, dependencies) isn't held to an order: a valid object can always be finished", async () => {
+  // Ordered, "c" first left no key to follow it, and minProperties no way to close: a dead end.
+  const three = { a: { type: "string" }, b: { type: "string" }, c: { type: "string" } }
+  for (const rule of [{ minProperties: 2 }, { dependentRequired: { c: ["a"] } }]) {
+    const schema = { type: "object", properties: three, additionalProperties: false, ...rule }
+    const c = await createConstraint({ schema, tokenizer })
+    accept(c, '{"c": "x"')
+    assert.equal(allows(c, byte(",")), true, JSON.stringify(rule))
+    accept(c, ',"a": "y"}')
+    assert.equal(c.complete, true)
+    assert.equal(await validateStructuredValue(schema, { c: "x", a: "y" }), true)
+    c.dispose()
+  }
+})
+
+test("whitespace after a value only before the end of what holds it, as in llama.cpp's grammar: a comma comes right after the value", async () => {
+  // Both required: after "a"'s value only a comma, no whitespace; after "b"'s, whitespace and then the end, no comma.
+  const c = await createConstraint({ schema: closed({ a: { type: "string" }, b: { type: "string" } }), tokenizer })
+  accept(c, '{"a": "x')
+  assert.equal(allows(c, extra('"\n')), false, "no newline after a value a comma must follow")
+  accept(c, '"')
+  assert.equal(allows(c, byte(" ")), false)
+  assert.equal(allows(c, byte(",")), true)
+  accept(c, ',"b": "y"')
+  assert.equal(allows(c, byte(" ")), true, "whitespace before the end")
+  accept(c, " ")
+  assert.equal(allows(c, byte(",")), false, "no comma after it")
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("an optional key may follow a value directly, or whitespace and the end", async () => {
+  const schema = { type: "object", properties: { a: { type: "string" }, b: { type: "string" } }, required: ["a"], additionalProperties: false }
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"a": "x"')
+  assert.equal(allows(c, byte(",")), true)
+  accept(c, "\n")
+  assert.equal(allows(c, byte(",")), false)
+  accept(c, "}")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("in an array, whitespace after an item only once it may end; numbers and nested objects are values too", async () => {
+  const schema = closed({ n: { type: "array", items: { type: "number" }, minItems: 2 }, o: closed({ k: { type: "boolean" }, j: { type: "boolean" } }) })
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"n": [1')
+  assert.equal(allows(c, byte(" ")), false, "one item of two: a comma next")
+  accept(c, ",2")
+  assert.equal(allows(c, byte(" ")), true)
+  accept(c, " ")
+  assert.equal(allows(c, byte(",")), false)
+  accept(c, ']')
+  assert.equal(allows(c, byte("\n")), false, "after the array, more keys: a comma next")
+  accept(c, ',"o": {"k": true,"j": false}')
+  assert.equal(allows(c, byte(" ")), true)
+  accept(c, " }")
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("a whitespace run is llama.cpp's space: one space, or one or two newlines and up to 20 spaces or tabs", async () => {
+  const c = await createConstraint({ schema: closed({ a: { type: "string" }, b: { type: "string" } }), tokenizer })
+  accept(c, '{"a": "x",')
+  assert.equal(allows(c, extra("  ")), false, "two spaces")
+  assert.equal(allows(c, extra(" \n")), false, "a space, then a newline")
+  assert.equal(allows(c, extra("\n\n\n")), false, "three newlines")
+  assert.equal(allows(c, byte("\t")), false, "a tab with no newline before it")
+  assert.equal(allows(c, extra("\n\n\t ")), true)
+  assert.equal(allows(c, extra("\n" + " ".repeat(20))), true)
+  assert.equal(allows(c, extra("\n" + " ".repeat(21))), false, "21 of indent")
+  accept(c, " ")
+  assert.equal(allows(c, byte(" ")), false, "a second space")
+  accept(c, '"b"')
+  assert.equal(allows(c, byte(" ")), true, "a space before the colon")
+  accept(c, ' : "y"\n}')
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
+test("checking a parsed value takes its keys in any order", async () => {
+  const schema = closed({ op: { type: "string" }, at: { type: "string" } })
+  assert.equal(await validateStructuredValue(schema, { at: "b", op: "a" }), true)
 })
 
 test("a token of several bytes is judged by where each byte lands", async () => {
@@ -119,7 +222,7 @@ test("nested objects, nullable values and local references are followed", async 
   }
   const c = await createConstraint({ schema, tokenizer })
   accept(c, '{"steps": [{"')
-  assert.equal(allowed(c), "ao")
+  assert.equal(allowed(c), "o", "op comes before at")
   accept(c, 'op": "')
   assert.equal(allowed(c), "ck")
   accept(c, 'keep","at": "')
@@ -196,4 +299,17 @@ test("HF ByteLevel vocabularies: the same, from their pieces", async () => {
   c.accept(id("}"))
   assert.equal(c.complete, true)
   c.dispose()
+})
+
+test("a value may start with a colon, right after the key's or after a space, as llama.cpp's grammar takes it", async () => {
+  const schema = closed({ a: { type: "string" }, b: { type: "string" } })
+  const c = await createConstraint({ schema, tokenizer })
+  accept(c, '{"a":"')
+  assert.equal(allows(c, byte(":")), true)
+  c.dispose()
+  const spaced = await createConstraint({ schema, tokenizer })
+  accept(spaced, '{"a": ":)", "b":"x"}')
+  assert.equal(spaced.complete, true)
+  spaced.dispose()
+  assert.equal(await validateStructuredValue(schema, { a: ":)", b: "x" }), true)
 })

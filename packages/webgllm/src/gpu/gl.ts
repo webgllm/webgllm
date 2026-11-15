@@ -86,7 +86,7 @@ export type Pass = {
   /** Integer uniforms go as `{ int: n }`; plain numbers are floats. */
   uniforms?: Record<
     string,
-    Uniform | { int: number } | { ivec4: [number, number, number, number] }
+    Uniform | { int: number } | { ivec4: [number, number, number, number] } | { ivec4s: ArrayLike<number> }
   >
   /**
    * The texture drawn into, or several of one size (multiple render
@@ -608,6 +608,7 @@ export class Gpu {
       if (typeof value === "number") gl.uniform1f(loc, value)
       else if ("int" in value) gl.uniform1i(loc, value.int)
       else if ("ivec4" in value) gl.uniform4i(loc, ...value.ivec4)
+      else if ("ivec4s" in value) gl.uniform4iv(loc, Int32Array.from(value.ivec4s))
       else if (value.length === 2) gl.uniform2f(loc, value[0], value[1])
       else if (value.length === 3)
         gl.uniform3f(loc, value[0], value[1], value[2])
@@ -701,6 +702,15 @@ export class Gpu {
       )
         return false
       values.set(name, { ivec4: [...value.ivec4] })
+    } else if ("ivec4s" in value) {
+      if (
+        old &&
+        typeof old === "object" &&
+        "ivec4s" in old &&
+        this.sameUniformArray(Array.from(old.ivec4s), Array.from(value.ivec4s))
+      )
+        return false
+      values.set(name, { ivec4s: Array.from(value.ivec4s) })
     } else {
       if (Array.isArray(old) && this.sameUniformArray(old, value)) return false
       values.set(name, [...value] as Uniform)

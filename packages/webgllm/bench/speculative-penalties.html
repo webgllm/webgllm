@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Speculative penalties</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Speculative decoding and penalties</h1>
+  <p>
+    Greedy replies through the production worker with speculative decoding on and off must be the same, for each
+    penalty window (<code>repeat_last_n</code> 0, 8, 64, and -1 for all): a batch of drafts checks each row with the
+    penalties drawing them one by one would apply. <code>?model=&lt;id&gt;</code> (LFM3 1.7B GGUF by default),
+    <code>&amp;penalty=&lt;n&gt;</code> (1.3 by default), <code>&amp;tokens=&lt;n&gt;</code> (160 by default).
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+    const penalty = Number(params.get("penalty") ?? 1.3)
+    const maxTokens = Number(params.get("tokens") ?? 160)
+    const prompts = [
+      "Repeat this list three times, exactly, one item per line: apple, banana, cherry, date, elderberry, fig, grape, honeydew.",
+      "Write the numbers from 1 to 40 in words, separated by commas.",
+      'Return this JSON three times, unchanged: {"name": "Ada", "role": "engineer", "skills": ["math", "logic", "poetry"]}'
+    ]
+    try {
+      const worker = new Worker("/bundle/src/worker.js", { type: "module" })
+      const send = (message) => worker.postMessage({ ...message, webgllm: true })
+      let pending
+      let reply = ""
+      worker.onmessage = ({ data }) => {
+        if (data.type === "claim") send({ type: "claimed", id: data.id })
+        else if (data.type === "ready") pending?.resolve()
+        else if (data.type === "token") reply += data.text
+        else if (data.type === "done") pending?.resolve(data.stats)
+        else if (data.type === "load-error" || data.type === "error") pending?.reject(new Error(data.message))
+      }
+      const wait = (start) => new Promise((resolve, reject) => { pending = { resolve, reject }; start() })
+      let t = performance.now()
+      await wait(() => send({ type: "load", model, loadId: 1 }))
+      log("loaded", model, `${Math.round(performance.now() - t)} ms`)
+      let n = 0
+      const generate = async (content, window, speculative) => {
+        reply = ""
+        const stats = await wait(() => send({
+          type: "generate", id: `r${n++}`, model, chat: [{ role: "user", content }], tools: [], thinking: false,
+          sampling: { temperature: 0, top_k: 1, repetition_penalty: penalty, repeat_last_n: window },
+          maxTokens, pipeline: true, speculative
+        }))
+        return { text: reply, stats }
+      }
+      let failed = 0
+      for (const window of [0, 8, 64, -1]) {
+        for (const [i, prompt] of prompts.entries()) {
+          const off = await generate(prompt, window, false)
+          const on = await generate(prompt, window, true)
+          const same = off.text === on.text
+          if (!same) failed++
+          log(`${same ? "PASS" : "FAIL"} window=${window} prompt=${i}: drafts kept ${on.stats.draftsKept ?? 0}/${on.stats.draftsChecked ?? 0} in ${on.stats.draftBatches ?? 0} batches, ${on.stats.outputTokens} tokens`)
+          if (!same) log("  off:", JSON.stringify(off.text), "\n  on: ", JSON.stringify(on.text))
+        }
+      }
+      log(`RESULT speculative_penalties failed=${failed} penalty=${penalty}`)
+      log("ALL DONE")
+    } catch (error) {
+      log("ERROR:", String(error?.stack ?? error))
+    }
+  </script>
+</html>

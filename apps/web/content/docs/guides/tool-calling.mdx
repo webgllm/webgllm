@@ -41,13 +41,18 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 - `"auto"` (default): the model decides.
 - `"none"`: no tool calls.
-- `"required"` or `{ type: "function", function: { name } }`: a forced call.
+- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
+- `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
 
-A forced call is constrained to the tool's JSON Schema while it's written, so its arguments are always valid. `parallel_tool_calls: false` keeps only the first call.
+`parallel_tool_calls: false` keeps only the first call.
+
+A required or named `tool_choice` can't be combined with a JSON `response_format`: the reply is either the call or the JSON, so the request is refused.
+
+A reply that runs out of `max_tokens` finishes with `"length"`, as llama.cpp's does, even when it holds calls. A call it cut off comes back with its arguments as far as they were written (`{"city":"Tok`), and nothing in the reply is repaired.
 
 ## Repair
 
-Automatic calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.
+Automatic and required calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.
 
 ## Schemas
 

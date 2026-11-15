@@ -13,6 +13,7 @@ import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
+import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
 import { quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
@@ -436,6 +437,14 @@ export function tuningToRetime(stored: Tuned): Tuned {
  * timings were kept (no submissionMs), whose pacing may be from the step
  * at two frames and whose packing from two pairs on a fast GPU.
  */
+/** The pick shaders' uSeenRows and uSeenRowCount (see K.PENALIZED). */
+function seenRowUniforms(rows: ReadonlyArray<SeenRow>) {
+  if (rows.length > MAX_SEEN_ROWS) throw new RangeError(`A batch's penalty rows can't pass ${MAX_SEEN_ROWS}.`)
+  const flat = new Array<number>(MAX_SEEN_ROWS * 4).fill(-1)
+  rows.forEach((row, i) => flat.splice(i * 4, 4, ...row))
+  return { uSeenRows: { ivec4s: flat }, uSeenRowCount: { int: rows.length } }
+}
+
 export function timesAgain(stored: Tuned): boolean {
   return !!stored.submissionRetime || (stored.submissionMs === undefined && stored.submissionReads !== undefined)
 }
@@ -5799,27 +5808,29 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     })
   }
 
-  /** Generated-token bits. The GPU mask also tracks prompt tokens and padding. */
-  private maskData: Uint8Array | null = null
+  /** Each token's seen state, as the GPU's mask has it (see setSeenState); padding isn't in it. */
+  private maskStates: Uint8Array | null = null
   private maskLimit = 0
   private maskUpdate: Uint8Array | null = null
 
   /**
-   * Sets which tokens the repetition penalty applies to, and bans every id
-   * from `vocabLimit` on (padding rows the tokenizer has no token for).
+   * Sets which tokens the repetition penalty applies to (state 1: see
+   * penalty-window.ts), and bans every id from `vocabLimit` on (padding rows
+   * the tokenizer has no token for).
    */
   setSeen(tokens: Iterable<number>, vocabLimit: number) {
     const mask = this.buffers.mask
-    const size = mask.width * mask.height, bytes = Math.ceil(size / 8)
-    const bits = this.maskData?.length === bytes ? this.maskData : new Uint8Array(bytes)
-    bits.fill(0)
+    const size = mask.width * mask.height
     this.maskLimit = Math.min(vocabLimit, size)
+    const states = this.maskStates?.length === this.maskLimit ? this.maskStates : new Uint8Array(this.maskLimit)
+    states.fill(0)
     const data = new Uint8Array(size)
     data.fill(2, this.maskLimit)
     for (const t of tokens) if (Number.isInteger(t) && t >= 0 && t < this.maskLimit) {
       data[t] = 1
+      states[t] = 1
     }
-    this.maskData = bits
+    this.maskStates = states
     this.gpu.write(
       mask,
       { x: 0, y: 0, width: mask.width, height: mask.height },
@@ -5832,14 +5843,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     releaseOwnedBuffer(data.buffer)
   }
 
-  /** Marks a generated token for repetition and presence penalties. */
-  markSeen(token: number) {
-    const data = this.maskData
-    if (!data || !Number.isInteger(token) || token < 0 || token >= this.maskLimit) return
-    const index = token >> 3, bit = 1 << (token & 7)
-    if (data[index] & bit) return
-    data[index] |= bit
-    const update = this.maskUpdate ??= new Uint8Array([3])
+  /**
+   * A token's state for the repetition and presence penalties: 0 not
+   * penalized, 1 in the window from the prompt, 3 written in this reply.
+   */
+  setSeenState(token: number, state: 0 | 1 | 3) {
+    const states = this.maskStates
+    if (!states || !Number.isInteger(token) || token < 0 || token >= this.maskLimit || states[token] === state) return
+    states[token] = state
+    const update = this.maskUpdate ??= new Uint8Array(1)
+    update[0] = state
     const width = this.buffers.mask.width
     this.gpu.write(
       this.buffers.mask,
@@ -5850,6 +5863,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         pixels: update
       }
     )
+  }
+
+  /** Marks a generated token for repetition and presence penalties (with no window: see setSeenState). */
+  markSeen(token: number) {
+    this.setSeenState(token, 3)
   }
 
   /**
@@ -5882,7 +5900,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     row0: number,
     rows: number,
     penalty: number,
-    drafts: Array<number>,
+    seenRows: ReadonlyArray<SeenRow>,
     guess = false,
     presencePenalty = 0
   ): Promise<Int32Array> {
@@ -5890,7 +5908,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const b = this.buffers
     const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
-    type Ivec4 = [number, number, number, number]
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -5902,8 +5919,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
-      uExtra: { ivec4: [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4 },
-      uExtra2: { ivec4: [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4 },
+      ...seenRowUniforms(seenRows),
       uPenaltyRow0: { int: 0 }
     }
     this.gpu.run({
@@ -5953,9 +5969,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /**
    * `candidates` for rows [row0, row0 + rows) of the last batch at once:
-   * one head pass, one pick, one readback. `drafts` are the batch's inputs
-   * after its first (row i + 1's input is drafts[i]): row r's penalty
-   * counts drafts before it as seen, as drawing them one by one would.
+   * one head pass, one pick, one readback. `seenRows`: where the batch's
+   * rows see tokens otherwise than the penalty mask (the drafts before
+   * them, and what those pushed out of the window: PenaltyWindow.ahead),
+   * as drawing them one by one would.
    * With `guess`, the last row's likeliest token is read forward (see
    * forwardGuess).
    */
@@ -5964,7 +5981,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     rows: number,
     chunks: number,
     penalty: number,
-    drafts: Array<number>,
+    seenRows: ReadonlyArray<SeenRow>,
     guess = false,
     penaltyRow0 = 0,
     presencePenalty = 0
@@ -5974,9 +5991,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
-    type Ivec4 = [number, number, number, number]
-    const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4
-    const extra2 = [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4
     const fast = TUNING.fastPick > 0
     const picking = {
       uOutW: { int: OUT_WIDTH },
@@ -5989,8 +6003,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
-      uExtra: { ivec4: extra },
-      uExtra2: { ivec4: extra2 },
+      ...seenRowUniforms(seenRows),
       uPenaltyRow0: { int: penaltyRow0 }
     }
     this.gpu.run({

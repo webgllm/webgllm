@@ -29,13 +29,13 @@ test("a named tool: its arguments alone, every tool still rendered", async () =>
 })
 
 test("required with one tool is that tool", () => {
-  const plan = planToolChoice([weather], "required")
+  const plan = planToolChoice([weather], "any")
   assert.ok(plan.mode === "forced")
   assert.deepEqual(plan.read({ city: "Oslo" }), { name: "get_weather", arguments: { city: "Oslo" } })
 })
 
 test("required with several: a name and its own tool's arguments", async () => {
-  const plan = planToolChoice([weather, time], "required")
+  const plan = planToolChoice([weather, time], "any")
   assert.ok(plan.mode === "forced")
   assert.equal(await validateStructuredValue(plan.schema, { name: "get_weather", arguments: { city: "Oslo" } }), true)
   assert.equal(await validateStructuredValue(plan.schema, { name: "get_time", arguments: { zone: "PST" } }), true)
@@ -45,28 +45,29 @@ test("required with several: a name and its own tool's arguments", async () => {
 })
 
 test("tools without parameters take an empty object; untyped parameters are objects", async () => {
-  const plan = planToolChoice([tool("ping")], "required")
+  const plan = planToolChoice([tool("ping")], "any")
   assert.ok(plan.mode === "forced")
   assert.equal(await validateStructuredValue(plan.schema, {}), true)
   assert.equal(await validateStructuredValue(plan.schema, { x: 1 }), false)
-  const untyped = planToolChoice([tool("f", { properties: { a: { type: "integer" } }, required: ["a"] })], "required")
+  const untyped = planToolChoice([tool("f", { properties: { a: { type: "integer" } }, required: ["a"] })], "any")
   assert.ok(untyped.mode === "forced")
   assert.deepEqual(untyped.schema, { type: "object", properties: { a: { type: "integer" } }, required: ["a"], additionalProperties: false })
 })
 
 test("unknown names, no tools and non-object parameters fail", () => {
   assert.throws(() => planToolChoice([weather], { name: "nope" }), /nope/)
+  assert.throws(() => planToolChoice([], "any"), /at least one tool/)
   assert.throws(() => planToolChoice([], "required"), /at least one tool/)
   assert.throws(() => planToolChoice([], { name: "nope" }), /nope/)
   for (const parameters of [{ type: "string" }, [1], "x"]) {
     let caught: unknown
-    try { planToolChoice([tool("f", parameters)], "required") } catch (error) { caught = error }
+    try { planToolChoice([tool("f", parameters)], "any") } catch (error) { caught = error }
     assert.equal(errorCode(caught), "invalid-schema")
   }
 })
 
 test("arguments that aren't an object are refused", () => {
-  const plan = planToolChoice([weather], "required")
+  const plan = planToolChoice([weather], "any")
   assert.ok(plan.mode === "forced")
   assert.throws(() => plan.read([1]))
 })
@@ -77,7 +78,7 @@ test("forced calls close objects that don't say otherwise, nested ones too", () 
     properties: { city: { type: "string" }, filters: { type: "object", properties: { units: { type: "string" } } }, tags: { type: "array", items: { type: "object" } } },
     required: ["city"]
   })
-  const plan = planToolChoice([open], "required")
+  const plan = planToolChoice([open], "any")
   assert.equal(plan.mode, "forced")
   const schema = (plan as { schema: { additionalProperties?: unknown; properties: Record<string, { additionalProperties?: unknown; items?: { additionalProperties?: unknown } }> } }).schema
   assert.equal(schema.additionalProperties, false)
@@ -85,7 +86,7 @@ test("forced calls close objects that don't say otherwise, nested ones too", () 
   assert.equal(schema.properties.tags.items?.additionalProperties, false)
   assert.equal(schema.properties.city.additionalProperties, undefined)
   // An explicit choice stays.
-  const loose = planToolChoice([tool("loose", { type: "object", additionalProperties: true })], "required")
+  const loose = planToolChoice([tool("loose", { type: "object", additionalProperties: true })], "any")
   assert.equal((loose as { schema: { additionalProperties?: unknown } }).schema.additionalProperties, true)
 })
 
@@ -103,11 +104,11 @@ test("required with several keeps each tool's local $defs references", async () 
     definitions: { value: { type: "string" } }
   })
   // One tool alone compiles.
-  const one = planToolChoice([setter], "required")
+  const one = planToolChoice([setter], "any")
   assert.ok(one.mode === "forced")
   assert.equal(await validateStructuredValue(one.schema, { value: 3 }), true)
   // Several: each branch's references still resolve to its own definitions.
-  const plan = planToolChoice([setter, namer], "required")
+  const plan = planToolChoice([setter, namer], "any")
   assert.ok(plan.mode === "forced")
   assert.equal(await validateStructuredValue(plan.schema, { name: "set_value", arguments: { value: 3 } }), true)
   assert.equal(await validateStructuredValue(plan.schema, { name: "set_value", arguments: { value: "x" } }), false)
@@ -180,10 +181,10 @@ test("required with several scopes references under properties named like data k
   const params = { type: "object", properties: { default: { $ref: "#/$defs/v" }, const: { $ref: "#/$defs/v" } }, required: ["default"], $defs: { v: { type: "integer" } } }
   const a = tool("a", params)
   const b = tool("b", { type: "object", properties: { x: { type: "string" } }, required: ["x"] })
-  const one = planToolChoice([a], "required")
+  const one = planToolChoice([a], "any")
   assert.ok(one.mode === "forced")
   assert.equal(await validateStructuredValue(one.schema, { default: 3 }), true)
-  const plan = planToolChoice([a, b], "required")
+  const plan = planToolChoice([a, b], "any")
   assert.ok(plan.mode === "forced")
   assert.equal(await validateStructuredValue(plan.schema, { name: "a", arguments: { default: 3, const: 4 } }), true)
   assert.equal(await validateStructuredValue(plan.schema, { name: "a", arguments: { default: "x" } }), false)
@@ -239,4 +240,9 @@ test("allOf objects whose keys can't all be known stay open", async () => {
     { allOf: [{ type: "object", properties: { a: {} } }, { required: ["b"] }] },
     { type: "object", properties: { a: {} }, allOf: [{ properties: { b: {} } }], anyOf: [{ properties: { c: {} } }] }
   ]) assert.equal((closeObjects(schema) as Record<string, unknown>).additionalProperties, undefined, JSON.stringify(schema))
+})
+
+test("required is a call in the model's own format: every tool rendered, no schema", () => {
+  assert.deepEqual(planToolChoice([weather, time], "required"), { mode: "required", tools: [weather, time] })
+  assert.deepEqual(planToolChoice([weather], "required"), { mode: "required", tools: [weather] })
 })
