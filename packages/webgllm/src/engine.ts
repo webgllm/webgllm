@@ -488,6 +488,19 @@ type Snapshot = {
 }
 
 /**
+ * A prompt prefix's state, kept apart from the live history (see
+ * prefix-store.ts): what a snapshot at `position` holds, plus a copy of
+ * each full-attention layer's keys and values for positions [0, position),
+ * which the live cache loses once another prompt overwrites them.
+ */
+export type SavedPrefix = {
+  position: number
+  state: Snapshot
+  /** Each full-attention layer's cache rows, in blocks as the live cache's (see kvTexture). */
+  kv: Array<Texture>
+}
+
+/**
  * A matmul's input: h2 activations, or the f32 residual and the norm to
  * apply (its weights, or "prescaled": already applied by the add).
  */
@@ -3087,6 +3100,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return at
   }
 
+  /** Where `rewind(position)` would leave the cache: the latest snapshot at or before it (0: none). */
+  rewindPosition(position: number): number {
+    return Math.max(0, ...[...this.snapshots.keys()].filter((p) => p <= position))
+  }
+
   /**
    * Rewinds the cache to the latest snapshot at or before `position`, and
    * returns where it is now: tokens before it are still in the cache.
@@ -3108,6 +3126,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.reset()
       return 0
     }
+    this.restoreState(saved, at)
+    this.position = at
+    return at
+  }
+
+  /** Puts a snapshot's state, saved at `at`, back in the layers (see rewind). */
+  private restoreState(saved: Snapshot, at: number) {
     const W = this.config.slidingWindow
     let c = 0
     let w = 0
@@ -3135,7 +3160,104 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         this.copyPositions(kv, W, a.kv, a.ring, Math.max(0, at - W), at)
       }
     }
+  }
+
+  /** A copy of a u32 texture (a window's saved keys and values, a cache block). */
+  private copyWhole(from: Texture, to = this.gpu.texture(from.internal, from.width, from.height)) {
+    try {
+      this.gpu.run({
+        program: this.gpu.program(K.COPY_POSITIONS),
+        inputs: { uX: from },
+        uniforms: { uPos0: { int: 0 }, uRow0: { int: 0 }, uMod: { int: from.height } },
+        output: to,
+        rect: { x: 0, y: 0, width: Math.min(from.width, to.width), height: Math.min(from.height, to.height) }
+      })
+      return to
+    } catch (error) {
+      this.gpu.delete(to)
+      throw error
+    }
+  }
+
+  /** A copy of a snapshot's state (no hidden row, no roles). */
+  private cloneSnapshot(saved: Snapshot): Snapshot {
+    const copy: Snapshot = { conv: [], windows: [], linear: [] }
+    try {
+      for (const t of saved.conv) copy.conv.push(this.copyOf(t))
+      for (const t of saved.linear) copy.linear.push(this.copyOf(t))
+      for (const t of saved.windows) copy.windows.push(this.copyWhole(t))
+      return copy
+    } catch (error) {
+      this.freeSnapshot(copy)
+      throw error
+    }
+  }
+
+  /** GPU bytes a saved prefix would hold at `position` (its snapshot's textures, its cache rows). */
+  savedPrefixBytes(position: number) {
+    const saved = this.snapshots.get(position)
+    if (!saved) return 0
+    let bytes = 0
+    for (const t of [...saved.conv, ...saved.linear, ...saved.windows]) bytes += t.bytes
+    const rows = 2 ** this.kvShift
+    const kvBytes = this.kvWidth() * Math.ceil(position / rows) * Math.min(position, rows) * 16
+    for (const layer of this.layers) if (layer.attention && !layer.attention.ring) bytes += kvBytes
+    return bytes
+  }
+
+  /**
+   * A copy of what resuming at `position` needs, for another history to
+   * restore (see restorePrefix): the snapshot there, and the full-attention
+   * cache rows before it (still the prompt's: later tokens only write past
+   * them). Undefined without a snapshot at `position`.
+   */
+  savePrefix(position: number): SavedPrefix | undefined {
+    const saved = this.snapshots.get(position)
+    if (!saved || position <= 0 || position > this.position) return undefined
+    const state = this.cloneSnapshot(saved)
+    const kv: Array<Texture> = []
+    try {
+      for (const layer of this.layers) {
+        const a = layer.attention
+        if (!a || a.ring) continue
+        kv.push(this.copyWhole(a.kv, this.kvTexture(position)))
+      }
+    } catch (error) {
+      this.freeSnapshot(state)
+      kv.forEach((t) => this.gpu.delete(t))
+      throw error
+    }
+    return { position, state, kv }
+  }
+
+  /** Frees a saved prefix's textures. */
+  freePrefix(saved: SavedPrefix) {
+    this.freeSnapshot(saved.state)
+    saved.kv.forEach((t) => this.gpu.delete(t))
+  }
+
+  /**
+   * Makes `saved` the cache: its full-attention rows and its snapshot's
+   * state put back, at its position. The live history's snapshots are
+   * another prompt's, so they go; a copy of `saved`'s snapshot takes their
+   * place, as the prefix (rewinds along the new history stop there).
+   */
+  async restorePrefix(saved: SavedPrefix): Promise<number> {
+    this.draft = null
+    this.guessAt = null
+    for (const s of this.snapshots.values()) this.freeSnapshot(s)
+    this.snapshots.clear()
+    const at = saved.position
+    await this.reserve(at)
+    let k = 0
+    for (const layer of this.layers) {
+      const a = layer.attention
+      if (!a || a.ring) continue
+      this.copyWhole(saved.kv[k++], a.kv)
+    }
+    this.restoreState(saved.state, at)
     this.position = at
+    if (this.snapshotLimit >= 2) this.keepSnapshot(at, this.cloneSnapshot(saved.state), "prefix")
     return at
   }
 

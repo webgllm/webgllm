@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 import type { Constraint } from "./constraint/index.js"
+import { PrefixStore } from "./prefix-store.js"
 
 const require = createRequire(join(process.cwd(), "package.json"))
 const { build } = await import(pathToFileURL(require.resolve("esbuild")).href) as typeof import("esbuild")
@@ -29,6 +30,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { outputTokenLimit } from './generation-limits.js';
   import { StructuredGeneration, maskLogits } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
+  import { PrefixStore, savePromptPrefix } from './prefix-store.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';
@@ -92,7 +94,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     tuned: { submissionOverlap: 0 },
     setAllowedTokens(mask: Uint32Array | null) { masks.push(mask) }, setAllowedTokenRows() {},
     dropGuess() {}, keepGuess() {}, accept() {}, reset() {}, canResume() { return false },
-    rewind() { position = 0; return 0 }, snapshotPosition() { return undefined }, snapshot() { return undefined },
+    rewind() { position = 0; return 0 }, rewindPosition() { return 0 }, snapshotPosition() { return undefined }, snapshot() { return undefined },
     batchSizes(count: number) { return [count] },
     preparePrompt: async () => undefined,
     setImages() {},
@@ -131,7 +133,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     tokenBytes: (t: number) => new TextEncoder().encode(TEXT[t] ?? ""),
     createStreamDecoder: () => ({ push: (t: number) => TEXT[t] ?? "", flush: () => "" })
   }
-  const model = { model: "LiquidAI/LFM3-1.7B-GGUF", engine, tokenizer, cached: [] as number[], claimed: 0 }
+  const model = { model: "LiquidAI/LFM3-1.7B-GGUF", engine, tokenizer, cached: [] as number[], claimed: 0, prefixes: new PrefixStore(() => {}) }
   const state = { stopped, messages, model, constraint: options.constraint, processors: options.processors, claims, reclaimBytes: options.growBy === undefined ? undefined : 32 * 2 ** 20 }
   const generate = makeGenerate(state) as ((r: Request) => Promise<void>) & { forward: (r: Forward) => Promise<void>; reset: (r: Extract<WorkerRequest, { type: "reset" }>) => void }
   return { generate, messages, masks, seen, penalties, reads, claims, model }

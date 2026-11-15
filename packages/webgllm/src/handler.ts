@@ -33,6 +33,8 @@ import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
+import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
+import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
 import type { ToolCall } from "./tool-choice.js"
 import { createStopFilter } from "./stop-sequences.js"
@@ -188,6 +190,8 @@ type Loaded = {
   imagePositions?: VisionConfig["positions"]
   /** Recent verified common content, for conservative short-prefix promotion. */
   previousShared?: number
+  /** Prompt prefixes saved apart from the live history (see prefix-store.ts). */
+  prefixes: PrefixStore<SavedPrefix>
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
@@ -596,6 +600,7 @@ async function load(
       tokenizer,
       cached: [],
       images: new ImageCache(),
+      prefixes: new PrefixStore<SavedPrefix>((saved) => engine.freePrefix(saved)),
       claimed: engine.gpu.bytes,
       noteKey,
       note: measured ?? note,
@@ -1040,10 +1045,28 @@ async function generate(request: GenerateRequest) {
     common++
   }
   const whole = common === prompt.length && engine.canResume(common)
-  const start = whole
-    ? engine.resume(common)
-    : engine.rewind(Math.min(common, prompt.length - 1))
-  model.cached.length = start
+  // A saved prefix of this prompt's (another system prompt's history may
+  // have replaced it since), where it reaches further than the live history.
+  // (Not the whole prompt: the last token is read for the logits after it.)
+  const stored = cacheEnabled && !raw && !whole
+    ? model.prefixes.match(keys, prompt.length - 1)
+    : undefined
+  const restored = stored && stored.keys.length > engine.rewindPosition(Math.min(common, prompt.length - 1))
+    ? stored
+    : undefined
+  let start: number
+  if (restored) {
+    // (Nothing held until it's back: a failure leaves an empty cache.)
+    model.cached.length = 0
+    start = await engine.restorePrefix(restored.state)
+    model.cached.push(...restored.keys)
+    common = start
+  } else {
+    start = whole
+      ? engine.resume(common)
+      : engine.rewind(Math.min(common, prompt.length - 1))
+    model.cached.length = start
+  }
   let natural: number | undefined
   if (cacheEnabled && common > 0 && !whole && prefix !== undefined && prefix > start) {
     let at = start
@@ -1076,6 +1099,13 @@ async function generate(request: GenerateRequest) {
   const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix
+  if (request.promptCacheBytes !== undefined) model.prefixes.setBudget(request.promptCacheBytes)
+  const learned = cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0
+  // The system prompt's end, saved for the store where it lacks it, even
+  // inside a batch (see Engine.forwardHidden's prefixAt): a few copies. It
+  // takes the place of a shorter boundary learned from the live history.
+  const storable = cacheEnabled && prefix !== undefined && prefix > start && prefix < prompt.length &&
+    model.prefixes.budget > 0 && !images.some((image) => image.start < prefix) && !model.prefixes.has(keys.slice(0, prefix))
   if (!stopped.has(id)) await engine.preparePrompt(prompt.length)
   let row = await readPrompt(engine, prompt, start, model.cached, {
     keys,
@@ -1083,10 +1113,12 @@ async function generate(request: GenerateRequest) {
     // After a changed request reveals a shorter common boundary, retain it
     // during this ordinary forward. One-off cold calls incur no extra work.
     prefix: reusablePrefix,
-    ...(cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0 && { observedPrefix: reusablePrefix }),
+    // (The store's first: the live history's shorter shared boundary has other requests to come back to.)
+    ...(storable ? { observedPrefix: prefix } : learned && { observedPrefix: reusablePrefix }),
     anchor,
     checkpoints: cacheEnabled
   })
+  if (cacheEnabled && !raw && !stopped.has(id)) savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix)
   const stats: RunTimings = {
     inputTokens: prompt.length,
     cachedTokens: start,
@@ -1634,6 +1666,7 @@ async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }
 function resetChat(request: Extract<WorkerRequest, { type: "reset" }>) {
   if (current?.model === request.model) {
     current.cached.length = 0
+    current.prefixes.clear()
     current.engine.reset()
   }
   logitProcessors?.get(request.model)?.resetState()

@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 import { readPrompt } from "./prompt.js"
+import { PrefixStore } from "./prefix-store.js"
 import type { Engine } from "./engine.js"
 
 const require = createRequire(join(process.cwd(), "package.json"))
@@ -26,6 +27,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { outputTokenLimit } from './generation-limits.js';
   import { StructuredGeneration } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
+  import { PrefixStore, savePromptPrefix } from './prefix-store.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';
@@ -54,7 +56,7 @@ function probe() {
     gpu: { compiled: { count: 0 }, calibratePromptPacing: (): Promise<void> | undefined => undefined },
     setAllowedTokens() { calls.masks++ }, dropGuess() { calls.drops++ },
     reset() { cached.length = 0 }, canResume() { return false },
-    rewind() { calls.rewinds++; return 0 }, snapshotPosition() { return undefined },
+    rewind() { calls.rewinds++; return 0 }, rewindPosition() { return 0 }, snapshotPosition() { return undefined },
     snapshot() { calls.snapshots++; return undefined },
     batchSizes(count: number) { const sizes = []; for (; count; count -= Math.min(256, count)) sizes.push(Math.min(256, count)); return sizes },
     preparePrompt: async () => undefined,
@@ -63,7 +65,7 @@ function probe() {
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
     specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, constraintTokenizer: {} }
-  return { calls, stopped, messages, model: { engine, tokenizer, cached },
+  return { calls, stopped, messages, model: { engine, tokenizer, cached, prefixes: new PrefixStore(() => {}) },
     createConstraint: async () => ({ dispose() { calls.disposed++ } }) }
 }
 const request = (id: string, cachePrompt: boolean): Extract<WorkerRequest, { type: "generate" }> => ({

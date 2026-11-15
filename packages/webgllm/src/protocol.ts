@@ -125,6 +125,11 @@ export type WorkerRequest =
       logitBias?: Record<string, number>
       /** Explicit false disables cross-call inference-cache reuse and retention. */
       cachePrompt?: boolean
+      /**
+       * Bytes of prompt prefixes the model keeps saved apart from its live
+       * cache (see prefix-store.ts): 128 MiB until a request says otherwise.
+       */
+      promptCacheBytes?: number
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean
