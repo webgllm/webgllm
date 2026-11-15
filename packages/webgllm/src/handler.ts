@@ -969,6 +969,13 @@ async function generate(request: GenerateRequest) {
   const toolPlan = planToolChoice(request.tools, request.toolChoice)
   const tools = toolPlan.tools.length ? toolPlan.tools : undefined
   const forced = toolPlan.mode === "forced" ? toolPlan : undefined
+  // "required", as llama.cpp has it: the model writes its call in its own
+  // format, text may come first, and the reply can't end before a call is
+  // written to its closing marker (LFM3's `</tool_call>`, LFM2's `<|tool_call_end|>`).
+  const callEnds = toolPlan.mode === "required"
+    ? [tokenizer.specialTokens.toolCallEnd, tokenizer.tokenToId("<|tool_call_end|>")].filter((t): t is number => typeof t === "number" && t >= 0)
+    : []
+  let called = toolPlan.mode !== "required"
   // A forced call is the reply: its arguments' schema takes the answer's place.
   const answerSchema = forced ? forced.schema : request.outputSchema
   const tokenizeAt = performance.now()
@@ -1283,6 +1290,14 @@ async function generate(request: GenerateRequest) {
     guesses.push(d.ids[best] === drawn)
     if (guesses.length > GUESS_WINDOW) guesses.shift()
   }
+  // Drafts stop short of a call's closing marker until a call is written:
+  // the rows after it may end the reply, which the batch's one mask (no
+  // end yet) wouldn't let them.
+  const untilCallEnd = (drafts: Array<number>) => {
+    if (called) return drafts
+    const at = drafts.findIndex((t) => callEnds.includes(t))
+    return at < 0 ? drafts : drafts.slice(0, at)
+  }
   // How many drafts to check with each token, by what they've cost and
   // earned (see DraftPolicy).
   const policy = new DraftPolicy(DRAFTS)
@@ -1291,14 +1306,14 @@ async function generate(request: GenerateRequest) {
   const draftsFor = (max: number) => {
     // (Gated DeltaNet models read one token at a time: see Engine.canDraft.)
     if (request.speculative === false || max <= 0 || !engine.canDraft) return []
-    const found = lookupDraft(history, max, TUNING.draftMatch)
+    const found = untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
     return found.slice(0, policy.choose(found))
   }
   // Whether a draft batch would follow (without changing what the policy
   // remembers).
   const draftsNext = () => {
     if (request.speculative === false || !engine.canDraft) return false
-    const found = lookupDraft(history, DRAFTS, TUNING.draftMatch)
+    const found = untilCallEnd(lookupDraft(history, DRAFTS, TUNING.draftMatch))
     return found.length > 0 && policy.peek(found) > 0
   }
   // The distribution of the token after `r`, a row of the last batch, as
@@ -1314,11 +1329,26 @@ async function generate(request: GenerateRequest) {
     thinkingOff = new Uint32Array(Math.ceil(vocab / 32)).fill(0xffffffff)
     for (const t of markers) thinkingOff[t >>> 5] &= ~(1 << (t & 31))
   }
+  // "required" before its call: every token but the end of the reply.
+  let noEnd: Uint32Array | null = null
+  const eosToken = tokenizer.specialTokens.eos
+  if (!called && eosToken >= 0 && eosToken < vocab) {
+    noEnd = new Uint32Array(Math.ceil(vocab / 32)).fill(0xffffffff)
+    noEnd[eosToken >>> 5] &= ~(1 << (eosToken & 31))
+  }
+  // (The last mask with the end taken out, by the mask it came from: the same array while that is.)
+  let endless: { from: Uint32Array; mask: Uint32Array } | undefined
+  const withoutEnd = (mask: Uint32Array | null) => {
+    if (!mask) return noEnd!
+    if (endless?.from !== mask) endless = { from: mask, mask: mask.map((word, i) => word & noEnd![i]) }
+    return endless.mask
+  }
   const updateAllowed = () => {
     // JSON literals are governed by their grammar. Only unconstrained replies
     // reserve control markers: with thinking off, or after an explicit
     // budgeted reasoning span closes.
-    const mask = structured ? structured.mask() : thinkingOff ?? thinkingBudget?.closedControlMask(vocab) ?? null
+    const open = structured ? structured.mask() : thinkingOff ?? thinkingBudget?.closedControlMask(vocab) ?? null
+    const mask = !called && noEnd && !structured ? withoutEnd(open) : open
     if (structured?.answering || appliedMask !== mask) engine.setAllowedTokens(mask)
     appliedMask = mask
     return mask ?? undefined
@@ -1420,6 +1450,8 @@ async function generate(request: GenerateRequest) {
   let stopHit = false
   let sawEos = false
   let callText = ""
+  // The reply's last characters while a "required" call isn't written yet.
+  let callTail = ""
   let unfiltered = false
   /** Sends reply text; false once a stop sequence ended the reply. */
   const send = (text: string, constrained = false) => {
@@ -1477,7 +1509,13 @@ async function generate(request: GenerateRequest) {
     else sampler.see([t], true)
     policy.drawn(t)
     history.push(t)
+    if (!called && callEnds.includes(t)) called = true
     const text = decoder.push(t)
+    // (A closing marker written as text, not its token, closes the call too.)
+    if (!called && text) {
+      callTail = (callTail + text).slice(-32)
+      if (callTail.includes("</tool_call>") || callTail.includes("<|tool_call_end|>")) called = true
+    }
     if (text) {
       if (calling) {
         // (A forced call's JSON isn't sent as text: its tokens count as written.)

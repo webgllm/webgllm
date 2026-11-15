@@ -430,7 +430,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     logprobs,
     generate,
     // A JSON answer can't hold markup; a forced call comes back in "done".
-    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto"),
+    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto" || toolChoice === "required"),
     parallelToolCalls: body.parallel_tool_calls !== false,
     repairToolCalls: body.repair_tool_calls !== false
   }
@@ -561,7 +561,7 @@ export async function planRepairs(
   for (const [index, call] of calls.entries()) {
     const tool = tools.find((t) => t.function.name === call.name)
     if (!tool) {
-      repairs.push({ index, problem: "unknown-tool", choice: "required", draft: call })
+      repairs.push({ index, problem: "unknown-tool", choice: "any", draft: call })
       continue
     }
     let valid = true
@@ -573,7 +573,7 @@ export async function planRepairs(
     if (!valid) repairs.push({ index, problem: "invalid-arguments", choice: { name: call.name }, draft: call })
   }
   if (malformed !== undefined && calls.length === 0 && tools.length > 0) {
-    repairs.push({ index: 0, problem: "malformed", choice: "required", markup: malformed })
+    repairs.push({ index: 0, problem: "malformed", choice: "any", markup: malformed })
   }
   return repairs
 }

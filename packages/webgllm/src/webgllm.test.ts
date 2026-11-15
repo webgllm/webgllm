@@ -101,12 +101,12 @@ test("a forced tool call comes back as tool_calls", async () => {
     model: LFM2,
     messages: hi,
     tools: [{ type: "function", function: { name: "pick" } }],
-    tool_choice: "required"
+    tool_choice: { type: "function", function: { name: "pick" } }
   })
   assert.equal(completion.choices[0]?.finish_reason, "tool_calls")
   assert.equal(completion.choices[0]?.message.content, null)
   assert.equal(completion.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"n":1}')
-  assert.equal(workers.of(LFM2)!.generations()[0]!.toolChoice, "required")
+  assert.deepEqual(workers.of(LFM2)!.generations()[0]!.toolChoice, { name: "pick" })
 })
 
 test("aborting a stream rejects with AbortError and stops the worker", async () => {
@@ -300,7 +300,7 @@ test("tool-call repair: unknown tools and unparsed markup are forced to any tool
     request.toolChoice ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Rome" } } } } : undefined
   const unknown = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"] } })
   const a = await unknown.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
-  assert.equal(unknown.workers.of(QWEN)!.generations()[1]!.toolChoice, "required")
+  assert.equal(unknown.workers.of(QWEN)!.generations()[1]!.toolChoice, "any")
   assert.equal(a.choices[0]?.message.tool_calls?.[0]?.function.name, "get_weather")
 
   const broken = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\nnot a call\n</tool_call>"] } })

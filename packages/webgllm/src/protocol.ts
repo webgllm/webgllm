@@ -31,7 +31,13 @@ export type WorkerErrorCode =
  * OpenAI's tool_choice: "auto" lets the model decide, "none" offers no tools,
  * "required" makes it call one of them, a name makes it call that one.
  */
-export type ToolChoice = "auto" | "none" | "required" | { name: string }
+/**
+ * "required": a call to one of the tools in the model's own format, as
+ * llama.cpp has it (text may come first; the reply can't end before a
+ * call). "any": a call to one of them as JSON held to their schemas (what
+ * a repair asks for: see planRepairs). `{ name }`: that tool's call as JSON.
+ */
+export type ToolChoice = "auto" | "none" | "required" | "any" | { name: string }
 
 /** Token counts and timings of one generation, measured in the worker. */
 export type RunTimings = {

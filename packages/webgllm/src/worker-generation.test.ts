@@ -61,8 +61,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
 const { makeGenerate } = await import(pathToFileURL(outfile).href)
 
 /** Token ids 0–9 are control tokens; the rest are words of TEXT. */
-const EOS = 1, THINK = 3, THINK_END = 4
-const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>" }
+const EOS = 1, THINK = 3, THINK_END = 4, TOOL_CALL = 5, TOOL_CALL_END = 6
+const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>", [TOOL_CALL]: "<tool_call>", [TOOL_CALL_END]: "</tool_call>" }
 const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d"]
 words.forEach((w, i) => { TEXT[10 + i] = w })
 const id = (w: string) => 10 + words.indexOf(w)
@@ -129,7 +129,8 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
       return prompt === "" ? [] : prompt.endsWith("<think>") ? [2, 20, THINK] : [2, 20, 21]
     },
     vocabSize: 64,
-    specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2 },
+    specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2, toolCall: TOOL_CALL, toolCallEnd: TOOL_CALL_END },
+    tokenToId: (token: string) => Object.entries(TEXT).find(([, text]) => text === token)?.[0] as number | undefined,
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),
     tokenBytes: (t: number) => new TextEncoder().encode(TEXT[t] ?? ""),
@@ -246,11 +247,24 @@ test("a forced tool call is sent as toolCall on done, not as text", async () => 
 test("thinking comes before a forced call, and is sent as text", async () => {
   const j = jsonConstraint(id("}"))
   const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
-  await s.generate(request({ tools: [weather], toolChoice: "required", thinking: true, stop: ["{"] }))
+  await s.generate(request({ tools: [weather], toolChoice: { name: "get_weather" }, thinking: true, stop: ["{"] }))
   // The template ended the prompt outside the thinking: it's opened first.
   assert.equal(text(s.messages), "<think> hm</think>")
   assert.deepEqual(done(s.messages).toolCall, { name: "get_weather", arguments: { city: "Oslo" } })
   assert.deepEqual(j.accepted, [...json, EOS])
+})
+
+test("required, as llama.cpp has it: the call in the model's own format, text before it allowed, and no end before the call is closed", async () => {
+  const s = scripted([id("Hello"), TOOL_CALL, id("a"), TOOL_CALL_END])
+  await s.generate(request({ tools: [weather], toolChoice: "required" }))
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // The steps before the closing marker refused the end; after it, the end is open again.
+  const set = s.masks.filter((m) => m !== null)
+  assert.equal(set.length, 2)
+  assert.equal(blocksEnd(set[0]), true)
+  assert.equal(blocksEnd(set[1]), false)
+  assert.equal(text(s.messages), "Hello<tool_call>a</tool_call>")
+  assert.equal(done(s.messages).toolCall, undefined, "parsed from the text on the main thread, like auto's")
 })
 
 test("toolChoice naming an unknown tool fails", async () => {

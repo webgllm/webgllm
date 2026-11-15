@@ -199,6 +199,8 @@ test("tools and tool_choice", () => {
   assert.deepEqual(named.generate.toolChoice, { name: "get_weather" })
   assert.equal(named.parseTools, false)
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).generate.toolChoice, "required")
+  // Its call comes as markup, read like auto's (and repaired like it).
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).parseTools, true)
   assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, tool_choice: "required" })), "TypeError")
   assert.equal(
     code(() => planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: { type: "function", function: { name: "nope" } } })),
@@ -427,8 +429,8 @@ test("planRepairs: valid calls pass; bad arguments, unknown tools and unparsed m
   const typed = { name: "get_weather", args: { city: 3 } }
   assert.equal((await planRepairs([typed], undefined, tools))[0]?.problem, "invalid-arguments")
   const unknown = { name: "get_time", args: {} }
-  assert.deepEqual(await planRepairs([ok, unknown], undefined, tools), [{ index: 1, problem: "unknown-tool", choice: "required", draft: unknown }])
-  assert.deepEqual(await planRepairs([], "<tool_call>junk</tool_call>", tools), [{ index: 0, problem: "malformed", choice: "required", markup: "<tool_call>junk</tool_call>" }])
+  assert.deepEqual(await planRepairs([ok, unknown], undefined, tools), [{ index: 1, problem: "unknown-tool", choice: "any", draft: unknown }])
+  assert.deepEqual(await planRepairs([], "<tool_call>junk</tool_call>", tools), [{ index: 0, problem: "malformed", choice: "any", markup: "<tool_call>junk</tool_call>" }])
   // No tools offered: markup stays text.
   assert.deepEqual(await planRepairs([], "<tool_call>junk</tool_call>", []), [])
   // A schema the validator can't check passes.
@@ -453,13 +455,13 @@ test("repairRequest appends the failed call and a note, drops stop strings and c
   assert.equal(request.thinking, true)
   // Thinking off stays off, with no budget.
   const off = planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, tools: [weatherTool], reasoning_effort: "none" })
-  const malformed = repairRequest(off, { index: 0, problem: "malformed", choice: "required", markup: "<tool_call>junk" })
+  const malformed = repairRequest(off, { index: 0, problem: "malformed", choice: "any", markup: "<tool_call>junk" })
   assert.equal(malformed.thinking, false)
   assert.equal(malformed.thinkingBudgetTokens, undefined)
   assert.equal(malformed.chat.at(-2)?.content, "<tool_call>junk")
   // LFM2 writes calls in its own format, in the content.
   const lfm2 = planCompletion({ model: "LiquidAI/LFM2.5-350M-GGUF", messages: hi, tools: [weatherTool] })
-  const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "required", draft: { name: "get_time", args: {} } })
+  const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "any", draft: { name: "get_time", args: {} } })
   assert.match(String(written.chat.at(-2)?.content ?? ""), /get_time/)
   assert.match(String(written.chat.at(-1)?.content ?? ""), /no tool named get_time/)
 })
