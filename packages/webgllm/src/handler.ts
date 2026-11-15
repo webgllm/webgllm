@@ -1726,6 +1726,31 @@ function resetChat(request: Extract<WorkerRequest, { type: "reset" }>) {
  * so one must finish (or stop) before the next reads its prompt.
  */
 let queue: Promise<void> = Promise.resolve()
+/** Generations, token forwards and resets waiting or running (see warmConstraint). */
+let pending = 0
+
+/**
+ * The constraint compiler's one-time work for a model's tokenizer:
+ * llguidance converting its vocabulary on the first structured answer
+ * (0.36 s for LFM3's in Node on an M-series Mac, seconds in a browser
+ * worker), which that answer used to wait for. Done once the worker is idle
+ * after a load instead; skipped when a request is already waiting, which
+ * does the work itself if it needs it. The conversion is kept with the
+ * tokenizer, so every later constraint reuses it.
+ */
+function warmConstraint(model: Loaded) {
+  if (pending > 0 || current !== model) return
+  // (Only ever a head start: a failure here is the first structured answer's to report.)
+  try {
+    void createConstraint({ schema: { type: "string" }, tokenizer: model.tokenizer.constraintTokenizer }).then(
+      (constraint) => constraint.dispose(),
+      () => undefined
+    )
+  } catch {
+    // Nothing to warm.
+  }
+}
+
 function receive(data: WorkerRequest) {
   if (data.type === "frames") {
     pacingEngine?.gpu.observeFrames(
@@ -1747,14 +1772,17 @@ function receive(data: WorkerRequest) {
     queue = queue.then(() => {
       const before = current
       startLoad(model, contextLength).then(
-        (loaded) =>
+        (loaded) => {
           post({
             type: "ready",
             model,
             loadId,
             contextLength: loaded.engine.contextLength,
             ...(loaded !== before && { timings: loaded.timings })
-          }),
+          })
+          // (After the messages already sent: a request among them goes first.)
+          if (loaded !== before) setTimeout(() => warmConstraint(loaded), 0)
+        },
         (error: unknown) => {
           if (!(error instanceof Superseded))
             post({ type: "load-error", model, loadId, message: errorMessage(error), code: errorCode(error) })
@@ -1770,14 +1798,18 @@ function receive(data: WorkerRequest) {
     if (data.meta) rememberModel(data.meta)
     void downloadModel(data.model, data.id)
   } else if (data.type === "reset") {
+    pending++
     queue = queue.then(() => {
       try {
         resetChat(data)
       } catch (error) {
         post({ type: "error", id: data.id, message: errorMessage(error), code: errorCode(error) })
+      } finally {
+        pending--
       }
     })
   } else if (data.type === "generate" || data.type === "forward") {
+    pending++
     queue = queue
       .then(() => (data.type === "generate" ? generate(data) : forwardTokens(data)))
       .catch((error: unknown) => {
@@ -1797,6 +1829,7 @@ function receive(data: WorkerRequest) {
         post({ type: "error", id: data.id, message: errorMessage(error), code: lost ? "gpu-context-lost" : errorCode(error) })
       })
       .finally(() => {
+        pending--
         stopped.delete(data.id)
         aborts.delete(data.id)
       })

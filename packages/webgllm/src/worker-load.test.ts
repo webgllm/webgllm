@@ -38,6 +38,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     const stopped = new Set(), aborts = new Map(), TUNING = {}, WEBGLLM = "webgllm"
     ${source.slice(claimsStart, claimsEnd)}
     const downloadModel = () => undefined
+    // The idle warm-up after a load (see warmConstraint): counted, never compiled here.
+    const createConstraint = async () => { state.warmups = (state.warmups ?? 0) + 1; return { dispose() {} } }
     async function generate(request) {
       const model = await startLoad(request.model, request.contextLength)
       const abort = aborts.get(request.id) ?? new AbortController()
@@ -53,7 +55,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
 const { makeWorker } = await import(pathToFileURL(outfile).href)
 
 type Engine = { contextLength: number; released: boolean; gpu: { isLost: boolean } }
-type Loaded = { model: string; contextLength: number | undefined; engine: Engine; cached: number[] }
+type Loaded = { model: string; contextLength: number | undefined; engine: Engine; cached: number[]; tokenizer?: { constraintTokenizer: object } }
 
 /** A request as the page sends it: with webgllm's mark (a message without one is the worker's own). */
 const mark = (data: unknown) => (typeof data !== "object" || data === null || "unmarked" in data ? data : { ...data, webgllm: true })
@@ -72,6 +74,7 @@ function worker() {
   let active = 0, most = 0
   const state = {
     messages,
+    warmups: 0,
     onmessage: null as unknown as (event: { data: WorkerRequest }) => void,
     async load(model: string, signal: AbortSignal, contextLength: number | undefined): Promise<Loaded> {
       active++
@@ -84,7 +87,7 @@ function worker() {
       } finally {
         active--
       }
-      return { model, contextLength, engine, cached: [] }
+      return { model, contextLength, engine, cached: [], tokenizer: { constraintTokenizer: {} } }
     },
     async generate(model: Loaded) {
       const done = gate()
@@ -96,7 +99,7 @@ function worker() {
   }
   makeWorker(state)
   const send = (data: WorkerRequest) => state.onmessage({ data: mark(data) as WorkerRequest })
-  return { send, messages, loads, generations, most: () => most }
+  return { send, messages, loads, generations, most: () => most, warmups: () => state.warmups }
 }
 
 const MODEL = "LiquidAI/LFM3-1.7B-GGUF"
@@ -317,4 +320,28 @@ test("the handler takes only the page's requests: the worker's own messages chan
   assert.equal(w.loads[0].engine.released, false)
   assert.equal(w.generations.length, 0)
   assert.equal(w.loads.length, 1)
+})
+
+test("the constraint compiler is warmed once the worker is idle after a load, not ahead of a request waiting", async () => {
+  const idle = worker()
+  idle.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  idle.loads[0].finish()
+  await settle()
+  assert.equal(idle.warmups(), 1)
+  // The same model again: nothing new to warm.
+  idle.send({ type: "load", model: MODEL, loadId: 2 })
+  await settle()
+  assert.equal(idle.warmups(), 1)
+
+  const busy = worker()
+  busy.send({ type: "load", model: MODEL, loadId: 1 })
+  busy.send(generate("first"))
+  await settle()
+  busy.loads[0].finish()
+  await settle()
+  // The request does that work itself if it needs it.
+  assert.equal(busy.warmups(), 0)
+  busy.generations[0]?.finish()
+  await settle()
 })

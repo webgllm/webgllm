@@ -10,9 +10,11 @@
  * position, its tokens' count and each texture's format and size), its
  * tokens (i32), then each texture's bytes.
  * Only a file made for the same identity (the model's weight files, the
- * engine's kernels and settings: see handler.ts) is used; others, and files
- * cut short (a write that never finished), are deleted when found. Files
- * past the byte budget go least recently used first.
+ * engine's code and settings: see handler.ts) is used. Another identity's
+ * (another webgllm bundle on the same origin, another version) is left for
+ * it, never matched, and counts toward the budget like any file. Files cut
+ * short (a write that never finished) are deleted when found. Files past the
+ * byte budget go least recently used first, whoever made them.
  */
 import type { PrefixTexture } from "./engine.js"
 import { escapeName } from "./storage.js"
@@ -32,7 +34,8 @@ type Header = {
   textures: Array<{ internal: number; width: number; height: number }>
 }
 
-type Indexed = { name: string; keys: Int32Array; bytes: number; data: number; used: number }
+/** A file in the folder: its tokens (none for another identity's, which never match), its bytes, its last use. */
+type Indexed = { name: string; keys: Int32Array; bytes: number; data: number; used: number; foreign?: boolean }
 
 /** A prefix read from disk: its tokens, and what Engine.importPrefix takes. */
 export type DiskPrefix = { keys: Array<number>; position: number; textures: Array<PrefixTexture> }
@@ -189,8 +192,7 @@ export class PrefixDisk {
           if (found) {
             index.set(name, found.entry)
             this.clock = Math.max(this.clock, found.entry.used)
-          }
-          else await this.folder.remove(name)
+          } else await this.folder.remove(name)
         } catch {
           await this.folder.remove(name)
         }
@@ -209,14 +211,16 @@ export class PrefixDisk {
     const used = view.getFloat64(8, true)
     const head = await this.folder.read(name, HEAD, HEAD + length)
     const header = JSON.parse(new TextDecoder().decode(head.bytes)) as Header
-    if (header.identity !== this.identity) return undefined
     const keysAt = HEAD + length
     const dataAt = keysAt + 4 * header.keys
     const data = header.textures.reduce((sum, t) => sum + t.width * t.height * 16, 0)
     const total = dataAt + data
     if (start.size !== total || header.keys !== header.position) return undefined
+    const lastUse = Number.isFinite(used) ? used : 0
+    // Another identity's: whole, so left for it.
+    if (header.identity !== this.identity) return { header, dataAt, entry: { name, keys: new Int32Array(0), bytes: total, data, used: lastUse, foreign: true } }
     const keys = new Int32Array((await this.folder.read(name, keysAt, dataAt)).bytes)
-    return { header, dataAt, entry: { name, keys, bytes: total, data, used: Number.isFinite(used) ? used : 0 } }
+    return { header, dataAt, entry: { name, keys, bytes: total, data, used: lastUse } }
   }
 
   /**
@@ -231,13 +235,13 @@ export class PrefixDisk {
     let best: Indexed | undefined
     for (const entry of index.values()) {
       const n = entry.keys.length
-      if (n <= least || n > most || entry.data > maxBytes || (best && n <= best.keys.length)) continue
+      if (entry.foreign || n <= least || n > most || entry.data > maxBytes || (best && n <= best.keys.length)) continue
       if (startsWith(keys, entry.keys)) best = entry
     }
     if (!best) return undefined
     try {
       const found = await this.readHeader(best.name)
-      if (!found) throw new Error("The file changed.")
+      if (!found || found.entry.foreign) throw new Error("The file changed.")
       const { header, dataAt } = found
       const file = await this.folder.read(best.name, dataAt)
       const textures: Array<PrefixTexture> = []
@@ -261,7 +265,7 @@ export class PrefixDisk {
   /** Marks the file holding exactly `keys`, if there's one, as used now (a hit in memory counts too). */
   async touch(keys: ArrayLike<number>) {
     const entry = (await this.entries()).get(nameOf(keys))
-    if (!entry || entry.keys.length !== keys.length || !startsWith(keys, entry.keys)) return
+    if (!entry || entry.foreign || entry.keys.length !== keys.length || !startsWith(keys, entry.keys)) return
     entry.used = this.stamp()
     await this.folder.writeAt(entry.name, 8, usedBytes(entry.used)).catch(() => undefined)
   }
@@ -269,7 +273,7 @@ export class PrefixDisk {
   /** Whether a file holds exactly `keys`. */
   async has(keys: ArrayLike<number>) {
     const entry = (await this.entries()).get(nameOf(keys))
-    return !!entry && entry.keys.length === keys.length && startsWith(keys, entry.keys)
+    return !!entry && !entry.foreign && entry.keys.length === keys.length && startsWith(keys, entry.keys)
   }
 
   /**
@@ -306,10 +310,11 @@ export class PrefixDisk {
     index.set(name, { name, keys: tokens, bytes: total, data, used })
   }
 
-  /** Deletes every file of this identity's. */
+  /** Deletes every file of this identity's (another's stay for it). */
   async clear() {
     const index = await this.entries()
-    for (const name of [...index.keys()]) {
+    for (const [name, entry] of [...index]) {
+      if (entry.foreign) continue
       index.delete(name)
       await this.folder.remove(name)
     }
