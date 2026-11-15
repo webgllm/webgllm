@@ -36,6 +36,8 @@ const INDIRECT = ["allOf", "not", "if", "then", "else", "dependentSchemas"]
 
 /** What the tokens of a tokenizer write, as far as JSON's structure and these strings need it. */
 export type FixedStringTokens = {
+  /** Tokens with whitespace in them (see Position.run). */
+  spaces: Uint32Array
   /** A token's bytes (HIGH for one that can't be read); nothing for a special token. */
   codes(id: number): ArrayLike<number> | undefined
   /** Tokens with a backslash or a byte past ASCII, as a bitset. */
@@ -121,7 +123,7 @@ function read(source: Record<string, unknown>, vocabSize: number): FixedStringTo
     }
   }
   const words = Math.ceil(vocabSize / 32)
-  const escapes = new Uint32Array(words), quoted = new Uint32Array(words), quotes = new Uint32Array(words)
+  const escapes = new Uint32Array(words), quoted = new Uint32Array(words), quotes = new Uint32Array(words), spaces = new Uint32Array(words)
   const lengths = new Uint16Array(vocabSize)
   let longest = 0
   const single = new Set<number>()
@@ -131,18 +133,20 @@ function read(source: Record<string, unknown>, vocabSize: number): FixedStringTo
     lengths[id] = Math.min(token.length, 0xffff)
     longest = Math.max(longest, token.length)
     if (token.length === 1) single.add(token[0])
-    let escape = false, quote = false
+    let escape = false, quote = false, space = false
     for (let i = 0; i < token.length; i++) {
       if (token[i] === BACKSLASH || token[i] >= HIGH) escape = true
       else if (token[i] === QUOTE) quote = true
+      else if (isSpace(token[i])) space = true
     }
+    if (space) spaces[id >>> 5] |= 1 << (id & 31)
     if (quote) quotes[id >>> 5] |= 1 << (id & 31)
     if (!escape) continue
     escapes[id >>> 5] |= 1 << (id & 31)
     if (quote) quoted[id >>> 5] |= 1 << (id & 31)
   }
   for (let byte = 0x20; byte <= 0x7e; byte++) if (byte !== BACKSLASH && !single.has(byte)) return null
-  return { codes, escapes, quoted, quotes, lengths, longest }
+  return { codes, escapes, quoted, quotes, spaces, lengths, longest }
 }
 
 /** A JSON pointer's target in the schema (`#/$defs/name`), or undefined. */
@@ -284,15 +288,6 @@ class Position {
   hexValue = 0
   /** The last character was a \u escape of a high surrogate: a low one next pairs with it. */
   high = false
-  /** The last byte was a key's colon, with nothing after it yet (see `tight`). */
-  colon = false
-  /**
-   * The open value string began right after its key's colon, no whitespace
-   * between: its first character can't be a colon. That's LFM3's `":` token
-   * taken again after the key's own `":`, a value opened with a stray colon
-   * (a value starting with one is still written after a space).
-   */
-  tight = false
   /** A value just ended (its closing quote, brace or bracket), or a number or literal is being written. */
   ended = false
   /**
@@ -303,8 +298,14 @@ class Position {
    * is written `"a",` and never `"a"\n  ,` (see closable).
    */
   spaced = false
+  /**
+   * The whitespace run being written outside strings, when generating:
+   * llama.cpp's grammar takes one space, or one or two newlines and then
+   * up to 20 spaces or tabs (its `space` rule), nothing else.
+   */
+  run: { space: boolean; newlines: number; indent: number } | null = null
 
-  /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder), and no value opens with a stray colon (see tight): generation, not checking. */
+  /** With `ordered`, closed objects' keys are held to llama.cpp's order (see keyOrder), and whitespace to llama.cpp's grammar (see spaced, run): generation, not checking. */
   constructor(private readonly root: unknown, readonly ordered = false) {}
 
   clone(): Position {
@@ -320,10 +321,9 @@ class Position {
     copy.hex = this.hex
     copy.hexValue = this.hexValue
     copy.high = this.high
-    copy.colon = this.colon
-    copy.tight = this.tight
     copy.ended = this.ended
     copy.spaced = this.spaced
+    copy.run = this.run && { ...this.run }
     return copy
   }
 
@@ -401,10 +401,6 @@ class Position {
         this.chars++
         return this.long()
       }
-      if (this.tight) {
-        this.tight = false
-        if (code === 0x3a && this.chars === 0) return true
-      }
       if (code === QUOTE) {
         this.inString = false
         this.ended = !this.isKey
@@ -444,10 +440,18 @@ class Position {
       }
       return long
     }
-    const afterColon = this.colon
-    this.colon = false
     // Whitespace after a value only before the end of what holds it (see spaced): when generating.
     if (this.ordered && isSpace(code)) {
+      // llama.cpp's `space`: " " | "\n"{1,2} [ \t]{0,20}.
+      const run = (this.run ??= { space: false, newlines: 0, indent: 0 })
+      if (code === 0x0a) {
+        if (run.space || run.indent > 0 || run.newlines >= 2) return true
+        run.newlines++
+      } else if (run.newlines > 0 && (code === 0x20 || code === 0x09)) {
+        if (run.indent >= 20) return true
+        run.indent++
+      } else if (code === 0x20 && !run.space) run.space = true
+      else return true
       if (this.ended) {
         this.ended = false
         const close = this.closable()
@@ -457,6 +461,7 @@ class Position {
       return false
     }
     if (this.ordered) {
+      this.run = null
       if (code === 0x2c && this.spaced) return true
       this.spaced = false
       // A number or literal being written: whitespace after it follows a value.
@@ -464,8 +469,6 @@ class Position {
     }
     switch (code) {
       case QUOTE:
-        // (When generating: checking a parsed value takes any string.)
-        this.tight = this.ordered && afterColon && !(!!top && top.object && top.expectKey)
         this.inString = true
         this.isKey = !!top && top.object && top.expectKey
         this.chars = 0
@@ -509,7 +512,6 @@ class Position {
         break
       case 0x3a:
         if (top) top.expectKey = false
-        this.colon = !!top?.object
         break
     }
     return false
@@ -558,7 +560,7 @@ export class FixedStrings {
    */
   filter(mask: Uint32Array): Uint32Array {
     const p = this.position
-    const { escapes, quoted, quotes, lengths } = this.tokens
+    const { escapes, quoted, quotes, spaces, lengths } = this.tokens
     // Inside a fixed string any escape does. Elsewhere (a free string too) only one
     // that has a quote can get into a fixed string, or into a bounded one and break its bounds.
     const suspects = p.inString && p.fixed ? escapes : this.bounded ? quotes : quoted
@@ -571,18 +573,20 @@ export class FixedStrings {
     const top = p.frames[p.frames.length - 1]
     // After a value (or in a string that ends in one), when generating: whitespace and commas (see Position.spaced).
     const spacing = p.ordered && (p.inString ? !p.isKey : p.ended || p.spaced)
-    const ordering = (!!top?.order && (p.inString ? p.isKey : true)) || (!p.inString && (p.colon || spacing)) || (p.inString && p.tight)
+    const ordering = (!!top?.order && (p.inString ? p.isKey : true)) || (!p.inString && spacing)
     const closing = spacing && p.inString
+    // Whitespace runs held to llama.cpp's rule (see Position.run): a token with whitespace in it, outside strings.
+    const runs = p.ordered
     const near = left < this.tokens.longest || ordering
     let out: Uint32Array | undefined
     for (let word = 0; word < mask.length; word++) {
-      let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (closing ? quotes[word] : 0) | (near ? ~0 : 0))
+      let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (closing ? quotes[word] : 0) | (runs ? (p.inString ? quotes[word] & spaces[word] : spaces[word]) : 0) | (near ? ~0 : 0))
       while (bits !== 0) {
         const bit = bits & -bits
         bits ^= bit
         const token = (word << 5) + 31 - Math.clz32(bit)
         // (Near maxLength, a token no longer than what's left can't run past it, unless it's suspect anyway.)
-        if (near && !ordering && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !(((short || closing) ? quotes[word] : 0) & bit)) continue
+        if (near && !ordering && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !(((short || closing) ? quotes[word] : 0) & bit) && !((runs ? spaces[word] : 0) & bit)) continue
         if (!this.spoils(token)) continue
         out ??= mask.slice()
         out[word] &= ~bit

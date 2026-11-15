@@ -4,7 +4,7 @@ import { createConstraint, tokenAllowed, validateStructuredValue, type Constrain
 
 const EOS = 256
 // Every byte as a token, then tokens of several bytes as models have them.
-const EXTRA = ['{"', "cut", "cuts", '\\"', '":', '","\\', '": "é', "\\n", '"}']
+const EXTRA = ['{"', "cut", "cuts", '\\"', '":', '","\\', '": "é', "\\n", '"}', "  ", " \n", "\n\n\n", "\n\n\t ", "\n" + " ".repeat(20), "\n" + " ".repeat(21), '"\n']
 const encoder = new TextEncoder()
 const tokenizer = {
   tokens: [...Array.from({ length: 257 }, (_, id) => (id === EOS ? [] : [id])), ...EXTRA.map((text) => [...encoder.encode(text)])],
@@ -172,6 +172,25 @@ test("in an array, whitespace after an item only once it may end; numbers and ne
   c.dispose()
 })
 
+test("a whitespace run is llama.cpp's space: one space, or one or two newlines and up to 20 spaces or tabs", async () => {
+  const c = await createConstraint({ schema: closed({ a: { type: "string" }, b: { type: "string" } }), tokenizer })
+  accept(c, '{"a": "x",')
+  assert.equal(allows(c, extra("  ")), false, "two spaces")
+  assert.equal(allows(c, extra(" \n")), false, "a space, then a newline")
+  assert.equal(allows(c, extra("\n\n\n")), false, "three newlines")
+  assert.equal(allows(c, byte("\t")), false, "a tab with no newline before it")
+  assert.equal(allows(c, extra("\n\n\t ")), true)
+  assert.equal(allows(c, extra("\n" + " ".repeat(20))), true)
+  assert.equal(allows(c, extra("\n" + " ".repeat(21))), false, "21 of indent")
+  accept(c, " ")
+  assert.equal(allows(c, byte(" ")), false, "a second space")
+  accept(c, '"b"')
+  assert.equal(allows(c, byte(" ")), true, "a space before the colon")
+  accept(c, ' : "y"\n}')
+  assert.equal(c.complete, true)
+  c.dispose()
+})
+
 test("checking a parsed value takes its keys in any order", async () => {
   const schema = closed({ op: { type: "string" }, at: { type: "string" } })
   assert.equal(await validateStructuredValue(schema, { at: "b", op: "a" }), true)
@@ -282,11 +301,11 @@ test("HF ByteLevel vocabularies: the same, from their pieces", async () => {
   c.dispose()
 })
 
-test("a value may start with a colon after a space; checking a parsed value takes one anywhere", async () => {
+test("a value may start with a colon, right after the key's or after a space, as llama.cpp's grammar takes it", async () => {
   const schema = closed({ a: { type: "string" }, b: { type: "string" } })
   const c = await createConstraint({ schema, tokenizer })
   accept(c, '{"a":"')
-  assert.equal(allows(c, byte(":")), false, "right after the key's colon: LFM3's stray colon")
+  assert.equal(allows(c, byte(":")), true)
   c.dispose()
   const spaced = await createConstraint({ schema, tokenizer })
   accept(spaced, '{"a": ":)", "b":"x"}')

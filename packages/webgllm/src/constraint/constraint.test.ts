@@ -99,7 +99,7 @@ test("numeric roots preserve valid extensions after an accepting prefix", async 
   bounded.dispose()
 })
 
-test("JSON takes whitespace where models write it, in runs of at most MAX_WHITESPACE_RUN tokens", async () => {
+test("JSON takes whitespace where llama.cpp's grammar does, in its runs: one space, or newlines and an indent", async () => {
   // The caller's own layout hints don't change it.
   const source = { type: "object", properties: { answer: { const: "a b" } }, required: ["answer"], additionalProperties: false, "x-guidance": { whitespace_flexible: false, key_separator: ":", item_separator: ", " } }
   const before = JSON.stringify(source)
@@ -117,15 +117,17 @@ test("JSON takes whitespace where models write it, in runs of at most MAX_WHITES
   assert.equal(JSON.stringify(source), before, "caller schema is never mutated")
   c.dispose()
 
+  // A run of more tokens than MAX_WHITESPACE_RUN is fine where llama.cpp takes it: a newline and 20 spaces.
   const run = await createConstraint({ schema: source, tokenizer })
-  accept(run, "{")
+  accept(run, "{\n")
   const copy = run.clone()
-  for (let i = 0; i < MAX_WHITESPACE_RUN; i++) {
+  for (let i = 0; i < 20; i++) {
     assert.equal(tokenAllowed(run.computeMask(), 32), true, `space ${i + 1}`)
     run.accept(32)
   }
-  assert.equal(tokenAllowed(run.computeMask(), 32), false, "a run stops at the cap")
-  assert.equal(tokenAllowed(run.computeMask(), 10), false)
+  assert.ok(20 > MAX_WHITESPACE_RUN)
+  assert.equal(tokenAllowed(run.computeMask(), 32), false, "21 of indent")
+  assert.equal(tokenAllowed(run.computeMask(), 10), false, "a newline after the indent")
   assert.equal(tokenAllowed(copy.computeMask(), 32), true, "a clone counts its own run")
   accept(run, '"answer"')
   assert.equal(tokenAllowed(run.computeMask(), 32), true, "a new run after the JSON goes on")
@@ -149,8 +151,8 @@ test("the whitespace cap leaves spaces inside strings alone", async () => {
   const s = await createConstraint({ schema: { type: "object", properties: { [spaces]: { const: tricky } }, required: [spaces], additionalProperties: false }, tokenizer })
   accept(s, `{"${spaces}": ${JSON.stringify(tricky)}`)
   const copy = s.clone()
-  for (let i = 0; i < MAX_WHITESPACE_RUN; i++) accept(s, " ")
-  assert.equal(tokenAllowed(s.computeMask(), 32), false, "formatting whitespace after the string is still capped")
+  accept(s, " ")
+  assert.equal(tokenAllowed(s.computeMask(), 32), false, "formatting whitespace after the string is still held to its runs")
   assert.equal(tokenAllowed(copy.computeMask(), 32), true, "a clone keeps its own state")
   accept(s, "}")
   assert.equal(s.complete, true)
@@ -347,11 +349,11 @@ const lfmTokenizer = {
 }
 const closedCity = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false }
 
-test("a key's colon can't be followed by another quote-colon: a value never starts with a stray ':'", async () => {
+test("after a key's quote-colon token, the value may open with that token again (a colon first), as llama.cpp's grammar takes it", async () => {
   const c = await createConstraint({ schema: closedCity, tokenizer: lfmTokenizer })
   accept(c, '{"city')
   c.accept(QUOTE_COLON)
-  assert.equal(tokenAllowed(c.computeMask(), QUOTE_COLON), false, '":" again would open the value with a colon')
+  assert.equal(tokenAllowed(c.computeMask(), QUOTE_COLON), true)
   assert.equal(tokenAllowed(c.computeMask(), SPACE_QUOTE), true, "the space and quote models write next")
   c.accept(SPACE_QUOTE)
   accept(c, 'Paris"}')

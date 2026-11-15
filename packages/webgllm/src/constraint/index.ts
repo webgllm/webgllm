@@ -31,6 +31,9 @@ export type ConstraintOptions = {
  * refused until the JSON goes on: a laid-out document needs a few between
  * two tokens, and a model stuck writing whitespace would otherwise run to
  * its output limit. Whitespace inside strings is content and isn't capped.
+ * Only for a tokenizer the document walker can't follow: where it can,
+ * runs are held to llama.cpp's own rule instead (see Position.run in
+ * fixed-strings.ts), which bounds them too.
  */
 export const MAX_WHITESPACE_RUN = 8
 
@@ -446,12 +449,12 @@ export async function createConstraint(options: ConstraintOptions): Promise<Cons
     if (cause instanceof StructuredOutputError) throw cause
     throw new StructuredOutputError("invalid-tokenizer", cause instanceof Error ? cause.message : String(cause), { cause })
   }
+  const strings = fixedStringTokens(source, vocabSize)
   let whitespace: Uint32Array | undefined
-  if (layout === MODEL && tokens) {
+  if (layout === MODEL && tokens && !strings) {
     whitespace = new Uint32Array(Math.ceil(vocabSize / 32))
     for (const id of tokens.whitespace) if (id >= 0 && id < vocabSize) whitespace[id >>> 5] |= 1 << (id & 31)
   }
-  const strings = fixedStringTokens(source, vocabSize)
   return new JsonConstraint(interpreter, vocabSize, eos, excludesNumericRoot(schema),
     canonicalAsciiObject(schema) ? canonicalTokenMask(source, vocabSize, eos) : undefined, shadow, whitespace, tokens ?? undefined,
     // Keys in llama.cpp's order when generating; checking a parsed value takes them in any order.
