@@ -1,3 +1,13 @@
+## 0.3.5 (2026-11-15)
+
+### 🚀 Features
+
+- **webgllm:** keep several prompt prefixes, in memory and on disk ([#14](https://github.com/webgllm/webgllm/pull/14))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.4 (2026-11-13)
 
 ### 🔥 Performance
