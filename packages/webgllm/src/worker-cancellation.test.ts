@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 import { readPrompt } from "./prompt.js"
+import { PrefixStore } from "./prefix-store.js"
 import type { Engine } from "./engine.js"
 
 const require = createRequire(join(process.cwd(), "package.json"))
@@ -26,6 +27,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { outputTokenLimit } from './generation-limits.js';
   import { StructuredGeneration } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
+  import { PrefixStore, savePromptPrefix } from './prefix-store.js';
+  import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';
@@ -33,6 +36,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   export function makeGenerate(state) {
     const stopped=state.stopped,post=m=>state.messages.push(m),logitProcessors=undefined;
     const startLoad=async()=>state.model,createConstraint=()=>state.createConstraint();
+    const RECLAIM_BYTES=Infinity,claimMemory=()=>undefined;
     // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
     const promptImages=(...a)=>(state.promptImages??(async(_model,prompt)=>({prompt,keys:prompt,images:[]})))(...a),encodeImages=(...a)=>(state.encodeImages??(async()=>0))(...a);
     const abortFor=(id)=>{const a=new AbortController();if(stopped.has(id))a.abort();state.signals?.set(id,a);return a.signal};
@@ -54,7 +58,7 @@ function probe() {
     gpu: { compiled: { count: 0 }, calibratePromptPacing: (): Promise<void> | undefined => undefined },
     setAllowedTokens() { calls.masks++ }, dropGuess() { calls.drops++ },
     reset() { cached.length = 0 }, canResume() { return false },
-    rewind() { calls.rewinds++; return 0 }, snapshotPosition() { return undefined },
+    rewind() { calls.rewinds++; return 0 }, rewindPosition() { return 0 }, snapshotPosition() { return undefined },
     snapshot() { calls.snapshots++; return undefined },
     batchSizes(count: number) { const sizes = []; for (; count; count -= Math.min(256, count)) sizes.push(Math.min(256, count)); return sizes },
     preparePrompt: async () => undefined,
@@ -63,7 +67,7 @@ function probe() {
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
     specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, constraintTokenizer: {} }
-  return { calls, stopped, messages, model: { engine, tokenizer, cached },
+  return { calls, stopped, messages, model: { engine, tokenizer, cached, prefixes: new PrefixStore(() => {}) },
     createConstraint: async () => ({ dispose() { calls.disposed++ } }) }
 }
 const request = (id: string, cachePrompt: boolean): Extract<WorkerRequest, { type: "generate" }> => ({
@@ -173,3 +177,96 @@ for (const step of ["promptImages", "encodeImages"] as const)
     assert.ok(state.calls.forwards > before)
     assert.ok(state.messages.some((m) => m.type === "done" && m.id === "next"))
   })
+
+/** A saved prefix on "disk" for the probe's prompt: its first `n` tokens, with `bytes` of textures. */
+function diskEntry(state: ReturnType<typeof probe>, n: number, bytes = 16) {
+  const keys = state.model.tokenizer.encodeChat().slice(0, n)
+  return { keys, position: n, textures: [{ internal: 0, width: 1, height: 1, bytes: new Uint8Array(bytes) }] }
+}
+
+function withDisk(state: ReturnType<typeof probe>, match: (...args: unknown[]) => Promise<unknown>) {
+  const spies = { imports: 0, restores: 0, budgetAtMatch: [] as number[], matches: [] as unknown[][], touched: [] as unknown[] }
+  Object.assign(state.model.engine, {
+    importPrefix: () => { spies.imports++; return { position: 5, state: {}, kv: [] } },
+    restorePrefix: async () => { spies.restores++; return 5 }
+  })
+  ;(state.model as Record<string, unknown>).disk = {
+    budget: 2 ** 30,
+    setBudget: async () => undefined,
+    touch: async (keys: unknown) => { spies.touched.push(keys) },
+    match: (...args: unknown[]) => {
+      spies.budgetAtMatch.push(state.model.prefixes.budget)
+      spies.matches.push(args)
+      return match(...args)
+    }
+  }
+  return spies
+}
+
+const plain = (id: string, extra: Partial<Extract<WorkerRequest, { type: "generate" }>> = {}) => {
+  const r: Extract<WorkerRequest, { type: "generate" }> = { ...request(id, true), maxTokens: 0, ...extra }
+  delete r.outputSchema
+  return r
+}
+
+test("a stop during the disk lookup ends the wait at once, and restores nothing", async () => {
+  const state = probe(), entered = gate()
+  let release!: (value: unknown) => void
+  const spies = withDisk(state, () => { entered.release(); return new Promise((resolve) => { release = resolve }) })
+  ;(state as Record<string, unknown>).signals = new Map<string, AbortController>()
+  const job = makeGenerate(state)(plain("cancelled"))
+  await entered.promise
+  state.stopped.add("cancelled")
+  ;(state as unknown as { signals: Map<string, AbortController> }).signals.get("cancelled")!.abort()
+  // (Settles without the lookup ever answering.)
+  await job
+  release(diskEntry(state, 5))
+  assert.equal(spies.imports, 0)
+  assert.equal(spies.restores, 0)
+  assert.equal(state.calls.forwards, 0)
+  assert.deepEqual(state.model.cached, [9, 9])
+  const done = state.messages.find((m) => m.type === "done")
+  assert.ok(done?.type === "done" && done.finishReason === "stop")
+})
+
+test("a lookup that answers after a stop still restores nothing", async () => {
+  const state = probe(), entered = gate()
+  let release!: (value: unknown) => void
+  const spies = withDisk(state, () => { entered.release(); return new Promise((resolve) => { release = resolve }) })
+  const job = makeGenerate(state)(plain("cancelled"))
+  await entered.promise
+  // (The probe's abort signals don't fire here: only the stop is seen, after the answer.)
+  state.stopped.add("cancelled")
+  release(diskEntry(state, 5))
+  await job
+  assert.equal(spies.imports, 0)
+  assert.equal(spies.restores, 0)
+  assert.deepEqual(state.model.cached, [9, 9])
+})
+
+test("the request's memory budget applies before the disk lookup: 0 looks nothing up, more lets more in", async () => {
+  const off = probe()
+  const offSpies = withDisk(off, async () => diskEntry(off, 5))
+  await makeGenerate(off)(plain("zero", { promptCacheBytes: 0 }))
+  assert.equal(offSpies.matches.length, 0)
+  assert.equal(offSpies.imports, 0)
+  assert.equal(offSpies.restores, 0)
+
+  const big = probe()
+  const bigSpies = withDisk(big, async () => diskEntry(big, 5, 200 * 2 ** 20))
+  await makeGenerate(big)(plain("larger", { promptCacheBytes: 256 * 2 ** 20 }))
+  assert.deepEqual(bigSpies.budgetAtMatch, [256 * 2 ** 20])
+  assert.equal(bigSpies.matches[0]?.[3], 256 * 2 ** 20, "entries past the budget aren't read")
+  assert.equal(bigSpies.imports, 1)
+  assert.equal(bigSpies.restores, 1)
+  assert.deepEqual(big.model.cached, big.model.tokenizer.encodeChat())
+  // The restored prefix counts as used on disk.
+  assert.deepEqual(bigSpies.touched, [big.model.tokenizer.encodeChat().slice(0, 5)])
+
+  // Smaller than the entry: not imported, so nothing allocated for it.
+  const small = probe()
+  const smallSpies = withDisk(small, async () => diskEntry(small, 5, 200 * 2 ** 20))
+  await makeGenerate(small)(plain("smaller", { promptCacheBytes: 64 * 2 ** 20 }))
+  assert.equal(smallSpies.imports, 0)
+  assert.equal(smallSpies.restores, 0)
+})

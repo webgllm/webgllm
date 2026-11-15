@@ -33,6 +33,9 @@ import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
+import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
+import { opfsFolder, persistPrefix, PrefixDisk, untilAborted } from "./prefix-disk.js"
+import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
 import type { ToolCall } from "./tool-choice.js"
 import { createStopFilter } from "./stop-sequences.js"
@@ -188,6 +191,10 @@ type Loaded = {
   imagePositions?: VisionConfig["positions"]
   /** Recent verified common content, for conservative short-prefix promotion. */
   previousShared?: number
+  /** Prompt prefixes saved apart from the live history (see prefix-store.ts). */
+  prefixes: PrefixStore<SavedPrefix>
+  /** The same on disk, where there's OPFS (see prefix-disk.ts). */
+  disk?: PrefixDisk
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
@@ -596,6 +603,14 @@ async function load(
       tokenizer,
       cached: [],
       images: new ImageCache(),
+      prefixes: new PrefixStore<SavedPrefix>((saved) => engine.freePrefix(saved)),
+      // A file is for these weights (their files as stored), these kernels and settings, on this GPU.
+      ...(typeof navigator !== "undefined" && typeof navigator.storage?.getDirectory === "function" && {
+        disk: new PrefixDisk(opfsFolder(model), [
+          code, scope, engine.contextLength,
+          ...weightFiles.map((f) => `${f.name}:${f.size}:${f.lastModified}`)
+        ].join("|"))
+      }),
       claimed: engine.gpu.bytes,
       noteKey,
       note: measured ?? note,
@@ -1013,6 +1028,9 @@ async function generate(request: GenerateRequest) {
     tokenizer.vocabSize
   )
   const schemaMs = performance.now() - schemaAt
+  let fresh: ReturnType<typeof savePromptPrefix<SavedPrefix>>
+  // A saved prefix this request restored, to mark used on disk too.
+  let used: Array<number> | undefined
   try {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   engine.setAllowedTokens(null)
@@ -1040,10 +1058,52 @@ async function generate(request: GenerateRequest) {
     common++
   }
   const whole = common === prompt.length && engine.canResume(common)
-  const start = whole
-    ? engine.resume(common)
-    : engine.rewind(Math.min(common, prompt.length - 1))
-  model.cached.length = start
+  // A saved prefix of this prompt's (another system prompt's history may
+  // have replaced it since), where it reaches further than the live history.
+  // (Not the whole prompt: the last token is read for the logits after it.)
+  // The request's budgets first: they decide what may be matched, read from disk and kept.
+  if (request.promptCacheBytes !== undefined) model.prefixes.setBudget(request.promptCacheBytes)
+  if (request.promptCacheDiskBytes !== undefined && model.disk) await model.disk.setBudget(request.promptCacheDiskBytes)
+  const storing = cacheEnabled && !raw && !whole
+  const live = engine.rewindPosition(Math.min(common, prompt.length - 1))
+  // On disk, one longer than what memory and the live history have (a page
+  // loaded again starts with none in memory), that fits the memory budget:
+  // into the store first, room made before its textures are.
+  if (storing && model.disk && model.prefixes.budget > 0) {
+    try {
+      const inMemory = model.prefixes.match(keys, prompt.length - 1)?.keys.length ?? 0
+      // (A stop meanwhile ends the wait: the read finishes unused, nothing allocated.)
+      const found = await untilAborted(model.disk.match(keys, prompt.length - 1, Math.max(live, inMemory), model.prefixes.budget), signal)
+      if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
+      if (found) {
+        const bytes = found.textures.reduce((sum, t) => sum + t.bytes.byteLength, 0)
+        if (model.prefixes.makeRoom(bytes)) {
+          const saved = engine.importPrefix(found.position, found.textures)
+          if (saved) model.prefixes.add(found.keys, bytes, saved)
+        }
+      }
+    } catch (error) {
+      if (engine.gpu.isLost) throw error
+      post({ type: "log", text: `Couldn't read a prompt prefix from disk: ${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+  // (After the disk: making room may have freed what memory matched before.)
+  const stored = storing ? model.prefixes.match(keys, prompt.length - 1) : undefined
+  const restored = stored && stored.keys.length > live ? stored : undefined
+  let start: number
+  if (restored) {
+    // (Nothing held until it's back: a failure leaves an empty cache.)
+    model.cached.length = 0
+    start = await engine.restorePrefix(restored.state)
+    model.cached.push(...restored.keys)
+    used = restored.keys
+    common = start
+  } else {
+    start = whole
+      ? engine.resume(common)
+      : engine.rewind(Math.min(common, prompt.length - 1))
+    model.cached.length = start
+  }
   let natural: number | undefined
   if (cacheEnabled && common > 0 && !whole && prefix !== undefined && prefix > start) {
     let at = start
@@ -1076,6 +1136,12 @@ async function generate(request: GenerateRequest) {
   const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix
+  const learned = cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0
+  // The system prompt's end, saved for the store where it lacks it, even
+  // inside a batch (see Engine.forwardHidden's prefixAt): a few copies. It
+  // takes the place of a shorter boundary learned from the live history.
+  const storable = cacheEnabled && prefix !== undefined && prefix > start && prefix < prompt.length &&
+    model.prefixes.budget > 0 && !images.some((image) => image.start < prefix) && !model.prefixes.has(keys.slice(0, prefix))
   if (!stopped.has(id)) await engine.preparePrompt(prompt.length)
   let row = await readPrompt(engine, prompt, start, model.cached, {
     keys,
@@ -1083,9 +1149,14 @@ async function generate(request: GenerateRequest) {
     // After a changed request reveals a shorter common boundary, retain it
     // during this ordinary forward. One-off cold calls incur no extra work.
     prefix: reusablePrefix,
-    ...(cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0 && { observedPrefix: reusablePrefix }),
+    // (The store's first: the live history's shorter shared boundary has other requests to come back to.)
+    ...(storable ? { observedPrefix: prefix } : learned && { observedPrefix: reusablePrefix }),
     anchor,
     checkpoints: cacheEnabled
+  })
+  if (cacheEnabled && !raw && !stopped.has(id)) fresh = savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix, {
+    lost: () => engine.gpu.isLost,
+    log: (text) => post({ type: "log", text })
   })
   const stats: RunTimings = {
     inputTokens: prompt.length,
@@ -1584,6 +1655,15 @@ async function generate(request: GenerateRequest) {
     structured?.dispose()
     engine.setAllowedTokens(null)
     engine.dropGuess()
+    // A system prompt read for the first time, to disk once the reply is out (the next request waits for it).
+    if (used && model.disk) await model.disk.touch(used).catch(() => undefined)
+    if (fresh && !engine.gpu.isLost)
+      await persistPrefix(model.disk, (saved) => model.prefixes.holds(saved), engine, fresh, (text) => post({ type: "log", text }))
+    // What the textures take now, on every way out (a prefill's too, which returns before the reply's claim).
+    if (!engine.gpu.isLost && engine.gpu.bytes > model.claimed + RECLAIM_BYTES) {
+      model.claimed = engine.gpu.bytes
+      void claimMemory(model.model, model.claimed)
+    }
   }
   })
 }
@@ -1634,6 +1714,7 @@ async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }
 function resetChat(request: Extract<WorkerRequest, { type: "reset" }>) {
   if (current?.model === request.model) {
     current.cached.length = 0
+    current.prefixes.clear()
     current.engine.reset()
   }
   logitProcessors?.get(request.model)?.resetState()

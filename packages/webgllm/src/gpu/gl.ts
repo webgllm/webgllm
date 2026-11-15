@@ -1125,6 +1125,42 @@ export class Gpu {
   }
 
   /**
+   * A whole RGBA32F or RGBA32UI texture's bytes, read back without
+   * stalling the GPU (see readStart): to save its contents elsewhere and
+   * upload them again as they were (see texture's `data`).
+   */
+  async readBytes(texture: Texture): Promise<Uint8Array> {
+    const gl = this.gl
+    const integer = texture.internal === GL.RGBA32UI
+    if (!integer && texture.internal !== GL.RGBA32F)
+      throw new Error(`Can't read back a texture of format ${texture.internal}.`)
+    const out = new Uint8Array(texture.width * texture.height * 16)
+    const buffer = gl.createBuffer()
+    if (!buffer) throw new GpuError("Couldn't create a pixel buffer.")
+    let sync: WebGLSync | null = null
+    try {
+      this.boundFb = this.framebuffer(texture)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.boundFb)
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, out.byteLength, gl.STREAM_READ)
+      if (integer) gl.readPixels(0, 0, texture.width, texture.height, gl.RGBA_INTEGER, gl.UNSIGNED_INT, 0)
+      else gl.readPixels(0, 0, texture.width, texture.height, gl.RGBA, gl.FLOAT, 0)
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
+      sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
+      gl.flush()
+      this.submitGpuWork()
+      await this.wait(sync, this.submissionBudget, performance.now())
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer)
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out)
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null)
+      return out
+    } finally {
+      if (sync) gl.deleteSync(sync)
+      gl.deleteBuffer(buffer)
+    }
+  }
+
+  /**
    * Reads a rectangle of an RGBA32F texture back, blocking until the GPU
    * gets there: no fence polling, so less latency (fine in a worker).
    */

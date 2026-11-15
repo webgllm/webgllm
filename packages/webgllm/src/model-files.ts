@@ -4,6 +4,7 @@
  * the model's context length, and removing them. Facts that don't change
  * (sizes, context lengths) are looked up once per page.
  */
+import { removePrefixFolder } from "./prefix-disk.js"
 import { blobSource } from "./byte-source.js"
 import { fileUrl, modelMeta, visionFileList } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
@@ -244,6 +245,8 @@ export const browserStorage: ModelStorage = {
   async remove(model, keep) {
     // The meta first: a model without it isn't counted as downloaded by a later page.
     await removeManifest(model)
+    // Its prompt prefixes saved on disk go with it.
+    await removePrefixFolder(model)
     let dir: FileSystemDirectoryHandle
     try {
       dir = await folder()

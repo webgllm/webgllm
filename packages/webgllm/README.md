@@ -209,6 +209,16 @@ await webgllm.resetChat()                                          // forget the
 
 The GPU normally picks each token itself and reads back only the candidates. `logprobs`, `logit_bias` and a `LogitProcessor` read every logit back for each token instead, so those replies are written slower.
 
+### Prompt caching
+
+Each model keeps what it read: a request that starts with the last one's tokens (the same chat, one more message) reads only what's new. It also keeps the end of each system prompt (with its tools) it has read, so a request with a system prompt it read before reads only what comes after it, even after requests with other system prompts in between. Those saved prefixes take up to `promptCacheBytes` of GPU memory per model (128 MiB by default, counted in its memory), least recently used first out. They are also written to disk, in the Origin Private File System, up to `promptCacheDiskBytes` per model (512 MiB by default), so a page loaded again reads a system prompt it read before from disk instead of from scratch. Only files made for the same weights, webgllm version and GPU are used, and deleting the model (`models.delete`) deletes them. `0` turns either off.
+
+```ts
+const webgllm = new WebGLLM({ promptCacheBytes: 256 * 2 ** 20, promptCacheDiskBytes: 2 ** 30 })
+```
+
+`usage.prompt_tokens_details.cached_tokens` says how many of a request's prompt tokens came from the cache. To read a prompt ahead of time (the system prompt and the messages so far, while the user types), send it with `max_tokens: 0`: nothing is generated, and the next request that starts with it reads only the rest. `cache_prompt: false` neither uses nor keeps anything of that request's.
+
 ### Other request fields
 
 `max_tokens` (or `max_completion_tokens`), `temperature`, `top_p`, `presence_penalty`, `stop`, `seed`, plus `top_k`, `min_p`, `repetition_penalty` and `cache_prompt`. Unset sampling fields take the model card's values. Every response has OpenAI's `usage` (with cached prompt tokens and reasoning tokens) and a `timings` object (first-token time, prompt and decode speed). Fields the engine can't honour (`n > 1`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `"unsupported-parameter"` rather than being ignored.

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Prompt prefix store</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Prompt prefix store</h1>
+  <p>
+    Two system prompts in turn (A, B, A, B), greedy, through the public API: the second A and B must answer as the first
+    did, with the same log probabilities, and read only what follows their system prompt. Then a prefill
+    (<code>max_tokens: 0</code>) and the same request after it. <code>?model=&lt;id&gt;</code> (LFM3 1.7B GGUF by
+    default), <code>&amp;cache=0</code> for no store (<code>promptCacheBytes: 0</code>), <code>&amp;words=&lt;n&gt;</code>
+    for each system prompt's length (1,700 words by default: about 2,400 tokens), <code>&amp;ctx=&lt;n&gt;</code>
+    (8,192 by default). <code>&amp;reload=1</code> after a run: this page loaded again asks A and B once more, which
+    must come from disk and answer as that run did. <code>&amp;fresh=1</code> deletes the prefixes on disk first.
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (...parts) => {
+      const line = parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+    const store = params.get("cache") !== "0"
+    const words = Number(params.get("words") ?? 1700)
+    const contextLength = Number(params.get("ctx") ?? 8192)
+    const reload = params.get("reload") === "1"
+    const KEY = "prefix-store-answers"
+
+    // A deterministic system prompt of about `words` words, different for each seed from its first sentence.
+    const subjects = ["slide", "title", "chart", "caption", "outline", "speaker note", "table", "image", "theme", "section"]
+    const verbs = ["keeps", "names", "shows", "lists", "matches", "shortens", "orders", "groups", "explains", "highlights"]
+    const objects = ["the main point", "one idea", "the audience's question", "a number with its unit", "the next step",
+      "the source", "a short example", "the key term", "the comparison", "the summary"]
+    function systemPrompt(seed) {
+      const role = seed === 1 ? "You plan slide decks." : "You review finished slide decks for mistakes."
+      const parts = [role, "Follow every rule below."]
+      let count = parts.join(" ").split(" ").length
+      for (let i = 0; count < words; i++) {
+        const k = i * 7 + seed * 13
+        const rule = `Rule ${i + 1}: each ${subjects[k % 10]} ${verbs[(k >> 1) % 10]} ${objects[(k * 3 + seed) % 10]}, and never more than ${3 + (k % 5)} lines.`
+        parts.push(rule)
+        count += rule.split(" ").length
+      }
+      return parts.join(" ")
+    }
+    const question = { role: "user", content: "Write one sentence that introduces a deck about the water cycle." }
+
+    try {
+      if (params.get("fresh") === "1") {
+        const root = await navigator.storage.getDirectory()
+        await root.removeEntry("webgl-prompt-cache", { recursive: true }).catch(() => undefined)
+        log("deleted the prefixes on disk")
+      }
+      const webgllm = new WebGLLM({ logLevel: params.get("log") ?? "warn", ...(store ? {} : { promptCacheBytes: 0, promptCacheDiskBytes: 0 }) })
+      let t = performance.now()
+      await webgllm.loadModel(model, { contextLength })
+      log("loaded", model, `ctx=${contextLength}`, `store=${store}`, `${Math.round(performance.now() - t)} ms`)
+
+      const ask = async (name, system, extra = {}) => {
+        const start = performance.now()
+        const reply = await webgllm.chat.completions.create({
+          model,
+          messages: [{ role: "system", content: system }, question],
+          temperature: 0,
+          max_tokens: 24,
+          reasoning_effort: "none",
+          logprobs: true,
+          top_logprobs: 3,
+          ...extra
+        })
+        const ms = Math.round(performance.now() - start)
+        const usage = reply.usage
+        const cached = usage.prompt_tokens_details?.cached_tokens ?? 0
+        log(`STEP ${name}: prompt=${usage.prompt_tokens} cached=${cached} first_token_ms=${Math.round(reply.timings.first_token_ms ?? 0)} prompt_ms=${Math.round(reply.timings.prompt_ms)} decode_ms=${Math.round(reply.timings.decode_ms)} wall_ms=${ms}`,
+          JSON.stringify(reply.choices[0].message.content ?? ""))
+        return { reply, cached, ms, firstTokenMs: reply.timings.first_token_ms, prompt: usage.prompt_tokens }
+      }
+      const same = (name, a, b) => {
+        const la = a.reply.choices[0].logprobs?.content ?? []
+        const lb = b.reply.choices[0].logprobs?.content ?? []
+        let diff = 0
+        for (let i = 0; i < Math.min(la.length, lb.length); i++) diff = Math.max(diff, Math.abs(la[i].logprob - lb[i].logprob))
+        const text = a.reply.choices[0].message.content === b.reply.choices[0].message.content
+        log(`${text && la.length === lb.length && diff < 0.05 ? "PASS" : "FAIL"} ${name}: same text=${text}, tokens ${la.length}/${lb.length}, largest logprob difference ${diff.toFixed(4)}`)
+      }
+
+      // Shaders compile on the first request: a short one first.
+      await ask("warm-up", "You are a helpful assistant.", { logprobs: false, top_logprobs: undefined })
+      const A = systemPrompt(1), B = systemPrompt(2)
+      if (reload) {
+        const before = JSON.parse(localStorage.getItem(KEY) ?? "null")
+        if (!before) throw new Error("Run the page without reload=1 first.")
+        const a = await ask("A from disk", A)
+        const b = await ask("B from disk", B)
+        same("A from disk answers as A did before the reload", { reply: before.a }, a)
+        same("B from disk answers as B did before the reload", { reply: before.b }, b)
+        log(`${a.cached > a.prompt / 2 && b.cached > b.prompt / 2 ? "PASS" : "FAIL"} A and B came from disk: cached ${a.cached}/${a.prompt} and ${b.cached}/${b.prompt}`)
+        log(`RESULT reload store=${store} prompt=${a.prompt} A_cold_first_token_ms=${Math.round(before.aMs)} ` +
+          `A_from_disk_first_token_ms=${Math.round(a.firstTokenMs)} A_cached=${a.cached} ` +
+          `B_from_disk_first_token_ms=${Math.round(b.firstTokenMs)} B_cached=${b.cached}`)
+        log("ALL DONE")
+        throw "done"
+      }
+      const a1 = await ask("A", A)
+      const b1 = await ask("B", B)
+      const a2 = await ask("A again", A)
+      const b2 = await ask("B again", B)
+      localStorage.setItem(KEY, JSON.stringify({ a: a1.reply, b: b1.reply, aMs: a1.firstTokenMs }))
+      same("A again answers as A", a1, a2)
+      same("B again answers as B", b1, b2)
+
+      // A prefill: the request read with nothing generated, then the same request.
+      const prefillStart = performance.now()
+      const C = systemPrompt(3)
+      const prefill = await webgllm.chat.completions.create({
+        model, messages: [{ role: "system", content: C }, question], max_tokens: 0, reasoning_effort: "none"
+      })
+      log(`STEP prefill C: prompt=${prefill.usage.prompt_tokens} completion=${prefill.usage.completion_tokens} finish=${prefill.choices[0].finish_reason} wall_ms=${Math.round(performance.now() - prefillStart)}`)
+      const c = await ask("C after prefill", C)
+
+      log(`RESULT store=${store} prompt=${a1.prompt} ` +
+        `A_first_token_ms=${Math.round(a1.firstTokenMs)} B_first_token_ms=${Math.round(b1.firstTokenMs)} ` +
+        `A_again_first_token_ms=${Math.round(a2.firstTokenMs)} A_again_cached=${a2.cached} ` +
+        `B_again_first_token_ms=${Math.round(b2.firstTokenMs)} B_again_cached=${b2.cached} ` +
+        `C_after_prefill_first_token_ms=${Math.round(c.firstTokenMs)} C_cached=${c.cached}`)
+      await webgllm.unloadModel?.(model)
+      log("ALL DONE")
+    } catch (error) {
+      if (error !== "done") log("ERROR:", String(error?.stack ?? error))
+    }
+  </script>
+</html>
