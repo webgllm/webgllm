@@ -36,20 +36,35 @@ const INDIRECT = ["allOf", "not", "if", "then", "else", "dependentSchemas"]
 
 /** What the tokens of a tokenizer write, as far as JSON's structure and these strings need it. */
 export type FixedStringTokens = {
-  /** A token's bytes, with every byte past ASCII as HIGH; nothing for a special token. */
+  /** A token's bytes (HIGH for one that can't be read); nothing for a special token. */
   codes(id: number): ArrayLike<number> | undefined
   /** Tokens with a backslash or a byte past ASCII, as a bitset. */
   escapes: Uint32Array
   /** Those of them that also have a quote: the ones that can enter a string. */
   quoted: Uint32Array
+  /** Tokens with a quote: the ones that can open or close a string. */
+  quotes: Uint32Array
+  /** Each token's length in bytes (0 for a special token), and the longest. */
+  lengths: Uint16Array
+  longest: number
 }
 
-/** A ByteLevel piece's characters as bytes: 0x21 to 0x7e are themselves, 0x100 to 0x121 the bytes up to space and DEL. */
-const byteLevelCode = (char: number) => (char >= 0x21 && char <= 0x7e ? char : char >= 0x100 && char <= 0x120 ? char - 0x100 : char === 0x121 ? 0x7f : HIGH)
+/**
+ * A ByteLevel piece's characters as its bytes (GPT-2's bytes_to_unicode
+ * reversed): printable bytes are themselves, the others 0x100 onward in
+ * order (bytes to space, then DEL to NBSP, then the soft hyphen).
+ */
+const byteLevelCode = (char: number) =>
+  (char >= 0x21 && char <= 0x7e) || (char >= 0xa1 && char <= 0xac) || (char >= 0xae && char <= 0xff) ? char
+    : char >= 0x100 && char <= 0x120 ? char - 0x100
+      : char >= 0x121 && char <= 0x142 ? 0x7f + char - 0x121
+        : char === 0x143 ? 0xad : HIGH
 
 const byteLevel = (decoder: unknown): boolean =>
   isRecord(decoder) && (decoder.type === "ByteLevel" ||
     (decoder.type === "Sequence" && Array.isArray(decoder.decoders) && decoder.decoders.length === 1 && byteLevel(decoder.decoders[0])))
+
+const utf8 = new TextEncoder()
 
 const cache = new WeakMap<object, Map<number, FixedStringTokens | null>>()
 
@@ -82,7 +97,7 @@ function read(source: Record<string, unknown>, vocabSize: number): FixedStringTo
     codes = (id) => {
       const bytes = tokens[id]
       if (special.has(id) || (!Array.isArray(bytes) && !(bytes instanceof Uint8Array))) return undefined
-      return Array.from(bytes as ArrayLike<number>, (byte) => (byte < HIGH ? byte : HIGH))
+      return Array.from(bytes as ArrayLike<number>)
     }
   } else {
     const json = source.tokenizerJSON
@@ -102,29 +117,32 @@ function read(source: Record<string, unknown>, vocabSize: number): FixedStringTo
     codes = (id) => {
       const piece = pieces[id]
       if (piece === undefined || special.has(id)) return undefined
-      return literal.has(id)
-        ? Array.from(piece, (c) => (c.charCodeAt(0) < HIGH ? c.charCodeAt(0) : HIGH))
-        : Array.from(piece, (c) => byteLevelCode(c.charCodeAt(0)))
+      return literal.has(id) ? Array.from(utf8.encode(piece)) : Array.from(piece, (c) => byteLevelCode(c.charCodeAt(0)))
     }
   }
   const words = Math.ceil(vocabSize / 32)
-  const escapes = new Uint32Array(words), quoted = new Uint32Array(words)
+  const escapes = new Uint32Array(words), quoted = new Uint32Array(words), quotes = new Uint32Array(words)
+  const lengths = new Uint16Array(vocabSize)
+  let longest = 0
   const single = new Set<number>()
   for (let id = 0; id < vocabSize; id++) {
     const token = codes(id)
     if (!token || token.length === 0) continue
+    lengths[id] = Math.min(token.length, 0xffff)
+    longest = Math.max(longest, token.length)
     if (token.length === 1) single.add(token[0])
     let escape = false, quote = false
     for (let i = 0; i < token.length; i++) {
       if (token[i] === BACKSLASH || token[i] >= HIGH) escape = true
       else if (token[i] === QUOTE) quote = true
     }
+    if (quote) quotes[id >>> 5] |= 1 << (id & 31)
     if (!escape) continue
     escapes[id >>> 5] |= 1 << (id & 31)
     if (quote) quoted[id >>> 5] |= 1 << (id & 31)
   }
   for (let byte = 0x20; byte <= 0x7e; byte++) if (byte !== BACKSLASH && !single.has(byte)) return null
-  return { codes, escapes, quoted }
+  return { codes, escapes, quoted, quotes, lengths, longest }
 }
 
 /** A JSON pointer's target in the schema (`#/$defs/name`), or undefined. */
@@ -192,6 +210,13 @@ class Position {
   isKey = false
   /** The open string is one the schema fixes. */
   fixed = false
+  /** The open value string's minLength and maxLength, when the schema gives them (see filter). */
+  min: number | undefined
+  max: number | undefined
+  /** Characters the open string holds so far (an escape is one). */
+  chars = 0
+  /** Hex digits left of a \u escape. */
+  hex = 0
 
   constructor(private readonly root: unknown) {}
 
@@ -202,6 +227,10 @@ class Position {
     copy.escaped = this.escaped
     copy.isKey = this.isKey
     copy.fixed = this.fixed
+    copy.min = this.min
+    copy.max = this.max
+    copy.chars = this.chars
+    copy.hex = this.hex
     return copy
   }
 
@@ -219,35 +248,60 @@ class Position {
     return "items" in top.schema ? resolve(this.root, top.schema.items) : null
   }
 
-  /** Takes one byte. True when it is a backslash or a byte past ASCII inside a string the schema fixes. */
+  /**
+   * Takes one byte. True when it can't be written there: a backslash or a
+   * byte past ASCII inside a string the schema fixes, a character past the
+   * open string's maxLength, or its closing quote before its minLength.
+   */
   feed(code: number): boolean {
     const top = this.frames[this.frames.length - 1]
     if (this.inString) {
       if (this.escaped) {
         this.escaped = false
+        if (code === 0x75) this.hex = 4
         return this.fixed
+      }
+      if (this.hex > 0) {
+        // A \u escape's digits: part of the one character its backslash counted.
+        this.hex--
+        if (this.isKey && top && top.key !== null) top.key += String.fromCharCode(code)
+        return false
       }
       if (code === QUOTE) {
         this.inString = false
-        return false
+        return this.min !== undefined && this.chars < this.min
       }
+      // A character starts at any byte but a UTF-8 continuation byte (10xxxxxx).
+      if (code < 0x80 || code >= 0xc0) this.chars++
+      const long = this.max !== undefined && this.chars > this.max
       if (code === BACKSLASH || code >= HIGH) {
         this.escaped = code === BACKSLASH
         // (A key written with them isn't looked up: what follows it is left alone.)
         if (this.isKey && top) top.key = null
-        return this.fixed
+        return this.fixed || long
       }
       if (this.isKey && top && top.key !== null) top.key += String.fromCharCode(code)
-      return false
+      return long
     }
     switch (code) {
       case QUOTE:
         this.inString = true
         this.isKey = !!top && top.object && top.expectKey
+        this.chars = 0
+        this.hex = 0
+        this.min = undefined
+        this.max = undefined
         if (this.isKey) {
           top.key = ""
           this.fixed = fixedKeys(top.schema)
-        } else this.fixed = fixedValue(this.valueSchema())
+        } else {
+          const schema = this.valueSchema()
+          this.fixed = fixedValue(schema)
+          if (schema) {
+            this.min = typeof schema.minLength === "number" ? schema.minLength : undefined
+            this.max = typeof schema.maxLength === "number" ? schema.maxLength : undefined
+          }
+        }
         break
       case 0x7b:
         this.frames.push({ object: true, schema: this.valueSchema(), key: null, expectKey: true, index: 0 })
@@ -271,25 +325,56 @@ class Position {
   }
 }
 
-/** Follows a generation's tokens and takes out of its masks what a fixed string can't hold. */
+/** Whether a schema has a minLength or maxLength anywhere. */
+export function lengthBounds(schema: unknown, depth = 0): boolean {
+  if (depth > 64) return false
+  if (Array.isArray(schema)) return schema.some((item) => lengthBounds(item, depth + 1))
+  if (!isRecord(schema)) return false
+  if (typeof schema.minLength === "number" || typeof schema.maxLength === "number") return true
+  return Object.entries(schema).some(([key, value]) => key !== "enum" && key !== "const" && key !== "default" && key !== "examples" && lengthBounds(value, depth + 1))
+}
+
+/** Follows a generation's tokens and takes out of its masks what a fixed string can't hold, and what a bounded string can't. */
 export class FixedStrings {
   private position: Position
 
-  constructor(private readonly tokens: FixedStringTokens, schema: unknown, position?: Position) {
+  constructor(
+    private readonly tokens: FixedStringTokens,
+    schema: unknown,
+    position?: Position,
+    /** Whether the schema has string lengths to hold (see lengthBounds). */
+    private readonly bounded = schema !== undefined && lengthBounds(schema)
+  ) {
     this.position = position ?? new Position(schema)
   }
 
-  /** The mask without the tokens that would write a backslash or a byte past ASCII into a fixed string; the mask itself when there are none. */
+  /**
+   * The mask without the tokens that can't be written next: one that would
+   * put a backslash or a byte past ASCII into a fixed string, run a string
+   * past its maxLength or close it before its minLength (see feed). The mask
+   * itself when there are none.
+   */
   filter(mask: Uint32Array): Uint32Array {
-    // Inside a fixed string any of them does. Elsewhere only one that has a quote can get into one.
-    const suspects = this.position.inString && this.position.fixed ? this.tokens.escapes : this.tokens.quoted
+    const p = this.position
+    const { escapes, quoted, quotes, lengths } = this.tokens
+    // Inside a fixed string any escape does. Elsewhere (a free string too) only one
+    // that has a quote can get into a fixed string, or into a bounded one and break its bounds.
+    const suspects = p.inString && p.fixed ? escapes : this.bounded ? quotes : quoted
+    // Inside a bounded string: a quote before minLength, and near maxLength, any
+    // token with more bytes than characters left (a character is at least one byte).
+    const short = p.inString && p.min !== undefined && p.chars < p.min
+    const left = p.inString && p.max !== undefined ? p.max - p.chars : Infinity
+    const near = left < this.tokens.longest
     let out: Uint32Array | undefined
     for (let word = 0; word < mask.length; word++) {
-      let bits = mask[word] & suspects[word]
+      let bits = mask[word] & ((suspects ? suspects[word] : 0) | (short ? quotes[word] : 0) | (near ? ~0 : 0))
       while (bits !== 0) {
         const bit = bits & -bits
         bits ^= bit
-        if (!this.spoils((word << 5) + 31 - Math.clz32(bit))) continue
+        const token = (word << 5) + 31 - Math.clz32(bit)
+        // (Near maxLength, a token no longer than what's left can't run past it, unless it's suspect anyway.)
+        if (near && lengths[token] <= left && !((suspects ? suspects[word] : 0) & bit) && !((short ? quotes[word] : 0) & bit)) continue
+        if (!this.spoils(token)) continue
         out ??= mask.slice()
         out[word] &= ~bit
       }
@@ -311,6 +396,6 @@ export class FixedStrings {
   }
 
   clone(): FixedStrings {
-    return new FixedStrings(this.tokens, undefined, this.position.clone())
+    return new FixedStrings(this.tokens, undefined, this.position.clone(), this.bounded)
   }
 }
