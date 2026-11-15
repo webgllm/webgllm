@@ -4,9 +4,11 @@
  * prefix store's entries (see prefix-store.ts), each read back from the GPU
  * once and written to a file of its own, then uploaded again from it.
  *
- * A file is `WGLP`, its header's length (u32), the header (JSON: the
- * identity it was made for, its position, its tokens' count and each
- * texture's format and size), its tokens (i32), then each texture's bytes.
+ * A file is `WGL2`, its header's length (u32), when it was last used (f64,
+ * ms: rewritten on each use, so the least recently used go first after a
+ * reload too), the header (JSON: the identity it was made for, its
+ * position, its tokens' count and each texture's format and size), its
+ * tokens (i32), then each texture's bytes.
  * Only a file made for the same identity (the model's weight files, the
  * engine's kernels and settings: see handler.ts) is used; others, and files
  * cut short (a write that never finished), are deleted when found. Files
@@ -18,7 +20,9 @@ import { escapeName } from "./storage.js"
 export const DEFAULT_PROMPT_CACHE_DISK_BYTES = 512 * 2 ** 20
 
 const DIR = "webgl-prompt-cache"
-const MAGIC = 0x504c4757 // "WGLP", little-endian
+const MAGIC = 0x324c4757 // "WGL2", little-endian
+/** Where the header starts: after the magic, its length and the last use. */
+const HEAD = 16
 const SUFFIX = ".prefix"
 
 type Header = {
@@ -28,7 +32,7 @@ type Header = {
   textures: Array<{ internal: number; width: number; height: number }>
 }
 
-type Indexed = { name: string; keys: Int32Array; bytes: number; used: number }
+type Indexed = { name: string; keys: Int32Array; bytes: number; data: number; used: number }
 
 /** A prefix read from disk: its tokens, and what Engine.importPrefix takes. */
 export type DiskPrefix = { keys: Array<number>; position: number; textures: Array<PrefixTexture> }
@@ -43,8 +47,10 @@ type SyncAccessHandle = {
 /** The OPFS operations used here (a fake one in tests). */
 export type PrefixFolder = {
   names(): Promise<Array<string>>
-  read(name: string, from?: number, to?: number): Promise<{ size: number; lastModified: number; bytes: ArrayBuffer }>
+  read(name: string, from?: number, to?: number): Promise<{ size: number; bytes: ArrayBuffer }>
   write(name: string, parts: Array<Uint8Array>): Promise<void>
+  /** Overwrites `bytes` at `at`, the rest of the file as it was. */
+  writeAt(name: string, at: number, bytes: Uint8Array): Promise<void>
   remove(name: string): Promise<void>
 }
 
@@ -65,7 +71,7 @@ export function opfsFolder(model: string): PrefixFolder {
     },
     async read(name, from = 0, to?: number) {
       const file = await (await (await open()).getFileHandle(name)).getFile()
-      return { size: file.size, lastModified: file.lastModified, bytes: await file.slice(from, to).arrayBuffer() }
+      return { size: file.size, bytes: await file.slice(from, to).arrayBuffer() }
     },
     async write(name, parts) {
       const handle = await (await open()).getFileHandle(name, { create: true })
@@ -82,10 +88,42 @@ export function opfsFolder(model: string): PrefixFolder {
         access.close()
       }
     },
+    async writeAt(name, at, bytes) {
+      const handle = await (await open()).getFileHandle(name)
+      const access = (await (handle as FileSystemFileHandle & {
+        createSyncAccessHandle: () => Promise<SyncAccessHandle>
+      }).createSyncAccessHandle())
+      try {
+        access.write(bytes, { at })
+        access.flush()
+      } finally {
+        access.close()
+      }
+    },
     async remove(name) {
       await (await open()).removeEntry(name).catch(() => undefined)
     }
   }
+}
+
+/**
+ * `promise`, or undefined as soon as `signal` aborts (a stopped request
+ * stops waiting; what it was waiting for finishes unused).
+ */
+export function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+  if (!signal) return promise
+  if (signal.aborted) {
+    promise.catch(() => undefined)
+    return Promise.resolve(undefined)
+  }
+  return new Promise<T | undefined>((resolve, reject) => {
+    const onAbort = () => resolve(undefined)
+    signal.addEventListener("abort", onAbort, { once: true })
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error) }
+    )
+  })
 }
 
 /** A file's name: its tokens' count and their hash (compared in full when read). */
@@ -97,6 +135,13 @@ function nameOf(keys: ArrayLike<number>) {
     b = Math.imul(b ^ keys[i], 0x5bd1e995) ^ (b >>> 15)
   }
   return `${keys.length}-${(a >>> 0).toString(16)}${(b >>> 0).toString(16)}${SUFFIX}`
+}
+
+/** A last-use time as the file holds it (f64, little-endian). */
+function usedBytes(used: number) {
+  const bytes = new Uint8Array(8)
+  new DataView(bytes.buffer).setFloat64(0, used, true)
+  return bytes
 }
 
 function startsWith(keys: ArrayLike<number>, prefix: ArrayLike<number>) {
@@ -156,33 +201,37 @@ export class PrefixDisk {
 
   /** A file's header and tokens, if it's whole and for this identity. */
   private async readHeader(name: string) {
-    const start = await this.folder.read(name, 0, 8)
+    const start = await this.folder.read(name, 0, HEAD)
+    if (start.bytes.byteLength < HEAD) return undefined
     const view = new DataView(start.bytes)
-    if (start.bytes.byteLength < 8 || view.getUint32(0, true) !== MAGIC) return undefined
+    if (view.getUint32(0, true) !== MAGIC) return undefined
     const length = view.getUint32(4, true)
-    const head = await this.folder.read(name, 8, 8 + length)
+    const used = view.getFloat64(8, true)
+    const head = await this.folder.read(name, HEAD, HEAD + length)
     const header = JSON.parse(new TextDecoder().decode(head.bytes)) as Header
     if (header.identity !== this.identity) return undefined
-    const keysAt = 8 + length
+    const keysAt = HEAD + length
     const dataAt = keysAt + 4 * header.keys
-    const total = dataAt + header.textures.reduce((sum, t) => sum + t.width * t.height * 16, 0)
+    const data = header.textures.reduce((sum, t) => sum + t.width * t.height * 16, 0)
+    const total = dataAt + data
     if (start.size !== total || header.keys !== header.position) return undefined
     const keys = new Int32Array((await this.folder.read(name, keysAt, dataAt)).bytes)
-    return { header, dataAt, entry: { name, keys, bytes: total, used: start.lastModified } }
+    return { header, dataAt, entry: { name, keys, bytes: total, data, used: Number.isFinite(used) ? used : 0 } }
   }
 
   /**
    * The longest prefix on disk that begins `keys`, longer than `least`
-   * tokens and no longer than `most`: read whole, and the most recently
-   * used now. Undefined if there's none (or it couldn't be read).
+   * tokens and no longer than `most`, whose textures take no more than
+   * `maxBytes`: read whole, and the most recently used now (on disk too).
+   * Undefined if there's none (or it couldn't be read).
    */
-  async match(keys: ArrayLike<number>, most: number, least = 0): Promise<DiskPrefix | undefined> {
+  async match(keys: ArrayLike<number>, most: number, least = 0, maxBytes = Infinity): Promise<DiskPrefix | undefined> {
     if (this.limit <= 0) return undefined
     const index = await this.entries()
     let best: Indexed | undefined
     for (const entry of index.values()) {
       const n = entry.keys.length
-      if (n <= least || n > most || (best && n <= best.keys.length)) continue
+      if (n <= least || n > most || entry.data > maxBytes || (best && n <= best.keys.length)) continue
       if (startsWith(keys, entry.keys)) best = entry
     }
     if (!best) return undefined
@@ -200,12 +249,21 @@ export class PrefixDisk {
       }
       if (at !== file.bytes.byteLength) throw new Error("The file is cut short.")
       best.used = this.stamp()
+      await this.folder.writeAt(best.name, 8, usedBytes(best.used)).catch(() => undefined)
       return { keys: Array.from(best.keys), position: header.position, textures }
     } catch {
       index.delete(best.name)
       await this.folder.remove(best.name)
       return undefined
     }
+  }
+
+  /** Marks the file holding exactly `keys`, if there's one, as used now (a hit in memory counts too). */
+  async touch(keys: ArrayLike<number>) {
+    const entry = (await this.entries()).get(nameOf(keys))
+    if (!entry || entry.keys.length !== keys.length || !startsWith(keys, entry.keys)) return
+    entry.used = this.stamp()
+    await this.folder.writeAt(entry.name, 8, usedBytes(entry.used)).catch(() => undefined)
   }
 
   /** Whether a file holds exactly `keys`. */
@@ -232,17 +290,20 @@ export class PrefixDisk {
     let json = JSON.stringify(header)
     while (new TextEncoder().encode(json).byteLength % 4) json += " "
     const head = new TextEncoder().encode(json)
-    const total = 8 + head.byteLength + 4 * keys.length + data
+    const total = HEAD + head.byteLength + 4 * keys.length + data
     if (total > this.limit) return
     const index = await this.entries()
     const name = nameOf(keys)
     await this.evict(total, name)
-    const start = new Uint8Array(8)
-    new DataView(start.buffer).setUint32(0, MAGIC, true)
-    new DataView(start.buffer).setUint32(4, head.byteLength, true)
+    const used = this.stamp()
+    const start = new Uint8Array(HEAD)
+    const view = new DataView(start.buffer)
+    view.setUint32(0, MAGIC, true)
+    view.setUint32(4, head.byteLength, true)
+    view.setFloat64(8, used, true)
     const tokens = Int32Array.from(keys)
     await this.folder.write(name, [start, head, new Uint8Array(tokens.buffer), ...textures.map((t) => t.bytes)])
-    index.set(name, { name, keys: tokens, bytes: total, used: this.stamp() })
+    index.set(name, { name, keys: tokens, bytes: total, data, used })
   }
 
   /** Deletes every file of this identity's. */

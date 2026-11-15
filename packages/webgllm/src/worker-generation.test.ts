@@ -31,7 +31,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { StructuredGeneration, maskLogits } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
   import { PrefixStore, savePromptPrefix } from './prefix-store.js';
-  import { persistPrefix } from './prefix-disk.js';
+  import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';
@@ -384,6 +384,16 @@ test("token forwards claim the memory their cache growth takes", async () => {
   assert.deepEqual(s.claims, [48 * 2 ** 20, 96 * 2 ** 20])
   assert.equal(s.model.claimed, 96 * 2 ** 20)
   assert.equal(forwarded(s.messages).length, 4)
+})
+
+test("a prefill (max_tokens: 0) claims the memory its prompt took, a saved prefix's included", async () => {
+  const s = scripted([], { growBy: 0 })
+  // What a prefix saved while the prompt was read adds, say.
+  s.model.engine.gpu.bytes = 48 * 2 ** 20
+  await s.generate(request({ maxTokens: 0 }))
+  assert.deepEqual(s.claims, [48 * 2 ** 20])
+  assert.equal(s.model.claimed, 48 * 2 ** 20)
+  assert.ok(s.messages.some((m) => m.type === "done"))
 })
 
 test("token forwards count the cache's tokens in the repetition penalty", async () => {

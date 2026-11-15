@@ -34,7 +34,7 @@ import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
 import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
-import { opfsFolder, persistPrefix, PrefixDisk } from "./prefix-disk.js"
+import { opfsFolder, persistPrefix, PrefixDisk, untilAborted } from "./prefix-disk.js"
 import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
 import type { ToolCall } from "./tool-choice.js"
@@ -1029,6 +1029,8 @@ async function generate(request: GenerateRequest) {
   )
   const schemaMs = performance.now() - schemaAt
   let fresh: ReturnType<typeof savePromptPrefix<SavedPrefix>>
+  // A saved prefix this request restored, to mark used on disk too.
+  let used: Array<number> | undefined
   try {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   engine.setAllowedTokens(null)
@@ -1059,25 +1061,34 @@ async function generate(request: GenerateRequest) {
   // A saved prefix of this prompt's (another system prompt's history may
   // have replaced it since), where it reaches further than the live history.
   // (Not the whole prompt: the last token is read for the logits after it.)
-  let stored = cacheEnabled && !raw && !whole
-    ? model.prefixes.match(keys, prompt.length - 1)
-    : undefined
+  // The request's budgets first: they decide what may be matched, read from disk and kept.
+  if (request.promptCacheBytes !== undefined) model.prefixes.setBudget(request.promptCacheBytes)
+  if (request.promptCacheDiskBytes !== undefined && model.disk) await model.disk.setBudget(request.promptCacheDiskBytes)
+  const storing = cacheEnabled && !raw && !whole
   const live = engine.rewindPosition(Math.min(common, prompt.length - 1))
-  // On disk, one longer than both (a page loaded again starts with none in memory): into the store first.
-  if (cacheEnabled && !raw && !whole && model.disk) {
+  // On disk, one longer than what memory and the live history have (a page
+  // loaded again starts with none in memory), that fits the memory budget:
+  // into the store first, room made before its textures are.
+  if (storing && model.disk && model.prefixes.budget > 0) {
     try {
-      if (request.promptCacheDiskBytes !== undefined) await model.disk.setBudget(request.promptCacheDiskBytes)
-      const found = await model.disk.match(keys, prompt.length - 1, Math.max(live, stored?.keys.length ?? 0))
-      const saved = found && engine.importPrefix(found.position, found.textures)
-      if (found && saved) {
+      const inMemory = model.prefixes.match(keys, prompt.length - 1)?.keys.length ?? 0
+      // (A stop meanwhile ends the wait: the read finishes unused, nothing allocated.)
+      const found = await untilAborted(model.disk.match(keys, prompt.length - 1, Math.max(live, inMemory), model.prefixes.budget), signal)
+      if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
+      if (found) {
         const bytes = found.textures.reduce((sum, t) => sum + t.bytes.byteLength, 0)
-        if (model.prefixes.add(found.keys, bytes, saved)) stored = model.prefixes.match(keys, prompt.length - 1)
+        if (model.prefixes.makeRoom(bytes)) {
+          const saved = engine.importPrefix(found.position, found.textures)
+          if (saved) model.prefixes.add(found.keys, bytes, saved)
+        }
       }
     } catch (error) {
       if (engine.gpu.isLost) throw error
       post({ type: "log", text: `Couldn't read a prompt prefix from disk: ${error instanceof Error ? error.message : String(error)}` })
     }
   }
+  // (After the disk: making room may have freed what memory matched before.)
+  const stored = storing ? model.prefixes.match(keys, prompt.length - 1) : undefined
   const restored = stored && stored.keys.length > live ? stored : undefined
   let start: number
   if (restored) {
@@ -1085,6 +1096,7 @@ async function generate(request: GenerateRequest) {
     model.cached.length = 0
     start = await engine.restorePrefix(restored.state)
     model.cached.push(...restored.keys)
+    used = restored.keys
     common = start
   } else {
     start = whole
@@ -1124,7 +1136,6 @@ async function generate(request: GenerateRequest) {
   const encodeMs = performance.now() - encodeAt
   const promptStart = performance.now()
   const reusablePrefix = plan.prefix
-  if (request.promptCacheBytes !== undefined) model.prefixes.setBudget(request.promptCacheBytes)
   const learned = cacheEnabled && reusablePrefix !== undefined && reusablePrefix > start && reusablePrefix <= common && common > 0
   // The system prompt's end, saved for the store where it lacks it, even
   // inside a batch (see Engine.forwardHidden's prefixAt): a few copies. It
@@ -1143,7 +1154,10 @@ async function generate(request: GenerateRequest) {
     anchor,
     checkpoints: cacheEnabled
   })
-  if (cacheEnabled && !raw && !stopped.has(id)) fresh = savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix)
+  if (cacheEnabled && !raw && !stopped.has(id)) fresh = savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix, {
+    lost: () => engine.gpu.isLost,
+    log: (text) => post({ type: "log", text })
+  })
   const stats: RunTimings = {
     inputTokens: prompt.length,
     cachedTokens: start,
@@ -1642,8 +1656,14 @@ async function generate(request: GenerateRequest) {
     engine.setAllowedTokens(null)
     engine.dropGuess()
     // A system prompt read for the first time, to disk once the reply is out (the next request waits for it).
+    if (used && model.disk) await model.disk.touch(used).catch(() => undefined)
     if (fresh && !engine.gpu.isLost)
       await persistPrefix(model.disk, (saved) => model.prefixes.holds(saved), engine, fresh, (text) => post({ type: "log", text }))
+    // What the textures take now, on every way out (a prefill's too, which returns before the reply's claim).
+    if (!engine.gpu.isLost && engine.gpu.bytes > model.claimed + RECLAIM_BYTES) {
+      model.claimed = engine.gpu.bytes
+      void claimMemory(model.model, model.claimed)
+    }
   }
   })
 }

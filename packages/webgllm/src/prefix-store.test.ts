@@ -6,7 +6,7 @@ import { GL } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import type { Pass, Program, Texture } from "./gpu/gl.js"
 import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
-import { persistPrefix, PrefixDisk } from "./prefix-disk.js"
+import { persistPrefix, PrefixDisk, untilAborted } from "./prefix-disk.js"
 import type { PrefixFolder } from "./prefix-disk.js"
 
 // The store's own bookkeeping, with plain values for states.
@@ -335,26 +335,32 @@ test("prefixes saved in a store are freed with it", () => {
 // On disk: a folder in memory, as OPFS would keep it.
 
 function memoryFolder() {
-  const files = new Map<string, { bytes: Uint8Array; lastModified: number }>()
-  let clock = 1
+  const files = new Map<string, { bytes: Uint8Array }>()
+  const reads: string[] = []
   const folder: PrefixFolder = {
     names: async () => [...files.keys()],
     async read(name, from = 0, to) {
       const file = files.get(name)
       if (!file) throw new Error(`No file ${name}`)
+      reads.push(`${name}@${from}`)
       const bytes = file.bytes.slice(from, to ?? file.bytes.byteLength)
-      return { size: file.bytes.byteLength, lastModified: file.lastModified, bytes: bytes.buffer }
+      return { size: file.bytes.byteLength, bytes: bytes.buffer }
     },
     async write(name, parts) {
       const size = parts.reduce((sum, p) => sum + p.byteLength, 0)
       const bytes = new Uint8Array(size)
       let at = 0
       for (const p of parts) { bytes.set(p, at); at += p.byteLength }
-      files.set(name, { bytes, lastModified: clock++ })
+      files.set(name, { bytes })
+    },
+    async writeAt(name, at, bytes) {
+      const file = files.get(name)
+      if (!file) throw new Error(`No file ${name}`)
+      file.bytes.set(bytes, at)
     },
     async remove(name) { files.delete(name) }
   }
-  return { files, folder }
+  return { files, folder, reads }
 }
 
 const texture = (value: number, width = 2, height = 2) => {
@@ -469,4 +475,97 @@ test("nothing goes to disk once the store has freed the prefix, or with no disk"
   await persistPrefix(new PrefixDisk(folder, "id"), (s) => store.holds(s), f.engine, fresh, assert.fail)
   await persistPrefix(undefined, () => true, f.engine, fresh, assert.fail)
   assert.equal(files.size, 0)
+})
+
+// The review's findings.
+
+test("savePromptPrefix makes room before copying: the store never holds more than its budget", () => {
+  const { s, freed } = store(25)
+  s.add([9], 10, "old")
+  s.add([8], 10, "older")
+  let peak = 0
+  const engine = {
+    snapshotPosition: () => 4,
+    savedPrefixBytes: () => 10,
+    savePrefix: () => { peak = s.bytes + 10; return "new" }
+  }
+  savePromptPrefix(engine, s, 6, [1, 2, 3, 4, 5, 6], [], 4)
+  assert.ok(peak <= 25, `${peak} bytes at the copy`)
+  assert.deepEqual(freed, ["old"])
+  assert.ok(s.has([1, 2, 3, 4]))
+})
+
+test("a failed prefix copy is skipped while the GPU is there, and thrown once it's lost", () => {
+  const logs: string[] = []
+  const { s } = store(100)
+  let lost = false
+  const engine = { snapshotPosition: () => 4, savedPrefixBytes: () => 10, savePrefix: (): string => { throw new Error("Out of memory.") } }
+  const failure = { lost: () => lost, log: (text: string) => logs.push(text) }
+  assert.equal(savePromptPrefix(engine, s, 6, [1, 2, 3, 4, 5, 6], [], 4, failure), undefined)
+  assert.equal(s.size, 0)
+  assert.match(logs[0] ?? "", /Out of memory/)
+  lost = true
+  assert.throws(() => savePromptPrefix(engine, s, 6, [1, 2, 3, 4, 5, 6], [], 4, failure), /Out of memory/)
+})
+
+test("the disk's least recently used order survives a reload", async () => {
+  const { files, folder } = memoryFolder()
+  const size = await (async () => {
+    const probe = memoryFolder()
+    await new PrefixDisk(probe.folder, "id").save([1], [texture(1)])
+    return [...probe.files.values()][0].bytes.byteLength
+  })()
+  const first = new PrefixDisk(folder, "id", 2 * size)
+  await first.save([1], [texture(1)])
+  await first.save([2], [texture(2)])
+  // A page loaded again uses [1]...
+  assert.ok(await new PrefixDisk(folder, "id", 2 * size).match([1, 0], 1))
+  // ...and the next one saves [3]: [2] goes, the least recently used.
+  const third = new PrefixDisk(folder, "id", 2 * size)
+  await third.save([3], [texture(3)])
+  assert.ok(await third.has([1]))
+  assert.equal(await third.has([2]), false)
+  assert.equal(files.size, 2)
+})
+
+test("a prefix used from memory counts as used on disk too", async () => {
+  const { folder } = memoryFolder()
+  const size = await (async () => {
+    const probe = memoryFolder()
+    await new PrefixDisk(probe.folder, "id").save([1], [texture(1)])
+    return [...probe.files.values()][0].bytes.byteLength
+  })()
+  const disk = new PrefixDisk(folder, "id", 2 * size)
+  await disk.save([1], [texture(1)])
+  await disk.save([2], [texture(2)])
+  await disk.touch([1])
+  await disk.touch([7])
+  const later = new PrefixDisk(folder, "id", 2 * size)
+  await later.save([3], [texture(3)])
+  assert.ok(await later.has([1]))
+  assert.equal(await later.has([2]), false)
+})
+
+test("a prefix on disk past the memory budget isn't read at all", async () => {
+  const { folder, reads } = memoryFolder()
+  await new PrefixDisk(folder, "id").save([1, 2], [texture(1, 4, 4)])
+  const disk = new PrefixDisk(folder, "id")
+  // (The index reads each file's header once.)
+  assert.ok(await disk.has([1, 2]))
+  const indexed = reads.length
+  assert.equal(await disk.match([1, 2, 3], 2, 0, 255), undefined)
+  assert.equal(reads.length, indexed)
+  assert.ok(await disk.match([1, 2, 3], 2, 0, 256))
+  assert.ok(reads.length > indexed)
+})
+
+test("untilAborted stops waiting when the signal aborts", async () => {
+  const controller = new AbortController()
+  let release!: (value: string) => void
+  const pending = untilAborted(new Promise<string>((resolve) => { release = resolve }), controller.signal)
+  controller.abort()
+  assert.equal(await pending, undefined)
+  release("late")
+  assert.equal(await untilAborted(Promise.resolve("now"), new AbortController().signal), "now")
+  assert.equal(await untilAborted(Promise.resolve("no signal")), "no signal")
 })

@@ -3329,7 +3329,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     this.restoreState(saved.state, at)
     this.position = at
-    if (this.snapshotLimit >= 2) this.keepSnapshot(at, this.cloneSnapshot(saved.state), "prefix")
+    // A live copy for rewinds along the new history: optional, so a failed one (out of memory) only skips it.
+    if (this.snapshotLimit >= 2) {
+      try {
+        this.keepSnapshot(at, this.cloneSnapshot(saved.state), "prefix")
+      } catch (error) {
+        if (this.gpu.isLost) throw error
+      }
+    }
     return at
   }
 

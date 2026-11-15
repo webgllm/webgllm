@@ -72,6 +72,17 @@ export class PrefixStore<S> {
     return !!entry
   }
 
+  /**
+   * Frees the least recently used entries until `bytes` more fit the
+   * budget, before they're allocated (so the store never holds more than
+   * its budget, even for a moment). False if `bytes` can't fit at all.
+   */
+  makeRoom(bytes: number) {
+    if (!this.fits(bytes)) return false
+    this.evict(bytes)
+    return true
+  }
+
   /** Whether an entry holds `state` (not freed). */
   holds(state: S) {
     return this.entries.some((e) => e.state === state)
@@ -137,12 +148,17 @@ export type PrefixEngine<S> = {
   savePrefix(position: number): S | undefined
 }
 
+/** How savePromptPrefix copes with a failed copy: whether the GPU is gone (then it throws), and where to say so otherwise. */
+export type SaveFailure = { lost?: () => boolean; log?: (text: string) => void }
+
 /**
  * Keeps the state at the end of the prompt's system prompt and tools
  * (`prefix` tokens in) in `store` if it lacks it, from the engine's prefix
  * snapshot there (the cache holding `cached` of the prompt's `keys`). Not
- * a prefix with an image in it, nor one past the budget. Returns what it
- * kept, if anything (for the disk: see prefix-disk.ts).
+ * a prefix with an image in it, nor one past the budget. Room is made
+ * before the copy. The copy is optional: if it fails (out of memory, say)
+ * with the GPU still there, nothing is kept and the request goes on.
+ * Returns what it kept, if anything (for the disk: see prefix-disk.ts).
  */
 export function savePromptPrefix<S>(
   engine: PrefixEngine<S>,
@@ -150,7 +166,8 @@ export function savePromptPrefix<S>(
   cached: number,
   keys: Array<number>,
   images: Array<{ start: number }>,
-  prefix: number | undefined
+  prefix: number | undefined,
+  failure: SaveFailure = {}
 ) {
   if (prefix === undefined || prefix <= 0 || prefix > cached) return
   if (engine.snapshotPosition("prefix") !== prefix) return
@@ -158,8 +175,16 @@ export function savePromptPrefix<S>(
   const tokens = keys.slice(0, prefix)
   if (store.has(tokens)) return
   const bytes = engine.savedPrefixBytes(prefix)
-  if (!store.fits(bytes)) return
-  const saved = engine.savePrefix(prefix)
+  if (!store.makeRoom(bytes)) return
+  let saved: S | undefined
+  try {
+    saved = engine.savePrefix(prefix)
+  } catch (error) {
+    // (savePrefix frees what it made before throwing.)
+    if (failure.lost?.()) throw error
+    failure.log?.(`Couldn't save a prompt prefix: ${error instanceof Error ? error.message : String(error)}`)
+    return undefined
+  }
   if (saved && store.add(tokens, bytes, saved)) return { keys: tokens, saved }
   return undefined
 }
