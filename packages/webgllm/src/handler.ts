@@ -27,7 +27,7 @@ import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sam
 import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
-import { THINK_OPEN } from "./reply.js"
+import { createThinkingSplitter, THINK_OPEN } from "./reply.js"
 import { budgetWrapUp, createThinkingBudget, templateClosing } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
@@ -1455,10 +1455,11 @@ async function generate(request: GenerateRequest) {
   let sawEos = false
   let callText = ""
   // The answer's last characters while a "required" call isn't written yet,
-  // whether its opening marker is written, and whether the reply is in its thinking.
+  // and whether its opening marker is written; the reply read into thinking
+  // and answer as the reply reader reads it (it gets the same text).
   let callTail = ""
   let callOpen = false
-  let answerThinking = startsInThinking
+  const callReader = called ? undefined : createThinkingSplitter()
   let unfiltered = false
   /** Sends reply text; false once a stop sequence ended the reply. */
   const send = (text: string, constrained = false) => {
@@ -1482,7 +1483,10 @@ async function generate(request: GenerateRequest) {
   // the prompt with `<think>`, Qwen3.5 with `<think>\n`), the reply starts
   // inside it: say so first, as the model would have, so the thinking
   // reads as thinking.
-  if (startsInThinking) send(THINK_OPEN)
+  if (startsInThinking) {
+    send(THINK_OPEN)
+    callReader?.push(THINK_OPEN)
+  }
 
   // A zero budget may close a template-opened span before any sampling.
   let token = openThinking ? think as number : thinkingBudget?.forcedToken ?? pick(await distribution(row, guessing()))
@@ -1517,15 +1521,14 @@ async function generate(request: GenerateRequest) {
     policy.drawn(t)
     history.push(t)
     const text = decoder.push(t)
-    // A "required" call is written once the answer (not the thinking) has a
-    // call's opening marker and then its closing one, as tokens or as text.
-    if (!called) {
-      if (t === think) answerThinking = true
-      else if (t === tokenizer.specialTokens.thinkEnd) {
-        answerThinking = false
-        callTail = ""
-      } else if (!answerThinking && text) {
-        callTail += text
+    // A "required" call is written once the answer has a call's opening
+    // marker and then its closing one. What's answer and what's thinking is
+    // read from the text as the reply reader reads it (tags split across
+    // tokens too), so a call the reader counts as thinking never counts here.
+    if (!called && callReader && text) {
+      for (const piece of callReader.push(text)) {
+        if (piece.kind !== "answer") continue
+        callTail += piece.text
         if (!callOpen) {
           const at = Math.max(callTail.lastIndexOf("<tool_call>"), callTail.lastIndexOf("<|tool_call_start|>"))
           if (at >= 0) {

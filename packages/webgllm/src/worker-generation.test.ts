@@ -39,7 +39,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { CodedError } from './worker-errors.js';
   import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from './sampler.js';
   import { DraftPolicy, lookupDraft } from './draft.js';
-  import { THINK_OPEN } from './reply.js';
+  import { createThinkingSplitter, THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
   const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16;
   // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
@@ -63,7 +63,7 @@ const { makeGenerate } = await import(pathToFileURL(outfile).href)
 /** Token ids 0–9 are control tokens; the rest are words of TEXT. */
 const EOS = 1, THINK = 3, THINK_END = 4, TOOL_CALL = 5, TOOL_CALL_END = 6
 const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>", [TOOL_CALL]: "<tool_call>", [TOOL_CALL_END]: "</tool_call>" }
-const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d"]
+const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d", "<thi", "nk>", "</thi"]
 words.forEach((w, i) => { TEXT[10 + i] = w })
 const id = (w: string) => 10 + words.indexOf(w)
 
@@ -285,6 +285,23 @@ test("required: a closing marker with no call opened, or a call written in the t
   const refused = thought.stepMasks.map(blocksEnd)
   assert.deepEqual(refused.slice(0, script.length), Array(script.length).fill(true))
   assert.equal(refused[script.length], false, "open once the answer's call is closed")
+})
+
+test("required: thinking tags split across ordinary tokens are read as the reply reader reads them", async () => {
+  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+  // A call inside "<thi"+"nk>" … "</thi"+"nk>" is thinking: the end stays refused after it.
+  const inside = [id("<thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END, id("</thi"), id("nk>"), id("Hello")]
+  const thought = scripted(inside)
+  await thought.generate(request({ tools: [weather], toolChoice: "required" }))
+  assert.equal(thought.stepMasks.length, inside.length + 1)
+  assert.ok(thought.stepMasks.every(blocksEnd), "no pick could end the reply")
+  // The same call after the split close is the answer's: the end opens after it.
+  const after = [id("<thi"), id("nk>"), id(" hm"), id("</thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END]
+  const answered = scripted(after)
+  await answered.generate(request({ tools: [weather], toolChoice: "required" }))
+  const refused = answered.stepMasks.map(blocksEnd)
+  assert.deepEqual(refused.slice(0, after.length), Array(after.length).fill(true))
+  assert.equal(refused[after.length], false)
 })
 
 test("an output schema with a required or named call is refused", async () => {
