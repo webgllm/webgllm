@@ -28,6 +28,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { StructuredGeneration } from './structured-generation.js';
   import { withPromptCachePolicy } from './prompt-cache-policy.js';
   import { PrefixStore, savePromptPrefix } from './prefix-store.js';
+  import { persistPrefix } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
   import { createStopFilter } from './stop-sequences.js';
   import { seededUniforms } from './seeded-random.js';

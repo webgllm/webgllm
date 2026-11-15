@@ -6,6 +6,8 @@ import { GL } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import type { Pass, Program, Texture } from "./gpu/gl.js"
 import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
+import { persistPrefix, PrefixDisk } from "./prefix-disk.js"
+import type { PrefixFolder } from "./prefix-disk.js"
 
 // The store's own bookkeeping, with plain values for states.
 
@@ -131,12 +133,25 @@ function engineFixture() {
     setPhase() {},
     outOfMemory: () => false,
     pace: async () => undefined,
-    texture(internal: number, width: number, height: number): Texture {
+    texture(internal: number, width: number, height: number, upload?: { pixels: ArrayBufferView }): Texture {
       if (++allocations === failAt) throw new Error("injected allocation failure")
       const tex = { id: id++, tex: {}, internal, width, height, bytes: width * height * 16 } as Texture
       live.add(tex)
-      data.set(tex, new Float64Array(width * height))
+      const values = new Float64Array(width * height)
+      // (A texel's value in its first word, as readBytes writes it.)
+      if (upload) {
+        const p = upload.pixels as Float32Array | Uint32Array
+        const words = new Float32Array(p.buffer, p.byteOffset, p.byteLength / 4)
+        for (let i = 0; i < values.length; i++) values[i] = words[i * 4]
+      }
+      data.set(tex, values)
       return tex
+    },
+    async readBytes(tex: Texture) {
+      assert.ok(live.has(tex), `read of a missing or freed texture ${tex.id}`)
+      const words = new Float32Array(tex.width * tex.height * 4)
+      data.get(tex)!.forEach((v, i) => { words[i * 4] = v })
+      return new Uint8Array(words.buffer)
     },
     program(source: string): Program {
       const program = { program: {}, uniforms: new Map(), samplers: [] } as unknown as Program
@@ -315,4 +330,143 @@ test("prefixes saved in a store are freed with it", () => {
   assert.ok(f.live.size > before)
   s.clear()
   assert.equal(f.live.size, before)
+})
+
+// On disk: a folder in memory, as OPFS would keep it.
+
+function memoryFolder() {
+  const files = new Map<string, { bytes: Uint8Array; lastModified: number }>()
+  let clock = 1
+  const folder: PrefixFolder = {
+    names: async () => [...files.keys()],
+    async read(name, from = 0, to) {
+      const file = files.get(name)
+      if (!file) throw new Error(`No file ${name}`)
+      const bytes = file.bytes.slice(from, to ?? file.bytes.byteLength)
+      return { size: file.bytes.byteLength, lastModified: file.lastModified, bytes: bytes.buffer }
+    },
+    async write(name, parts) {
+      const size = parts.reduce((sum, p) => sum + p.byteLength, 0)
+      const bytes = new Uint8Array(size)
+      let at = 0
+      for (const p of parts) { bytes.set(p, at); at += p.byteLength }
+      files.set(name, { bytes, lastModified: clock++ })
+    },
+    async remove(name) { files.delete(name) }
+  }
+  return { files, folder }
+}
+
+const texture = (value: number, width = 2, height = 2) => {
+  const bytes = new Uint8Array(width * height * 16)
+  bytes.fill(value)
+  return { internal: GL.RGBA32UI, width, height, bytes }
+}
+
+test("a prefix saved to disk is found again by a page loaded later, byte for byte", async () => {
+  const { folder } = memoryFolder()
+  await new PrefixDisk(folder, "id").save([1, 2, 3], [texture(7), texture(9, 4, 1)])
+  const later = new PrefixDisk(folder, "id")
+  assert.ok(await later.has([1, 2, 3]))
+  const found = await later.match([1, 2, 3, 4], 3)
+  assert.deepEqual(found?.keys, [1, 2, 3])
+  assert.equal(found?.position, 3)
+  assert.deepEqual(found?.textures.map((t) => [t.internal, t.width, t.height]), [[GL.RGBA32UI, 2, 2], [GL.RGBA32UI, 4, 1]])
+  assert.ok(found?.textures[0].bytes.every((b) => b === 7))
+  assert.ok(found?.textures[1].bytes.every((b) => b === 9))
+  // Not the whole prompt, nor one no longer than what memory has.
+  assert.equal(await later.match([1, 2, 3], 2), undefined)
+  assert.equal(await later.match([1, 2, 3, 4], 3, 3), undefined)
+  assert.equal(await later.match([1, 2, 9, 4], 3), undefined)
+})
+
+test("files for other weights or kernels, and files cut short, are deleted when found", async () => {
+  const { files, folder } = memoryFolder()
+  await new PrefixDisk(folder, "old weights").save([1, 2], [texture(1)])
+  await new PrefixDisk(folder, "id").save([5, 6], [texture(2)])
+  // A write that never finished.
+  const [cut] = [...files.keys()].filter((name) => name.startsWith("2-")).slice(-1)
+  const whole = files.get(cut)!
+  files.set(cut, { ...whole, bytes: whole.bytes.slice(0, whole.bytes.byteLength - 1) })
+  await folder.write("notes.txt", [new Uint8Array([1])])
+  const disk = new PrefixDisk(folder, "id")
+  assert.equal(await disk.match([1, 2, 3], 2), undefined)
+  assert.equal(await disk.match([5, 6, 7], 2), undefined)
+  // (Only the prefix files are looked at.)
+  assert.deepEqual([...files.keys()], ["notes.txt"])
+})
+
+test("files past the disk budget go least recently used first; 0 deletes them all", async () => {
+  const { files, folder } = memoryFolder()
+  const size = (await (async () => {
+    const probe = memoryFolder()
+    await new PrefixDisk(probe.folder, "id").save([1], [texture(1)])
+    return [...probe.files.values()][0].bytes.byteLength
+  })())
+  const disk = new PrefixDisk(folder, "id", 2 * size)
+  await disk.save([1], [texture(1)])
+  await disk.save([2], [texture(2)])
+  // [1] used: [2] is the oldest now.
+  assert.ok(await disk.match([1, 0], 1))
+  await disk.save([3], [texture(3)])
+  assert.ok(await disk.has([1]))
+  assert.equal(await disk.has([2]), false)
+  assert.ok(await disk.has([3]))
+  assert.equal(files.size, 2)
+  // Too big for the budget at all: nothing written, nothing deleted.
+  await disk.save([4], [texture(4, 8, 8)])
+  assert.equal(files.size, 2)
+  // An image's key isn't a token: not saved.
+  await disk.save([2 ** 40], [texture(5)])
+  assert.equal(files.size, 2)
+  await disk.setBudget(0)
+  assert.equal(files.size, 0)
+  assert.equal(await disk.match([3, 0], 1), undefined)
+  await assert.rejects(disk.setBudget(-1), RangeError)
+})
+
+test("a prefix goes from the GPU to disk and back to the GPU, and restores as it was", async () => {
+  const f = engineFixture()
+  const { engine } = f
+  const { folder } = memoryFolder()
+  const store = new PrefixStore<SavedPrefix>((saved) => engine.freePrefix(saved), 1 << 20)
+  const keys = [11, 12, 13, 14, 15, 16, 17, 18]
+  f.read(1, 6)
+  engine.snapshot(undefined, "prefix")
+  f.read(1, 8)
+  const fresh = savePromptPrefix(engine, store, 8, keys, [], 6)
+  assert.deepEqual(fresh?.keys, keys.slice(0, 6))
+  await persistPrefix(new PrefixDisk(folder, "id"), (s) => store.holds(s), engine, fresh, assert.fail)
+  // A page loaded again: a new engine state, nothing in memory.
+  const g = engineFixture()
+  g.read(2, 8)
+  const found = await new PrefixDisk(folder, "id").match(keys, 7)
+  assert.equal(found?.position, 6)
+  const saved = g.engine.importPrefix(found!.position, found!.textures)!
+  assert.ok(saved)
+  await g.engine.restorePrefix(saved)
+  for (let p = 0; p < 6; p++) assert.deepEqual(g.at(p), [1000 + p, 1000 + p])
+  assert.ok(g.data.get(g.layers[0].conv!.state[0])!.every((v) => v === 1))
+  const ring = g.data.get(g.layers[2].attention!.kv)!
+  assert.equal(ring[0], 1004)
+  assert.equal(ring[2], 1005)
+  g.engine.freePrefix(saved)
+  // Shapes another engine wouldn't make: refused, nothing allocated.
+  const before = g.live.size
+  assert.equal(g.engine.importPrefix(6, found!.textures.slice(1)), undefined)
+  assert.equal(g.engine.importPrefix(3, found!.textures), undefined)
+  assert.equal(g.live.size, before)
+})
+
+test("nothing goes to disk once the store has freed the prefix, or with no disk", async () => {
+  const f = engineFixture()
+  const { folder, files } = memoryFolder()
+  const store = new PrefixStore<SavedPrefix>((saved) => f.engine.freePrefix(saved), 1 << 20)
+  f.read(1, 6)
+  f.engine.snapshot(undefined, "prefix")
+  const fresh = savePromptPrefix(f.engine, store, 6, [1, 2, 3, 4, 5, 6], [], 6)
+  store.clear()
+  await persistPrefix(new PrefixDisk(folder, "id"), (s) => store.holds(s), f.engine, fresh, assert.fail)
+  await persistPrefix(undefined, () => true, f.engine, fresh, assert.fail)
+  assert.equal(files.size, 0)
 })

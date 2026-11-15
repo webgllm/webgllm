@@ -493,6 +493,9 @@ type Snapshot = {
  * each full-attention layer's keys and values for positions [0, position),
  * which the live cache loses once another prompt overwrites them.
  */
+/** A saved prefix's texture, read back (see Engine.exportPrefix). */
+export type PrefixTexture = { internal: number; width: number; height: number; bytes: Uint8Array }
+
 export type SavedPrefix = {
   position: number
   state: Snapshot
@@ -3228,6 +3231,75 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       throw error
     }
     return { position, state, kv }
+  }
+
+  /** How many textures of each kind a saved prefix holds, and its full-attention caches' shape at `position`. */
+  private prefixLayout(position: number) {
+    const rows = 2 ** this.kvShift
+    return {
+      conv: this.layers.filter((l) => l.conv).length,
+      linear: 2 * this.layers.filter((l) => l.linear).length,
+      windows: this.layers.filter((l) => l.attention?.ring).length,
+      kv: this.layers.filter((l) => l.attention && !l.attention.ring).length,
+      kvShape: { internal: GL.RGBA32UI, width: this.kvWidth() * Math.ceil(position / rows), height: Math.min(position, rows) }
+    }
+  }
+
+  /** A saved prefix's textures, in order: conv states, Gated DeltaNet states, windows, full-attention caches. */
+  private prefixTextures(saved: SavedPrefix) {
+    return [...saved.state.conv, ...saved.state.linear, ...saved.state.windows, ...saved.kv]
+  }
+
+  /** A saved prefix's textures' shapes and contents, read back from the GPU (see importPrefix). */
+  async exportPrefix(saved: SavedPrefix): Promise<Array<PrefixTexture>> {
+    const out: Array<PrefixTexture> = []
+    for (const t of this.prefixTextures(saved))
+      out.push({ internal: t.internal, width: t.width, height: t.height, bytes: await this.gpu.readBytes(t) })
+    return out
+  }
+
+  /**
+   * A saved prefix at `position` made from exported textures (see
+   * exportPrefix), if they fit this engine: as many of each kind, in f32
+   * and u32 as saved, the full-attention caches of their exact shape.
+   * Undefined if they don't.
+   */
+  importPrefix(position: number, textures: Array<PrefixTexture>): SavedPrefix | undefined {
+    if (!Number.isInteger(position) || position <= 0 || position >= this.contextLength) return undefined
+    const layout = this.prefixLayout(position)
+    const states = layout.conv + layout.linear
+    if (textures.length !== states + layout.windows + layout.kv) return undefined
+    const fits = textures.every((t, i) =>
+      t.bytes.byteLength === t.width * t.height * 16 && t.width > 0 && t.height > 0 &&
+      (i < states
+        ? t.internal === GL.RGBA32F
+        : i < states + layout.windows
+          ? t.internal === GL.RGBA32UI && t.height === this.config.slidingWindow
+          : t.internal === layout.kvShape.internal && t.width === layout.kvShape.width && t.height === layout.kvShape.height))
+    if (!fits) return undefined
+    const made: Array<Texture> = []
+    try {
+      for (const t of textures) {
+        const integer = t.internal === GL.RGBA32UI
+        const words = t.bytes.byteLength / 4
+        const pixels = t.bytes.byteOffset % 4 === 0
+          ? integer ? new Uint32Array(t.bytes.buffer, t.bytes.byteOffset, words) : new Float32Array(t.bytes.buffer, t.bytes.byteOffset, words)
+          : integer ? new Uint32Array(t.bytes.slice().buffer) : new Float32Array(t.bytes.slice().buffer)
+        made.push(this.gpu.texture(t.internal, t.width, t.height, {
+          format: integer ? GL.RGBA_INTEGER : GL.RGBA,
+          type: integer ? GL.UNSIGNED_INT : GL.FLOAT,
+          pixels
+        }))
+      }
+    } catch (error) {
+      made.forEach((t) => this.gpu.delete(t))
+      throw error
+    }
+    const take = (n: number) => made.splice(0, n)
+    const conv = take(layout.conv)
+    const linear = take(layout.linear)
+    const windows = take(layout.windows)
+    return { position, state: { conv, windows, linear }, kv: made }
   }
 
   /** Frees a saved prefix's textures. */

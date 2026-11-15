@@ -34,6 +34,7 @@ import { createConstraint } from "./constraint/index.js"
 import { StructuredGeneration, maskLogits } from "./structured-generation.js"
 import { withPromptCachePolicy } from "./prompt-cache-policy.js"
 import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
+import { opfsFolder, persistPrefix, PrefixDisk } from "./prefix-disk.js"
 import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
 import type { ToolCall } from "./tool-choice.js"
@@ -192,6 +193,8 @@ type Loaded = {
   previousShared?: number
   /** Prompt prefixes saved apart from the live history (see prefix-store.ts). */
   prefixes: PrefixStore<SavedPrefix>
+  /** The same on disk, where there's OPFS (see prefix-disk.ts). */
+  disk?: PrefixDisk
   /** Milliseconds each phase of the load took. */
   timings?: Record<string, number>
   /** The texture bytes last claimed from the page's memory budget (see claimMemory). */
@@ -601,6 +604,13 @@ async function load(
       cached: [],
       images: new ImageCache(),
       prefixes: new PrefixStore<SavedPrefix>((saved) => engine.freePrefix(saved)),
+      // A file is for these weights (their files as stored), these kernels and settings, on this GPU.
+      ...(typeof navigator !== "undefined" && typeof navigator.storage?.getDirectory === "function" && {
+        disk: new PrefixDisk(opfsFolder(model), [
+          code, scope, engine.contextLength,
+          ...weightFiles.map((f) => `${f.name}:${f.size}:${f.lastModified}`)
+        ].join("|"))
+      }),
       claimed: engine.gpu.bytes,
       noteKey,
       note: measured ?? note,
@@ -1018,6 +1028,7 @@ async function generate(request: GenerateRequest) {
     tokenizer.vocabSize
   )
   const schemaMs = performance.now() - schemaAt
+  let fresh: ReturnType<typeof savePromptPrefix<SavedPrefix>>
   try {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   engine.setAllowedTokens(null)
@@ -1048,12 +1059,26 @@ async function generate(request: GenerateRequest) {
   // A saved prefix of this prompt's (another system prompt's history may
   // have replaced it since), where it reaches further than the live history.
   // (Not the whole prompt: the last token is read for the logits after it.)
-  const stored = cacheEnabled && !raw && !whole
+  let stored = cacheEnabled && !raw && !whole
     ? model.prefixes.match(keys, prompt.length - 1)
     : undefined
-  const restored = stored && stored.keys.length > engine.rewindPosition(Math.min(common, prompt.length - 1))
-    ? stored
-    : undefined
+  const live = engine.rewindPosition(Math.min(common, prompt.length - 1))
+  // On disk, one longer than both (a page loaded again starts with none in memory): into the store first.
+  if (cacheEnabled && !raw && !whole && model.disk) {
+    try {
+      if (request.promptCacheDiskBytes !== undefined) await model.disk.setBudget(request.promptCacheDiskBytes)
+      const found = await model.disk.match(keys, prompt.length - 1, Math.max(live, stored?.keys.length ?? 0))
+      const saved = found && engine.importPrefix(found.position, found.textures)
+      if (found && saved) {
+        const bytes = found.textures.reduce((sum, t) => sum + t.bytes.byteLength, 0)
+        if (model.prefixes.add(found.keys, bytes, saved)) stored = model.prefixes.match(keys, prompt.length - 1)
+      }
+    } catch (error) {
+      if (engine.gpu.isLost) throw error
+      post({ type: "log", text: `Couldn't read a prompt prefix from disk: ${error instanceof Error ? error.message : String(error)}` })
+    }
+  }
+  const restored = stored && stored.keys.length > live ? stored : undefined
   let start: number
   if (restored) {
     // (Nothing held until it's back: a failure leaves an empty cache.)
@@ -1118,7 +1143,7 @@ async function generate(request: GenerateRequest) {
     anchor,
     checkpoints: cacheEnabled
   })
-  if (cacheEnabled && !raw && !stopped.has(id)) savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix)
+  if (cacheEnabled && !raw && !stopped.has(id)) fresh = savePromptPrefix(engine, model.prefixes, model.cached.length, keys, images, prefix)
   const stats: RunTimings = {
     inputTokens: prompt.length,
     cachedTokens: start,
@@ -1616,6 +1641,9 @@ async function generate(request: GenerateRequest) {
     structured?.dispose()
     engine.setAllowedTokens(null)
     engine.dropGuess()
+    // A system prompt read for the first time, to disk once the reply is out (the next request waits for it).
+    if (fresh && !engine.gpu.isLost)
+      await persistPrefix(model.disk, (saved) => model.prefixes.holds(saved), engine, fresh, (text) => post({ type: "log", text }))
   }
   })
 }

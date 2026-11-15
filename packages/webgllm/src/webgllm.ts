@@ -62,6 +62,15 @@ export type WebGLLMOptions = {
    * memory (see `memoryBudget`).
    */
   promptCacheBytes?: number
+  /**
+   * Bytes of those prefixes each model keeps on disk, in the Origin Private
+   * File System (512 MiB when left out; 0 keeps none, and deletes those
+   * there). A page loaded again reads a system prompt it read before from
+   * there instead of from scratch. Only files made for the same weights,
+   * webgllm's kernels and this GPU are used. Deleting the model
+   * (`models.delete`) deletes them too.
+   */
+  promptCacheDiskBytes?: number
   /** Which worker and engine messages reach the console ("warn" by default). */
   logLevel?: LogLevel
   /**
@@ -164,8 +173,10 @@ export class WebGLLM {
   constructor(private readonly options: WebGLLMOptions = {}) {
     const level = LEVELS[options.logLevel ?? "warn"]
     const cacheBytes = options.promptCacheBytes
-    if (cacheBytes !== undefined && (typeof cacheBytes !== "number" || !Number.isFinite(cacheBytes) || cacheBytes < 0))
-      throw new TypeError("promptCacheBytes must be a nonnegative number.")
+    const diskBytes = options.promptCacheDiskBytes
+    for (const [name, bytes] of [["promptCacheBytes", cacheBytes], ["promptCacheDiskBytes", diskBytes]] as const)
+      if (bytes !== undefined && (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0))
+        throw new TypeError(`${name} must be a nonnegative number.`)
     this.storage = internals.storage
     this.pool = new ModelPool({
       createWorker: internals.createWorker,
@@ -189,7 +200,8 @@ export class WebGLLM {
       completions: new Completions({
         checkSupport: () => this.checkSupport(),
         contextLength: options.contextLength,
-        ...(cacheBytes !== undefined && { promptCacheBytes: cacheBytes })
+        ...(cacheBytes !== undefined && { promptCacheBytes: cacheBytes }),
+        ...(diskBytes !== undefined && { promptCacheDiskBytes: diskBytes })
       }, this.pool)
     }
     this.completions = new TextCompletions({ checkSupport: () => this.checkSupport(), contextLength: options.contextLength }, this.pool)
@@ -342,6 +354,8 @@ type CompletionContext = {
   contextLength: number | undefined
   /** See WebGLLMOptions.promptCacheBytes. */
   promptCacheBytes?: number
+  /** See WebGLLMOptions.promptCacheDiskBytes. */
+  promptCacheDiskBytes?: number
 }
 
 class Completions {
@@ -368,6 +382,7 @@ class Completions {
     if (named !== undefined && !knownModelMeta(named)) await resolveModel(named, signal)
     const plan = planCompletion(body)
     if (this.llm.promptCacheBytes !== undefined) plan.generate.promptCacheBytes = this.llm.promptCacheBytes
+    if (this.llm.promptCacheDiskBytes !== undefined) plan.generate.promptCacheDiskBytes = this.llm.promptCacheDiskBytes
     if (!this.pool.isLoaded(plan.model)) this.llm.checkSupport()
     // In a worker of the caller's (one model): its turn, from this load to its last token.
     const end = await this.pool.turn(signal)

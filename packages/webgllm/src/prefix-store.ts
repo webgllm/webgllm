@@ -72,6 +72,11 @@ export class PrefixStore<S> {
     return !!entry
   }
 
+  /** Whether an entry holds `state` (not freed). */
+  holds(state: S) {
+    return this.entries.some((e) => e.state === state)
+  }
+
   /** Whether an entry of `bytes` would fit the budget at all. */
   fits(bytes: number) {
     return bytes > 0 && bytes <= this.limit
@@ -136,7 +141,8 @@ export type PrefixEngine<S> = {
  * Keeps the state at the end of the prompt's system prompt and tools
  * (`prefix` tokens in) in `store` if it lacks it, from the engine's prefix
  * snapshot there (the cache holding `cached` of the prompt's `keys`). Not
- * a prefix with an image in it, nor one past the budget.
+ * a prefix with an image in it, nor one past the budget. Returns what it
+ * kept, if anything (for the disk: see prefix-disk.ts).
  */
 export function savePromptPrefix<S>(
   engine: PrefixEngine<S>,
@@ -154,5 +160,6 @@ export function savePromptPrefix<S>(
   const bytes = engine.savedPrefixBytes(prefix)
   if (!store.fits(bytes)) return
   const saved = engine.savePrefix(prefix)
-  if (saved) store.add(tokens, bytes, saved)
+  if (saved && store.add(tokens, bytes, saved)) return { keys: tokens, saved }
+  return undefined
 }
