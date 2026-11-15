@@ -1378,12 +1378,14 @@ async function generate(request: GenerateRequest) {
   ) => {
     if (masks) engine.setAllowedTokenRows(masks)
     else updateAllowed()
+    // Each row's penalties as drawing the drafts one by one would give them.
+    const seenRows = penalize() ? seen.ahead(drafts) : []
     if (greedy) {
       const tokens = await engine.argmax(
         0,
         rows,
         penalty(),
-        drafts,
+        seenRows,
         guess,
         presence()
       )
@@ -1398,7 +1400,7 @@ async function generate(request: GenerateRequest) {
       rows,
       sampling.top_k,
       penalty(),
-      drafts,
+      seenRows,
       guess,
       0,
       presence()

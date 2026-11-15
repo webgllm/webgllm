@@ -102,7 +102,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     setImages() {},
     async forwardHidden(batch: number[]) { position += batch.length; return batch.length - 1 },
     setSeen(tokens: Iterable<number>) { seen.push([...tokens]) }, markSeen() {}, setSeenState() {},
-    async argmax(_row: number, _rows: number, penalty: number, _drafts: number[], _guess: boolean, presence = 0) {
+    async argmax(_row: number, _rows: number, penalty: number, _seenRows: unknown[], _guess: boolean, presence = 0) {
       penalties.push([penalty, presence])
       return Int32Array.of(queue.shift() ?? EOS)
     },

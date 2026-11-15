@@ -13,6 +13,7 @@ import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
+import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
 import { quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
@@ -436,6 +437,14 @@ export function tuningToRetime(stored: Tuned): Tuned {
  * timings were kept (no submissionMs), whose pacing may be from the step
  * at two frames and whose packing from two pairs on a fast GPU.
  */
+/** The pick shaders' uSeenRows and uSeenRowCount (see K.PENALIZED). */
+function seenRowUniforms(rows: ReadonlyArray<SeenRow>) {
+  if (rows.length > MAX_SEEN_ROWS) throw new RangeError(`A batch's penalty rows can't pass ${MAX_SEEN_ROWS}.`)
+  const flat = new Array<number>(MAX_SEEN_ROWS * 4).fill(-1)
+  rows.forEach((row, i) => flat.splice(i * 4, 4, ...row))
+  return { uSeenRows: { ivec4s: flat }, uSeenRowCount: { int: rows.length } }
+}
+
 export function timesAgain(stored: Tuned): boolean {
   return !!stored.submissionRetime || (stored.submissionMs === undefined && stored.submissionReads !== undefined)
 }
@@ -5891,7 +5900,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     row0: number,
     rows: number,
     penalty: number,
-    drafts: Array<number>,
+    seenRows: ReadonlyArray<SeenRow>,
     guess = false,
     presencePenalty = 0
   ): Promise<Int32Array> {
@@ -5899,7 +5908,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const b = this.buffers
     const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
-    type Ivec4 = [number, number, number, number]
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -5911,8 +5919,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
-      uExtra: { ivec4: [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4 },
-      uExtra2: { ivec4: [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4 },
+      ...seenRowUniforms(seenRows),
       uPenaltyRow0: { int: 0 }
     }
     this.gpu.run({
@@ -5962,9 +5969,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /**
    * `candidates` for rows [row0, row0 + rows) of the last batch at once:
-   * one head pass, one pick, one readback. `drafts` are the batch's inputs
-   * after its first (row i + 1's input is drafts[i]): row r's penalty
-   * counts drafts before it as seen, as drawing them one by one would.
+   * one head pass, one pick, one readback. `seenRows`: where the batch's
+   * rows see tokens otherwise than the penalty mask (the drafts before
+   * them, and what those pushed out of the window: PenaltyWindow.ahead),
+   * as drawing them one by one would.
    * With `guess`, the last row's likeliest token is read forward (see
    * forwardGuess).
    */
@@ -5973,7 +5981,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     rows: number,
     chunks: number,
     penalty: number,
-    drafts: Array<number>,
+    seenRows: ReadonlyArray<SeenRow>,
     guess = false,
     penaltyRow0 = 0,
     presencePenalty = 0
@@ -5983,9 +5991,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
-    type Ivec4 = [number, number, number, number]
-    const extra = [0, 1, 2, 3].map((i) => drafts[i] ?? -1) as Ivec4
-    const extra2 = [4, 5, 6, 7].map((i) => drafts[i] ?? -1) as Ivec4
     const fast = TUNING.fastPick > 0
     const picking = {
       uOutW: { int: OUT_WIDTH },
@@ -5998,8 +6003,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uLogitRows: { int: this.logitRows },
       uHeadSplit: { int: head.split },
       uHeadStride: { int: head.stride },
-      uExtra: { ivec4: extra },
-      uExtra2: { ivec4: extra2 },
+      ...seenRowUniforms(seenRows),
       uPenaltyRow0: { int: penaltyRow0 }
     }
     this.gpu.run({
