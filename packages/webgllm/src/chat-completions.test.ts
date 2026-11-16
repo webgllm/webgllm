@@ -210,8 +210,9 @@ test("tools and tool_choice", () => {
   assert.equal(auto.parseTools, true)
   assert.equal("toolChoice" in auto.generate, false)
   assert.deepEqual(auto.generate.tools[0], { type: "function", function: { description: "", ...weather.function } })
+  // "none" keeps the tools in the prompt, as llama.cpp does, and reads no calls.
   const none = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "none" })
-  assert.deepEqual(none.generate.tools, [])
+  assert.deepEqual(none.generate.tools, auto.generate.tools)
   assert.equal(none.generate.toolChoice, "none")
   assert.equal(none.parseTools, false)
   const named = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: { type: "function", function: { name: "get_weather" } } })

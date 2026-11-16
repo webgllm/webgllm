@@ -246,12 +246,10 @@ const argumentsOf = (value: unknown, name: string) => {
 
 export function planToolChoice(tools: Array<ChatTool>, choice: ToolChoice = "auto"): ToolPlan {
   if (choice === "auto") return { mode: "auto", tools }
-  // "none" renders no tools, as if none were offered: the template then
-  // neither describes them nor asks for calls, so the model answers in text
-  // (past calls in the chat still render). Keeping the tools and banning the
-  // call markup instead would need each format's markers in the worker, and
-  // a model that meant to call would write the call some other way.
-  if (choice === "none") return { mode: "none", tools: [] }
+  // "none" as llama.cpp has it: the template renders the tools as for
+  // "auto" (the prompt, and its cache, stay the same), and nothing about a
+  // call is constrained or read: markup the model writes stays text.
+  if (choice === "none") return { mode: "none", tools }
   // "required" as llama.cpp has it: the model writes its call in its own
   // template's format, as with "auto" (text may come first), and the reply
   // can't end before one (see the handler). Its arguments aren't held to a

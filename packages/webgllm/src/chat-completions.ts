@@ -379,8 +379,8 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   const offered = toTools((body.tools as Array<ChatCompletionTool> | null | undefined) ?? [])
   if (offered.length && !meta.supports.capabilities.includes("tools")) throw unsupported(`${model} doesn't take tools.`)
   const toolChoice = toToolChoice(body.tool_choice, offered)
-  // "none" offers no tools at all: the prompt doesn't list them.
-  const tools = toolChoice === "none" ? [] : offered
+  // "none" keeps the tools in the prompt, as llama.cpp does: only no call is constrained or read.
+  const tools = offered
 
   const { effort, given, budget } = reasoningOf(body)
   const kwargs = templateKwargsOf(body)

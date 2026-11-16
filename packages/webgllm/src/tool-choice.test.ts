@@ -15,7 +15,7 @@ test("auto renders the tools and constrains nothing", () => {
 })
 
 test("none renders no tools", () => {
-  assert.deepEqual(planToolChoice([weather, time], "none"), { mode: "none", tools: [] })
+  assert.deepEqual(planToolChoice([weather, time], "none"), { mode: "none", tools: [weather, time] })
 })
 
 test("a named tool: its arguments alone, every tool still rendered", async () => {
