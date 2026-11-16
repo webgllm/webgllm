@@ -7,6 +7,7 @@ import { Engine, TUNING } from "../src/engine.js"
 import * as K from "../src/gpu/kernels.js"
 import type { LayerProbe } from "../src/engine.js"
 import type { Texture } from "../src/gpu/gl.js"
+import type { WeightPiece } from "../src/weights.js"
 import { httpSource } from "../src/byte-source.js"
 import { headPermutation, loadGguf } from "../src/load-gguf.js"
 import { loadOnnx } from "../src/load-onnx.js"
@@ -167,7 +168,17 @@ async function run(params: {
     `GPU: ${engine.gpu.limits.renderer}, max texture ${engine.gpu.limits.maxTextureSize}`
   )
   const t0 = performance.now()
-  await engine.load(await modelPieces(params))
+  // Which layers' q/k rows the loader reordered from the source's head
+  // layout: those are the layers whose reference rows need the same order
+  // (llama.cpp's full-attention layers; an ONNX graph's only where it has HF's layout).
+  const reorderedHeads = new Set<number>()
+  async function* noting(pieces: AsyncIterable<WeightPiece>) {
+    for await (const piece of pieces) {
+      if (piece.kind === "layer" && piece.headsReordered) reorderedHeads.add(piece.layer)
+      yield piece
+    }
+  }
+  await engine.load(noting(await modelPieces(params)))
   {
     const c = engine.layoutChoice
     if (c)
@@ -211,9 +222,13 @@ async function run(params: {
   const c = engine.config
   const qDims = c.numHeads * c.headDim
   const kvDims = c.numKvHeads * c.headDim
-  const qPerm = headPermutation(c.numHeads, c.headDim, c.ropeDimsFull)
-  const kPerm = headPermutation(c.numKvHeads, c.headDim, c.ropeDimsFull)
-  /** Reference rows put in our layout: q/k dims reordered in full-attention layers. */
+  // The reorder a layer's loader applied, by its rotated dims.
+  const perms = (layer: number) => {
+    if (!reorderedHeads.has(layer)) return { q: null, k: null }
+    const dims = c.layerTypes[layer] === "full_attention" ? c.ropeDimsFull : c.ropeDimsSliding
+    return { q: headPermutation(c.numHeads, c.headDim, dims), k: headPermutation(c.numKvHeads, c.headDim, dims) }
+  }
+  /** Reference rows put in our layout: q/k dims reordered in the layers the loader reordered. */
   const reorder = (
     want: Float32Array,
     dims: number,
@@ -264,7 +279,7 @@ async function run(params: {
   const probe: LayerProbe | undefined = params.layers
     ? async (layer, name, read) => {
         const type = c.layerTypes[layer]
-        const full = type === "full_attention"
+        const { q: qPerm, k: kPerm } = perms(layer)
         // Qwen3.5's references are llama.cpp's own tensor names.
         const simple: Record<string, string> = c.linear
           ? {
@@ -304,7 +319,7 @@ async function run(params: {
             qDims,
             t.offset,
             rows,
-            full ? qPerm : null
+            qPerm
           )
           await check(
             `k_proj-${layer}`,
@@ -313,7 +328,7 @@ async function run(params: {
             kvDims,
             t.offset,
             rows,
-            full ? kPerm : null
+            kPerm
           )
           await check(
             `v_proj-${layer}`,
@@ -347,7 +362,7 @@ async function run(params: {
             qDims,
             t.offset,
             rows,
-            full ? qPerm : null,
+            qPerm,
             Math.sqrt(c.headDim)
           )
         } else {

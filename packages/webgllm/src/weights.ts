@@ -208,7 +208,17 @@ export type WeightPiece =
    */
   | { kind: "embedding"; value: QuantMatrix; row0?: number; totalRows?: number }
   | { kind: "finalNorm"; value: Float32Array }
-  | { kind: "layer"; layer: number; value: LayerWeights }
+  | {
+      kind: "layer"
+      layer: number
+      value: LayerWeights
+      /**
+       * The layer's q and k rows were reordered from the source's head
+       * layout (HF's) to each head's rotated dims first: a reference taken
+       * in the source's layout needs the same reordering to be compared.
+       */
+      headsReordered?: boolean
+    }
 
 /** Random access to a file's bytes: a URL (range requests), OPFS, or disk in tests. */
 export type ByteSource = {
