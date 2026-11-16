@@ -421,27 +421,31 @@ class Completions {
     const settled = await this.settleToolCalls(plan, last, options.signal)
     for (const d of settled.deltas) deltas.push(d)
     const toolCalls = reader.toolCalls(settled.calls)
-    return buildCompletion(meta, deltas, toolCalls, finishReasonOf(settled.calls, last.finishReason), end.stats, settled.repairs, plan.logprobs ? logprobs : undefined)
+    return buildCompletion(meta, deltas, toolCalls, finishReasonOf(settled.calls, settled.finishReason), end.stats, settled.repairs, plan.logprobs ? logprobs : undefined)
   }
 
   /**
    * Checks an automatic reply's tool calls and generates bad ones again,
-   * each constrained to its tool's schema (see planRepairs). Unrepaired
-   * malformed markup is shown as the text it is.
+   * each held to its tools (see planRepairs). A repair takes a call's place
+   * only once it's checked valid; one cut off by the token limit stays cut
+   * off (its `partial` arguments, and "length" for the reply), as any reply
+   * cut off in a call does. Unrepaired malformed markup is shown as the text
+   * it is.
    */
   private async settleToolCalls(
     plan: CompletionPlan,
     last: { calls: Array<ParsedToolCall>; malformed?: string; finishReason: FinishReason },
     signal: AbortSignal | undefined
-  ): Promise<{ calls: Array<ParsedToolCall>; deltas: Array<ReplyDelta>; repairs: Array<RunTimings> }> {
+  ): Promise<{ calls: Array<ParsedToolCall>; deltas: Array<ReplyDelta>; repairs: Array<RunTimings>; finishReason: FinishReason }> {
     const calls = [...last.calls]
     const repairs: Array<RunTimings> = []
+    let finishReason = last.finishReason
     let malformed = last.malformed
     if (plan.parseTools && plan.repairToolCalls) {
       for (const repair of await planRepairs(calls, malformed, plan.generate.tools, last.finishReason)) {
         throwIfAborted(signal)
         // The call is read from the repair's reply as any reply's is; its text and thinking aren't shown.
-        const reader = createReplyReader({ format: modelMeta(plan.model).toolFormat ?? "lfm3", parseTools: true, parallelToolCalls: false })
+        const reader = createReplyReader({ format: modelMeta(plan.model).toolFormat ?? "lfm3", parseTools: true, parallelToolCalls: false, tools: plan.generate.tools })
         const end = await abortable(
           this.pool.generate(plan.model, repairRequest(plan, repair), {
             contextLength: this.llm.contextLength,
@@ -450,14 +454,24 @@ class Completions {
           }),
           signal
         )
-        const [call] = reader.finish(end).calls
-        if (!call) throw new Error("A tool call couldn't be repaired.")
+        const done = reader.finish(end)
+        const [call] = done.calls
         repairs.push(end.stats)
+        if (done.finishReason === "length") {
+          // Cut off: the call as far as it was written (none written: the call stays), and the reply ends as one cut off.
+          if (call) calls[repair.index] = call
+          finishReason = "length"
+          malformed = undefined
+          continue
+        }
+        if (!call) throw new Error("A tool call couldn't be repaired.")
+        // Only a repair that checks out takes the call's place; otherwise the call stays as the model wrote it.
+        if ((await planRepairs([call], undefined, plan.generate.tools, done.finishReason)).length > 0) continue
         calls[repair.index] = { name: call.name, args: call.args }
         malformed = undefined
       }
     }
-    return { calls, deltas: malformed !== undefined ? [{ content: malformed }] : [], repairs }
+    return { calls, deltas: malformed !== undefined ? [{ content: malformed }] : [], repairs, finishReason }
   }
 
   /**
@@ -485,7 +499,7 @@ class Completions {
       const toolCalls = reader.toolCalls(settled.calls)
       emit(...writer.toolCalls(toolCalls))
       const timings = timingsOf(ended.stats)
-      emit(writer.finish(finishReasonOf(settled.calls, last.finishReason), plan.includeUsage ? undefined : timings))
+      emit(writer.finish(finishReasonOf(settled.calls, settled.finishReason), plan.includeUsage ? undefined : timings))
       if (plan.includeUsage) emit(writer.usage(usageOf(ended.stats, settled.repairs), timings))
     })
   }
@@ -646,7 +660,8 @@ const readerFor = (plan: CompletionPlan) =>
   createReplyReader({
     format: modelMeta(plan.model).toolFormat ?? "lfm3",
     parseTools: plan.parseTools,
-    parallelToolCalls: plan.parallelToolCalls
+    parallelToolCalls: plan.parallelToolCalls,
+    tools: plan.generate.tools
   })
 
 class Models {

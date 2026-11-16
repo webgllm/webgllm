@@ -38,7 +38,7 @@ function eachSubschema(node: Record<string, unknown>, visit: (child: unknown, pa
 }
 
 /** `node` with each direct subschema replaced by `map(child, path)`. */
-function mapSubschemas(node: Record<string, unknown>, map: (child: unknown, path: Array<string>) => unknown) {
+export function mapSubschemas(node: Record<string, unknown>, map: (child: unknown, path: Array<string>) => unknown) {
   const out: Record<string, unknown> = { ...node }
   eachSubschema(node, (child, path) => {
     const mapped = map(child, path)

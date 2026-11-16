@@ -4,6 +4,8 @@
  * - LFM2 and LFM2.5: `<|tool_call_start|>[get_weather(city="Tokyo")]<|tool_call_end|>`
  * - LFM3 and Qwen3.5: `<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>`
  */
+import type { ChatTool } from "./tokenizer.js"
+import { mayBeString, toolSchema } from "./tool-schemas.js"
 
 /**
  * A call as parsed. `partial`: the call was cut off (the reply ran out of
@@ -182,9 +184,12 @@ function parsePythonic(body: string) {
 /**
  * `<function=name><parameter=k>v</parameter></function>` → calls. With
  * `cut`, the text ends where the reply ran out of tokens: a function with
- * no closing tag is the call it cut off (see ParsedToolCall.partial).
+ * no closing tag is the call it cut off (see ParsedToolCall.partial). A
+ * value whose parameter may be a string is the text as written, as
+ * llama.cpp reads it (`123` stays "123" for a string); any other is JSON
+ * where it parses.
  */
-function parseXmlish(body: string, cut = false) {
+function parseXmlish(body: string, cut = false, tools: ReadonlyArray<ChatTool> = []) {
   const calls: Array<ParsedToolCall> = []
   for (const f of body.matchAll(
     /<function=([^>\n]+)>([\s\S]*?)(<\/function>|$)/g
@@ -192,10 +197,13 @@ function parseXmlish(body: string, cut = false) {
     const args: Record<string, unknown> = {}
     const written: Array<string> = []
     let end = 0
+    const offered = tools.find((t) => t.function.name === f[1].trim())
+    const tool = offered && toolSchema(offered)
     for (const p of f[2].matchAll(
       /<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g
     )) {
-      const value = parseXmlValue(p[2])
+      const declared = tool?.properties.find(([name]) => name === p[1].trim())
+      const value = tool && declared && mayBeString(tool, declared[1]) ? p[2] : parseXmlValue(p[2])
       args[p[1].trim()] = value
       written.push(`${JSON.stringify(p[1].trim())}:${JSON.stringify(value)}`)
       end = (p.index ?? 0) + p[0].length
@@ -216,15 +224,16 @@ function parseXmlish(body: string, cut = false) {
  * Every tool call in `text`, in LFM3's or LFM2's format. With `cut`, the
  * text ends where the reply ran out of tokens: a call it ends inside is
  * marked `partial` (LFM3's markup), or left out where its format can't say
- * what of it was written (the calls before it stand).
+ * what of it was written (the calls before it stand). `tools`, the offered
+ * ones, decide how XML values read (see parseXmlish).
  */
-export function parseToolCalls(text: string, cut = false): Array<ParsedToolCall> {
+export function parseToolCalls(text: string, cut = false, tools: ReadonlyArray<ChatTool> = []): Array<ParsedToolCall> {
   const calls: Array<ParsedToolCall> = []
   for (const m of text.matchAll(/<tool_call>([\s\S]*?)(<\/tool_call>|$)/g)) {
     const open = cut && !m[2]
     const body = open ? m[1].trimStart() : m[1].trim()
     if (body.includes("<function=")) {
-      calls.push(...parseXmlish(body, open))
+      calls.push(...parseXmlish(body, open, tools))
       continue
     }
     if (open) continue

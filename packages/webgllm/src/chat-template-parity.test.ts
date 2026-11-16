@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import hub from "./test-fixtures/hub.json" with { type: "json" }
 import { loadTokenizer } from "./tokenizer.js"
-import type { ChatMessage } from "./tokenizer.js"
+import type { ChatMessage, ChatTool } from "./tokenizer.js"
 import { withCallsInText } from "./tool-calls.js"
 
 const TEMPLATES = {
@@ -74,4 +74,27 @@ test("a last assistant message is continued as llama.cpp continues it", () => {
     onnx.applyChatTemplate([hi, { role: "assistant", content: "Hel" }], { continueFinalMessage: true }),
     onnx.applyChatTemplate([hi], { addGenerationPrompt: true }) + "Hel"
   )
+})
+
+test("XML values read by their parameter's schema: a string stays the text written, as llama.cpp reads it", async () => {
+  const { parseToolCalls } = await import("./tool-calls.js")
+  const tools: Array<ChatTool> = [{
+    type: "function",
+    function: {
+      name: "f",
+      description: "",
+      parameters: {
+        type: "object",
+        $defs: { code: { type: "string" } },
+        properties: { s: { type: "string" }, n: { type: "integer" }, b: { type: "boolean" }, r: { $ref: "#/$defs/code" }, maybe: { type: ["string", "null"] } }
+      }
+    }
+  }]
+  const call = (body: string) => `<tool_call>\n<function=f>\n${body}</function>\n</tool_call>`
+  const p = (k: string, v: string) => `<parameter=${k}>\n${v}\n</parameter>\n`
+  const [read] = parseToolCalls(call(p("s", "123") + p("n", "123") + p("b", "true") + p("r", "null") + p("maybe", "false")), false, tools)
+  assert.deepEqual(read?.args, { s: "123", n: 123, b: true, r: "null", maybe: "false" })
+  // A parameter the tool doesn't declare, or a tool not offered: JSON where it parses, as before.
+  assert.deepEqual(parseToolCalls(call(p("other", "123")), false, tools)[0]?.args, { other: 123 })
+  assert.deepEqual(parseToolCalls(call(p("s", "123")))[0]?.args, { s: 123 })
 })

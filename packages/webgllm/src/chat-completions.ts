@@ -474,6 +474,8 @@ export type GenerationEnd = {
 export function createReplyReader(options: {
   format?: ToolFormat
   parseTools: boolean
+  /** The offered tools: how their calls' values read (see parseToolCalls). */
+  tools?: ReadonlyArray<ChatTool>
   parallelToolCalls?: boolean
   newId?: () => string
 }) {
@@ -515,7 +517,7 @@ export function createReplyReader(options: {
         // Out of tokens: a call it cut off is sent as written, as llama.cpp sends it (see
         // finishReasonOf), and nothing in the reply is repaired (see planRepairs).
         const cut = end.finishReason === "length"
-        calls = markup ? parseToolCalls(markup, cut) : []
+        calls = markup ? parseToolCalls(markup, cut, options.tools) : []
         if (markup && calls.length === 0 && !cut) malformed = markup
       }
       return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }

@@ -736,3 +736,26 @@ test("out of tokens after a finished call, inside a second one's opener: the fin
   const cut = await inValue.chat.completions.create({ model: QWEN, messages: hi, tools: weather, tool_choice: "required" })
   assert.equal(cut.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"city":"Tok')
 })
+
+test("tool-call repair cut off by the token limit stays cut off, and a repair that's still invalid doesn't replace the call", async () => {
+  const cut = llm({
+    reply: (request) =>
+      request.toolChoice
+        ? { tokens: ["<tool_call>\n<function=get_weather>\n<parameter=city>\nTok"], done: { finishReason: "length" } }
+        : { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] }
+  })
+  const a = await cut.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
+  assert.equal(a.choices[0]?.finish_reason, "length")
+  assert.equal(a.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"city":"Tok')
+  const streamed = await collect(
+    await cut.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true, stream: true })
+  )
+  assert.equal(streamed.at(-1)?.choices[0]?.finish_reason, "length")
+  assert.equal(streamed.flatMap((c) => c.choices[0]?.delta.tool_calls ?? [])[0]?.function?.arguments, '{"city":"Tok')
+
+  const still = llm({ reply: () => ({ tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] }) })
+  const b = await still.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
+  assert.equal(still.workers.of(QWEN)!.generations().length, 2, "repaired once")
+  assert.equal(b.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"town":"Paris"}', "the call as the model wrote it")
+  assert.equal(b.choices[0]?.finish_reason, "tool_calls")
+})

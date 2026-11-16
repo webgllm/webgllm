@@ -35,6 +35,8 @@ import type { Constraint } from "./constraint/index.js"
 import type { ChatTool } from "./tokenizer.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ToolFormat } from "./tool-calls.js"
+import { isString, mayBeString, toolSchema, valueSchema } from "./tool-schemas.js"
+import type { ToolSchema } from "./tool-schemas.js"
 
 /** The vocabulary as the matcher reads it: each token's bytes, sorted. */
 export type CallVocab = {
@@ -197,46 +199,19 @@ function split(vocab: CallVocab, triggers: Array<number>) {
   return found
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value)
+type Tool = ToolSchema
 
-/** Whether a value held to `schema` may be a string (llama.cpp's may_be_string): written raw in the XML format. */
-function mayBeString(schema: unknown): boolean {
-  if (!isObject(schema)) return true
-  const type = schema.type
-  if (type === "string") return true
-  if (Array.isArray(type)) return type.includes("string")
-  if (type !== undefined) return false
-  for (const key of ["anyOf", "oneOf"]) if (Array.isArray(schema[key]) && (schema[key] as Array<unknown>).some(mayBeString)) return true
-  if (Array.isArray(schema.enum)) return schema.enum.some((v) => typeof v === "string")
-  if ("const" in schema) return typeof schema.const === "string"
-  return !("properties" in schema || "items" in schema || "$ref" in schema || "anyOf" in schema || "oneOf" in schema || "allOf" in schema)
-}
-
-type Tool = { name: string; properties: Array<[string, unknown]>; required: Array<string>; root: Record<string, unknown> }
-
-function toolOf(tool: ChatTool): Tool {
-  const root = isObject(tool.function.parameters) ? tool.function.parameters : {}
-  const properties = isObject(root.properties) ? Object.entries(root.properties) : []
-  const names = new Set(properties.map(([name]) => name))
-  const required = Array.isArray(root.required) ? (root.required as Array<unknown>).filter((r): r is string => typeof r === "string" && names.has(r)) : []
-  return { name: tool.function.name, properties, required, root }
-}
-
-/** A parameter's schema on its own: the tool's definitions beside it, objects closed as llama.cpp reads them. */
-function valueSchema(tool: Tool, schema: unknown): object {
-  const own = isObject(schema) ? schema : {}
-  const defs = { ...(isObject(tool.root.$defs) && { $defs: tool.root.$defs }), ...(isObject(tool.root.definitions) && { definitions: tool.root.definitions }) }
-  return closeObjects({ ...defs, ...own }) as object
-}
+/** A value's JSON Schema for the constraint: the parameter's own, references resolved, objects closed as llama.cpp reads them. */
+const jsonSchema = (tool: Tool, schema: unknown) => closeObjects(valueSchema(tool, schema)) as object
 
 /** The XML format's call, after its opening marker. */
 function xmlCall(tools: Array<Tool>, end: number): State {
   const args = (tool: Tool, used: Array<string>): State => {
     const value = (name: string, schema: unknown): State => {
       const after = () => args(tool, [...used, name])
-      return mayBeString(schema)
+      return mayBeString(tool, schema)
         ? { k: "until", suffix: enc("\n</parameter>\n"), m: 0, next: after }
-        : { k: "json", schema: valueSchema(tool, schema), next: () => lit("\n</parameter>\n", after) }
+        : { k: "json", schema: jsonSchema(tool, schema), next: () => lit("\n</parameter>\n", after) }
     }
     const open = ([name, schema]: [string, unknown]) => ({ text: `<parameter=${name}>\n`, next: () => value(name, schema) })
     const required = tool.required.find((r) => !used.includes(r))
@@ -258,12 +233,16 @@ function pythonCalls(tools: Array<Tool>, end: number, parallel: boolean): State 
   const args = (tool: Tool, used: Array<string>): State => {
     const value = (name: string, schema: unknown): State => {
       const after = () => args(tool, [...used, name])
-      return isObject(schema) && schema.type === "string" ? { k: "quoted", q: 0, esc: false, next: after } : { k: "json", schema: valueSchema(tool, schema), next: after }
+      return isString(tool, schema) ? { k: "quoted", q: 0, esc: false, next: after } : { k: "json", schema: jsonSchema(tool, schema), next: after }
     }
     const unused = tool.properties.filter(([name]) => !used.includes(name))
     const seps = used.length ? [", ", ","] : [""]
+    // The call closes once its required arguments are written (llama.cpp's
+    // Python-style grammar doesn't check them; its XML one does, and a call
+    // without them is no call the tool takes).
+    const complete = tool.required.every((name) => used.includes(name))
     return pick([
-      { text: ")", next: afterCall },
+      ...(complete ? [{ text: ")", next: afterCall }] : []),
       ...seps.flatMap((sep) => unused.map(([name, schema]) => ({ text: `${sep}${name}=`, next: () => value(name, schema) })))
     ])
   }
@@ -303,7 +282,7 @@ export class ToolCallGrammar {
 
   constructor(private readonly o: ToolCallGrammarOptions) {
     this.thinking = o.startsInThinking
-    this.tools = o.tools.map(toolOf)
+    this.tools = o.tools.map(toolSchema)
   }
 
   /** Inside a call. */

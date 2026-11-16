@@ -160,3 +160,48 @@ test("the vocabulary is read once per tokenizer", () => {
   assert.ok(!vocab.order.includes(START), "special tokens aren't text")
   assert.ok(vocab.whitespace.includes(10))
 })
+
+test("Python style: the call can't close before its required arguments, written before or after an optional one", async () => {
+  const g = grammar("lfm2")
+  g.observe(START)
+  await write(g, ["[", "get_weather", "("])
+  await g.ready()
+  assert.ok(!allowed(g.mask(), idOf(")")), "city is required")
+  await write(g, ["days", "=", "12"])
+  await g.ready()
+  assert.ok(!allowed(g.mask(), idOf(")")), "still no city")
+  await write(g, [", ", "city", "=", "'", "Oslo", "'"])
+  await g.ready()
+  assert.ok(allowed(g.mask(), idOf(")")))
+})
+
+test("a parameter's references resolve against the whole tool, and a root $ref is followed to its object", async () => {
+  const { toolSchema, valueSchema, mayBeString } = await import("./tool-schemas.js")
+  const local = toolSchema({ type: "function", function: { name: "f", parameters: { type: "object", properties: { a: { type: "integer", minimum: 1 }, b: { $ref: "#/properties/a" } }, required: ["b"] } } })
+  assert.deepEqual(valueSchema(local, local.properties[1]![1]), { type: "integer", minimum: 1 })
+  // It compiles with the real JSON constraint (the reference alone didn't resolve).
+  const { validateStructuredValue } = await import("./constraint/index.js")
+  assert.equal(await validateStructuredValue(valueSchema(local, local.properties[1]![1]), 3), true)
+  assert.equal(await validateStructuredValue(valueSchema(local, local.properties[1]![1]), 0), false)
+  const rooted = toolSchema({
+    type: "function",
+    function: { name: "g", parameters: { $ref: "#/$defs/args", $defs: { args: { type: "object", properties: { city: { $ref: "#/$defs/city" } }, required: ["city"] }, city: { type: "string" } } } }
+  })
+  assert.deepEqual(rooted.properties.map(([name]) => name), ["city"])
+  assert.deepEqual(rooted.required, ["city"])
+  assert.equal(mayBeString(rooted, rooted.properties[0]![1]), true)
+  // A definition reference stays, with the definitions beside it (a recursive one still compiles).
+  const value = valueSchema(rooted, rooted.properties[0]![1]) as Record<string, unknown>
+  assert.equal(value.$ref, "#/$defs/city")
+  assert.ok((value.$defs as Record<string, unknown>).city)
+  // The grammar asks for the root $ref's required parameter.
+  const g = new ToolCallGrammar({
+    format: "lfm3", tools: [{ type: "function", function: { name: "get_weather", description: "", parameters: { $ref: "#/$defs/args", $defs: { args: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } } } }],
+    parallel: true, vocab: callVocab(tokenizer), start: START, end: END, eos: EOS, think: THINK, thinkEnd: THINK_END, startsInThinking: false, json: async () => digits()
+  })
+  g.observe(START)
+  await write(g, ["\n<function=", "get_weather", ">\n"])
+  await g.ready()
+  assert.ok(!allowed(g.mask(), idOf("</function>\n")), "city is required")
+  assert.ok(allowed(g.mask(), idOf("<parameter=")))
+})

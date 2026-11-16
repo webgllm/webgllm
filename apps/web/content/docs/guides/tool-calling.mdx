@@ -50,8 +50,10 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 As in llama.cpp, a call is held to the tools while it's written, in the model's own format: it can only name an offered tool and that tool's parameters, and each value is held to its parameter's schema. The model's text before a call isn't constrained, and after its calls the reply ends.
 
-- LFM3 and Qwen3.5 (`<tool_call>\n<function=…>\n<parameter=…>`): required parameters come first, in the order the schema declares them, then optional ones in any order. A value that may be a string is written raw, up to `</parameter>`; any other value is JSON held to its schema.
-- LFM2.5 (`[name(key="value")]`): arguments in any order. A string parameter's value is a quoted string; any other value is JSON held to its schema (llama.cpp takes any value there).
+- LFM3 and Qwen3.5 (`<tool_call>\n<function=…>\n<parameter=…>`): required parameters come first, in the order the schema declares them, then optional ones in any order. A value that may be a string is written raw, up to `</parameter>`, and comes back as the text written (`123` stays `"123"`), as llama.cpp reads it; any other value is JSON held to its schema.
+- LFM2.5 (`[name(key="value")]`): arguments in any order, and the call can't close before its required ones (llama.cpp's grammar doesn't check them here; its XML one does). A string parameter's value is a quoted string; any other value is JSON held to its schema (llama.cpp takes any value there).
+
+A parameter's schema may refer to the rest of the tool's (`$ref` to its `$defs`, or to another parameter), and the parameters may sit behind a root `$ref`.
 
 Each token of a call gets its own mask, so a call is written a little slower than text.
 
@@ -69,7 +71,7 @@ System and developer messages join into one leading system message: Qwen3.5's te
 
 ## Repair
 
-Off by default: calls come back as the model wrote them, as in llama.cpp. `repair_tool_calls: true` checks automatic and required calls against their tools: a call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, with the model's failed attempt and a note on what was wrong in the chat, constrained to the schema. Its tokens count in `usage`.
+Off by default: calls come back as the model wrote them, as in llama.cpp. `repair_tool_calls: true` checks automatic and required calls against their tools: a call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, with the model's failed attempt and a note on what was wrong in the chat, held to the tools. The repair takes the call's place only if it checks out; a repair cut off by `max_tokens` comes back cut off, with `"length"`, as any call cut off does. Its tokens count in `usage`.
 
 ## Schemas
 
