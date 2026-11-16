@@ -50,13 +50,19 @@ export function toolSchema(tool: ChatTool): ToolSchema {
   const object = followed(root, root)
   const declared = isObject(object) && isObject(object.properties) ? Object.entries(object.properties) : []
   const names = new Set(declared.map(([name]) => name))
-  const required = isObject(object) && Array.isArray(object.required)
-    ? (object.required as Array<unknown>).filter((r): r is string => typeof r === "string" && names.has(r))
-    : []
-  return { name: tool.function.name, root, properties: declared, required }
+  // Required keys from every schema on the way to the object: a root `$ref`'s siblings require too.
+  const wanted = new Set<string>()
+  for (let node: unknown = root, i = 0; isObject(node) && i < 17; i++) {
+    if (Array.isArray(node.required)) for (const r of node.required) if (typeof r === "string") wanted.add(r)
+    if (node === object || typeof node.$ref !== "string") break
+    node = resolve(root, node.$ref)
+  }
+  return { name: tool.function.name, root, properties: declared, required: declared.map(([name]) => name).filter((name) => wanted.has(name) && names.has(name)) }
 }
 
 const DEFINITION = /^#\/(\$defs|definitions)\/[^/]+$/
+/** Keywords that only describe a schema: beside a `$ref`, they're kept as they are. */
+const ANNOTATIONS = new Set(["title", "description", "$comment", "examples", "default", "deprecated", "readOnly", "writeOnly"])
 
 /**
  * A parameter's schema on its own, for the JSON constraint: references into
@@ -73,33 +79,50 @@ export function valueSchema(tool: ToolSchema, schema: unknown): object {
       if (target !== undefined) {
         const { $ref, ...rest } = node
         const resolved = inline(target, new Set([...through, $ref as string]))
-        return Object.keys(rest).length && isObject(resolved) ? { ...resolved, ...rest } : resolved
+        const constraints = Object.keys(rest).filter((key) => !ANNOTATIONS.has(key))
+        if (!constraints.length) return Object.keys(rest).length && isObject(resolved) ? { ...resolved, ...rest } : resolved
+        // Both hold, as beside a reference: the siblings narrow what it points at, never replace it.
+        return { allOf: [resolved, inline(rest, through)] }
       }
     }
     return mapSubschemas(node, (child) => inline(child, through))
   }
   const own = inline(isObject(schema) ? schema : {}, new Set())
+  // Each definition on its own, its references resolved against the tool too.
+  const definitions = (map: unknown) =>
+    Object.fromEntries(Object.entries(map as Record<string, unknown>).map(([name, sub]) => [name, inline(sub, new Set())]))
   const defs = {
-    ...(isObject(root.$defs) && { $defs: inline(root.$defs, new Set()) }),
-    ...(isObject(root.definitions) && { definitions: inline(root.definitions, new Set()) })
+    ...(isObject(root.$defs) && { $defs: definitions(root.$defs) }),
+    ...(isObject(root.definitions) && { definitions: definitions(root.definitions) })
   }
   return isObject(own) ? { ...defs, ...own } : own === true ? {} : { not: {} }
 }
 
-/** Whether a value held to `schema` may be a string, its references followed (llama.cpp's may_be_string). */
-export function mayBeString(tool: ToolSchema, schema: unknown, seen = new Set<unknown>()): boolean {
-  const node = followed(tool.root, schema)
-  if (!isObject(node) || seen.has(node)) return node !== false
-  seen.add(node)
-  const type = node.type
-  if (type === "string") return true
-  if (Array.isArray(type)) return type.includes("string")
-  if (type !== undefined) return false
+/**
+ * Whether a value held to `schema` may be a string (llama.cpp's
+ * may_be_string): what a `$ref` points at and the keywords beside it both
+ * allow one. `path` holds the schemas on the way here, for references that
+ * come round again (each branch has its own).
+ */
+export function mayBeString(tool: ToolSchema, schema: unknown, path: ReadonlySet<unknown> = new Set()): boolean {
+  if (schema === false) return false
+  if (!isObject(schema) || path.has(schema)) return true
+  const within = new Set(path).add(schema)
+  if (typeof schema.$ref === "string") {
+    const { $ref, ...rest } = schema
+    const target = resolve(tool.root, $ref as string)
+    return (target === undefined || mayBeString(tool, target, within)) && mayBeString(tool, rest, within)
+  }
+  const type = schema.type
+  if (type !== undefined && type !== "string" && !(Array.isArray(type) && type.includes("string"))) return false
+  if (Array.isArray(schema.enum) && !schema.enum.some((v) => typeof v === "string")) return false
+  if ("const" in schema && typeof schema.const !== "string") return false
+  if (Array.isArray(schema.allOf) && !schema.allOf.every((branch) => mayBeString(tool, branch, within))) return false
   for (const key of ["anyOf", "oneOf"])
-    if (Array.isArray(node[key]) && (node[key] as Array<unknown>).some((branch) => mayBeString(tool, branch, seen))) return true
-  if (Array.isArray(node.enum)) return node.enum.some((v) => typeof v === "string")
-  if ("const" in node) return typeof node.const === "string"
-  return !["properties", "items", "prefixItems", "anyOf", "oneOf", "allOf", "$ref", "minimum", "maximum"].some((key) => key in node)
+    if (Array.isArray(schema[key]) && !(schema[key] as Array<unknown>).some((branch) => mayBeString(tool, branch, within))) return false
+  // No type: keywords that only an object, an array or a number has say it isn't one.
+  if (type === undefined && ["properties", "items", "prefixItems", "minimum", "maximum"].some((key) => key in schema)) return false
+  return true
 }
 
 /** Whether a parameter is declared a string, its references followed (llama.cpp's Python-style check: quoted only then). */

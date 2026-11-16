@@ -205,3 +205,30 @@ test("a parameter's references resolve against the whole tool, and a root $ref i
   assert.ok(!allowed(g.mask(), idOf("</function>\n")), "city is required")
   assert.ok(allowed(g.mask(), idOf("<parameter=")))
 })
+
+test("references keep what's beside them, resolve inside definitions, and a repeated one is checked again", async () => {
+  const { toolSchema, valueSchema, mayBeString } = await import("./tool-schemas.js")
+  const { validateStructuredValue } = await import("./constraint/index.js")
+  const tool = (parameters: Record<string, unknown>) => toolSchema({ type: "function", function: { name: "f", parameters } })
+  // Beside a reference, keywords narrow it: both minimums hold.
+  const narrowed = tool({ type: "object", properties: { a: { type: "integer", minimum: 10 }, b: { $ref: "#/properties/a", minimum: 0 } } })
+  const b = valueSchema(narrowed, narrowed.properties[1]![1])
+  assert.equal(await validateStructuredValue(b, 1), false)
+  assert.equal(await validateStructuredValue(b, 12), true)
+  // A root $ref's siblings require too.
+  const rooted = tool({ $ref: "#/$defs/Args", required: ["city"], $defs: { Args: { type: "object", properties: { city: { type: "string" } } } } })
+  assert.deepEqual(rooted.required, ["city"])
+  // A definition that points elsewhere in the tool resolves there.
+  const defined = tool({ type: "object", properties: { a: { type: "integer" }, b: { $ref: "#/$defs/B" } }, $defs: { B: { $ref: "#/properties/a" } } })
+  const viaDef = valueSchema(defined, defined.properties[1]![1])
+  assert.equal(await validateStructuredValue(viaDef, 1), true)
+  assert.equal(await validateStructuredValue(viaDef, "x"), false)
+  // The same reference in two branches: both say integer, so no string.
+  const twice = tool({ type: "object", properties: { b: { anyOf: [{ $ref: "#/$defs/I" }, { $ref: "#/$defs/I" }] } }, $defs: { I: { type: "integer" } } })
+  assert.equal(mayBeString(twice, twice.properties[0]![1]), false)
+  // A reference to anything, with a type beside it: that type decides.
+  const typed = tool({ type: "object", properties: { n: { $ref: "#/$defs/any", type: "integer" } }, $defs: { any: {} } })
+  assert.equal(mayBeString(typed, typed.properties[0]![1]), false)
+  const stringy = tool({ type: "object", properties: { s: { $ref: "#/$defs/code", minLength: 2 } }, $defs: { code: { type: "string" } } })
+  assert.equal(mayBeString(stringy, stringy.properties[0]![1]), true)
+})
