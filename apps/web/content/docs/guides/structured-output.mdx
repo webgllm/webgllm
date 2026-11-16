@@ -21,7 +21,7 @@ Tokens are constrained to the schema while they're picked, so the answer is alwa
 
 ## Schemas
 
-- Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. A free-form key is slow to constrain and lets the model invent keys. Set `additionalProperties: true` for an open object.
+- Objects that list their properties and don't set `additionalProperties` take no other keys, as llama.cpp's grammar reads a schema. An object that lists none (`{ "type": "object" }`) is any object, as there: a free-form key is slow to constrain and lets the model invent keys, so list the properties where you can. Set `additionalProperties: true` to open an object.
 - Objects composed with `not`, `if`, `oneOf`, `contains`, `allOf`, `const`, `enum`, or a `$ref` beside their own keywords stay as written.
 - `pattern`, `format`, numeric bounds and numeric enums are checked as each value ends, not while it's written. An answer that can't satisfy them fails with `invalid-output`.
 - `stop` sequences don't apply inside the answer: the schema decides where it ends.

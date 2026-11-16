@@ -30,6 +30,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { PrefixStore, savePromptPrefix } from './prefix-store.js';
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
+  import { withCallsInText } from './tool-calls.js';
+  import { callVocab, ToolCallGrammar } from './tool-call-grammar.js';
   import { createStopFilter } from './stop-sequences.js';
   import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';
@@ -68,7 +70,7 @@ function probe() {
     async forwardHidden() { calls.forwards++; return 0 }
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
-    specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, constraintTokenizer: {} }
+    specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, writesToolCalls: () => true, constraintTokenizer: {} }
   return { calls, stopped, messages, model: { engine, tokenizer, cached, prefixes: new PrefixStore(() => {}) },
     createConstraint: async () => ({ dispose() { calls.disposed++ } }) }
 }

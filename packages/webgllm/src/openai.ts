@@ -124,9 +124,16 @@ export type ChatCompletionCreateParamsBase = {
   response_format?: ResponseFormat
   tools?: Array<ChatCompletionTool>
   tool_choice?: ChatCompletionToolChoiceOption
-  /** False keeps only the first tool call of a reply. */
+  /**
+   * False: one tool call per reply (the call's grammar ends the reply after
+   * it). Unset, as llama.cpp defaults it: true where the model's chat
+   * template writes a turn's second call, else false.
+   */
   parallel_tool_calls?: boolean
-  /** A hint: models that can't switch thinking off ignore "none". */
+  /**
+   * "none" turns thinking off (models that can't switch it off ignore it),
+   * any other level turns it on; the template gets it as `reasoning_effort`.
+   */
   reasoning_effort?: ReasoningEffort | null
   /**
    * OpenRouter's reasoning settings: `effort` as `reasoning_effort` (they
@@ -159,10 +166,21 @@ export type ChatCompletionCreateParamsBase = {
   /** False: don't reuse or keep the prompt's cache across calls. */
   cache_prompt?: boolean | null
   /**
-   * Automatic tool calls are checked against their tools; a bad one (an
-   * unknown tool, arguments that fail the schema, markup that doesn't
-   * parse) is generated again constrained to the schema. False returns
-   * them as the model wrote them. Default true.
+   * More chat template variables, by their names in the template. Its
+   * `enable_thinking` (a boolean) turns thinking on or off, unless
+   * `reasoning_effort` is "none".
+   */
+  chat_template_kwargs?: Record<string, unknown> | null
+  /** The thinking budget, as `reasoning.max_tokens` but without turning thinking on; -1 for none. */
+  reasoning_budget_tokens?: number | null
+  /** Another name for `reasoning_budget_tokens`. */
+  thinking_budget_tokens?: number | null
+  /**
+   * True checks automatic and required tool calls against their tools: a bad
+   * one (an unknown tool, arguments that fail the schema, markup that doesn't
+   * parse) is generated again, with a note to the model on what was wrong,
+   * constrained to the schema. Default false: calls come back as the model
+   * wrote them, as in llama.cpp.
    */
   repair_tool_calls?: boolean | null
 }

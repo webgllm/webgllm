@@ -242,7 +242,6 @@ test("a chat's images in template order, and the cache of prepared ones", () => 
         ]
       }
     ],
-    "qwen3.5",
     true
   )
   assert.deepEqual(chat[3].content, [

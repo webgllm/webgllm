@@ -11,8 +11,10 @@ export type Sampling = {
   top_p?: number
   /** Minimum probability relative to the most likely token; zero disables it. */
   min_p?: number
-  /** Subtract once for tokens generated in this reply (not prompt-only tokens). */
+  /** Subtracted once from each token in the window (see repeat_last_n). */
   presence_penalty?: number
+  /** Subtracted from each token in the window once for each time it's there, as llama.cpp's penalty_freq. */
+  frequency_penalty?: number
   /**
    * How many of the last tokens the penalties look at, prompt included
    * (llama.cpp's repeat_last_n): 64 by default, 0 for none, -1 for all.
@@ -33,6 +35,7 @@ export function createSampler({
   top_p = 1,
   min_p = 0,
   presence_penalty = 0,
+  frequency_penalty = 0,
   repeat_last_n = DEFAULT_REPEAT_LAST_N
 }: Sampling) {
   const window = new PenaltyWindow(repeat_last_n)
@@ -49,13 +52,13 @@ export function createSampler({
      * and presence penalties (for logits a GPU already penalized).
      */
     distribution(logits: Float32Array, penalize = true): { ids: Int32Array; p: Float32Array } {
-      if (penalize && (repetition_penalty !== 1 || presence_penalty !== 0)) {
-        for (const [token] of window.entries()) {
+      if (penalize && (repetition_penalty !== 1 || presence_penalty !== 0 || frequency_penalty !== 0)) {
+        for (const [token, count] of window.counted()) {
           if (token < 0 || token >= logits.length) continue
           const x = logits[token]
           if (repetition_penalty !== 1) logits[token] = x < 0 ? x * repetition_penalty : x / repetition_penalty
-          // (Every token in the window, the prompt's too, as llama.cpp applies it.)
-          if (presence_penalty !== 0) logits[token] -= presence_penalty
+          // (Every token in the window, the prompt's too, as llama.cpp applies them.)
+          logits[token] -= count * frequency_penalty + presence_penalty
         }
       }
       const k = Math.max(

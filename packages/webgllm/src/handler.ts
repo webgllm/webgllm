@@ -28,6 +28,8 @@ import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTunin
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { createThinkingSplitter, THINK_OPEN } from "./reply.js"
+import { withCallsInText } from "./tool-calls.js"
+import { callVocab, ToolCallGrammar } from "./tool-call-grammar.js"
 import { budgetWrapUp, createThinkingBudget, templateClosing } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
@@ -37,7 +39,6 @@ import { PrefixStore, savePromptPrefix } from "./prefix-store.js"
 import { opfsFolder, persistPrefix, PrefixDisk, untilAborted } from "./prefix-disk.js"
 import type { SavedPrefix } from "./engine.js"
 import { planToolChoice } from "./tool-choice.js"
-import type { ToolCall } from "./tool-choice.js"
 import { createStopFilter } from "./stop-sequences.js"
 import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
 import { seededUniforms } from "./seeded-random.js"
@@ -968,7 +969,6 @@ async function generate(request: GenerateRequest) {
   const compiledBefore = engine.gpu.compiled.count
   const toolPlan = planToolChoice(request.tools, request.toolChoice)
   const tools = toolPlan.tools.length ? toolPlan.tools : undefined
-  const forced = toolPlan.mode === "forced" ? toolPlan : undefined
   // "required", as llama.cpp has it: the model writes its call in its own
   // format, text may come first, and the reply can't end before a call is
   // written to its closing marker (LFM3's `</tool_call>`, LFM2's `<|tool_call_end|>`).
@@ -976,20 +976,29 @@ async function generate(request: GenerateRequest) {
     ? [tokenizer.specialTokens.toolCallEnd, tokenizer.tokenToId("<|tool_call_end|>")].filter((t): t is number => typeof t === "number" && t >= 0)
     : []
   let called = toolPlan.mode !== "required"
-  // A required or forced call and a JSON answer can't both be the reply (chat-completions refuses it too).
-  if (request.outputSchema && (toolPlan.mode === "required" || toolPlan.mode === "forced")) {
+  // A required call and a JSON answer can't both be the reply (chat-completions refuses it too).
+  if (request.outputSchema && toolPlan.mode === "required") {
     throw new Error("An output schema can't be combined with a required or named tool choice.")
   }
-  // A forced call is the reply: its arguments' schema takes the answer's place.
-  const answerSchema = forced ? forced.schema : request.outputSchema
+  const answerSchema = request.outputSchema
   const tokenizeAt = performance.now()
   // A raw prompt (OpenAI's Completions) is read as it is: no chat template, so nothing of a chat's framing to cache by.
   const raw = request.prompt !== undefined
-  const templateOptions = { ...(request.thinking !== undefined && { enableThinking: request.thinking }), addGenerationPrompt: true }
-  const encoded = raw ? tokenizer.encode(request.prompt!) : tokenizer.encodeChat(request.chat, { tools, ...templateOptions })
+  const variables = request.templateVariables
+  // Past calls as `tool_calls`, or in their turn's text where the template doesn't write those (see withCallsInText).
+  const chat = raw || tokenizer.writesToolCalls() ? request.chat : withCallsInText(request.chat, modelMeta(request.model).toolFormat ?? "lfm3")
+  // A last assistant message is continued (llama.cpp's prefill_assistant, on by default there).
+  const continues = chat?.[chat.length - 1]?.role === "assistant"
+  const templateOptions = {
+    ...variables,
+    ...(request.thinking !== undefined && { enableThinking: request.thinking }),
+    addGenerationPrompt: !continues,
+    ...(continues && { continueFinalMessage: true })
+  }
+  const encoded = raw ? tokenizer.encode(request.prompt!) : tokenizer.encodeChat(chat, { tools, ...templateOptions })
   // The text those tokens are of, for another source: how the image step
   // tells the template's image placeholders from a message's own text.
-  const source: TemplateSource = { chat: request.chat, tools }
+  const source: TemplateSource = { chat, tools }
   const render = (from: TemplateSource) => tokenizer.applyChatTemplate(from.chat, { ...(from.tools && { tools: from.tools }), ...templateOptions })
   // Each image's token expanded to its tokens (the image fetched and
   // resized here); `keys` is what the cache compares.
@@ -1008,16 +1017,16 @@ async function generate(request: GenerateRequest) {
   if (!prompt.length) throw new Error("The prompt has no tokens.")
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
-  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
-  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
+  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, chat, request.thinking, tools, variables) : undefined
+  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, chat, request.thinking, tools, variables) : undefined
   const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
-  const last = prompt[prompt.length - 1]
+  // The reply starts inside a thought when the prompt's last turn opened one
+  // and didn't close it: the template opened it (LFM3's `<think>`, Qwen3.5's
+  // `<think>\n`), or a continued message's thinking has no text after it yet.
   // (A raw prompt is written back as it is: no thinking of the chat template's to announce.)
   const startsInThinking = !raw && think !== null &&
-    (last === think ||
-      (prompt[prompt.length - 2] === think &&
-        tokenizer.decode([last]).trim() === ""))
+    prompt.lastIndexOf(think) > Math.max(prompt.lastIndexOf(tokenizer.specialTokens.thinkEnd ?? -1), prompt.lastIndexOf(tokenizer.specialTokens.imStart ?? -1))
   const thinkingBudget = createThinkingBudget(
     request.thinkingBudgetTokens,
     tokenizer.specialTokens,
@@ -1039,6 +1048,30 @@ async function generate(request: GenerateRequest) {
     startsInThinking || openThinking,
     tokenizer.vocabSize
   )
+  // Automatic and required calls held to their tools while they're written,
+  // in the model's own format, as llama.cpp's grammars hold them (see
+  // tool-call-grammar.ts). Not beside a JSON answer: that reply is the JSON.
+  const callFormat = modelMeta(request.model).toolFormat ?? "lfm3"
+  const [callStart, callEnd] = callFormat === "lfm2"
+    ? [tokenizer.tokenToId("<|tool_call_start|>"), tokenizer.tokenToId("<|tool_call_end|>")]
+    : [tokenizer.specialTokens.toolCall, tokenizer.specialTokens.toolCallEnd]
+  const grammar = !raw && answerSchema === undefined && (toolPlan.mode === "auto" || toolPlan.mode === "required") && toolPlan.tools.length &&
+    typeof callStart === "number" && callStart >= 0 && typeof callEnd === "number" && callEnd >= 0
+    ? new ToolCallGrammar({
+      format: callFormat,
+      tools: toolPlan.callable ?? toolPlan.tools,
+      // Unset, as llama.cpp defaults it: whether the template writes a turn's second call.
+      parallel: request.parallelToolCalls ?? tokenizer.writesParallelToolCalls(),
+      vocab: callVocab(tokenizer),
+      start: callStart,
+      end: callEnd,
+      eos: tokenizer.specialTokens.eos,
+      think: tokenizer.specialTokens.think,
+      thinkEnd: tokenizer.specialTokens.thinkEnd,
+      startsInThinking,
+      json: (schema) => createConstraint({ schema, tokenizer: tokenizer.constraintTokenizer })
+    })
+    : undefined
   const schemaMs = performance.now() - schemaAt
   let fresh: ReturnType<typeof savePromptPrefix<SavedPrefix>>
   // A saved prefix this request restored, to mark used on disk too.
@@ -1122,7 +1155,7 @@ async function generate(request: GenerateRequest) {
     for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
   }
   const framing = cacheEnabled && !raw && common > 0 && !whole
-    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking) : 0
+    ? templateFramingFor(tokenizer, prompt, chat[0]?.role ?? "user", request.thinking, request.templateVariables) : 0
   const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
   if (!whole) model.previousShared = plan.previousShared
   const cacheRestoreMs = performance.now() - restoreAt
@@ -1207,7 +1240,9 @@ async function generate(request: GenerateRequest) {
   // read back: the token is then picked here, not on the GPU.
   const processor = logitProcessors?.get(request.model)
   const bias = request.logitBias ? Object.entries(request.logitBias).map(([token, value]) => [Number(token), value] as const).filter(([token]) => Number.isInteger(token) && token >= 0 && token < vocab) : []
-  const allLogits = !!request.logprobs || bias.length > 0 || !!processor
+  // So does a frequency penalty: the GPU's penalties know whether a token
+  // is in the window, not how many times.
+  const allLogits = !!request.logprobs || bias.length > 0 || !!processor || (sampling.frequency_penalty ?? 0) !== 0
   const onGpu = !allLogits && (greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS))
   // The log probability of the token just chosen, until it's written (see emit).
   let scored: { token: number; of: (token: number) => TokenLogprob } | undefined
@@ -1297,7 +1332,13 @@ async function generate(request: GenerateRequest) {
   // Drafts stop short of a call's closing marker until a call is written:
   // the rows after it may end the reply, which the batch's one mask (no
   // end yet) wouldn't let them.
+  // None inside a call held to its tools (or after it, where it ends the
+  // reply), and they stop short of a call's opening marker: each token of a
+  // call has its own mask.
   const untilCallEnd = (drafts: Array<number>) => {
+    if (grammar?.holding) return []
+    const opens = grammar ? drafts.indexOf(callStart as number) : -1
+    if (opens >= 0) drafts = drafts.slice(0, opens)
     if (called) return drafts
     const at = drafts.findIndex((t) => callEnds.includes(t))
     return at < 0 ? drafts : drafts.slice(0, at)
@@ -1351,9 +1392,11 @@ async function generate(request: GenerateRequest) {
     // JSON literals are governed by their grammar. Only unconstrained replies
     // reserve control markers: with thinking off, or after an explicit
     // budgeted reasoning span closes.
-    const open = structured ? structured.mask() : thinkingOff ?? thinkingBudget?.closedControlMask(vocab) ?? null
-    const mask = !called && noEnd && !structured ? withoutEnd(open) : open
-    if (structured?.answering || appliedMask !== mask) engine.setAllowedTokens(mask)
+    // A tool call's mask, where one is being written, decides alone.
+    const call = grammar?.mask() ?? null
+    const open = call ?? (structured ? structured.mask() : thinkingOff ?? thinkingBudget?.closedControlMask(vocab) ?? null)
+    const mask = !called && noEnd && !structured && !call ? withoutEnd(open) : open
+    if (structured?.answering || call || appliedMask !== mask) engine.setAllowedTokens(mask)
     appliedMask = mask
     return mask ?? undefined
   }
@@ -1366,6 +1409,7 @@ async function generate(request: GenerateRequest) {
   const penalty = () => penalize() ? sampling.repetition_penalty : 1
   const presence = () => penalize() ? sampling.presence_penalty : 0
   const distribution = async (r: number, guess = false) => {
+    await grammar?.ready()
     const mask = updateAllowed()
     if (greedy && onGpu) {
       const [token] = await engine.argmax(
@@ -1411,7 +1455,10 @@ async function generate(request: GenerateRequest) {
     masks?: readonly Uint32Array[]
   ) => {
     if (masks) engine.setAllowedTokenRows(masks)
-    else updateAllowed()
+    else {
+      await grammar?.ready()
+      updateAllowed()
+    }
     // Each row's penalties as drawing the drafts one by one would give them.
     const seenRows = penalize() ? seen.ahead(drafts) : []
     if (greedy) {
@@ -1446,14 +1493,12 @@ async function generate(request: GenerateRequest) {
     })
   }
 
-  // Stop sequences end the answer (see stop-sequences.ts); a forced call's
-  // JSON isn't text: it's kept, and sent as the call (see "done").
-  // Neither applies inside a constrained answer: the schema ends it, and a
-  // stop string cut from it would leave JSON that fails the schema.
+  // Stop sequences end the answer (see stop-sequences.ts), but not inside a
+  // constrained answer: the schema ends it, and a stop string cut from it
+  // would leave JSON that fails the schema.
   const stopFilter = createStopFilter(request.stop)
   let stopHit = false
   let sawEos = false
-  let callText = ""
   // The answer's last characters while a "required" call isn't written yet,
   // and whether its opening marker is written; the reply read into thinking
   // and answer as the reply reader reads it (it gets the same text).
@@ -1505,8 +1550,8 @@ async function generate(request: GenerateRequest) {
     stats.outputTokens++
     // (Whether this token is the answer's, before it may close the thinking.)
     const constrained = !!structured?.answering
-    const calling = !!forced && constrained
     structured?.observe(t)
+    grammar?.observe(t)
     processor?.processSampledToken(t)
     // (A token the model didn't choose, like a forced close of its thinking, has no distribution: probability 1.)
     if (scoring && t !== eos) waiting.push(scored?.token === t ? scored.of(t) : { ...logprobEntry(t, 0), top_logprobs: [] })
@@ -1540,14 +1585,7 @@ async function generate(request: GenerateRequest) {
         callTail = callTail.slice(-32)
       }
     }
-    if (text) {
-      if (calling) {
-        // (A forced call's JSON isn't sent as text: its tokens count as written.)
-        callText += text
-        track(text)
-        if (scoring) sentChars += text.length
-      } else if (!send(text, constrained)) return false
-    }
+    if (text && !send(text, constrained)) return false
     return stats.outputTokens < maxTokens
   }
   let going = emit(token)
@@ -1666,14 +1704,11 @@ async function generate(request: GenerateRequest) {
   // A guess still pending is for a token that wasn't drawn.
   engine.dropGuess()
   const rest = decoder.flush()
-  if (rest && !stopHit) {
-    if (forced && structured!.answering) callText += rest
-    else send(rest, !!structured?.answering)
-  }
+  if (rest && !stopHit) send(rest, !!structured?.answering)
   const held = stopHit || unfiltered ? "" : stopFilter?.flush()
   if (held) postText(held)
-  // What's left: tokens whose text never made a message (a forced call's,
-  // an unfinished character's); after a stop sequence, nothing past it.
+  // What's left: tokens whose text never made a message (an unfinished
+  // character's); after a stop sequence, nothing past it.
   const unsent = !scoring ? [] : stopHit ? sentEntries() : [...sentEntries(), ...spans.splice(0).flatMap((span) => span.entries), ...waiting]
   if (cacheEnabled) engine.snapshot()
   stats.decodeMs = performance.now() - firstTokenAt
@@ -1705,8 +1740,6 @@ async function generate(request: GenerateRequest) {
   if (structured && !stopped.has(id) && !structured.complete) {
     throw new Error("Structured output was truncated before the JSON Schema was satisfied (output token or context limit).")
   }
-  let toolCall: ToolCall | undefined
-  if (forced && structured?.complete) toolCall = forced.read(JSON.parse(callText))
   // "length": maxTokens or the context ended it, not its end-of-turn token,
   // a stop sequence or a stop request.
   const finishReason: FinishReason =
@@ -1721,9 +1754,10 @@ async function generate(request: GenerateRequest) {
     model.note = { ...model.note, tuned: { ...engine.tuned }, pacing: recommendation }
     void writeGpuNote(model.noteKey, model.note)
   }
-  post({ type: "done", id, stats, finishReason, ...(unsent.length && { logprobs: unsent }), ...(toolCall && { toolCall }) })
+  post({ type: "done", id, stats, finishReason, ...(unsent.length && { logprobs: unsent }) })
   } finally {
     structured?.dispose()
+    grammar?.dispose()
     engine.setAllowedTokens(null)
     engine.dropGuess()
     // A system prompt read for the first time, to disk once the reply is out (the next request waits for it).

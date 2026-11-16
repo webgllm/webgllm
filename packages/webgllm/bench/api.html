@@ -131,7 +131,7 @@
       log("json_schema", parsed)
       check("json_schema answer parses with the fields", parsed && typeof parsed.born === "number" && typeof parsed.name === "string")
 
-      // Tool calls: auto, then a forced call.
+      // Tool calls: auto, then a required call.
       const tools = [{
         type: "function",
         function: {
@@ -164,7 +164,9 @@
         check("answer uses the tool result", /18/.test(followup.choices[0].message.content ?? ""))
       }
 
-      // Tool-call repair: a required enum the model tends to leave out.
+      // A call is held to its tool while it's written (as llama.cpp holds it):
+      // a required argument the model tends to leave out is written. Repair,
+      // opt-in, then checks the call against the schema (the enum too).
       const strictTools = [{
         type: "function",
         function: {
@@ -178,14 +180,16 @@
         }
       }]
       const ask = [{ role: "user", content: "What's the weather in Paris right now?" }]
-      const raw = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0, repair_tool_calls: false })
-      const repaired = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0 })
+      const raw = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0 })
+      const repaired = await webgllm.chat.completions.create({ model, messages: ask, tools: strictTools, temperature: 0, repair_tool_calls: true })
       const rawCall = raw.choices[0].message.tool_calls?.[0]
       const fixedCall = repaired.choices[0].message.tool_calls?.[0]
       log("repair raw", rawCall?.function ?? raw.choices[0].message.content, raw.usage.completion_tokens)
       log("repair fixed", fixedCall?.function ?? repaired.choices[0].message.content, repaired.usage)
+      const rawArgs = rawCall ? JSON.parse(rawCall.function.arguments) : null
+      check("a call held to its tool has both required arguments", !!rawArgs && typeof rawArgs.city === "string" && typeof rawArgs.units === "string")
       const fixedArgs = fixedCall ? JSON.parse(fixedCall.function.arguments) : null
-      check("repaired call has both required arguments", !!fixedArgs && typeof fixedArgs.city === "string" && ["celsius", "fahrenheit"].includes(fixedArgs.units))
+      check("a repaired call has both required arguments", !!fixedArgs && typeof fixedArgs.city === "string" && typeof fixedArgs.units === "string")
 
       // Abort mid-stream.
       const controller = new AbortController()

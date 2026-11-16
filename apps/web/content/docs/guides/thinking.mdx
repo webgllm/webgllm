@@ -26,7 +26,9 @@ Without streaming, the reasoning is in `message.reasoning_content`.
 - `LiquidAI/LFM2.5-1.2B-Thinking-GGUF` always thinks and ignores `"none"`.
 - `models.list()` says which models think (`supports.thinking`).
 
-`reasoning.max_tokens` caps the reasoning; the model then answers. A budget without an effort turns thinking on.
+`reasoning.max_tokens` caps the reasoning; the model then answers. A budget without an effort turns thinking on. llama.cpp's `reasoning_budget_tokens` (or `thinking_budget_tokens`) caps it too, without turning thinking on; -1 is no cap.
+
+`chat_template_kwargs` passes more variables to the chat template, as in llama.cpp. Its `enable_thinking` (a boolean) turns thinking on or off, unless the effort is `"none"`. Any effort but `"none"` also reaches the template as `reasoning_effort`.
 
 ## Which `reasoning` fields work
 
@@ -34,4 +36,4 @@ The `reasoning` object is a subset of OpenRouter's:
 
 - `effort`: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"` or `"xhigh"`, the same values as OpenAI's `reasoning_effort`. Every value but `"none"` turns thinking on. OpenRouter's `"max"` is refused.
 - `max_tokens`: the thinking budget, a whole number of tokens. Unlike OpenRouter, it can be set together with `effort`.
-- `exclude` and `enabled` are refused with an `unsupported-parameter` error, as is the old `thinking_budget_tokens`. Reasoning tokens count in `max_completion_tokens` and in `usage.completion_tokens_details.reasoning_tokens`.
+- `exclude` and `enabled` are refused with an `unsupported-parameter` error. Reasoning tokens count in `max_completion_tokens` and in `usage.completion_tokens_details.reasoning_tokens`.

@@ -43,12 +43,15 @@ Send the whole chat each time, as with OpenAI. webgllm keeps the model's cache b
 | Field | Notes |
 | --- | --- |
 | `max_completion_tokens` (or `max_tokens`) | Thinking included |
-| `temperature`, `top_p`, `presence_penalty` | |
-| `top_k`, `min_p`, `repetition_penalty` | webgllm's own |
+| `temperature`, `top_p`, `presence_penalty`, `frequency_penalty` | |
+| `top_k`, `min_p`, `repetition_penalty`, `repeat_last_n` | llama.cpp's |
 | `stop`, `seed` | |
-| `cache_prompt` | webgllm's own |
+| `cache_prompt` | llama.cpp's |
+| `chat_template_kwargs` | llama.cpp's: more chat template variables (see [Thinking](/docs/guides/thinking)) |
+| `reasoning_budget_tokens` (or `thinking_budget_tokens`) | llama.cpp's: the thinking budget |
+| `repair_tool_calls` | webgllm's own (see [Tool calling](/docs/guides/tool-calling#repair)) |
 
-Unset sampling fields take the model card's values. `logprobs` (with `top_logprobs`) and `logit_bias` work as in OpenAI's API; see [Tokens and logits](/docs/reference/webgllm#tokens-and-logits). Fields the engine can't honour (`n > 1`, `frequency_penalty`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
+Unset sampling fields take the model card's values. `logprobs` (with `top_logprobs`) and `logit_bias` work as in OpenAI's API; see [Tokens and logits](/docs/reference/webgllm#tokens-and-logits). `frequency_penalty` works as llama.cpp's (each time a token is among the last `repeat_last_n`); setting it reads back every logit, so tokens come a little slower. A last assistant message is continued, as llama.cpp does by default: the reply picks up where its text (or its unfinished thinking) stops. Fields the engine can't honour (`n > 1`, audio content, and images for a model without a vision encoder) throw a `WebGLLMError` with code `unsupported-parameter` rather than being ignored.
 
 ## Images
 

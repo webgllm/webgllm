@@ -116,8 +116,27 @@ test("a thinking budget (reasoning.max_tokens) needs a model that takes one, tur
     false
   )
   assert.equal(code(() => planCompletion({ model: LFM2, messages: hi, reasoning: { max_tokens: 64 } })), "unsupported-parameter")
-  // The old field is refused, never dropped: a cap the caller asked for isn't silently lost.
-  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", thinking_budget_tokens: 64 } as never)), "unsupported-parameter")
+  // llama.cpp's names: a budget only (thinking as it was), -1 for none, and they must agree with reasoning.max_tokens.
+  const llama = planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", reasoning_budget_tokens: 64 }).generate
+  assert.equal(llama.thinkingBudgetTokens, 64)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", thinking_budget_tokens: 32 }).generate.thinkingBudgetTokens, 32)
+  assert.equal("thinking" in planCompletion({ model: QWEN, messages: hi, reasoning_budget_tokens: 64 }).generate, false)
+  assert.equal("thinkingBudgetTokens" in planCompletion({ model: QWEN, messages: hi, reasoning_budget_tokens: -1 }).generate, false)
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning: { max_tokens: 64 }, reasoning_budget_tokens: 32 })), "TypeError")
+})
+
+test("chat_template_kwargs and the effort go to the template, as llama.cpp passes them", () => {
+  const kw = planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }).generate
+  assert.equal(kw.thinking, true)
+  assert.deepEqual(kw.templateVariables, { preserve_thinking: true })
+  // reasoning_effort "none" wins over the kwargs' enable_thinking; another level leaves it be.
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none", chat_template_kwargs: { enable_thinking: true } }).generate.thinking, false)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "low", chat_template_kwargs: { enable_thinking: false } }).generate.thinking, false)
+  assert.deepEqual(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "low" }).generate.templateVariables, { reasoning_effort: "low", reasoning_strength: "low" })
+  assert.equal("templateVariables" in planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none" }).generate, false)
+  assert.equal("templateVariables" in planCompletion({ model: QWEN, messages: hi }).generate, false)
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: { enable_thinking: "yes" } })), "TypeError")
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: [] as never })), "TypeError")
 })
 
 test("reasoning.effort works as reasoning_effort; the two must agree, and other reasoning fields are refused", () => {
@@ -131,7 +150,6 @@ test("reasoning.effort works as reasoning_effort; the two must agree, and other 
 test("unsupported OpenAI fields throw unsupported-parameter", () => {
   const bad: Array<Partial<ChatCompletionCreateParams> & Record<string, unknown>> = [
     { n: 2 },
-    { frequency_penalty: 0.5 },
     { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } } as never] }] },
     { response_format: { type: "grammar" } as never },
     { tools: [{ type: "custom", custom: { name: "x" } } as never] },
@@ -190,14 +208,16 @@ test("tools and tool_choice", () => {
   const auto = planCompletion({ model: LFM3, messages: hi, tools: [weather] })
   assert.equal(auto.parseTools, true)
   assert.equal("toolChoice" in auto.generate, false)
-  assert.deepEqual(auto.generate.tools[0], { type: "function", function: weather.function })
+  assert.deepEqual(auto.generate.tools[0], { type: "function", function: { description: "", ...weather.function } })
+  // "none" keeps the tools in the prompt, as llama.cpp does, and reads no calls.
   const none = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "none" })
-  assert.deepEqual(none.generate.tools, [])
+  assert.deepEqual(none.generate.tools, auto.generate.tools)
   assert.equal(none.generate.toolChoice, "none")
   assert.equal(none.parseTools, false)
   const named = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: { type: "function", function: { name: "get_weather" } } })
   assert.deepEqual(named.generate.toolChoice, { name: "get_weather" })
-  assert.equal(named.parseTools, false)
+  // A named call is written in the model's format and read like any call.
+  assert.equal(named.parseTools, true)
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).generate.toolChoice, "required")
   // A required or named call can't share the reply with a JSON answer: refused, not one dropped.
   const json = { type: "json_schema", json_schema: { name: "x", schema: { type: "object" } } }
@@ -213,27 +233,28 @@ test("tools and tool_choice", () => {
     "TypeError"
   )
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: false }).parallelToolCalls, false)
-  // A tool without parameters gets an empty object schema.
+  // Set either way, it goes to the worker; unset, the worker takes the template's default (llama.cpp's).
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: false }).generate.parallelToolCalls, false)
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: true }).generate.parallelToolCalls, true)
+  assert.equal("parallelToolCalls" in planCompletion({ model: LFM3, messages: hi, tools: [weather] }).generate, false)
+  // A tool without a description or parameters, as llama.cpp passes it: "" and {}.
   const bare = planCompletion({ model: LFM3, messages: hi, tools: [{ type: "function", function: { name: "now" } }] })
-  assert.deepEqual(bare.generate.tools[0]?.function.parameters, { type: "object", properties: {}, required: [] })
+  assert.deepEqual(bare.generate.tools[0]?.function, { name: "now", description: "", parameters: {} })
 })
 
 test("messages: system and developer join first; parts join; tool calls get object arguments", () => {
-  const chat = toChatMessages(
-    [
-      { role: "system", content: "Be brief." },
-      { role: "user", content: [{ type: "text", text: "Weather " }, { type: "text", text: "in Paris?" }] },
-      { role: "developer", content: "Use tools." },
-      {
-        role: "assistant",
-        content: null,
-        reasoning_content: "Need the tool.",
-        tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } }]
-      },
-      { role: "tool", tool_call_id: "call_1", content: "18C" }
-    ],
-    "qwen3.5"
-  )
+  const chat = toChatMessages([
+    { role: "system", content: "Be brief." },
+    { role: "user", content: [{ type: "text", text: "Weather " }, { type: "text", text: "in Paris?" }] },
+    { role: "developer", content: "Use tools." },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "Need the tool.",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } }]
+    },
+    { role: "tool", tool_call_id: "call_1", content: "18C" }
+  ])
   assert.deepEqual(chat, [
     { role: "system", content: "Be brief.\n\nUse tools." },
     { role: "user", content: "Weather in Paris?" },
@@ -243,45 +264,44 @@ test("messages: system and developer join first; parts join; tool calls get obje
       reasoning_content: "Need the tool.",
       tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } }]
     },
-    { role: "tool", content: "18C", tool_call_id: "call_1", name: "get_weather" }
+    // A tool result's name only where the message gives one, as llama.cpp reads it.
+    { role: "tool", content: "18C", tool_call_id: "call_1" }
   ])
 })
 
-test("messages: LFM3 keeps thinking as `thinking`; LFM2 writes calls into the content", () => {
-  const turn = [
-    { role: "user" as const, content: "Weather?" },
+test("messages: as llama.cpp passes them: thinking on every assistant turn, calls as tool_calls, empty messages kept", () => {
+  const chat = toChatMessages([
+    { role: "user", content: "Weather?" },
     {
-      role: "assistant" as const,
+      role: "assistant",
       content: "",
       reasoning_content: "hmm",
-      tool_calls: [{ id: "c", type: "function" as const, function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }]
+      tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }]
     },
-    { role: "tool" as const, tool_call_id: "c", content: "" }
-  ]
-  assert.equal(toChatMessages(turn, "lfm3")[1]?.thinking, "hmm")
-  const lfm2 = toChatMessages(turn, "lfm2")
-  assert.equal(lfm2[1]?.content, '<|tool_call_start|>[get_weather(city="Oslo")]<|tool_call_end|>')
-  assert.equal(lfm2[1]?.tool_calls, undefined)
-  // An empty tool result reads as a sentence, not nothing.
-  assert.equal(lfm2[2]?.content, "The tool returned nothing.")
-})
-
-test("messages: earlier turns keep their answers, not their tool calls", () => {
-  const chat = toChatMessages(
-    [
-      { role: "user", content: "Weather?" },
-      { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: "{}" } }] },
-      { role: "tool", tool_call_id: "c", content: "18C" },
-      { role: "assistant", content: "It's 18C." },
-      { role: "user", content: "Thanks" }
-    ],
-    "lfm3"
-  )
+    { role: "tool", tool_call_id: "c", content: "", name: "get_weather" } as never,
+    { role: "assistant", content: "It's 18C.", reasoning_content: "done" },
+    { role: "user", content: "" },
+    { role: "assistant", content: null } as never
+  ])
   assert.deepEqual(chat, [
     { role: "user", content: "Weather?" },
-    { role: "assistant", content: "It's 18C." },
-    { role: "user", content: "Thanks" }
+    {
+      role: "assistant",
+      content: "",
+      reasoning_content: "hmm",
+      tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: { city: "Oslo" } } }]
+    },
+    { role: "tool", content: "", tool_call_id: "c", name: "get_weather" },
+    { role: "assistant", content: "It's 18C.", reasoning_content: "done" },
+    { role: "user", content: "" },
+    { role: "assistant", content: "" }
   ])
+  // Arguments that aren't JSON (a call cut off at the token limit) are {}: the templates fail on a string.
+  const cut = toChatMessages([
+    { role: "user", content: "Weather?" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: '{"city":"Os' } }] }
+  ])
+  assert.deepEqual(cut[1]?.tool_calls?.[0]?.function.arguments, {})
 })
 
 const end = { finishReason: "stop" as const }
@@ -341,14 +361,6 @@ test("a structured answer after thinking is just the JSON", () => {
   const r = readAll(["<think>plan</think>", "\n", '{"a":', "1}"], { parseTools: false })
   assert.equal(r.reasoning, "plan")
   assert.deepEqual(JSON.parse(r.content), { a: 1 })
-})
-
-test("a forced tool call from the worker becomes the reply's tool call", () => {
-  const r = readAll(["<think>pick</think>"], { parseTools: false }, { finishReason: "stop", toolCall: { name: "get_weather", arguments: { city: "Oslo" } } })
-  assert.equal(r.reasoning, "pick")
-  assert.equal(r.content, "")
-  assert.deepEqual(r.toolCalls, [{ id: "call_0", type: "function", function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }])
-  assert.equal(r.finishReason, "tool_calls")
 })
 
 test("length passes through as the finish reason", () => {
@@ -465,10 +477,10 @@ test("repairRequest appends the failed call and a note, drops stop strings and c
   assert.equal(malformed.thinking, false)
   assert.equal(malformed.thinkingBudgetTokens, undefined)
   assert.equal(malformed.chat.at(-2)?.content, "<tool_call>junk")
-  // LFM2 writes calls in its own format, in the content.
+  // LFM2's failed call goes as tool_calls too: its template writes it.
   const lfm2 = planCompletion({ model: "LiquidAI/LFM2.5-350M-GGUF", messages: hi, tools: [weatherTool] })
   const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "any", draft: { name: "get_time", args: {} } })
-  assert.match(String(written.chat.at(-2)?.content ?? ""), /get_time/)
+  assert.equal(written.chat.at(-2)?.tool_calls?.[0]?.function.name, "get_time")
   assert.match(String(written.chat.at(-1)?.content ?? ""), /no tool named get_time/)
 })
 
@@ -484,8 +496,9 @@ test("usage sums the reply and its repairs", () => {
   })
 })
 
-test("repair_tool_calls must be a boolean and defaults to on", () => {
-  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, true)
+test("repair_tool_calls must be a boolean and defaults to off, as llama.cpp has no repair", () => {
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, false)
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: true }).repairToolCalls, true)
   assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: false }).repairToolCalls, false)
   assert.throws(() => planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: "yes" as never }), TypeError)
 })
@@ -535,4 +548,25 @@ test("a Completions request: a raw prompt, no chat, the card's sampling", () => 
   assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: "x", n: 2 })), "unsupported-parameter")
   assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: "x", suffix: "y" })), "unsupported-parameter")
   assert.equal(code(() => planTextCompletion({ model: "gpt-4o", prompt: "x" })), "model-not-supported")
+})
+
+test("a last assistant message is continued: one, without tool calls, as llama.cpp allows", () => {
+  const prefill = planCompletion({ model: LFM3, messages: [...hi, { role: "assistant", content: "Hel" }] })
+  assert.deepEqual(prefill.generate.chat.at(-1), { role: "assistant", content: "Hel" })
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: [...hi, { role: "assistant", content: "a" }, { role: "assistant", content: "b" }] })), "TypeError")
+  assert.equal(
+    code(() =>
+      planCompletion({
+        model: LFM3,
+        messages: [...hi, { role: "assistant", content: null, tool_calls: [{ id: "c", type: "function", function: { name: "f", arguments: "{}" } }] }]
+      })
+    ),
+    "TypeError"
+  )
+})
+
+test("frequency_penalty goes to the sampler, as llama.cpp's penalty_freq; 0 is left out", () => {
+  assert.equal(planCompletion({ model: LFM3, messages: hi, frequency_penalty: 0.5 }).generate.sampling.frequency_penalty, 0.5)
+  assert.equal("frequency_penalty" in planCompletion({ model: LFM3, messages: hi, frequency_penalty: 0 }).generate.sampling, false)
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, frequency_penalty: 3 })), "RangeError")
 })

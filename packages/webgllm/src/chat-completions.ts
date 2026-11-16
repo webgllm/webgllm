@@ -28,7 +28,7 @@ import type { FinishReason as WorkerFinishReason, RunTimings, TokenLogprob, Tool
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
-import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
+import { createToolCallSplitter, parseToolCalls } from "./tool-calls.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
@@ -121,6 +121,12 @@ export function contentText(content: ChatCompletionContent | null | undefined): 
   return text
 }
 
+/**
+ * A past call's arguments as the template takes them: the JSON parsed (an
+ * object, as llama.cpp parses them for templates that read objects). Text
+ * that isn't JSON, such as a call cut off at the token limit, is `{}`:
+ * llama.cpp refuses the request, and the templates fail on a string.
+ */
 function parseArguments(json: string): Record<string, unknown> {
   try {
     const args = JSON.parse(json) as unknown
@@ -130,13 +136,8 @@ function parseArguments(json: string): Record<string, unknown> {
   }
 }
 
-/**
- * An assistant turn with tool calls, written the way the model's template
- * takes them: LFM2's template doesn't read `tool_calls`, so its calls go in
- * the content in its own format; LFM3's and Qwen3.5's write `tool_calls`.
- */
-function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: string }>, format: ToolFormat): ChatMessage {
-  if (format === "lfm2") return { role: "assistant", content: content + formatLfm2ToolCalls(calls) }
+/** An assistant turn with tool calls, as `tool_calls`: the template writes them in its own format. */
+function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: string }>): ChatMessage {
   return {
     role: "assistant",
     content,
@@ -144,40 +145,23 @@ function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: 
   }
 }
 
-/** The current turn's thinking, under the key the format's template reads. */
-function withThinking(turn: ChatMessage, thinking: string, format: ToolFormat): ChatMessage {
-  if (format === "lfm3") return { ...turn, thinking }
-  if (format === "qwen3.5") return { ...turn, reasoning_content: thinking }
-  return turn
-}
-
 /**
- * OpenAI messages as chat-template messages. System and developer messages
- * join into one leading system message (templates take one, first). Tool
- * calls and results of earlier turns are left out and their answers kept:
- * small models copy the shape of past calls badly and get lost in old
- * results. The current turn's calls and results stay, with its thinking
- * (Liquid's guidance for tool use), since the model answers from them.
+ * OpenAI messages as chat-template messages, as llama.cpp passes them to a
+ * chat template: each message as given, its thinking as `reasoning_content`
+ * and its tool calls as `tool_calls`, so the template decides what of them
+ * it writes. One change: system and developer messages join into one
+ * leading system message, since Qwen3.5's template refuses a system message
+ * anywhere else.
  */
 export function toChatMessages(
   messages: Array<ChatCompletionMessageParam>,
-  format: ToolFormat,
   /** Whether the model reads images (user messages' image_url parts). */
   images = false
 ): Array<ChatMessage> {
   if (!Array.isArray(messages) || messages.length === 0) throw new TypeError("messages must be a non-empty array.")
   const system: Array<string> = []
   const chat: Array<ChatMessage> = []
-  let currentTurn = -1
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
-      currentTurn = i
-      break
-    }
-  }
-  const toolNames = new Map<string, string>()
-  for (const [i, m] of messages.entries()) {
-    const earlier = i < currentTurn
+  for (const m of messages) {
     switch (m?.role) {
       case "system":
       case "developer": {
@@ -185,20 +169,16 @@ export function toChatMessages(
         if (text) system.push(text)
         break
       }
-      case "user": {
-        const content = userContent(m.content, images)
-        if (content.length) chat.push({ role: "user", content })
+      case "user":
+        chat.push({ role: "user", content: userContent(m.content, images) })
         break
-      }
       case "tool": {
-        if (earlier) break
-        const text = contentText(m.content)
-        const name = toolNames.get(m.tool_call_id)
+        const name = (m as { name?: unknown }).name
         chat.push({
           role: "tool",
-          content: text && text !== "null" ? text : "The tool returned nothing.",
+          content: contentText(m.content),
           ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
-          ...(name && { name })
+          ...(typeof name === "string" && name && { name })
         })
         break
       }
@@ -208,15 +188,10 @@ export function toChatMessages(
           if (call?.type !== "function" || typeof call.function?.name !== "string") {
             throw unsupported("Assistant tool calls must be function calls.")
           }
-          toolNames.set(call.id, call.function.name)
           return { id: call.id, name: call.function.name, args: parseArguments(call.function.arguments) }
         })
-        if (calls.length === 0 || earlier) {
-          if (text) chat.push({ role: "assistant", content: text })
-          break
-        }
-        const turn = assistantToolTurn(text, calls, format)
-        chat.push(m.reasoning_content ? withThinking(turn, m.reasoning_content, format) : turn)
+        const turn: ChatMessage = calls.length ? assistantToolTurn(text, calls) : { role: "assistant", content: text }
+        chat.push(m.reasoning_content ? { ...turn, reasoning_content: m.reasoning_content } : turn)
         break
       }
       default:
@@ -231,13 +206,10 @@ function toTools(tools: Array<ChatCompletionTool>): Array<ChatTool> {
     if (tool?.type !== "function" || typeof tool.function?.name !== "string") {
       throw unsupported(`Tools of type "${String(tool?.type)}" aren't supported: only "function".`)
     }
+    // As llama.cpp passes a tool: no description is "", no parameters {}.
     return {
       type: "function",
-      function: {
-        name: tool.function.name,
-        ...(tool.function.description !== undefined && { description: tool.function.description }),
-        parameters: tool.function.parameters ?? { type: "object", properties: {}, required: [] }
-      }
+      function: { name: tool.function.name, description: tool.function.description ?? "", parameters: tool.function.parameters ?? {} }
     }
   })
 }
@@ -259,16 +231,19 @@ function toToolChoice(choice: unknown, tools: Array<ChatTool>): ToolChoice {
 }
 
 /**
- * The reasoning effort and thinking budget, as OpenRouter takes them:
- * `reasoning: { effort, max_tokens }`, or OpenAI's `reasoning_effort`. A
- * budget without an effort turns thinking on.
+ * The reasoning effort and thinking budget: OpenRouter's `reasoning: {
+ * effort, max_tokens }` or OpenAI's `reasoning_effort`, and llama.cpp's
+ * `reasoning_budget_tokens` (or `thinking_budget_tokens`; -1 for none).
+ * OpenRouter's budget without an effort turns thinking on; llama.cpp's is
+ * a budget only, as there. `given` is the effort as the request wrote it.
  */
-function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: number | undefined } {
-  if (body.thinking_budget_tokens !== undefined && body.thinking_budget_tokens !== null) {
-    throw unsupported("thinking_budget_tokens is now reasoning.max_tokens.")
-  }
+function reasoningOf(body: Record<string, unknown>): { effort: unknown; given: unknown; budget: number | undefined } {
+  const llamaBudget =
+    numberField(body, "reasoning_budget_tokens", { min: -1, integer: true }) ??
+    numberField(body, "thinking_budget_tokens", { min: -1, integer: true })
+  const llama = llamaBudget === -1 ? undefined : llamaBudget
   const reasoning = body.reasoning
-  if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, budget: undefined }
+  if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, given: body.reasoning_effort, budget: llama }
   if (typeof reasoning !== "object" || Array.isArray(reasoning)) throw new TypeError("reasoning must be an object.")
   const fields = reasoning as Record<string, unknown>
   const other = Object.keys(fields).find((key) => key !== "effort" && key !== "max_tokens")
@@ -279,7 +254,26 @@ function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: 
     throw new TypeError("reasoning.effort and reasoning_effort disagree.")
   }
   const budget = numberField({ "reasoning.max_tokens": fields.max_tokens }, "reasoning.max_tokens", { min: 0, integer: true })
-  return { effort: own ?? openai ?? (budget !== undefined ? "high" : undefined), budget }
+  if (budget !== undefined && llama !== undefined && budget !== llama) {
+    throw new TypeError("reasoning.max_tokens and reasoning_budget_tokens disagree.")
+  }
+  const given = own ?? openai
+  return { effort: given ?? (budget !== undefined ? "high" : undefined), given, budget: budget ?? llama }
+}
+
+/**
+ * llama.cpp's `chat_template_kwargs`: more chat template variables, and
+ * its `enable_thinking` (a boolean) for thinking.
+ */
+function templateKwargsOf(body: Record<string, unknown>): { variables: Record<string, unknown>; enableThinking: boolean | undefined } {
+  const kwargs = body.chat_template_kwargs
+  if (kwargs === undefined || kwargs === null) return { variables: {}, enableThinking: undefined }
+  if (typeof kwargs !== "object" || Array.isArray(kwargs)) throw new TypeError("chat_template_kwargs must be an object.")
+  const { enable_thinking, ...variables } = kwargs as Record<string, unknown>
+  if (enable_thinking !== undefined && enable_thinking !== null && typeof enable_thinking !== "boolean") {
+    throw new TypeError("chat_template_kwargs.enable_thinking must be a boolean.")
+  }
+  return { variables, enableThinking: enable_thinking ?? undefined }
 }
 
 /**
@@ -304,6 +298,7 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
   const top_p = numberField(body, "top_p", { min: 0, max: 1 }) ?? base.top_p
   const min_p = numberField(body, "min_p", { min: 0, max: 1 }) ?? base.min_p
   const presence_penalty = numberField(body, "presence_penalty", { min: -2, max: 2 }) ?? base.presence_penalty
+  const frequency_penalty = numberField(body, "frequency_penalty", { min: -2, max: 2 })
   // llama.cpp's name: how many of the last tokens the penalties look at (64 by default, -1 for all).
   const repeat_last_n = numberField(body, "repeat_last_n", { min: -1, integer: true })
   return {
@@ -313,6 +308,7 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
     ...(top_p !== undefined && { top_p }),
     ...(min_p !== undefined && { min_p }),
     ...(presence_penalty !== undefined && { presence_penalty }),
+    ...(frequency_penalty !== undefined && frequency_penalty !== 0 && { frequency_penalty }),
     ...(repeat_last_n !== undefined && { repeat_last_n })
   }
 }
@@ -366,26 +362,34 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })
   if (topLogprobs !== undefined && !logprobs) throw new TypeError("top_logprobs needs logprobs: true.")
   const logitBias = logitBiasOf(body.logit_bias)
-  if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
-    throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
-  }
   if (body.audio || (Array.isArray(body.modalities) && body.modalities.some((m) => m !== "text"))) {
     throw unsupported("Only text output is supported.")
   }
   if (body.prediction) throw unsupported("Predicted outputs aren't supported.")
 
-  const format = meta.toolFormat ?? "lfm3"
-  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, format, meta.supports.input.includes("image"))
+  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, meta.supports.input.includes("image"))
 
+  // A last assistant message is continued, as llama.cpp does: one, without tool calls.
+  if (chat.at(-1)?.role === "assistant") {
+    if (chat.at(-2)?.role === "assistant") throw new TypeError("Cannot have 2 or more assistant messages at the end of the list.")
+    if (chat.at(-1)?.tool_calls?.length) throw new TypeError("Cannot continue an assistant message that contains tool calls.")
+  }
   if (body.tools !== undefined && body.tools !== null && !Array.isArray(body.tools)) throw new TypeError("tools must be an array.")
   const offered = toTools((body.tools as Array<ChatCompletionTool> | null | undefined) ?? [])
   if (offered.length && !meta.supports.capabilities.includes("tools")) throw unsupported(`${model} doesn't take tools.`)
   const toolChoice = toToolChoice(body.tool_choice, offered)
-  // "none" offers no tools at all: the prompt doesn't list them.
-  const tools = toolChoice === "none" ? [] : offered
+  // "none" keeps the tools in the prompt, as llama.cpp does: only no call is constrained or read.
+  const tools = offered
 
-  const { effort, budget } = reasoningOf(body)
-  const thinking = thinkingFor(effort, meta)
+  const { effort, given, budget } = reasoningOf(body)
+  const kwargs = templateKwargsOf(body)
+  // As llama.cpp reads them: the kwargs' enable_thinking, which effort "none" overrides.
+  const thinking = effort === "none" ? thinkingFor(effort, meta) : (kwargs.enableThinking ?? thinkingFor(effort, meta))
+  // The effort goes to the template too, under both names llama.cpp gives it ("none" doesn't).
+  const templateVariables = {
+    ...kwargs.variables,
+    ...(typeof given === "string" && given !== "none" && { reasoning_effort: given, reasoning_strength: given })
+  }
   if (budget !== undefined && thinking !== false && !meta.reasoning?.budget) {
     throw unsupported(`${model} doesn't take a thinking budget.`)
   }
@@ -416,6 +420,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     tools,
     sampling: samplingFor(body, meta, thinking),
     ...(thinking !== undefined && { thinking }),
+    ...(Object.keys(templateVariables).length && { templateVariables }),
     // Thinking switched off ignores a budget.
     ...(budget !== undefined && thinking !== false && { thinkingBudgetTokens: budget }),
     ...(outputSchema && { outputSchema }),
@@ -423,6 +428,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     ...(stops.length && { stop: stops }),
     ...(seed !== undefined && { seed }),
     ...(toolChoice !== "auto" && { toolChoice }),
+    ...(typeof body.parallel_tool_calls === "boolean" && { parallelToolCalls: body.parallel_tool_calls }),
     ...(body.cache_prompt === false && { cachePrompt: false }),
     ...(logprobs && { logprobs, ...(topLogprobs !== undefined && { topLogprobs }) }),
     ...(logitBias && { logitBias })
@@ -433,10 +439,10 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     includeUsage: (body.stream_options as { include_usage?: boolean } | undefined)?.include_usage === true,
     logprobs,
     generate,
-    // A JSON answer can't hold markup; a forced call comes back in "done".
-    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto" || toolChoice === "required"),
+    // A JSON answer can't hold markup; "none" reads no calls.
+    parseTools: tools.length > 0 && !outputSchema && toolChoice !== "none",
     parallelToolCalls: body.parallel_tool_calls !== false,
-    repairToolCalls: body.repair_tool_calls !== false
+    repairToolCalls: body.repair_tool_calls === true
   }
 }
 
@@ -456,7 +462,6 @@ export type ReplyDelta = { reasoning_content: string } | { content: string }
 /** How the worker ended a generation. */
 export type GenerationEnd = {
   finishReason: WorkerFinishReason
-  toolCall?: { name: string; arguments: Record<string, unknown> }
 }
 
 /**
@@ -469,6 +474,8 @@ export type GenerationEnd = {
 export function createReplyReader(options: {
   format?: ToolFormat
   parseTools: boolean
+  /** The offered tools: how their calls' values read (see parseToolCalls). */
+  tools?: ReadonlyArray<ChatTool>
   parallelToolCalls?: boolean
   newId?: () => string
 }) {
@@ -510,10 +517,9 @@ export function createReplyReader(options: {
         // Out of tokens: a call it cut off is sent as written, as llama.cpp sends it (see
         // finishReasonOf), and nothing in the reply is repaired (see planRepairs).
         const cut = end.finishReason === "length"
-        calls = markup ? parseToolCalls(markup, cut) : []
+        calls = markup ? parseToolCalls(markup, cut, options.tools) : []
         if (markup && calls.length === 0 && !cut) malformed = markup
       }
-      if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
       return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }
     },
     /** Checked calls as OpenAI's tool calls (one only when parallel calls are off). */
@@ -599,21 +605,21 @@ export async function planRepairs(
 
 /**
  * The request again with the model's own failed call appended as its turn,
- * a note on what was wrong, and the call forced to the tool's schema. The
- * draft keeps what the model got right (forcing from the bare prompt
- * loses it), and appending keeps the prompt's cache. Stop strings don't
+ * a note on what was wrong, and a call required, held to the tools as it's
+ * written (see tool-call-grammar.ts). The draft keeps what the model got
+ * right (calling from the bare prompt loses it), and appending keeps the
+ * prompt's cache. Stop strings don't
  * apply to a call, and thinking closes at once where the model takes a
  * budget: it already thought in the reply being repaired.
  */
 export function repairRequest(plan: CompletionPlan, repair: ToolRepair): GenerateFields {
   const { stop: _stop, thinkingBudgetTokens: _budget, ...rest } = plan.generate
   const meta = modelMeta(plan.model)
-  const format = meta.toolFormat ?? "lfm3"
   const names = plan.generate.tools.map((t) => t.function.name).join(", ")
   const attempt: ChatMessage =
     repair.problem === "malformed"
       ? { role: "assistant", content: repair.markup }
-      : assistantToolTurn("", [{ ...repair.draft, id: "call_0" }], format)
+      : assistantToolTurn("", [{ ...repair.draft, id: "call_0" }])
   const note =
     repair.problem === "invalid-arguments"
       ? `The arguments of that ${repair.draft.name} call don't match its parameters. Call ${repair.draft.name} again with arguments that do.`
@@ -748,9 +754,6 @@ export function planTextCompletion(params: CompletionCreateParams): TextCompleti
     if (count !== undefined && count > 1) throw unsupported(`${key} > 1 isn't supported: one choice per request.`)
   }
   if (body.suffix !== undefined && body.suffix !== null) throw unsupported("suffix isn't supported.")
-  if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
-    throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
-  }
   if (body.logprobs !== undefined && body.logprobs !== null && typeof body.logprobs !== "boolean") throw new TypeError("logprobs must be a boolean.")
   const logprobs = body.logprobs === true
   const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })

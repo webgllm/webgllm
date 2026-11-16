@@ -39,21 +39,40 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 ## `tool_choice`
 
-- `"auto"` (default): the model decides.
-- `"none"`: no tool calls.
-- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
-- `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
+- `"auto"` (default): the model decides. Once it writes a call's opening marker, the call is held to the tools (below).
+- `"none"`: no tool calls. As in llama.cpp, the tools stay in the prompt (so it, and its cache, match `"auto"`); nothing is read as a call, and call markup the model writes stays text.
+- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A reply that runs out of `max_tokens` first ends without a call.
+- `{ type: "function", function: { name } }`: a required call to that tool alone. llama.cpp has no named choice (it reads one as `"auto"`); webgllm keeps OpenAI's.
 
-`parallel_tool_calls: false` keeps only the first call.
+`parallel_tool_calls: false` allows one call per reply, as llama.cpp's grammar does. Left out, it defaults as llama.cpp defaults it: on where the model's chat template writes a turn's second call (LFM3, Qwen3.5, the LFM2.5 GGUFs), off where it doesn't (LFM2-1.2B-Tool and the LFM2.5 ONNX repositories, whose templates write no `tool_calls`).
+
+## Calls held to their tools
+
+As in llama.cpp, a call is held to the tools while it's written, in the model's own format: it can only name an offered tool and that tool's parameters, and each value is held to its parameter's schema. The model's text before a call isn't constrained, and after its calls the reply ends.
+
+- LFM3 and Qwen3.5 (`<tool_call>\n<function=…>\n<parameter=…>`): required parameters come first, in the order the schema declares them, then optional ones in any order. A value that may be a string is written raw, up to `</parameter>`, and comes back as the text written (`123` stays `"123"`), as llama.cpp reads it; any other value is JSON held to its schema.
+- LFM2.5 (`[name(key="value")]`): arguments in any order, and the call can't close before its required ones (llama.cpp's grammar doesn't check them here; its XML one does). A string parameter's value is a quoted string; any other value is JSON held to its schema (llama.cpp takes any value there).
+
+A parameter's schema may refer to the rest of the tool's (`$ref` to its `$defs`, or to another parameter), and the parameters may sit behind a root `$ref`.
+
+Each token of a call gets its own mask, so a call is written a little slower than text.
 
 A required or named `tool_choice` can't be combined with a JSON `response_format`: the reply is either the call or the JSON, so the request is refused.
 
 A reply that runs out of `max_tokens` finishes with `"length"`, as llama.cpp's does, even when it holds calls. A call it cut off comes back with its arguments as far as they were written (`{"city":"Tok`), and nothing in the reply is repaired.
 
+## History
+
+The whole conversation goes to the model's chat template, as llama.cpp passes it: earlier turns' tool calls (as `tool_calls`, their arguments parsed) and results, each tool result as its content (an empty one stays empty), and each assistant turn's `reasoning_content`. The template decides what of them it writes. A tool without a description or parameters goes as llama.cpp sends it: `""` and `{}`.
+
+The LFM2.5 ONNX repositories' and LFM2-1.2B-Tool's templates don't write `tool_calls`, so for them each past call goes into its turn's text in the model's own format; llama.cpp passes `tool_calls` alone, and such a template drops them.
+
+System and developer messages join into one leading system message: Qwen3.5's template refuses a system message anywhere else (llama.cpp passes them where they are, and the request fails there).
+
 ## Repair
 
-Automatic and required calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.
+Off by default: calls come back as the model wrote them, as in llama.cpp. `repair_tool_calls: true` checks automatic and required calls against their tools: a call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, with the model's failed attempt and a note on what was wrong in the chat, held to the tools. The repair takes the call's place only if it checks out; a repair cut off by `max_tokens` comes back cut off, with `"length"`, as any call cut off does. Its tokens count in `usage`.
 
 ## Schemas
 
-Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. Set `additionalProperties: true` for an open object. See [Structured output](/docs/guides/structured-output#schemas) for the exceptions.
+Objects that list their properties and don't set `additionalProperties` take no other keys, as llama.cpp's grammar reads a schema; `{ "type": "object" }` with no properties is any object. Set `additionalProperties: true` to open one. See [Structured output](/docs/guides/structured-output#schemas) for the exceptions.

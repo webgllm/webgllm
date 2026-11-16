@@ -134,4 +134,9 @@ export class PenaltyWindow {
   entries(): Array<[number, SeenState]> {
     return [...this.counts.keys()].map((token) => [token, this.stateOf(token)])
   }
+
+  /** Each token in the window and how many times it's there (for the frequency penalty). */
+  counted(): Array<[number, number]> {
+    return [...this.counts].map(([token, count]) => [token, count.all])
+  }
 }

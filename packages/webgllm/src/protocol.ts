@@ -142,8 +142,19 @@ export type WorkerRequest =
        */
       promptCacheDiskBytes?: number
       tools: Array<ChatTool>
+      /**
+       * False: one tool call per reply, as the call's grammar allows (see
+       * tool-call-grammar.ts). Unset: whether the template writes a turn's
+       * second call, as llama.cpp defaults it.
+       */
+      parallelToolCalls?: boolean
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean
+      /**
+       * More chat template variables, by their names in the template:
+       * llama.cpp's `chat_template_kwargs` and its `reasoning_effort`.
+       */
+      templateVariables?: Record<string, unknown>
       /** Close thinking at this many content tokens, then continue the answer. */
       thinkingBudgetTokens?: number
       /** JSON Schema enforced during answer token selection. */
@@ -159,7 +170,7 @@ export type WorkerRequest =
       stop?: Array<string>
       /** Seeds the sampler: the same seed, prompt and settings give the same reply. */
       seed?: number
-      /** "auto" when left out. A forced call is sent as `toolCall` in "done", not as text. */
+      /** "auto" when left out. A named tool (or "any") is a required call to it, written as any call is. */
       toolChoice?: ToolChoice
       /** Draft tokens by prompt lookup (speculative decoding); on by default. */
       speculative?: boolean
@@ -235,8 +246,6 @@ export type WorkerResponse =
       finishReason: FinishReason
       /** Log probabilities of tokens written after the last "token" message. */
       logprobs?: Array<TokenLogprob>
-      /** The call a forced toolChoice ("required" or a name) produced. */
-      toolCall?: { name: string; arguments: Record<string, unknown> }
     }
   /** A generation, a "forward" or a "reset" failed. */
   | { type: "error"; id: string; message: string; code?: WorkerErrorCode }
