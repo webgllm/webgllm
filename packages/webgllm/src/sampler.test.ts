@@ -44,6 +44,16 @@ describe("createSampler", () => {
     assert.deepEqual([...next], [4, 6, -1, 1], "the window starts empty for every reply")
   })
 
+  test("frequency penalty applies once for each time a token is in the window, as llama.cpp's penalty_freq", () => {
+    const s = createSampler({ temperature: 0, top_k: 0, repetition_penalty: 1, presence_penalty: 0.5, frequency_penalty: 1 })
+    s.see([0, 1])
+    s.see([1, 1, 2], true)
+    const logits = Float32Array.of(4, 6, -1, 1)
+    s.distribution(logits)
+    // Token 1 is there 3 times: 6 - 3 - 0.5. Tokens 0 and 2 once: - 1 - 0.5.
+    assert.deepEqual([...logits], [2.5, 2.5, -2.5, 1])
+  })
+
   test("top_p, then min_p relative to the highest probability, as llama.cpp orders them", () => {
     const s = createSampler({ temperature: 1, top_k: 0, repetition_penalty: 1, min_p: 0.5, top_p: 0.9 })
     const d = s.distribution(Float32Array.of(0, Math.log(0.6), Math.log(0.1)))

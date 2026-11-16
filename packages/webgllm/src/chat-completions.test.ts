@@ -150,7 +150,6 @@ test("reasoning.effort works as reasoning_effort; the two must agree, and other 
 test("unsupported OpenAI fields throw unsupported-parameter", () => {
   const bad: Array<Partial<ChatCompletionCreateParams> & Record<string, unknown>> = [
     { n: 2 },
-    { frequency_penalty: 0.5 },
     { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } } as never] }] },
     { response_format: { type: "grammar" } as never },
     { tools: [{ type: "custom", custom: { name: "x" } } as never] },
@@ -567,4 +566,10 @@ test("a last assistant message is continued: one, without tool calls, as llama.c
     ),
     "TypeError"
   )
+})
+
+test("frequency_penalty goes to the sampler, as llama.cpp's penalty_freq; 0 is left out", () => {
+  assert.equal(planCompletion({ model: LFM3, messages: hi, frequency_penalty: 0.5 }).generate.sampling.frequency_penalty, 0.5)
+  assert.equal("frequency_penalty" in planCompletion({ model: LFM3, messages: hi, frequency_penalty: 0 }).generate.sampling, false)
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: hi, frequency_penalty: 3 })), "RangeError")
 })

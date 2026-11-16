@@ -1218,7 +1218,9 @@ async function generate(request: GenerateRequest) {
   // read back: the token is then picked here, not on the GPU.
   const processor = logitProcessors?.get(request.model)
   const bias = request.logitBias ? Object.entries(request.logitBias).map(([token, value]) => [Number(token), value] as const).filter(([token]) => Number.isInteger(token) && token >= 0 && token < vocab) : []
-  const allLogits = !!request.logprobs || bias.length > 0 || !!processor
+  // So does a frequency penalty: the GPU's penalties know whether a token
+  // is in the window, not how many times.
+  const allLogits = !!request.logprobs || bias.length > 0 || !!processor || (sampling.frequency_penalty ?? 0) !== 0
   const onGpu = !allLogits && (greedy || (sampling.top_k > 0 && sampling.top_k <= MAX_CHUNKS))
   // The log probability of the token just chosen, until it's written (see emit).
   let scored: { token: number; of: (token: number) => TokenLogprob } | undefined

@@ -298,6 +298,7 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
   const top_p = numberField(body, "top_p", { min: 0, max: 1 }) ?? base.top_p
   const min_p = numberField(body, "min_p", { min: 0, max: 1 }) ?? base.min_p
   const presence_penalty = numberField(body, "presence_penalty", { min: -2, max: 2 }) ?? base.presence_penalty
+  const frequency_penalty = numberField(body, "frequency_penalty", { min: -2, max: 2 })
   // llama.cpp's name: how many of the last tokens the penalties look at (64 by default, -1 for all).
   const repeat_last_n = numberField(body, "repeat_last_n", { min: -1, integer: true })
   return {
@@ -307,6 +308,7 @@ function samplingFor(body: Record<string, unknown>, meta: WebGlModelMeta, thinki
     ...(top_p !== undefined && { top_p }),
     ...(min_p !== undefined && { min_p }),
     ...(presence_penalty !== undefined && { presence_penalty }),
+    ...(frequency_penalty !== undefined && frequency_penalty !== 0 && { frequency_penalty }),
     ...(repeat_last_n !== undefined && { repeat_last_n })
   }
 }
@@ -360,9 +362,6 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })
   if (topLogprobs !== undefined && !logprobs) throw new TypeError("top_logprobs needs logprobs: true.")
   const logitBias = logitBiasOf(body.logit_bias)
-  if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
-    throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
-  }
   if (body.audio || (Array.isArray(body.modalities) && body.modalities.some((m) => m !== "text"))) {
     throw unsupported("Only text output is supported.")
   }
@@ -753,9 +752,6 @@ export function planTextCompletion(params: CompletionCreateParams): TextCompleti
     if (count !== undefined && count > 1) throw unsupported(`${key} > 1 isn't supported: one choice per request.`)
   }
   if (body.suffix !== undefined && body.suffix !== null) throw unsupported("suffix isn't supported.")
-  if ((numberField(body, "frequency_penalty", { min: -2, max: 2 }) ?? 0) !== 0) {
-    throw unsupported("frequency_penalty isn't supported; presence_penalty and repetition_penalty are.")
-  }
   if (body.logprobs !== undefined && body.logprobs !== null && typeof body.logprobs !== "boolean") throw new TypeError("logprobs must be a boolean.")
   const logprobs = body.logprobs === true
   const topLogprobs = numberField(body, "top_logprobs", { min: 0, max: 20, integer: true })
