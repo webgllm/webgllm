@@ -72,7 +72,7 @@ test("arguments that aren't an object are refused", () => {
   assert.throws(() => plan.read([1]))
 })
 
-test("forced calls close objects that don't say otherwise, nested ones too", () => {
+test("forced calls close objects that list their properties, nested ones too, as llama.cpp reads a schema", () => {
   const open = tool("lookup", {
     type: "object",
     properties: { city: { type: "string" }, filters: { type: "object", properties: { units: { type: "string" } } }, tags: { type: "array", items: { type: "object" } } },
@@ -83,11 +83,17 @@ test("forced calls close objects that don't say otherwise, nested ones too", () 
   const schema = (plan as { schema: { additionalProperties?: unknown; properties: Record<string, { additionalProperties?: unknown; items?: { additionalProperties?: unknown } }> } }).schema
   assert.equal(schema.additionalProperties, false)
   assert.equal(schema.properties.filters.additionalProperties, false)
-  assert.equal(schema.properties.tags.items?.additionalProperties, false)
+  // An object that lists no properties is any object, as in llama.cpp.
+  assert.equal(schema.properties.tags.items?.additionalProperties, undefined)
   assert.equal(schema.properties.city.additionalProperties, undefined)
   // An explicit choice stays.
   const loose = planToolChoice([tool("loose", { type: "object", additionalProperties: true })], "any")
   assert.equal((loose as { schema: { additionalProperties?: unknown } }).schema.additionalProperties, true)
+  // No parameters, or {}: an empty object, as llama.cpp reads them.
+  for (const parameters of [undefined, {}]) {
+    const bare = planToolChoice([tool("now", parameters as never)], "any") as { schema: unknown }
+    assert.deepEqual(bare.schema, { type: "object", properties: {}, additionalProperties: false })
+  }
 })
 
 test("required with several keeps each tool's local $defs references", async () => {

@@ -73,10 +73,11 @@ const UNSAFE = new Set(["not", "if", "oneOf", "contains"])
 const CLOSE = 0, OPEN = 1, FROZEN = 2
 
 /**
- * Objects that don't say otherwise take no other properties, as in OpenAI's
- * strict mode. An open object lets a constrained model keep inventing keys
- * and never close it, running to the output limit, and each token of a
- * free-form key costs llguidance 0.2.1 about a second to mask on a real
+ * Objects that list their properties take no others unless they say so, as
+ * llama.cpp's grammar reads a schema (and OpenAI's strict mode); an object
+ * that lists none (`{"type": "object"}`) stays any object, as there. An
+ * open object lets a constrained model keep inventing keys, and each token
+ * of a free-form key costs llguidance 0.2.1 about a second to mask on a real
  * vocabulary (https://github.com/nico-martin/llguidance-js/issues/5).
  *
  * Only where that just narrows the schema and every declared property stays
@@ -205,7 +206,10 @@ export function closeObjects(schema: unknown): unknown {
     const out = mapSubschemas(node, (child, path) => close(child, at === "#" ? pointer(path) : at + pointer(path).slice(1)))
     if (level.get(at) !== CLOSE) return out
     const isObjectType = out.type === "object" || (Array.isArray(out.type) && out.type.includes("object"))
-    if (isObjectType && !PROPERTY_SOURCES.some((k) => k in out)) out.additionalProperties = false
+    // As llama.cpp reads a schema: an object that lists its properties takes no
+    // others (a schema with "properties" and no type is an object there too);
+    // one that lists none, `{"type": "object"}`, is any object.
+    if ((isObjectType || out.type === undefined) && "properties" in out && !PROPERTY_SOURCES.some((k) => k in out)) out.additionalProperties = false
     else {
       const keys = allOfKeys(node)
       const merged = keys && merge(node, out, at)
@@ -221,9 +225,11 @@ export function closeObjects(schema: unknown): unknown {
   return close(schema, "#")
 }
 
-/** A tool's parameters as an object schema (no parameters: an empty object). */
+/** A tool's parameters as an object schema: none (or `{}`) is an empty object, as llama.cpp reads them. */
 function argumentSchema(tool: ChatTool): Record<string, unknown> {
-  const parameters = tool.function.parameters ?? { type: "object", properties: {}, additionalProperties: false }
+  const given = tool.function.parameters
+  const none = given === undefined || given === null || (isObject(given) && Object.keys(given).length === 0)
+  const parameters = none ? { type: "object", properties: {} } : given
   if (!isObject(parameters))
     throw new CodedError(`Tool ${tool.function.name}'s parameters aren't a JSON Schema object.`, "invalid-schema")
   if (parameters.type !== undefined && parameters.type !== "object")
