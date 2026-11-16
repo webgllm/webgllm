@@ -39,12 +39,21 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 ## `tool_choice`
 
-- `"auto"` (default): the model decides.
+- `"auto"` (default): the model decides. Once it writes a call's opening marker, the call is held to the tools (below).
 - `"none"`: no tool calls. As in llama.cpp, the tools stay in the prompt (so it, and its cache, match `"auto"`); nothing is read as a call, and call markup the model writes stays text.
-- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. With `repair_tool_calls: true`, a call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
-- `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
+- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A reply that runs out of `max_tokens` first ends without a call.
+- `{ type: "function", function: { name } }`: a required call to that tool alone. llama.cpp has no named choice (it reads one as `"auto"`); webgllm keeps OpenAI's.
 
-`parallel_tool_calls: false` keeps only the first call.
+`parallel_tool_calls: false` allows one call per reply, as llama.cpp's grammar does.
+
+## Calls held to their tools
+
+As in llama.cpp, a call is held to the tools while it's written, in the model's own format: it can only name an offered tool and that tool's parameters, and each value is held to its parameter's schema. The model's text before a call isn't constrained, and after its calls the reply ends.
+
+- LFM3 and Qwen3.5 (`<tool_call>\n<function=…>\n<parameter=…>`): required parameters come first, in the order the schema declares them, then optional ones in any order. A value that may be a string is written raw, up to `</parameter>`; any other value is JSON held to its schema.
+- LFM2.5 (`[name(key="value")]`): arguments in any order. A string parameter's value is a quoted string; any other value is JSON held to its schema (llama.cpp takes any value there).
+
+Each token of a call gets its own mask, so a call is written a little slower than text.
 
 A required or named `tool_choice` can't be combined with a JSON `response_format`: the reply is either the call or the JSON, so the request is refused.
 

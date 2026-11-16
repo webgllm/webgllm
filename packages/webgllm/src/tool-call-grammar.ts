@@ -26,9 +26,10 @@
  *
  * Built by hand, from the JSON constraint and a byte-level matcher over the
  * vocabulary, because llguidance-js 0.2.1's grammar entry can't embed a JSON
- * Schema (`%json` is refused). When it can, this whole file becomes one Lark
- * grammar per format with `%json` for each value, as llama.cpp writes them:
- * see https://github.com/webgllm/webgllm/issues/ISSUE.
+ * Schema (`%json` is refused). When it can
+ * (https://github.com/nico-martin/llguidance-js/pull/7), swap this whole file
+ * for one Lark grammar per format with `%json` for each value, as llama.cpp
+ * writes them: see https://github.com/webgllm/webgllm/issues/17.
  */
 import type { Constraint } from "./constraint/index.js"
 import type { ChatTool } from "./tokenizer.js"
