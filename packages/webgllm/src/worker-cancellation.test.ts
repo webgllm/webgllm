@@ -30,6 +30,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { PrefixStore, savePromptPrefix } from './prefix-store.js';
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
+  import { withCallsInText } from './tool-calls.js';
+  import { callVocab, ToolCallGrammar } from './tool-call-grammar.js';
   import { createStopFilter } from './stop-sequences.js';
   import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';

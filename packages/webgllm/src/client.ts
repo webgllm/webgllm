@@ -27,7 +27,6 @@ export type WorkerGenerationEnd = {
   finishReason: FinishReason
   /** Log probabilities of the tokens written after the last text (when asked for). */
   logprobs?: Array<TokenLogprob>
-  toolCall?: { name: string; arguments: Record<string, unknown> }
 }
 
 /** A piece of a reply's raw text, with its tokens' log probabilities when they were asked for. */
@@ -395,8 +394,7 @@ export class ModelWorker {
           stats: data.stats,
           // (A worker from before finish reasons: its end-of-turn token.)
           finishReason: data.finishReason ?? "stop",
-          ...(data.logprobs && { logprobs: data.logprobs }),
-          ...(data.toolCall && { toolCall: data.toolCall })
+          ...(data.logprobs && { logprobs: data.logprobs })
         })
         this.settled()
         break

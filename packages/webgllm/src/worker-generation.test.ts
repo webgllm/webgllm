@@ -1,5 +1,5 @@
 // The worker's generate function on a scripted engine: finish reasons, stop
-// sequences, forced tool calls and seeded sampling, end to end through the
+// sequences, tool calls held to their tools and seeded sampling, end to end through the
 // real decode loop (as worker-cancellation.test.ts extracts it).
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
@@ -33,6 +33,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { PrefixStore, savePromptPrefix } from './prefix-store.js';
   import { persistPrefix, untilAborted } from './prefix-disk.js';
   import { planToolChoice } from './tool-choice.js';
+  import { withCallsInText } from './tool-calls.js';
+  import { callVocab, ToolCallGrammar } from './tool-call-grammar.js';
   import { createStopFilter } from './stop-sequences.js';
   import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from './penalty-window.js';
   import { seededUniforms } from './seeded-random.js';
@@ -63,7 +65,8 @@ const { makeGenerate } = await import(pathToFileURL(outfile).href)
 /** Token ids 0–9 are control tokens; the rest are words of TEXT. */
 const EOS = 1, THINK = 3, THINK_END = 4, TOOL_CALL = 5, TOOL_CALL_END = 6
 const TEXT: Record<number, string> = { [THINK]: "<think>", [THINK_END]: "</think>", [TOOL_CALL]: "<tool_call>", [TOOL_CALL_END]: "</tool_call>" }
-const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d", "<thi", "nk>", "</thi"]
+const words = ["Hello", " world", ".", " STOP", " more", "{", "\"city\"", ":", "\"Oslo\"", "}", " hm", "\n\n", "a", "b", "c", "d", "<thi", "nk>", "</thi",
+  "\n<function=get_weather>\n", "<parameter=city>\n", "Oslo", "\n</parameter>\n", "</function>\n"]
 words.forEach((w, i) => { TEXT[10 + i] = w })
 const id = (w: string) => 10 + words.indexOf(w)
 
@@ -135,6 +138,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     vocabSize: 64,
     specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2, toolCall: TOOL_CALL, toolCallEnd: TOOL_CALL_END },
     writesToolCalls: () => true,
+    isSpecial: (t: number) => t < 10,
     tokenToId: (token: string) => Object.entries(TEXT).find(([, text]) => text === token)?.[0] as number | undefined,
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),
@@ -238,48 +242,47 @@ function jsonConstraint(last: number) {
 const weather = { type: "function" as const, function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }
 const json = [id("{"), id("\"city\""), id(":"), id("\"Oslo\""), id("}")]
 
-test("a forced tool call is sent as toolCall on done, not as text", async () => {
-  const j = jsonConstraint(id("}"))
-  const s = scripted([...json], { constraint: () => j.constraint })
+/** A whole call to get_weather, in LFM3's format. */
+const CALL = [TOOL_CALL, id("\n<function=get_weather>\n"), id("<parameter=city>\n"), id("Oslo"), id("\n</parameter>\n"), id("</function>\n"), TOOL_CALL_END]
+const callText = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>"
+const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
+const allows = (mask: Uint32Array | null, token: number) => !mask || (mask[token >>> 5] & (1 << (token & 31))) !== 0
+
+test("a named tool's call is written in the model's format, held to that tool, and read from the text", async () => {
+  const s = scripted([...CALL])
   await s.generate(request({ tools: [weather], toolChoice: { name: "get_weather" } }))
-  assert.equal(text(s.messages), "")
-  const d = done(s.messages)
-  assert.deepEqual(d.toolCall, { name: "get_weather", arguments: { city: "Oslo" } })
-  assert.equal(d.finishReason, "stop")
-  assert.deepEqual(j.accepted, [...json, EOS])
+  assert.equal(text(s.messages), callText)
+  assert.equal(done(s.messages).finishReason, "stop")
+  // Each step's mask allowed the token the script drew, and the end only once the call was closed.
+  CALL.forEach((token, i) => assert.ok(allows(s.stepMasks[i + 1] ?? null, CALL[i + 1] ?? EOS) || i === CALL.length - 1, `step ${i}`))
+  assert.deepEqual(s.stepMasks.map(blocksEnd), [...Array(CALL.length).fill(true), false])
 })
 
-test("thinking comes before a forced call, and is sent as text", async () => {
-  const j = jsonConstraint(id("}"))
-  const s = scripted([id(" hm"), THINK_END, ...json], { constraint: () => j.constraint })
-  await s.generate(request({ tools: [weather], toolChoice: { name: "get_weather" }, thinking: true, stop: ["{"] }))
-  // The template ended the prompt outside the thinking: it's opened first.
-  assert.equal(text(s.messages), "<think> hm</think>")
-  assert.deepEqual(done(s.messages).toolCall, { name: "get_weather", arguments: { city: "Oslo" } })
-  assert.deepEqual(j.accepted, [...json, EOS])
+test("an automatic call is held to its tools once its opening marker is written, and nothing before it", async () => {
+  const s = scripted([id("Hello"), ...CALL])
+  await s.generate(request({ tools: [weather] }))
+  assert.equal(text(s.messages), "Hello" + callText)
+  // Before the call, any word (thinking is off: only its markers are refused); inside it, only the call's.
+  assert.ok(allows(s.stepMasks[0]!, id("a")) && allows(s.stepMasks[1]!, id("a")))
+  assert.ok(!allows(s.stepMasks[2]!, id("a")))
+  assert.ok(allows(s.stepMasks[2]!, id("\n<function=get_weather>\n")))
 })
 
 test("required, as llama.cpp has it: the call in the model's own format, text before it allowed, and no end before the call is closed", async () => {
-  const s = scripted([id("Hello"), TOOL_CALL, id("a"), TOOL_CALL_END])
+  const s = scripted([id("Hello"), ...CALL])
   await s.generate(request({ tools: [weather], toolChoice: "required" }))
-  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
-  // The steps before the closing marker refused the end; after it, the end is open again.
-  const set = s.masks.filter((m) => m !== null)
-  assert.equal(set.length, 2)
-  assert.equal(blocksEnd(set[0]), true)
-  assert.equal(blocksEnd(set[1]), false)
-  assert.equal(text(s.messages), "Hello<tool_call>a</tool_call>")
-  assert.equal(done(s.messages).toolCall, undefined, "parsed from the text on the main thread, like auto's")
+  assert.equal(text(s.messages), "Hello" + callText)
+  // Every pick before the closing marker refused the end; the one after it allows it.
+  assert.deepEqual(s.stepMasks.map(blocksEnd), [...Array(CALL.length + 1).fill(true), false])
 })
 
 test("required: a closing marker with no call opened, or a call written in the thinking, doesn't let the reply end", async () => {
-  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
   // "Hello</tool_call>": every mask after it still refuses the end.
   const unmatched = scripted([id("Hello"), TOOL_CALL_END, id("a")])
   await unmatched.generate(request({ tools: [weather], toolChoice: "required" }))
   assert.ok(unmatched.masks.filter((m) => m !== null).every(blocksEnd))
   // A whole call inside the thinking: still refused after it, until one in the answer.
-  const script = [THINK, TOOL_CALL, id("a"), TOOL_CALL_END, THINK_END, TOOL_CALL, id("b"), TOOL_CALL_END]
+  const script = [THINK, TOOL_CALL, id("a"), TOOL_CALL_END, THINK_END, ...CALL]
   const thought = scripted(script)
   await thought.generate(request({ tools: [weather], toolChoice: "required", thinking: true }))
   // Pick i draws token i+1 (pick 0 drew the first). The end is refused through the answer's call, then open.
@@ -289,7 +292,6 @@ test("required: a closing marker with no call opened, or a call written in the t
 })
 
 test("required: thinking tags split across ordinary tokens are read as the reply reader reads them", async () => {
-  const blocksEnd = (mask: Uint32Array | null) => !!mask && (mask[EOS >>> 5] & (1 << (EOS & 31))) === 0
   // A call inside "<thi"+"nk>" … "</thi"+"nk>" is thinking: the end stays refused after it.
   const inside = [id("<thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END, id("</thi"), id("nk>"), id("Hello")]
   const thought = scripted(inside)
@@ -297,7 +299,7 @@ test("required: thinking tags split across ordinary tokens are read as the reply
   assert.equal(thought.stepMasks.length, inside.length + 1)
   assert.ok(thought.stepMasks.every(blocksEnd), "no pick could end the reply")
   // The same call after the split close is the answer's: the end opens after it.
-  const after = [id("<thi"), id("nk>"), id(" hm"), id("</thi"), id("nk>"), TOOL_CALL, id("a"), TOOL_CALL_END]
+  const after = [id("<thi"), id("nk>"), id(" hm"), id("</thi"), id("nk>"), ...CALL]
   const answered = scripted(after)
   await answered.generate(request({ tools: [weather], toolChoice: "required" }))
   const refused = answered.stepMasks.map(blocksEnd)

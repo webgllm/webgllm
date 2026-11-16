@@ -440,18 +440,20 @@ class Completions {
     if (plan.parseTools && plan.repairToolCalls) {
       for (const repair of await planRepairs(calls, malformed, plan.generate.tools, last.finishReason)) {
         throwIfAborted(signal)
+        // The call is read from the repair's reply as any reply's is; its text and thinking aren't shown.
+        const reader = createReplyReader({ format: modelMeta(plan.model).toolFormat ?? "lfm3", parseTools: true, parallelToolCalls: false })
         const end = await abortable(
           this.pool.generate(plan.model, repairRequest(plan, repair), {
             contextLength: this.llm.contextLength,
-            // A forced call comes back in "done"; any thinking before it isn't shown.
-            onToken: () => undefined,
+            onToken: (text) => void reader.push(text),
             ...(signal && { signal })
           }),
           signal
         )
-        if (!end.toolCall) throw new Error("A tool call couldn't be repaired.")
+        const [call] = reader.finish(end).calls
+        if (!call) throw new Error("A tool call couldn't be repaired.")
         repairs.push(end.stats)
-        calls[repair.index] = { name: end.toolCall.name, args: end.toolCall.arguments }
+        calls[repair.index] = { name: call.name, args: call.args }
         malformed = undefined
       }
     }

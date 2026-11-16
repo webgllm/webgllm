@@ -142,6 +142,8 @@ export type WorkerRequest =
        */
       promptCacheDiskBytes?: number
       tools: Array<ChatTool>
+      /** False: one tool call per reply, as the call's grammar allows (see tool-call-grammar.ts). */
+      parallelToolCalls?: boolean
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean
       /**
@@ -164,7 +166,7 @@ export type WorkerRequest =
       stop?: Array<string>
       /** Seeds the sampler: the same seed, prompt and settings give the same reply. */
       seed?: number
-      /** "auto" when left out. A forced call is sent as `toolCall` in "done", not as text. */
+      /** "auto" when left out. A named tool (or "any") is a required call to it, written as any call is. */
       toolChoice?: ToolChoice
       /** Draft tokens by prompt lookup (speculative decoding); on by default. */
       speculative?: boolean
@@ -240,8 +242,6 @@ export type WorkerResponse =
       finishReason: FinishReason
       /** Log probabilities of tokens written after the last "token" message. */
       logprobs?: Array<TokenLogprob>
-      /** The call a forced toolChoice ("required" or a name) produced. */
-      toolCall?: { name: string; arguments: Record<string, unknown> }
     }
   /** A generation, a "forward" or a "reset" failed. */
   | { type: "error"; id: string; message: string; code?: WorkerErrorCode }

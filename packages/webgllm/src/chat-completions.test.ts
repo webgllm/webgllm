@@ -216,7 +216,8 @@ test("tools and tool_choice", () => {
   assert.equal(none.parseTools, false)
   const named = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: { type: "function", function: { name: "get_weather" } } })
   assert.deepEqual(named.generate.toolChoice, { name: "get_weather" })
-  assert.equal(named.parseTools, false)
+  // A named call is written in the model's format and read like any call.
+  assert.equal(named.parseTools, true)
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "required" }).generate.toolChoice, "required")
   // A required or named call can't share the reply with a JSON answer: refused, not one dropped.
   const json = { type: "json_schema", json_schema: { name: "x", schema: { type: "object" } } }
@@ -356,14 +357,6 @@ test("a structured answer after thinking is just the JSON", () => {
   const r = readAll(["<think>plan</think>", "\n", '{"a":', "1}"], { parseTools: false })
   assert.equal(r.reasoning, "plan")
   assert.deepEqual(JSON.parse(r.content), { a: 1 })
-})
-
-test("a forced tool call from the worker becomes the reply's tool call", () => {
-  const r = readAll(["<think>pick</think>"], { parseTools: false }, { finishReason: "stop", toolCall: { name: "get_weather", arguments: { city: "Oslo" } } })
-  assert.equal(r.reasoning, "pick")
-  assert.equal(r.content, "")
-  assert.deepEqual(r.toolCalls, [{ id: "call_0", type: "function", function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }])
-  assert.equal(r.finishReason, "tool_calls")
 })
 
 test("length passes through as the finish reason", () => {

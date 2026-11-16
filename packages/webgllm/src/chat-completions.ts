@@ -428,6 +428,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     ...(stops.length && { stop: stops }),
     ...(seed !== undefined && { seed }),
     ...(toolChoice !== "auto" && { toolChoice }),
+    ...(body.parallel_tool_calls === false && { parallelToolCalls: false }),
     ...(body.cache_prompt === false && { cachePrompt: false }),
     ...(logprobs && { logprobs, ...(topLogprobs !== undefined && { topLogprobs }) }),
     ...(logitBias && { logitBias })
@@ -438,8 +439,8 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     includeUsage: (body.stream_options as { include_usage?: boolean } | undefined)?.include_usage === true,
     logprobs,
     generate,
-    // A JSON answer can't hold markup; a forced call comes back in "done".
-    parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto" || toolChoice === "required"),
+    // A JSON answer can't hold markup; "none" reads no calls.
+    parseTools: tools.length > 0 && !outputSchema && toolChoice !== "none",
     parallelToolCalls: body.parallel_tool_calls !== false,
     repairToolCalls: body.repair_tool_calls === true
   }
@@ -461,7 +462,6 @@ export type ReplyDelta = { reasoning_content: string } | { content: string }
 /** How the worker ended a generation. */
 export type GenerationEnd = {
   finishReason: WorkerFinishReason
-  toolCall?: { name: string; arguments: Record<string, unknown> }
 }
 
 /**
@@ -518,7 +518,6 @@ export function createReplyReader(options: {
         calls = markup ? parseToolCalls(markup, cut) : []
         if (markup && calls.length === 0 && !cut) malformed = markup
       }
-      if (end.toolCall) calls = [{ name: end.toolCall.name, args: end.toolCall.arguments }, ...calls]
       return { deltas, calls, ...(malformed !== undefined && { malformed }), finishReason: end.finishReason }
     },
     /** Checked calls as OpenAI's tool calls (one only when parallel calls are off). */
@@ -604,9 +603,10 @@ export async function planRepairs(
 
 /**
  * The request again with the model's own failed call appended as its turn,
- * a note on what was wrong, and the call forced to the tool's schema. The
- * draft keeps what the model got right (forcing from the bare prompt
- * loses it), and appending keeps the prompt's cache. Stop strings don't
+ * a note on what was wrong, and a call required, held to the tools as it's
+ * written (see tool-call-grammar.ts). The draft keeps what the model got
+ * right (calling from the bare prompt loses it), and appending keeps the
+ * prompt's cache. Stop strings don't
  * apply to a call, and thinking closes at once where the model takes a
  * budget: it already thought in the reply being repaired.
  */

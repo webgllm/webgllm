@@ -95,8 +95,8 @@ test("without include_usage the timings ride on the finish chunk", async () => {
   assert.equal(last.timings?.prompt_ms, 4)
 })
 
-test("a forced tool call comes back as tool_calls", async () => {
-  const { llm: client, workers } = llm({ reply: () => ({ tokens: [], done: { toolCall: { name: "pick", arguments: { n: 1 } } } }) })
+test("a named tool's call, written in the model's format, comes back as tool_calls", async () => {
+  const { llm: client, workers } = llm({ reply: () => ({ tokens: ["<|tool_call_start|>[pick(n=1)]<|tool_call_end|>"] }) })
   const completion = await client.chat.completions.create({
     model: LFM2,
     messages: hi,
@@ -276,7 +276,7 @@ test("tool-call repair: arguments that fail the schema are generated again for t
   const { llm: client, workers } = llm({
     reply: (request) =>
       request.toolChoice
-        ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Paris" } } } }
+        ? { tokens: [qwenCall("<parameter=city>\nParis\n</parameter>")] }
         : { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] }
   })
   const completion = await client.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
@@ -295,9 +295,9 @@ test("tool-call repair: arguments that fail the schema are generated again for t
   assert.equal(completion.usage.prompt_tokens, 2 * STATS.inputTokens)
 })
 
-test("tool-call repair: unknown tools and unparsed markup are forced to any tool; off (the default) returns them as written", async () => {
+test("tool-call repair: unknown tools and unparsed markup are called again with any tool; off (the default) returns them as written", async () => {
   const forced = (request: { toolChoice?: unknown }) =>
-    request.toolChoice ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Rome" } } } } : undefined
+    request.toolChoice ? { tokens: [qwenCall("<parameter=city>\nRome\n</parameter>")] } : undefined
   const unknown = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"] } })
   const a = await unknown.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
   assert.equal(unknown.workers.of(QWEN)!.generations()[1]!.toolChoice, "any")
@@ -318,7 +318,7 @@ test("tool-call repair runs before a stream's tool calls, and valid calls aren't
   const { llm: client, workers } = llm({
     reply: (request) =>
       request.toolChoice
-        ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Oslo" } } } }
+        ? { tokens: [qwenCall("<parameter=city>\nOslo\n</parameter>")] }
         : { tokens: ["Checking.", qwenCall("<parameter=city>\nOslo\n</parameter>")] }
   })
   const chunks = await collect(

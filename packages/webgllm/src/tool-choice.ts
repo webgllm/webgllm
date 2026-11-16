@@ -1,23 +1,19 @@
 /**
  * OpenAI's tool_choice in the worker: which tools the chat template renders,
- * and for a forced call, the JSON Schema its answer is constrained to.
+ * and which ones a call may name (see tool-call-grammar.ts). Also how a
+ * schema's objects are closed, as llama.cpp's grammar reads them.
  */
 import type { ToolChoice } from "./protocol.js"
 import type { ChatTool } from "./tokenizer.js"
 import { CodedError } from "./worker-errors.js"
 
-export type ToolCall = { name: string; arguments: Record<string, unknown> }
-
-export type ToolPlan =
-  | { mode: "auto" | "none" | "required"; tools: Array<ChatTool> }
-  | {
-      mode: "forced"
-      tools: Array<ChatTool>
-      /** The answer's JSON Schema: the tool's arguments, or `{ name, arguments }` for one of several. */
-      schema: object
-      /** The call the schema-valid answer stands for. */
-      read: (value: unknown) => ToolCall
-    }
+export type ToolPlan = {
+  mode: "auto" | "none" | "required"
+  /** The tools the template renders. */
+  tools: Array<ChatTool>
+  /** The tools a call may name, where fewer than all (a named choice). */
+  callable?: Array<ChatTool>
+}
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value)
@@ -225,29 +221,14 @@ export function closeObjects(schema: unknown): unknown {
   return close(schema, "#")
 }
 
-/** A tool's parameters as an object schema: none (or `{}`) is an empty object, as llama.cpp reads them. */
-function argumentSchema(tool: ChatTool): Record<string, unknown> {
-  const given = tool.function.parameters
-  const none = given === undefined || given === null || (isObject(given) && Object.keys(given).length === 0)
-  const parameters = none ? { type: "object", properties: {} } : given
+/** A tool a call is held to must describe its parameters as an object. */
+function checkParameters(tool: ChatTool) {
+  const parameters = tool.function.parameters
+  if (parameters === undefined || parameters === null) return
   if (!isObject(parameters))
     throw new CodedError(`Tool ${tool.function.name}'s parameters aren't a JSON Schema object.`, "invalid-schema")
   if (parameters.type !== undefined && parameters.type !== "object")
     throw new CodedError(`Tool ${tool.function.name}'s parameters must describe an object.`, "invalid-schema")
-  return closeObjects({ type: "object", ...parameters }) as Record<string, unknown>
-}
-
-/** `schema` with its local references ("#..." pointers) moved beneath `base`. */
-function scopeRefs(schema: unknown, base: string): unknown {
-  if (!isObject(schema)) return schema
-  const out = mapSubschemas(schema, (child) => scopeRefs(child, base))
-  if (typeof out.$ref === "string" && out.$ref.startsWith("#")) out.$ref = base + out.$ref.slice(1)
-  return out
-}
-
-const argumentsOf = (value: unknown, name: string) => {
-  if (!isObject(value)) throw new Error(`Tool ${name}'s arguments aren't a JSON object.`)
-  return value
 }
 
 export function planToolChoice(tools: Array<ChatTool>, choice: ToolChoice = "auto"): ToolPlan {
@@ -257,55 +238,26 @@ export function planToolChoice(tools: Array<ChatTool>, choice: ToolChoice = "aut
   // call is constrained or read: markup the model writes stays text.
   if (choice === "none") return { mode: "none", tools }
   // "required" as llama.cpp has it: the model writes its call in its own
-  // template's format, as with "auto" (text may come first), and the reply
-  // can't end before one (see the handler). Its arguments aren't held to a
-  // schema while it writes them: a bad call is repaired (see planRepairs).
+  // template's format, as with "auto" (text may come first), held to the
+  // tools as it's written (see tool-call-grammar.ts), and the reply can't
+  // end before one (see the handler).
   if (choice === "required") {
     if (!tools.length) throw new Error('toolChoice "required" needs at least one tool.')
+    tools.forEach(checkParameters)
     return { mode: "required", tools }
   }
-  // Forced calls keep every tool in the prompt, exactly as "auto" renders
-  // it: the model reads the tools in its own template's words, and the
-  // prompt stays the same for the cache across auto and forced turns.
-  let chosen: Array<ChatTool>
+  // A named tool (and "any", which repairs use) is "required" with only
+  // those tools callable. llama.cpp has no named choice (it reads one as
+  // "auto"); OpenAI's is kept, its call written as the model writes any.
+  // Every tool stays in the prompt, as "auto" renders it: the model reads
+  // them in its own template's words, and the prompt's cache holds.
   if (choice === "any") {
     if (!tools.length) throw new Error('toolChoice "any" needs at least one tool.')
-    chosen = tools
-  } else {
-    const named = tools.find((t) => t.function.name === choice.name)
-    if (!named) throw new Error(`toolChoice names ${choice.name}, which isn't one of the tools.`)
-    chosen = [named]
+    tools.forEach(checkParameters)
+    return { mode: "required", tools }
   }
-  if (chosen.length === 1) {
-    // One possible tool: its arguments alone, as for a named tool.
-    const name = chosen[0].function.name
-    return { mode: "forced", tools, schema: argumentSchema(chosen[0]), read: (value) => ({ name, arguments: argumentsOf(value, name) }) }
-  }
-  // Several: the name first (each branch fixes it), then its arguments.
-  // Each tool's arguments sit in the root's $defs, and its local references
-  // point beneath them: nested under anyOf, "#/$defs/x" would resolve
-  // against the union's root instead of the tool's own schema.
-  const $defs: Record<string, unknown> = {}
-  const schema = {
-    anyOf: chosen.map((tool, i) => {
-      const key = `tool${i}`
-      $defs[key] = scopeRefs(argumentSchema(tool), `#/$defs/${key}`)
-      return {
-        type: "object",
-        properties: { name: { const: tool.function.name }, arguments: { $ref: `#/$defs/${key}` } },
-        required: ["name", "arguments"],
-        additionalProperties: false
-      }
-    }),
-    $defs
-  }
-  return {
-    mode: "forced",
-    tools,
-    schema,
-    read: (value) => {
-      if (!isObject(value) || typeof value.name !== "string") throw new Error("The forced tool call has no tool name.")
-      return { name: value.name, arguments: argumentsOf(value.arguments, value.name) }
-    }
-  }
+  const named = tools.find((t) => t.function.name === choice.name)
+  if (!named) throw new Error(`toolChoice names ${choice.name}, which isn't one of the tools.`)
+  checkParameters(named)
+  return { mode: "required", tools, callable: [named] }
 }
