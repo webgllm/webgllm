@@ -134,6 +134,7 @@ function scripted(script: number[], options: { candidates?: [number[], number[]]
     },
     vocabSize: 64,
     specialTokens: { think: THINK, thinkEnd: THINK_END, eos: EOS, imStart: 2, toolCall: TOOL_CALL, toolCallEnd: TOOL_CALL_END },
+    writesToolCalls: () => true,
     tokenToId: (token: string) => Object.entries(TEXT).find(([, text]) => text === token)?.[0] as number | undefined,
     constraintTokenizer: {},
     decode: (ids: number[]) => ids.map((t) => TEXT[t] ?? "").join(""),

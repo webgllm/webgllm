@@ -298,3 +298,42 @@ export function createToolCallSplitter(markers: Array<string> = MARKERS) {
     }
   }
 }
+
+/** A value written the way Python (and LFM2) writes it. */
+function pythonValue(value: unknown): string {
+  if (value === true) return "True"
+  if (value === false) return "False"
+  if (value === null || value === undefined) return "None"
+  return JSON.stringify(value)
+}
+
+/** Tool calls in LFM2's own format, as the model writes them. */
+export function formatLfm2ToolCalls(calls: Array<{ name: string; args: Record<string, unknown> }>) {
+  const list = calls
+    .map(
+      (c) =>
+        `${c.name}(${Object.entries(c.args)
+          .map(([k, v]) => `${k}=${pythonValue(v)}`)
+          .join(", ")})`
+    )
+    .join(", ")
+  return `<|tool_call_start|>[${list}]<|tool_call_end|>`
+}
+
+/**
+ * The chat for a template that doesn't write `tool_calls` (the LFM2.5 ONNX
+ * repositories' and LFM2-1.2B-Tool's): each past call written into its
+ * turn's text in the model's own format, so the model still reads what it
+ * called. llama.cpp passes `tool_calls` alone, and such a template drops them.
+ */
+export function withCallsInText<M extends { content: unknown; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> }>(
+  chat: Array<M>,
+  format: ToolFormat
+): Array<M> {
+  if (format !== "lfm2") return chat
+  return chat.map((m) => {
+    if (!m.tool_calls?.length || typeof m.content !== "string") return m
+    const { tool_calls, ...rest } = m
+    return { ...rest, content: m.content + formatLfm2ToolCalls(tool_calls.map((c) => ({ name: c.function.name, args: c.function.arguments }))) } as M
+  })
+}

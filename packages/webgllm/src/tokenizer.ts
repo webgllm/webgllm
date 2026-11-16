@@ -60,6 +60,13 @@ export type ChatTemplateOptions = {
   addGenerationPrompt?: boolean
   /** Keeps the thinking of earlier turns too (`preserve_thinking`). */
   preserveThinking?: boolean
+  /**
+   * A last assistant message is continued, as llama.cpp's
+   * `continue_final_message` does: the chat before it, the assistant's turn
+   * opening, then its thinking (an open `<think>` where it has thinking and
+   * no text yet) and text, with nothing closing the turn.
+   */
+  continueFinalMessage?: boolean
   /** More template variables, by their names in the template. */
   [variable: string]: unknown
 }
@@ -135,6 +142,8 @@ export type Tokenizer = {
   /** Ids `isSpecial` is true of: those decode skips when asked to. */
   isSpecial: (id: number) => boolean
   specialTokens: SpecialTokenIds
+  /** Whether the chat template writes past turns' `tool_calls` (found once, by rendering one). */
+  writesToolCalls: () => boolean
   /** One past the highest id the tokenizer knows (the model's may be more). */
   vocabSize: number
   /** Exact tokenizer data for the schema constraint runtime. */
@@ -184,6 +193,8 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     clean_up_tokenization_spaces: false
   })
   const template = new Template(chatTemplate)
+  // Whether the template writes thoughts in `<think>` tags (llama.cpp finds the same by reading it).
+  const thinks = chatTemplate.includes("<think>")
 
   const added =
     (files.tokenizerJson as { added_tokens?: Array<AddedTokenJson> })
@@ -313,6 +324,37 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
   const applyChatTemplate = (
     messages: Array<ChatMessage>,
     options: ChatTemplateOptions = {}
+  ): string => {
+    const { continueFinalMessage, ...rest } = options
+    const final = messages[messages.length - 1]
+    if (continueFinalMessage && final?.role === "assistant") {
+      // As llama.cpp builds it: the chat before the message, the generation
+      // prompt (what add_generation_prompt adds), cut where it opens a
+      // thought, then the thought and the text.
+      const before = messages.slice(0, -1)
+      const closed = renderChat(before, { ...rest, addGenerationPrompt: false })
+      const opened = renderChat(before, { ...rest, addGenerationPrompt: true })
+      let n = 0
+      while (n < closed.length && n < opened.length && closed[n] === opened[n]) n++
+      let generation = opened.slice(n)
+      const text = typeof final.content === "string"
+        ? final.content
+        : final.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+      const thinking = final.reasoning_content ?? ""
+      const inThinking = thinking !== "" && text === ""
+      if (thinks) {
+        const at = generation.indexOf("<think>")
+        if (at >= 0) generation = generation.slice(0, at)
+        generation += "<think>" + thinking + (inThinking ? "" : "</think>")
+      }
+      return closed + generation + (inThinking ? "" : text)
+    }
+    return renderChat(messages, rest)
+  }
+
+  const renderChat = (
+    messages: Array<ChatMessage>,
+    options: ChatTemplateOptions
   ) => {
     const {
       tools,
@@ -338,7 +380,26 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     return template.render(context)
   }
 
+  let writes: boolean | undefined
+  const writesToolCalls = () => {
+    if (writes === undefined) {
+      try {
+        const name = "webgllm_probe_tool"
+        const probe: Array<ChatMessage> = [
+          { role: "user", content: "x" },
+          { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name, arguments: {} } }] },
+          { role: "tool", content: "y", tool_call_id: "c" }
+        ]
+        writes = renderChat(probe, {}).includes(name)
+      } catch {
+        writes = true
+      }
+    }
+    return writes
+  }
+
   return {
+    writesToolCalls,
     encode,
     decode,
     createStreamDecoder,

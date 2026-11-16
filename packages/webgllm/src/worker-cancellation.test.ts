@@ -68,7 +68,7 @@ function probe() {
     async forwardHidden() { calls.forwards++; return 0 }
   }
   const tokenizer = { encodeChat: () => Array.from({ length: 512 }, (_, i) => 10 + i % 30), vocabSize: 128,
-    specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, constraintTokenizer: {} }
+    specialTokens: { think: null, thinkEnd: null, eos: 1, imStart: 2 }, writesToolCalls: () => true, constraintTokenizer: {} }
   return { calls, stopped, messages, model: { engine, tokenizer, cached, prefixes: new PrefixStore(() => {}) },
     createConstraint: async () => ({ dispose() { calls.disposed++ } }) }
 }

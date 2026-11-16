@@ -28,6 +28,7 @@ import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTunin
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { createThinkingSplitter, THINK_OPEN } from "./reply.js"
+import { withCallsInText } from "./tool-calls.js"
 import { budgetWrapUp, createThinkingBudget, templateClosing } from "./thinking-budget.js"
 import { outputTokenLimit } from "./generation-limits.js"
 import { createConstraint } from "./constraint/index.js"
@@ -986,11 +987,20 @@ async function generate(request: GenerateRequest) {
   // A raw prompt (OpenAI's Completions) is read as it is: no chat template, so nothing of a chat's framing to cache by.
   const raw = request.prompt !== undefined
   const variables = request.templateVariables
-  const templateOptions = { ...variables, ...(request.thinking !== undefined && { enableThinking: request.thinking }), addGenerationPrompt: true }
-  const encoded = raw ? tokenizer.encode(request.prompt!) : tokenizer.encodeChat(request.chat, { tools, ...templateOptions })
+  // Past calls as `tool_calls`, or in their turn's text where the template doesn't write those (see withCallsInText).
+  const chat = raw || tokenizer.writesToolCalls() ? request.chat : withCallsInText(request.chat, modelMeta(request.model).toolFormat ?? "lfm3")
+  // A last assistant message is continued (llama.cpp's prefill_assistant, on by default there).
+  const continues = chat?.[chat.length - 1]?.role === "assistant"
+  const templateOptions = {
+    ...variables,
+    ...(request.thinking !== undefined && { enableThinking: request.thinking }),
+    addGenerationPrompt: !continues,
+    ...(continues && { continueFinalMessage: true })
+  }
+  const encoded = raw ? tokenizer.encode(request.prompt!) : tokenizer.encodeChat(chat, { tools, ...templateOptions })
   // The text those tokens are of, for another source: how the image step
   // tells the template's image placeholders from a message's own text.
-  const source: TemplateSource = { chat: request.chat, tools }
+  const source: TemplateSource = { chat, tools }
   const render = (from: TemplateSource) => tokenizer.applyChatTemplate(from.chat, { ...(from.tools && { tools: from.tools }), ...templateOptions })
   // Each image's token expanded to its tokens (the image fetched and
   // resized here); `keys` is what the cache compares.
@@ -1009,16 +1019,16 @@ async function generate(request: GenerateRequest) {
   if (!prompt.length) throw new Error("The prompt has no tokens.")
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
-  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools, variables) : undefined
-  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools, variables) : undefined
+  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, chat, request.thinking, tools, variables) : undefined
+  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, chat, request.thinking, tools, variables) : undefined
   const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
-  const last = prompt[prompt.length - 1]
+  // The reply starts inside a thought when the prompt's last turn opened one
+  // and didn't close it: the template opened it (LFM3's `<think>`, Qwen3.5's
+  // `<think>\n`), or a continued message's thinking has no text after it yet.
   // (A raw prompt is written back as it is: no thinking of the chat template's to announce.)
   const startsInThinking = !raw && think !== null &&
-    (last === think ||
-      (prompt[prompt.length - 2] === think &&
-        tokenizer.decode([last]).trim() === ""))
+    prompt.lastIndexOf(think) > Math.max(prompt.lastIndexOf(tokenizer.specialTokens.thinkEnd ?? -1), prompt.lastIndexOf(tokenizer.specialTokens.imStart ?? -1))
   const thinkingBudget = createThinkingBudget(
     request.thinkingBudgetTokens,
     tokenizer.specialTokens,
@@ -1123,7 +1133,7 @@ async function generate(request: GenerateRequest) {
     for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
   }
   const framing = cacheEnabled && !raw && common > 0 && !whole
-    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking, request.templateVariables) : 0
+    ? templateFramingFor(tokenizer, prompt, chat[0]?.role ?? "user", request.thinking, request.templateVariables) : 0
   const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
   if (!whole) model.previousShared = plan.previousShared
   const cacheRestoreMs = performance.now() - restoreAt

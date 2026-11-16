@@ -552,3 +552,18 @@ test("a Completions request: a raw prompt, no chat, the card's sampling", () => 
   assert.equal(code(() => planTextCompletion({ model: LFM3, prompt: "x", suffix: "y" })), "unsupported-parameter")
   assert.equal(code(() => planTextCompletion({ model: "gpt-4o", prompt: "x" })), "model-not-supported")
 })
+
+test("a last assistant message is continued: one, without tool calls, as llama.cpp allows", () => {
+  const prefill = planCompletion({ model: LFM3, messages: [...hi, { role: "assistant", content: "Hel" }] })
+  assert.deepEqual(prefill.generate.chat.at(-1), { role: "assistant", content: "Hel" })
+  assert.equal(code(() => planCompletion({ model: LFM3, messages: [...hi, { role: "assistant", content: "a" }, { role: "assistant", content: "b" }] })), "TypeError")
+  assert.equal(
+    code(() =>
+      planCompletion({
+        model: LFM3,
+        messages: [...hi, { role: "assistant", content: null, tool_calls: [{ id: "c", type: "function", function: { name: "f", arguments: "{}" } }] }]
+      })
+    ),
+    "TypeError"
+  )
+})

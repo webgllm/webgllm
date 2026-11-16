@@ -370,6 +370,11 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
 
   const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, meta.supports.input.includes("image"))
 
+  // A last assistant message is continued, as llama.cpp does: one, without tool calls.
+  if (chat.at(-1)?.role === "assistant") {
+    if (chat.at(-2)?.role === "assistant") throw new TypeError("Cannot have 2 or more assistant messages at the end of the list.")
+    if (chat.at(-1)?.tool_calls?.length) throw new TypeError("Cannot continue an assistant message that contains tool calls.")
+  }
   if (body.tools !== undefined && body.tools !== null && !Array.isArray(body.tools)) throw new TypeError("tools must be an array.")
   const offered = toTools((body.tools as Array<ChatCompletionTool> | null | undefined) ?? [])
   if (offered.length && !meta.supports.capabilities.includes("tools")) throw unsupported(`${model} doesn't take tools.`)
