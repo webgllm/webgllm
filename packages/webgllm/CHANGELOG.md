@@ -1,3 +1,26 @@
+## 0.3.7 (2026-11-16)
+
+### 🚀 Features
+
+- tool calls held to their tools as they're written, in the model's own format, as llama.cpp's grammars hold them; a named tool is a required call to it ([3533bb4](https://github.com/webgllm/webgllm/commit/3533bb4))
+- frequency_penalty, as llama.cpp's penalty_freq ([aa3cde0](https://github.com/webgllm/webgllm/commit/aa3cde0))
+- continue a last assistant message, as llama.cpp does; past calls in the text only where a template can't write tool_calls ([ed69279](https://github.com/webgllm/webgllm/commit/ed69279))
+- chat_template_kwargs, the reasoning effort to the template, and llama.cpp's thinking budget names ([f1455f9](https://github.com/webgllm/webgllm/commit/f1455f9))
+
+### 🩹 Fixes
+
+- a reference's siblings narrow it, definitions resolve against the tool, and each branch is checked on its own for strings ([1bdf539](https://github.com/webgllm/webgllm/commit/1bdf539))
+- tool calls read and held by their schemas: XML strings stay text, Python calls need their required arguments, references resolve against the whole tool, a cut-off repair stays cut off ([1782818](https://github.com/webgllm/webgllm/commit/1782818))
+- parallel_tool_calls defaults as llama.cpp's: on where the chat template writes a turn's second call ([98d35a2](https://github.com/webgllm/webgllm/commit/98d35a2))
+- close schema objects as llama.cpp does: those that list properties ([88d1925](https://github.com/webgllm/webgllm/commit/88d1925))
+- tool_choice none keeps the tools in the prompt, as llama.cpp does ([69da59b](https://github.com/webgllm/webgllm/commit/69da59b))
+- pass messages and tools to the chat template as llama.cpp does ([d3d8589](https://github.com/webgllm/webgllm/commit/d3d8589))
+- pass the whole tool history and tool results as given, as llama.cpp does; tool-call repair is opt-in ([6e9163b](https://github.com/webgllm/webgllm/commit/6e9163b))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.6 (2026-11-15)
 
 ### 🩹 Fixes
