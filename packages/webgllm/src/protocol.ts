@@ -142,7 +142,11 @@ export type WorkerRequest =
        */
       promptCacheDiskBytes?: number
       tools: Array<ChatTool>
-      /** False: one tool call per reply, as the call's grammar allows (see tool-call-grammar.ts). */
+      /**
+       * False: one tool call per reply, as the call's grammar allows (see
+       * tool-call-grammar.ts). Unset: whether the template writes a turn's
+       * second call, as llama.cpp defaults it.
+       */
       parallelToolCalls?: boolean
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean

@@ -124,7 +124,11 @@ export type ChatCompletionCreateParamsBase = {
   response_format?: ResponseFormat
   tools?: Array<ChatCompletionTool>
   tool_choice?: ChatCompletionToolChoiceOption
-  /** False keeps only the first tool call of a reply. */
+  /**
+   * False: one tool call per reply (the call's grammar ends the reply after
+   * it). Unset, as llama.cpp defaults it: true where the model's chat
+   * template writes a turn's second call, else false.
+   */
   parallel_tool_calls?: boolean
   /**
    * "none" turns thinking off (models that can't switch it off ignore it),

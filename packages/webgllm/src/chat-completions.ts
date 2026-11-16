@@ -428,7 +428,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     ...(stops.length && { stop: stops }),
     ...(seed !== undefined && { seed }),
     ...(toolChoice !== "auto" && { toolChoice }),
-    ...(body.parallel_tool_calls === false && { parallelToolCalls: false }),
+    ...(typeof body.parallel_tool_calls === "boolean" && { parallelToolCalls: body.parallel_tool_calls }),
     ...(body.cache_prompt === false && { cachePrompt: false }),
     ...(logprobs && { logprobs, ...(topLogprobs !== undefined && { topLogprobs }) }),
     ...(logitBias && { logitBias })

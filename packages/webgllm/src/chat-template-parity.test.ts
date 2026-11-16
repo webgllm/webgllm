@@ -35,11 +35,13 @@ const call: ChatMessage = {
   tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: { city: "Oslo" } } }]
 }
 
-test("the templates that write past tool calls, and the ones that don't", () => {
-  assert.equal(withTemplate(TEMPLATES.lfm3).writesToolCalls(), true)
-  assert.equal(withTemplate(TEMPLATES.qwen).writesToolCalls(), true)
-  assert.equal(withTemplate(TEMPLATES.lfm25).writesToolCalls(), true)
+test("the templates that write past tool calls, and a turn's second one (llama.cpp's default for parallel calls)", () => {
+  for (const url of [TEMPLATES.lfm3, TEMPLATES.qwen, TEMPLATES.lfm25]) {
+    assert.equal(withTemplate(url).writesToolCalls(), true, url)
+    assert.equal(withTemplate(url).writesParallelToolCalls(), true, url)
+  }
   assert.equal(withTemplate(TEMPLATES.lfm25Onnx).writesToolCalls(), false)
+  assert.equal(withTemplate(TEMPLATES.lfm25Onnx).writesParallelToolCalls(), false)
 })
 
 test("LFM2.5's template writes a past call itself; where a template can't, the call goes into the turn's text", () => {

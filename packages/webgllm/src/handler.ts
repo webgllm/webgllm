@@ -1060,7 +1060,8 @@ async function generate(request: GenerateRequest) {
     ? new ToolCallGrammar({
       format: callFormat,
       tools: toolPlan.callable ?? toolPlan.tools,
-      parallel: request.parallelToolCalls !== false,
+      // Unset, as llama.cpp defaults it: whether the template writes a turn's second call.
+      parallel: request.parallelToolCalls ?? tokenizer.writesParallelToolCalls(),
       vocab: callVocab(tokenizer),
       start: callStart,
       end: callEnd,

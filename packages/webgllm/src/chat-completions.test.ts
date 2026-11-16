@@ -233,6 +233,10 @@ test("tools and tool_choice", () => {
     "TypeError"
   )
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: false }).parallelToolCalls, false)
+  // Set either way, it goes to the worker; unset, the worker takes the template's default (llama.cpp's).
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: false }).generate.parallelToolCalls, false)
+  assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: true }).generate.parallelToolCalls, true)
+  assert.equal("parallelToolCalls" in planCompletion({ model: LFM3, messages: hi, tools: [weather] }).generate, false)
   // A tool without a description or parameters, as llama.cpp passes it: "" and {}.
   const bare = planCompletion({ model: LFM3, messages: hi, tools: [{ type: "function", function: { name: "now" } }] })
   assert.deepEqual(bare.generate.tools[0]?.function, { name: "now", description: "", parameters: {} })

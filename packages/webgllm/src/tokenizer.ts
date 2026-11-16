@@ -144,6 +144,11 @@ export type Tokenizer = {
   specialTokens: SpecialTokenIds
   /** Whether the chat template writes past turns' `tool_calls` (found once, by rendering one). */
   writesToolCalls: () => boolean
+  /**
+   * Whether it writes a turn's second tool call too: llama.cpp's
+   * supports_parallel_tool_calls, the default for parallel calls.
+   */
+  writesParallelToolCalls: () => boolean
   /** One past the highest id the tokenizer knows (the model's may be more). */
   vocabSize: number
   /** Exact tokenizer data for the schema constraint runtime. */
@@ -380,26 +385,33 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     return template.render(context)
   }
 
-  let writes: boolean | undefined
-  const writesToolCalls = () => {
-    if (writes === undefined) {
+  // A past turn with two calls, rendered once: whether the template writes
+  // the first (tool_calls at all) and the second (parallel calls), as
+  // llama.cpp's capability checks find them.
+  let written: { first: boolean; second: boolean } | undefined
+  const probeToolCalls = () => {
+    if (!written) {
+      const call = (id: string, name: string) => ({ id, type: "function" as const, function: { name, arguments: { arg: "value" } } })
+      const probe: Array<ChatMessage> = [
+        { role: "user", content: "x" },
+        { role: "assistant", content: "", tool_calls: [call("c1", "webgllm_probe_first"), call("c2", "webgllm_probe_second")] },
+        { role: "tool", content: "y", tool_call_id: "c1" },
+        { role: "tool", content: "z", tool_call_id: "c2" }
+      ]
       try {
-        const name = "webgllm_probe_tool"
-        const probe: Array<ChatMessage> = [
-          { role: "user", content: "x" },
-          { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name, arguments: {} } }] },
-          { role: "tool", content: "y", tool_call_id: "c" }
-        ]
-        writes = renderChat(probe, {}).includes(name)
+        const text = renderChat(probe, {})
+        written = { first: text.includes("webgllm_probe_first"), second: text.includes("webgllm_probe_second") }
       } catch {
-        writes = true
+        // A template that can't render the probe: llama.cpp takes it as no tool calls, nor parallel ones.
+        written = { first: false, second: false }
       }
     }
-    return writes
+    return written
   }
 
   return {
-    writesToolCalls,
+    writesToolCalls: () => probeToolCalls().first,
+    writesParallelToolCalls: () => probeToolCalls().second,
     encode,
     decode,
     createStreamDecoder,
