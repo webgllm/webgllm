@@ -985,7 +985,8 @@ async function generate(request: GenerateRequest) {
   const tokenizeAt = performance.now()
   // A raw prompt (OpenAI's Completions) is read as it is: no chat template, so nothing of a chat's framing to cache by.
   const raw = request.prompt !== undefined
-  const templateOptions = { ...(request.thinking !== undefined && { enableThinking: request.thinking }), addGenerationPrompt: true }
+  const variables = request.templateVariables
+  const templateOptions = { ...variables, ...(request.thinking !== undefined && { enableThinking: request.thinking }), addGenerationPrompt: true }
   const encoded = raw ? tokenizer.encode(request.prompt!) : tokenizer.encodeChat(request.chat, { tools, ...templateOptions })
   // The text those tokens are of, for another source: how the image step
   // tells the template's image placeholders from a message's own text.
@@ -1008,8 +1009,8 @@ async function generate(request: GenerateRequest) {
   if (!prompt.length) throw new Error("The prompt has no tokens.")
   const prepareImagesMs = performance.now() - imagesAt
   const cacheEnabled = request.cachePrompt !== false
-  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
-  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools) : undefined
+  const prefix = cacheEnabled && !raw ? systemPrefixFor(tokenizer, prompt, request.chat, request.thinking, tools, variables) : undefined
+  const anchor = cacheEnabled && !raw ? anchorFor(tokenizer, prompt, request.chat, request.thinking, tools, variables) : undefined
   const tokenizeMs = performance.now() - tokenizeAt - prepareImagesMs
   const think = tokenizer.specialTokens.think
   const last = prompt[prompt.length - 1]
@@ -1122,7 +1123,7 @@ async function generate(request: GenerateRequest) {
     for (const size of engine.batchSizes(prompt.length - start)) { at += size; if (at > prefix) break; natural = at }
   }
   const framing = cacheEnabled && !raw && common > 0 && !whole
-    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking) : 0
+    ? templateFramingFor(tokenizer, prompt, request.chat[0]?.role ?? "user", request.thinking, request.templateVariables) : 0
   const plan = adaptivePrefixFor({ shared: common, declared: prefix, retained: engine.snapshotPosition("prefix"), previousShared: model.previousShared, natural, framing })
   if (!whole) model.previousShared = plan.previousShared
   const cacheRestoreMs = performance.now() - restoreAt

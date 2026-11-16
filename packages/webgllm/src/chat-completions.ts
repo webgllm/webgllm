@@ -231,16 +231,19 @@ function toToolChoice(choice: unknown, tools: Array<ChatTool>): ToolChoice {
 }
 
 /**
- * The reasoning effort and thinking budget, as OpenRouter takes them:
- * `reasoning: { effort, max_tokens }`, or OpenAI's `reasoning_effort`. A
- * budget without an effort turns thinking on.
+ * The reasoning effort and thinking budget: OpenRouter's `reasoning: {
+ * effort, max_tokens }` or OpenAI's `reasoning_effort`, and llama.cpp's
+ * `reasoning_budget_tokens` (or `thinking_budget_tokens`; -1 for none).
+ * OpenRouter's budget without an effort turns thinking on; llama.cpp's is
+ * a budget only, as there. `given` is the effort as the request wrote it.
  */
-function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: number | undefined } {
-  if (body.thinking_budget_tokens !== undefined && body.thinking_budget_tokens !== null) {
-    throw unsupported("thinking_budget_tokens is now reasoning.max_tokens.")
-  }
+function reasoningOf(body: Record<string, unknown>): { effort: unknown; given: unknown; budget: number | undefined } {
+  const llamaBudget =
+    numberField(body, "reasoning_budget_tokens", { min: -1, integer: true }) ??
+    numberField(body, "thinking_budget_tokens", { min: -1, integer: true })
+  const llama = llamaBudget === -1 ? undefined : llamaBudget
   const reasoning = body.reasoning
-  if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, budget: undefined }
+  if (reasoning === undefined || reasoning === null) return { effort: body.reasoning_effort, given: body.reasoning_effort, budget: llama }
   if (typeof reasoning !== "object" || Array.isArray(reasoning)) throw new TypeError("reasoning must be an object.")
   const fields = reasoning as Record<string, unknown>
   const other = Object.keys(fields).find((key) => key !== "effort" && key !== "max_tokens")
@@ -251,7 +254,26 @@ function reasoningOf(body: Record<string, unknown>): { effort: unknown; budget: 
     throw new TypeError("reasoning.effort and reasoning_effort disagree.")
   }
   const budget = numberField({ "reasoning.max_tokens": fields.max_tokens }, "reasoning.max_tokens", { min: 0, integer: true })
-  return { effort: own ?? openai ?? (budget !== undefined ? "high" : undefined), budget }
+  if (budget !== undefined && llama !== undefined && budget !== llama) {
+    throw new TypeError("reasoning.max_tokens and reasoning_budget_tokens disagree.")
+  }
+  const given = own ?? openai
+  return { effort: given ?? (budget !== undefined ? "high" : undefined), given, budget: budget ?? llama }
+}
+
+/**
+ * llama.cpp's `chat_template_kwargs`: more chat template variables, and
+ * its `enable_thinking` (a boolean) for thinking.
+ */
+function templateKwargsOf(body: Record<string, unknown>): { variables: Record<string, unknown>; enableThinking: boolean | undefined } {
+  const kwargs = body.chat_template_kwargs
+  if (kwargs === undefined || kwargs === null) return { variables: {}, enableThinking: undefined }
+  if (typeof kwargs !== "object" || Array.isArray(kwargs)) throw new TypeError("chat_template_kwargs must be an object.")
+  const { enable_thinking, ...variables } = kwargs as Record<string, unknown>
+  if (enable_thinking !== undefined && enable_thinking !== null && typeof enable_thinking !== "boolean") {
+    throw new TypeError("chat_template_kwargs.enable_thinking must be a boolean.")
+  }
+  return { variables, enableThinking: enable_thinking ?? undefined }
 }
 
 /**
@@ -355,8 +377,15 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   // "none" offers no tools at all: the prompt doesn't list them.
   const tools = toolChoice === "none" ? [] : offered
 
-  const { effort, budget } = reasoningOf(body)
-  const thinking = thinkingFor(effort, meta)
+  const { effort, given, budget } = reasoningOf(body)
+  const kwargs = templateKwargsOf(body)
+  // As llama.cpp reads them: the kwargs' enable_thinking, which effort "none" overrides.
+  const thinking = effort === "none" ? thinkingFor(effort, meta) : (kwargs.enableThinking ?? thinkingFor(effort, meta))
+  // The effort goes to the template too, under both names llama.cpp gives it ("none" doesn't).
+  const templateVariables = {
+    ...kwargs.variables,
+    ...(typeof given === "string" && given !== "none" && { reasoning_effort: given, reasoning_strength: given })
+  }
   if (budget !== undefined && thinking !== false && !meta.reasoning?.budget) {
     throw unsupported(`${model} doesn't take a thinking budget.`)
   }
@@ -387,6 +416,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     tools,
     sampling: samplingFor(body, meta, thinking),
     ...(thinking !== undefined && { thinking }),
+    ...(Object.keys(templateVariables).length && { templateVariables }),
     // Thinking switched off ignores a budget.
     ...(budget !== undefined && thinking !== false && { thinkingBudgetTokens: budget }),
     ...(outputSchema && { outputSchema }),

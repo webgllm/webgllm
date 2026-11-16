@@ -7,6 +7,9 @@
 import type { Engine } from "./engine.js"
 import type { ChatMessage, ChatTool, Tokenizer } from "./tokenizer.js"
 
+/** Chat template variables beside the chat, its tools and `enable_thinking` (llama.cpp's chat_template_kwargs). */
+export type TemplateVariables = Record<string, unknown>
+
 /** How many leading items `a` and `b` share. */
 export function sharedPrefix(a: ArrayLike<number>, b: ArrayLike<number>) {
   let n = 0
@@ -17,16 +20,16 @@ export function sharedPrefix(a: ArrayLike<number>, b: ArrayLike<number>) {
 const framing = new WeakMap<Tokenizer, Map<string, Array<number>>>()
 
 /** Tokenization-only probes identify framing, not instructions; no probe is sent to a model. */
-export function templateFramingFor(tokenizer: Tokenizer, prompt: Array<number>, role: string, thinking?: boolean): number {
+export function templateFramingFor(tokenizer: Tokenizer, prompt: Array<number>, role: string, thinking?: boolean, variables?: TemplateVariables): number {
   if (role !== "system" && role !== "user") return 0
   let entries = framing.get(tokenizer)
   if (!entries) { entries = new Map(); framing.set(tokenizer, entries) }
-  const key = JSON.stringify({ role, thinking })
+  const key = JSON.stringify({ role, thinking, variables })
   let tokens = entries.get(key)
   if (!tokens) {
     const chat = (content: string): Array<ChatMessage> => [{ role, content }, ...(role === "system" ? [{ role: "user" as const, content: "Z" }] : [])]
     try {
-      const options = { addGenerationPrompt: false, ...(thinking !== undefined && { enableThinking: thinking }) }
+      const options = { ...variables, addGenerationPrompt: false, ...(thinking !== undefined && { enableThinking: thinking }) }
       const a = tokenizer.encodeChat(chat("A"), options), b = tokenizer.encodeChat(chat("B"), options)
       tokens = a.slice(0, sharedPrefix(a, b))
     } catch { tokens = [] }
@@ -48,15 +51,17 @@ export function systemPrefixFor(
   prompt: Array<number>,
   chat: Array<ChatMessage>,
   thinking: boolean | undefined,
-  tools?: Array<ChatTool>
+  tools?: Array<ChatTool>,
+  variables?: TemplateVariables
 ): number | undefined {
   const first = chat.findIndex(message => message.role !== "system")
   const system = first < 0 ? chat : chat.slice(0, first)
   if (!system.length && !tools?.length) return undefined
-  const key = JSON.stringify({ system, thinking, tools })
+  const key = JSON.stringify({ system, thinking, tools, variables })
   let known = prefixes.get(tokenizer)
   if (!known || known.key !== key) {
     const options = {
+      ...variables,
       addGenerationPrompt: false,
       ...(tools?.length && { tools }),
       ...(thinking !== undefined && { enableThinking: thinking })
@@ -95,12 +100,14 @@ export function systemPrefixFor(
 export function unsharedTail(
   tokenizer: Tokenizer,
   thinking: boolean | undefined,
-  tools?: Array<ChatTool>
+  tools?: Array<ChatTool>,
+  variables?: TemplateVariables
 ) {
-  const key = JSON.stringify({ thinking, tools })
+  const key = JSON.stringify({ thinking, tools, variables })
   const known = tails.get(tokenizer)
   if (known?.key === key) return known.tail
   const options = {
+    ...variables,
     addGenerationPrompt: true,
     ...(tools?.length && { tools }),
     ...(thinking !== undefined && { enableThinking: thinking })
@@ -129,10 +136,11 @@ export function anchorFor(
   prompt: Array<number>,
   chat: Array<{ role: string }>,
   thinking: boolean | undefined,
-  tools?: Array<ChatTool>
+  tools?: Array<ChatTool>,
+  variables?: TemplateVariables
 ) {
   if (chat[chat.length - 1]?.role !== "user") return undefined
-  const tail = unsharedTail(tokenizer, thinking, tools)
+  const tail = unsharedTail(tokenizer, thinking, tools, variables)
   if (tail <= 0) return prompt.length
   const imStart = tokenizer.specialTokens.imStart
   const from = prompt.length - tail

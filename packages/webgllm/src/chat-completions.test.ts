@@ -116,8 +116,27 @@ test("a thinking budget (reasoning.max_tokens) needs a model that takes one, tur
     false
   )
   assert.equal(code(() => planCompletion({ model: LFM2, messages: hi, reasoning: { max_tokens: 64 } })), "unsupported-parameter")
-  // The old field is refused, never dropped: a cap the caller asked for isn't silently lost.
-  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", thinking_budget_tokens: 64 } as never)), "unsupported-parameter")
+  // llama.cpp's names: a budget only (thinking as it was), -1 for none, and they must agree with reasoning.max_tokens.
+  const llama = planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", reasoning_budget_tokens: 64 }).generate
+  assert.equal(llama.thinkingBudgetTokens, 64)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "high", thinking_budget_tokens: 32 }).generate.thinkingBudgetTokens, 32)
+  assert.equal("thinking" in planCompletion({ model: QWEN, messages: hi, reasoning_budget_tokens: 64 }).generate, false)
+  assert.equal("thinkingBudgetTokens" in planCompletion({ model: QWEN, messages: hi, reasoning_budget_tokens: -1 }).generate, false)
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, reasoning: { max_tokens: 64 }, reasoning_budget_tokens: 32 })), "TypeError")
+})
+
+test("chat_template_kwargs and the effort go to the template, as llama.cpp passes them", () => {
+  const kw = planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }).generate
+  assert.equal(kw.thinking, true)
+  assert.deepEqual(kw.templateVariables, { preserve_thinking: true })
+  // reasoning_effort "none" wins over the kwargs' enable_thinking; another level leaves it be.
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none", chat_template_kwargs: { enable_thinking: true } }).generate.thinking, false)
+  assert.equal(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "low", chat_template_kwargs: { enable_thinking: false } }).generate.thinking, false)
+  assert.deepEqual(planCompletion({ model: QWEN, messages: hi, reasoning_effort: "low" }).generate.templateVariables, { reasoning_effort: "low", reasoning_strength: "low" })
+  assert.equal("templateVariables" in planCompletion({ model: QWEN, messages: hi, reasoning_effort: "none" }).generate, false)
+  assert.equal("templateVariables" in planCompletion({ model: QWEN, messages: hi }).generate, false)
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: { enable_thinking: "yes" } })), "TypeError")
+  assert.equal(code(() => planCompletion({ model: QWEN, messages: hi, chat_template_kwargs: [] as never })), "TypeError")
 })
 
 test("reasoning.effort works as reasoning_effort; the two must agree, and other reasoning fields are refused", () => {

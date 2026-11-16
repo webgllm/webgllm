@@ -144,6 +144,11 @@ export type WorkerRequest =
       tools: Array<ChatTool>
       /** The chat template's `enable_thinking`; its default when left out. */
       thinking?: boolean
+      /**
+       * More chat template variables, by their names in the template:
+       * llama.cpp's `chat_template_kwargs` and its `reasoning_effort`.
+       */
+      templateVariables?: Record<string, unknown>
       /** Close thinking at this many content tokens, then continue the answer. */
       thinkingBudgetTokens?: number
       /** JSON Schema enforced during answer token selection. */
