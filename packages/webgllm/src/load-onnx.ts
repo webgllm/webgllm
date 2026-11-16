@@ -252,6 +252,7 @@ export async function* loadOnnx(
     let conv: ConvWeights | undefined
     let attention: AttentionWeights | undefined
     let linear: LinearAttentionWeights | undefined
+    let headsReordered = false
     if (l.type === "linear_attention") {
       const lc = config.linear
       if (!lc) throw new Error("ONNX: the config has no Gated DeltaNet shapes")
@@ -300,6 +301,7 @@ export async function* loadOnnx(
       // A graph with HF's head layout: each head's rotated dims are put
       // first, q's, k's and their norms' (see headPermutation).
       const reorder = l.hfHeads && rotatedDims(l.type, config) < headDim
+      headsReordered = !!reorder
       const qPerm = reorder ? headPermutation(numHeads, headDim, rotatedDims(l.type, config)) : undefined
       const kPerm = reorder ? headPermutation(numKvHeads, headDim, rotatedDims(l.type, config)) : undefined
       const normPerm = reorder ? headPermutation(1, headDim, rotatedDims(l.type, config)) : undefined
@@ -338,7 +340,7 @@ export async function* loadOnnx(
     if (conv) value.conv = conv
     if (attention) value.attention = attention
     if (linear) value.linear = linear
-    yield { kind: "layer", layer: i, value }
+    yield { kind: "layer", layer: i, value, ...(headsReordered && { headsReordered }) }
   }
 
   yield { kind: "finalNorm", value: await floats(finalNorm, D) }

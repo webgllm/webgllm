@@ -17,6 +17,8 @@ adb reverse tcp:8787 tcp:8787        # a phone over USB: localhost is a secure c
 - `ONNX_COMMUNITY_DIR` (served at `/onnx-community/`): a copy of `onnx-community/LFM3-1.7B-ONNX` (config, tokenizer, `onnx/model_q4f16.onnx*`), `check.html`'s ONNX build by default; `ONNX_DIR` (served at `/onnx/`, `&onnx=onnx`) for another ONNX build
 - `HF_DIR`: `LiquidAI/LFM3-1.7B`'s `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`
 - `REF_DIR`, `REF_ONNX_DIR`: reference tensors from llama.cpp and onnxruntime (`manifest.json`, `tokens.json`, `logits.bin`, `gen_logits.bin`, `l_out-N.bin`, …)
+  - `make-onnx-ref.py` writes a `REF_ONNX_DIR` from an ONNX build with onnxruntime on the CPU: `python -I bench/make-onnx-ref.py <onnx-community/LFM3-1.7B-ONNX dir> <out dir>` (a 345-token chat prompt, longer than the sliding window, and 32 greedy steps). MatMulNBits' `accuracy_level` is 0 by default: the export's 4 quantizes activations to int8 on the CPU, which puts onnxruntime itself further from full precision than the engine.
+  - `check.html` reorders a reference's q/k heads only in the layers the loader reordered (`headsReordered` on a layer piece): every full-attention layer of a GGUF (llama.cpp's HF layout), and an ONNX graph's only where it uses HF's layout.
 - `RESULTS_FILE`: where pages' `POST /result` lines go (default `bench/results.jsonl`)
 
 Results print in the server's terminal: each line a page logs is `[page] …`.

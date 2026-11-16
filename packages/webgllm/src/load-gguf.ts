@@ -384,7 +384,8 @@ export async function* loadGguf(
     if (conv) value.conv = conv
     if (attention) value.attention = attention
     if (linear) value.linear = linear
-    yield { kind: "layer", layer: i, value }
+    // Full-attention layers' q/k rows are put in rotated-first order (qPerm, kPerm) from llama.cpp's HF layout.
+    yield { kind: "layer", layer: i, value, ...(full && attention && { headsReordered: true }) }
   }
 
   yield { kind: "finalNorm", value: await norm(finalNormName) }
