@@ -28,7 +28,7 @@ import type { FinishReason as WorkerFinishReason, RunTimings, TokenLogprob, Tool
 import { createThinkingSplitter } from "./reply.js"
 import type { Sampling } from "./sampler.js"
 import type { ChatContentPart, ChatMessage, ChatTool } from "./tokenizer.js"
-import { createToolCallSplitter, formatLfm2ToolCalls, parseToolCalls } from "./tool-calls.js"
+import { createToolCallSplitter, parseToolCalls } from "./tool-calls.js"
 import { closeObjects } from "./tool-choice.js"
 import type { ParsedToolCall, ToolFormat } from "./tool-calls.js"
 
@@ -121,6 +121,12 @@ export function contentText(content: ChatCompletionContent | null | undefined): 
   return text
 }
 
+/**
+ * A past call's arguments as the template takes them: the JSON parsed (an
+ * object, as llama.cpp parses them for templates that read objects). Text
+ * that isn't JSON, such as a call cut off at the token limit, is `{}`:
+ * llama.cpp refuses the request, and the templates fail on a string.
+ */
 function parseArguments(json: string): Record<string, unknown> {
   try {
     const args = JSON.parse(json) as unknown
@@ -130,13 +136,8 @@ function parseArguments(json: string): Record<string, unknown> {
   }
 }
 
-/**
- * An assistant turn with tool calls, written the way the model's template
- * takes them: LFM2's template doesn't read `tool_calls`, so its calls go in
- * the content in its own format; LFM3's and Qwen3.5's write `tool_calls`.
- */
-function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: string }>, format: ToolFormat): ChatMessage {
-  if (format === "lfm2") return { role: "assistant", content: content + formatLfm2ToolCalls(calls) }
+/** An assistant turn with tool calls, as `tool_calls`: the template writes them in its own format. */
+function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: string }>): ChatMessage {
   return {
     role: "assistant",
     content,
@@ -144,30 +145,22 @@ function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: 
   }
 }
 
-/** A tool-call turn's thinking, under the key the format's template reads. */
-function withThinking(turn: ChatMessage, thinking: string, format: ToolFormat): ChatMessage {
-  if (format === "lfm3") return { ...turn, thinking }
-  if (format === "qwen3.5") return { ...turn, reasoning_content: thinking }
-  return turn
-}
-
 /**
  * OpenAI messages as chat-template messages, as llama.cpp passes them to a
- * chat template. System and developer messages join into one leading system
- * message (templates take one, first). Every turn's tool calls and results
- * stay, with a call's thinking where it has some: the template decides what
- * of them it writes. A tool result is its content as given.
+ * chat template: each message as given, its thinking as `reasoning_content`
+ * and its tool calls as `tool_calls`, so the template decides what of them
+ * it writes. One change: system and developer messages join into one
+ * leading system message, since Qwen3.5's template refuses a system message
+ * anywhere else.
  */
 export function toChatMessages(
   messages: Array<ChatCompletionMessageParam>,
-  format: ToolFormat,
   /** Whether the model reads images (user messages' image_url parts). */
   images = false
 ): Array<ChatMessage> {
   if (!Array.isArray(messages) || messages.length === 0) throw new TypeError("messages must be a non-empty array.")
   const system: Array<string> = []
   const chat: Array<ChatMessage> = []
-  const toolNames = new Map<string, string>()
   for (const m of messages) {
     switch (m?.role) {
       case "system":
@@ -176,19 +169,16 @@ export function toChatMessages(
         if (text) system.push(text)
         break
       }
-      case "user": {
-        const content = userContent(m.content, images)
-        if (content.length) chat.push({ role: "user", content })
+      case "user":
+        chat.push({ role: "user", content: userContent(m.content, images) })
         break
-      }
       case "tool": {
-        const text = contentText(m.content)
-        const name = toolNames.get(m.tool_call_id)
+        const name = (m as { name?: unknown }).name
         chat.push({
           role: "tool",
-          content: text,
+          content: contentText(m.content),
           ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
-          ...(name && { name })
+          ...(typeof name === "string" && name && { name })
         })
         break
       }
@@ -198,15 +188,10 @@ export function toChatMessages(
           if (call?.type !== "function" || typeof call.function?.name !== "string") {
             throw unsupported("Assistant tool calls must be function calls.")
           }
-          toolNames.set(call.id, call.function.name)
           return { id: call.id, name: call.function.name, args: parseArguments(call.function.arguments) }
         })
-        if (calls.length === 0) {
-          if (text) chat.push({ role: "assistant", content: text })
-          break
-        }
-        const turn = assistantToolTurn(text, calls, format)
-        chat.push(m.reasoning_content ? withThinking(turn, m.reasoning_content, format) : turn)
+        const turn: ChatMessage = calls.length ? assistantToolTurn(text, calls) : { role: "assistant", content: text }
+        chat.push(m.reasoning_content ? { ...turn, reasoning_content: m.reasoning_content } : turn)
         break
       }
       default:
@@ -221,13 +206,10 @@ function toTools(tools: Array<ChatCompletionTool>): Array<ChatTool> {
     if (tool?.type !== "function" || typeof tool.function?.name !== "string") {
       throw unsupported(`Tools of type "${String(tool?.type)}" aren't supported: only "function".`)
     }
+    // As llama.cpp passes a tool: no description is "", no parameters {}.
     return {
       type: "function",
-      function: {
-        name: tool.function.name,
-        ...(tool.function.description !== undefined && { description: tool.function.description }),
-        parameters: tool.function.parameters ?? { type: "object", properties: {}, required: [] }
-      }
+      function: { name: tool.function.name, description: tool.function.description ?? "", parameters: tool.function.parameters ?? {} }
     }
   })
 }
@@ -364,8 +346,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
   }
   if (body.prediction) throw unsupported("Predicted outputs aren't supported.")
 
-  const format = meta.toolFormat ?? "lfm3"
-  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, format, meta.supports.input.includes("image"))
+  const chat = toChatMessages(body.messages as Array<ChatCompletionMessageParam>, meta.supports.input.includes("image"))
 
   if (body.tools !== undefined && body.tools !== null && !Array.isArray(body.tools)) throw new TypeError("tools must be an array.")
   const offered = toTools((body.tools as Array<ChatCompletionTool> | null | undefined) ?? [])
@@ -598,12 +579,11 @@ export async function planRepairs(
 export function repairRequest(plan: CompletionPlan, repair: ToolRepair): GenerateFields {
   const { stop: _stop, thinkingBudgetTokens: _budget, ...rest } = plan.generate
   const meta = modelMeta(plan.model)
-  const format = meta.toolFormat ?? "lfm3"
   const names = plan.generate.tools.map((t) => t.function.name).join(", ")
   const attempt: ChatMessage =
     repair.problem === "malformed"
       ? { role: "assistant", content: repair.markup }
-      : assistantToolTurn("", [{ ...repair.draft, id: "call_0" }], format)
+      : assistantToolTurn("", [{ ...repair.draft, id: "call_0" }])
   const note =
     repair.problem === "invalid-arguments"
       ? `The arguments of that ${repair.draft.name} call don't match its parameters. Call ${repair.draft.name} again with arguments that do.`

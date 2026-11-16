@@ -190,7 +190,7 @@ test("tools and tool_choice", () => {
   const auto = planCompletion({ model: LFM3, messages: hi, tools: [weather] })
   assert.equal(auto.parseTools, true)
   assert.equal("toolChoice" in auto.generate, false)
-  assert.deepEqual(auto.generate.tools[0], { type: "function", function: weather.function })
+  assert.deepEqual(auto.generate.tools[0], { type: "function", function: { description: "", ...weather.function } })
   const none = planCompletion({ model: LFM3, messages: hi, tools: [weather], tool_choice: "none" })
   assert.deepEqual(none.generate.tools, [])
   assert.equal(none.generate.toolChoice, "none")
@@ -213,27 +213,24 @@ test("tools and tool_choice", () => {
     "TypeError"
   )
   assert.equal(planCompletion({ model: LFM3, messages: hi, tools: [weather], parallel_tool_calls: false }).parallelToolCalls, false)
-  // A tool without parameters gets an empty object schema.
+  // A tool without a description or parameters, as llama.cpp passes it: "" and {}.
   const bare = planCompletion({ model: LFM3, messages: hi, tools: [{ type: "function", function: { name: "now" } }] })
-  assert.deepEqual(bare.generate.tools[0]?.function.parameters, { type: "object", properties: {}, required: [] })
+  assert.deepEqual(bare.generate.tools[0]?.function, { name: "now", description: "", parameters: {} })
 })
 
 test("messages: system and developer join first; parts join; tool calls get object arguments", () => {
-  const chat = toChatMessages(
-    [
-      { role: "system", content: "Be brief." },
-      { role: "user", content: [{ type: "text", text: "Weather " }, { type: "text", text: "in Paris?" }] },
-      { role: "developer", content: "Use tools." },
-      {
-        role: "assistant",
-        content: null,
-        reasoning_content: "Need the tool.",
-        tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } }]
-      },
-      { role: "tool", tool_call_id: "call_1", content: "18C" }
-    ],
-    "qwen3.5"
-  )
+  const chat = toChatMessages([
+    { role: "system", content: "Be brief." },
+    { role: "user", content: [{ type: "text", text: "Weather " }, { type: "text", text: "in Paris?" }] },
+    { role: "developer", content: "Use tools." },
+    {
+      role: "assistant",
+      content: null,
+      reasoning_content: "Need the tool.",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } }]
+    },
+    { role: "tool", tool_call_id: "call_1", content: "18C" }
+  ])
   assert.deepEqual(chat, [
     { role: "system", content: "Be brief.\n\nUse tools." },
     { role: "user", content: "Weather in Paris?" },
@@ -243,47 +240,44 @@ test("messages: system and developer join first; parts join; tool calls get obje
       reasoning_content: "Need the tool.",
       tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } }]
     },
-    { role: "tool", content: "18C", tool_call_id: "call_1", name: "get_weather" }
+    // A tool result's name only where the message gives one, as llama.cpp reads it.
+    { role: "tool", content: "18C", tool_call_id: "call_1" }
   ])
 })
 
-test("messages: LFM3 keeps thinking as `thinking`; LFM2 writes calls into the content", () => {
-  const turn = [
-    { role: "user" as const, content: "Weather?" },
+test("messages: as llama.cpp passes them: thinking on every assistant turn, calls as tool_calls, empty messages kept", () => {
+  const chat = toChatMessages([
+    { role: "user", content: "Weather?" },
     {
-      role: "assistant" as const,
+      role: "assistant",
       content: "",
       reasoning_content: "hmm",
-      tool_calls: [{ id: "c", type: "function" as const, function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }]
+      tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: '{"city":"Oslo"}' } }]
     },
-    { role: "tool" as const, tool_call_id: "c", content: "" }
-  ]
-  assert.equal(toChatMessages(turn, "lfm3")[1]?.thinking, "hmm")
-  const lfm2 = toChatMessages(turn, "lfm2")
-  assert.equal(lfm2[1]?.content, '<|tool_call_start|>[get_weather(city="Oslo")]<|tool_call_end|>')
-  assert.equal(lfm2[1]?.tool_calls, undefined)
-  // A tool result is its content as given, empty too, as llama.cpp passes it.
-  assert.equal(lfm2[2]?.content, "")
-})
-
-test("messages: earlier turns keep their tool calls and results, as llama.cpp passes them", () => {
-  const chat = toChatMessages(
-    [
-      { role: "user", content: "Weather?" },
-      { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: "{}" } }] },
-      { role: "tool", tool_call_id: "c", content: "18C" },
-      { role: "assistant", content: "It's 18C." },
-      { role: "user", content: "Thanks" }
-    ],
-    "lfm3"
-  )
+    { role: "tool", tool_call_id: "c", content: "", name: "get_weather" } as never,
+    { role: "assistant", content: "It's 18C.", reasoning_content: "done" },
+    { role: "user", content: "" },
+    { role: "assistant", content: null } as never
+  ])
   assert.deepEqual(chat, [
     { role: "user", content: "Weather?" },
-    { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: {} } }] },
-    { role: "tool", content: "18C", tool_call_id: "c", name: "get_weather" },
-    { role: "assistant", content: "It's 18C." },
-    { role: "user", content: "Thanks" }
+    {
+      role: "assistant",
+      content: "",
+      reasoning_content: "hmm",
+      tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: { city: "Oslo" } } }]
+    },
+    { role: "tool", content: "", tool_call_id: "c", name: "get_weather" },
+    { role: "assistant", content: "It's 18C.", reasoning_content: "done" },
+    { role: "user", content: "" },
+    { role: "assistant", content: "" }
   ])
+  // Arguments that aren't JSON (a call cut off at the token limit) are {}: the templates fail on a string.
+  const cut = toChatMessages([
+    { role: "user", content: "Weather?" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: '{"city":"Os' } }] }
+  ])
+  assert.deepEqual(cut[1]?.tool_calls?.[0]?.function.arguments, {})
 })
 
 const end = { finishReason: "stop" as const }
@@ -467,10 +461,10 @@ test("repairRequest appends the failed call and a note, drops stop strings and c
   assert.equal(malformed.thinking, false)
   assert.equal(malformed.thinkingBudgetTokens, undefined)
   assert.equal(malformed.chat.at(-2)?.content, "<tool_call>junk")
-  // LFM2 writes calls in its own format, in the content.
+  // LFM2's failed call goes as tool_calls too: its template writes it.
   const lfm2 = planCompletion({ model: "LiquidAI/LFM2.5-350M-GGUF", messages: hi, tools: [weatherTool] })
   const written = repairRequest(lfm2, { index: 0, problem: "unknown-tool", choice: "any", draft: { name: "get_time", args: {} } })
-  assert.match(String(written.chat.at(-2)?.content ?? ""), /get_time/)
+  assert.equal(written.chat.at(-2)?.tool_calls?.[0]?.function.name, "get_time")
   assert.match(String(written.chat.at(-1)?.content ?? ""), /no tool named get_time/)
 })
 

@@ -298,24 +298,3 @@ export function createToolCallSplitter(markers: Array<string> = MARKERS) {
     }
   }
 }
-
-/** A value written the way Python (and LFM2) writes it. */
-function pythonValue(value: unknown): string {
-  if (value === true) return "True"
-  if (value === false) return "False"
-  if (value === null || value === undefined) return "None"
-  return JSON.stringify(value)
-}
-
-/** Past tool calls in LFM2's own format, for the assistant turn's text. */
-export function formatLfm2ToolCalls(calls: Array<ParsedToolCall>) {
-  const list = calls
-    .map(
-      (c) =>
-        `${c.name}(${Object.entries(c.args)
-          .map(([k, v]) => `${k}=${pythonValue(v)}`)
-          .join(", ")})`
-    )
-    .join(", ")
-  return `<|tool_call_start|>[${list}]<|tool_call_end|>`
-}
