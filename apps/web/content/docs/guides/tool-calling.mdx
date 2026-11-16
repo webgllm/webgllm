@@ -40,7 +40,7 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 ## `tool_choice`
 
 - `"auto"` (default): the model decides.
-- `"none"`: no tool calls.
+- `"none"`: no tool calls. As in llama.cpp, the tools stay in the prompt (so it, and its cache, match `"auto"`); nothing is read as a call, and call markup the model writes stays text.
 - `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. With `repair_tool_calls: true`, a call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
 - `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
 
@@ -52,7 +52,11 @@ A reply that runs out of `max_tokens` finishes with `"length"`, as llama.cpp's d
 
 ## History
 
-The whole conversation goes to the model's chat template, as llama.cpp passes it: earlier turns' tool calls and results included, and each tool result as its content (an empty one stays empty). The template decides what of them it writes.
+The whole conversation goes to the model's chat template, as llama.cpp passes it: earlier turns' tool calls (as `tool_calls`, their arguments parsed) and results, each tool result as its content (an empty one stays empty), and each assistant turn's `reasoning_content`. The template decides what of them it writes. A tool without a description or parameters goes as llama.cpp sends it: `""` and `{}`.
+
+The LFM2.5 ONNX repositories' and LFM2-1.2B-Tool's templates don't write `tool_calls`, so for them each past call goes into its turn's text in the model's own format; llama.cpp passes `tool_calls` alone, and such a template drops them.
+
+System and developer messages join into one leading system message: Qwen3.5's template refuses a system message anywhere else (llama.cpp passes them where they are, and the request fails there).
 
 ## Repair
 
@@ -60,4 +64,4 @@ Off by default: calls come back as the model wrote them, as in llama.cpp. `repai
 
 ## Schemas
 
-Objects that don't set `additionalProperties` are treated as closed, as in OpenAI's strict mode. Set `additionalProperties: true` for an open object. See [Structured output](/docs/guides/structured-output#schemas) for the exceptions.
+Objects that list their properties and don't set `additionalProperties` take no other keys, as llama.cpp's grammar reads a schema; `{ "type": "object" }` with no properties is any object. Set `additionalProperties: true` to open one. See [Structured output](/docs/guides/structured-output#schemas) for the exceptions.
