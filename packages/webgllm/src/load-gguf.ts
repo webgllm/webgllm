@@ -271,6 +271,8 @@ export async function* loadGguf(
       : await norm(`${blk}post_ffw_norm.weight`)
     let conv: ConvWeights | undefined
     let attention: AttentionWeights | undefined
+    // Whether this layer's q/k rows were put in rotated-first order (qPerm, kPerm).
+    let headsReordered = false
     let linear: LinearAttentionWeights | undefined
     if (type === "linear_attention") {
       const l = config.linear
@@ -344,6 +346,8 @@ export async function* loadGguf(
       conv = { inProj, outProj, kernel }
     } else {
       const kv = numKvHeads * headDim
+      // LFM's full-attention layers: llama.cpp's HF head layout, put rotated-first.
+      headsReordered = full
       const qkvg = await matrix(D, [
         {
           name: `${blk}attn_q.weight`,
@@ -384,8 +388,8 @@ export async function* loadGguf(
     if (conv) value.conv = conv
     if (attention) value.attention = attention
     if (linear) value.linear = linear
-    // Full-attention layers' q/k rows are put in rotated-first order (qPerm, kPerm) from llama.cpp's HF layout.
-    yield { kind: "layer", layer: i, value, ...(full && attention && { headsReordered: true }) }
+    // (Qwen's q/k keep their layout: only LFM's full-attention layers are reordered.)
+    yield { kind: "layer", layer: i, value, ...(headsReordered && { headsReordered }) }
   }
 
   yield { kind: "finalNorm", value: await norm(finalNormName) }

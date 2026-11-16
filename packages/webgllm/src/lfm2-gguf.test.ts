@@ -78,3 +78,50 @@ test("three official GGUF entries use recommended sampling with Thinking-only re
     assert.equal(meta.files.kind==="gguf"&&meta.files.model.path.includes("QAD"),!thinking)
   }
 })
+
+/** A two-layer Qwen3.5 GGUF: Gated DeltaNet, then full attention with partial RoPE (8 of 16 dims). */
+function qwenFixture() {
+  const tensors = new Map<string, GgufTensorInfo>(), chunks: Uint8Array[] = []
+  let offset = 0
+  const add = (name: string, dims: number[], type: number = GgmlType.Q4_0) => {
+    const count = dims.reduce((a, b) => a * b, 1), bytes = new Uint8Array(type === GgmlType.F32 ? count * 4 : (count / 32) * 18)
+    if (type === GgmlType.F32) { const view = new DataView(bytes.buffer); for (let i = 0; i < count; i++) view.setFloat32(i * 4, 1.25, true) }
+    else for (let i = 0; i < bytes.length; i += 18) { bytes[i] = 0; bytes[i + 1] = 60; bytes.fill(136, i + 2, i + 18) }
+    tensors.set(name, { name, dims, type, offset, byteLength: bytes.length }); offset += bytes.length; chunks.push(bytes)
+  }
+  const F32 = GgmlType.F32
+  for (let i = 0; i < 2; i++) {
+    const p = `blk.${i}.`
+    add(p + "attn_norm.weight", [32], F32); add(p + "post_attention_norm.weight", [32], F32)
+    if (i === 0) {
+      add(p + "attn_qkv.weight", [32, 96]); add(p + "attn_gate.weight", [32, 32])
+      add(p + "ssm_beta.weight", [32, 2]); add(p + "ssm_alpha.weight", [32, 2]); add(p + "ssm_out.weight", [32, 32])
+      add(p + "ssm_conv1d.weight", [4, 96], F32); add(p + "ssm_a", [2], F32); add(p + "ssm_dt.bias", [2], F32); add(p + "ssm_norm.weight", [16], F32)
+    } else {
+      add(p + "attn_q.weight", [32, 64]); add(p + "attn_k.weight", [32, 16]); add(p + "attn_v.weight", [32, 16]); add(p + "attn_output.weight", [32, 32])
+      add(p + "attn_q_norm.weight", [16], F32); add(p + "attn_k_norm.weight", [16], F32)
+    }
+    for (const name of ["ffn_gate", "ffn_up", "ffn_down"]) add(p + name + ".weight", [32, 32])
+  }
+  add("output_norm.weight", [32], F32)
+  add("token_embd.weight", [32, 8])
+  const metadata = new Map<string, GgufValue>([
+    ["general.architecture", "qwen35"], ["qwen35.block_count", 2], ["qwen35.embedding_length", 32], ["qwen35.attention.head_count", 2],
+    ["qwen35.attention.head_count_kv", 1], ["qwen35.attention.key_length", 16], ["qwen35.rope.dimension_count", 8], ["qwen35.feed_forward_length", 32],
+    ["qwen35.context_length", 4096], ["qwen35.rope.freq_base", 1e7], ["qwen35.attention.layer_norm_rms_epsilon", 1e-6], ["qwen35.full_attention_interval", 2],
+    ["qwen35.ssm.group_count", 2], ["qwen35.ssm.time_step_rank", 2], ["qwen35.ssm.state_size", 16], ["qwen35.ssm.inner_size", 32], ["qwen35.ssm.conv_kernel", 4]
+  ])
+  const bytes = new Uint8Array(offset); let at = 0; for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.length }
+  const header: GgufHeader = { version: 3, metadata, tensors, dataOffset: 0, headerLength: 0 }
+  return { header, source: { size: bytes.length, async read(offset: number, length: number) { return bytes.slice(offset, offset + length) } } }
+}
+
+test("only the layers whose q/k rows the loader reorders say so: LFM's full attention, not its conv, sliding or Qwen's", async () => {
+  const flags = (pieces: WeightPiece[]) => pieces.flatMap((p) => (p.kind === "layer" ? [[p.value.attention ? "attention" : p.value.linear ? "linear" : "conv", !!p.headsReordered]] : []))
+  assert.deepEqual(flags(await collect(fixture())), [["conv", false], ["attention", true]])
+  assert.deepEqual(flags(await collect(fixture("lfm2", 4))), [["conv", false], ["attention", false]], "sliding attention keeps its layout")
+  const qwen = await collect(qwenFixture())
+  const cfg = qwen.find((p) => p.kind === "config"); assert.ok(cfg?.kind === "config"); assert.deepEqual(cfg.config.layerTypes, ["linear_attention", "full_attention"])
+  assert.ok(cfg.config.ropeDimsFull < cfg.config.headDim, "partial RoPE, where a reorder would change the rows")
+  assert.deepEqual(flags(qwen), [["linear", false], ["attention", false]], "Qwen's q/k keep their layout")
+})

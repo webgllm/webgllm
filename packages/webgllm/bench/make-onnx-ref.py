@@ -132,8 +132,13 @@ gdir = os.path.join(args.out_dir, "graph")
 os.makedirs(gdir, exist_ok=True)
 data_name = os.path.basename(src) + "_data"
 link = os.path.join(gdir, data_name)
+weights = os.path.abspath(os.path.join(os.path.dirname(src), data_name))
+# A hard link: onnxruntime refuses data outside the graph's directory. One left
+# by an earlier run (another model, a reused out dir) is replaced, never kept.
+if os.path.lexists(link) and not (os.path.exists(link) and os.path.samefile(link, weights)):
+    os.remove(link)
 if not os.path.exists(link):
-    os.link(os.path.abspath(os.path.join(os.path.dirname(src), data_name)), link)  # a hard link: onnxruntime refuses data outside the graph dir
+    os.link(weights, link)
 gpath = os.path.join(gdir, os.path.basename(src))
 onnx.save(m, gpath)
 
