@@ -144,7 +144,7 @@ function assistantToolTurn(content: string, calls: Array<ParsedToolCall & { id: 
   }
 }
 
-/** The current turn's thinking, under the key the format's template reads. */
+/** A tool-call turn's thinking, under the key the format's template reads. */
 function withThinking(turn: ChatMessage, thinking: string, format: ToolFormat): ChatMessage {
   if (format === "lfm3") return { ...turn, thinking }
   if (format === "qwen3.5") return { ...turn, reasoning_content: thinking }
@@ -152,12 +152,11 @@ function withThinking(turn: ChatMessage, thinking: string, format: ToolFormat): 
 }
 
 /**
- * OpenAI messages as chat-template messages. System and developer messages
- * join into one leading system message (templates take one, first). Tool
- * calls and results of earlier turns are left out and their answers kept:
- * small models copy the shape of past calls badly and get lost in old
- * results. The current turn's calls and results stay, with its thinking
- * (Liquid's guidance for tool use), since the model answers from them.
+ * OpenAI messages as chat-template messages, as llama.cpp passes them to a
+ * chat template. System and developer messages join into one leading system
+ * message (templates take one, first). Every turn's tool calls and results
+ * stay, with a call's thinking where it has some: the template decides what
+ * of them it writes. A tool result is its content as given.
  */
 export function toChatMessages(
   messages: Array<ChatCompletionMessageParam>,
@@ -168,16 +167,8 @@ export function toChatMessages(
   if (!Array.isArray(messages) || messages.length === 0) throw new TypeError("messages must be a non-empty array.")
   const system: Array<string> = []
   const chat: Array<ChatMessage> = []
-  let currentTurn = -1
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
-      currentTurn = i
-      break
-    }
-  }
   const toolNames = new Map<string, string>()
-  for (const [i, m] of messages.entries()) {
-    const earlier = i < currentTurn
+  for (const m of messages) {
     switch (m?.role) {
       case "system":
       case "developer": {
@@ -191,12 +182,11 @@ export function toChatMessages(
         break
       }
       case "tool": {
-        if (earlier) break
         const text = contentText(m.content)
         const name = toolNames.get(m.tool_call_id)
         chat.push({
           role: "tool",
-          content: text && text !== "null" ? text : "The tool returned nothing.",
+          content: text,
           ...(m.tool_call_id && { tool_call_id: m.tool_call_id }),
           ...(name && { name })
         })
@@ -211,7 +201,7 @@ export function toChatMessages(
           toolNames.set(call.id, call.function.name)
           return { id: call.id, name: call.function.name, args: parseArguments(call.function.arguments) }
         })
-        if (calls.length === 0 || earlier) {
+        if (calls.length === 0) {
           if (text) chat.push({ role: "assistant", content: text })
           break
         }
@@ -436,7 +426,7 @@ export function planCompletion(params: ChatCompletionCreateParams): CompletionPl
     // A JSON answer can't hold markup; a forced call comes back in "done".
     parseTools: tools.length > 0 && !outputSchema && (toolChoice === "auto" || toolChoice === "required"),
     parallelToolCalls: body.parallel_tool_calls !== false,
-    repairToolCalls: body.repair_tool_calls !== false
+    repairToolCalls: body.repair_tool_calls === true
   }
 }
 

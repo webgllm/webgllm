@@ -262,11 +262,11 @@ test("messages: LFM3 keeps thinking as `thinking`; LFM2 writes calls into the co
   const lfm2 = toChatMessages(turn, "lfm2")
   assert.equal(lfm2[1]?.content, '<|tool_call_start|>[get_weather(city="Oslo")]<|tool_call_end|>')
   assert.equal(lfm2[1]?.tool_calls, undefined)
-  // An empty tool result reads as a sentence, not nothing.
-  assert.equal(lfm2[2]?.content, "The tool returned nothing.")
+  // A tool result is its content as given, empty too, as llama.cpp passes it.
+  assert.equal(lfm2[2]?.content, "")
 })
 
-test("messages: earlier turns keep their answers, not their tool calls", () => {
+test("messages: earlier turns keep their tool calls and results, as llama.cpp passes them", () => {
   const chat = toChatMessages(
     [
       { role: "user", content: "Weather?" },
@@ -279,6 +279,8 @@ test("messages: earlier turns keep their answers, not their tool calls", () => {
   )
   assert.deepEqual(chat, [
     { role: "user", content: "Weather?" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c", type: "function", function: { name: "get_weather", arguments: {} } }] },
+    { role: "tool", content: "18C", tool_call_id: "c", name: "get_weather" },
     { role: "assistant", content: "It's 18C." },
     { role: "user", content: "Thanks" }
   ])
@@ -484,8 +486,9 @@ test("usage sums the reply and its repairs", () => {
   })
 })
 
-test("repair_tool_calls must be a boolean and defaults to on", () => {
-  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, true)
+test("repair_tool_calls must be a boolean and defaults to off, as llama.cpp has no repair", () => {
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi }).repairToolCalls, false)
+  assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: true }).repairToolCalls, true)
   assert.equal(planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: false }).repairToolCalls, false)
   assert.throws(() => planCompletion({ model: "unsloth/Qwen3.5-2B-GGUF", messages: hi, repair_tool_calls: "yes" as never }), TypeError)
 })

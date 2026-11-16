@@ -41,7 +41,7 @@ const answer = await webgllm.chat.completions.create({ model, messages, tools })
 
 - `"auto"` (default): the model decides.
 - `"none"`: no tool calls.
-- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. A call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
+- `"required"`: a call to one of the tools, as llama.cpp has it. The model writes the call in its own format, as with `"auto"`, and may write text before it, but the reply can't end until a call is written. With `repair_tool_calls: true`, a call it gets wrong is generated again, as with `"auto"` (below). A reply that runs out of `max_tokens` first ends without a call.
 - `{ type: "function", function: { name } }`: a call to that tool, constrained to its JSON Schema while it's written, so its arguments are always valid.
 
 `parallel_tool_calls: false` keeps only the first call.
@@ -50,9 +50,13 @@ A required or named `tool_choice` can't be combined with a JSON `response_format
 
 A reply that runs out of `max_tokens` finishes with `"length"`, as llama.cpp's does, even when it holds calls. A call it cut off comes back with its arguments as far as they were written (`{"city":"Tok`), and nothing in the reply is repaired.
 
+## History
+
+The whole conversation goes to the model's chat template, as llama.cpp passes it: earlier turns' tool calls and results included, and each tool result as its content (an empty one stays empty). The template decides what of them it writes.
+
 ## Repair
 
-Automatic and required calls are checked against their tools. A call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, constrained to the schema. Its tokens count in `usage`. `repair_tool_calls: false` returns calls as the model wrote them.
+Off by default: calls come back as the model wrote them, as in llama.cpp. `repair_tool_calls: true` checks automatic and required calls against their tools: a call to an unknown tool, arguments that fail the schema, or call markup that doesn't parse is generated again, with the model's failed attempt and a note on what was wrong in the chat, constrained to the schema. Its tokens count in `usage`.
 
 ## Schemas
 

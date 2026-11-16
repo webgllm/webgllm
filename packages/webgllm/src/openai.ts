@@ -159,10 +159,11 @@ export type ChatCompletionCreateParamsBase = {
   /** False: don't reuse or keep the prompt's cache across calls. */
   cache_prompt?: boolean | null
   /**
-   * Automatic tool calls are checked against their tools; a bad one (an
-   * unknown tool, arguments that fail the schema, markup that doesn't
-   * parse) is generated again constrained to the schema. False returns
-   * them as the model wrote them. Default true.
+   * True checks automatic and required tool calls against their tools: a bad
+   * one (an unknown tool, arguments that fail the schema, markup that doesn't
+   * parse) is generated again, with a note to the model on what was wrong,
+   * constrained to the schema. Default false: calls come back as the model
+   * wrote them, as in llama.cpp.
    */
   repair_tool_calls?: boolean | null
 }

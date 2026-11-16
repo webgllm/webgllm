@@ -279,7 +279,7 @@ test("tool-call repair: arguments that fail the schema are generated again for t
         ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Paris" } } } }
         : { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] }
   })
-  const completion = await client.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  const completion = await client.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
   const [first, repair] = workers.of(QWEN)!.generations()
   assert.equal(first!.toolChoice, undefined)
   assert.deepEqual(repair!.toolChoice, { name: "get_weather" })
@@ -295,21 +295,21 @@ test("tool-call repair: arguments that fail the schema are generated again for t
   assert.equal(completion.usage.prompt_tokens, 2 * STATS.inputTokens)
 })
 
-test("tool-call repair: unknown tools and unparsed markup are forced to any tool; off returns them as written", async () => {
+test("tool-call repair: unknown tools and unparsed markup are forced to any tool; off (the default) returns them as written", async () => {
   const forced = (request: { toolChoice?: unknown }) =>
     request.toolChoice ? { tokens: [], done: { toolCall: { name: "get_weather", arguments: { city: "Rome" } } } } : undefined
   const unknown = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"] } })
-  const a = await unknown.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  const a = await unknown.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
   assert.equal(unknown.workers.of(QWEN)!.generations()[1]!.toolChoice, "any")
   assert.equal(a.choices[0]?.message.tool_calls?.[0]?.function.name, "get_weather")
 
   const broken = llm({ reply: (r) => forced(r) ?? { tokens: ["<tool_call>\nnot a call\n</tool_call>"] } })
-  const b = await broken.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
+  const b = await broken.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: true })
   assert.equal(b.choices[0]?.message.tool_calls?.length, 1)
   assert.equal(b.choices[0]?.message.content, null)
 
   const off = llm({ reply: (r) => forced(r) ?? { tokens: [qwenCall("<parameter=town>\nParis\n</parameter>")] } })
-  const c = await off.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool], repair_tool_calls: false })
+  const c = await off.llm.chat.completions.create({ model: QWEN, messages: hi, tools: [weatherTool] })
   assert.equal(off.workers.of(QWEN)!.generations().length, 1)
   assert.equal(c.choices[0]?.message.tool_calls?.[0]?.function.arguments, '{"town":"Paris"}')
 })
