@@ -61,7 +61,9 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         }
       }
       postMessage({ type: "bench-phase", name, gpuBytes: this.gpu.bytes })
-      return Reflect.apply(original, this, args)
+      const value = await Reflect.apply(original, this, args)
+      postMessage({ type: "bench-phase", name: `${name}:end`, gpuBytes: this.gpu.bytes })
+      return value
     }
   })
 }

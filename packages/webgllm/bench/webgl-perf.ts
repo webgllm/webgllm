@@ -50,7 +50,7 @@ let measuring = true
 let gaps: number[] = [],
   taps = 0
 const gpuEvents: unknown[] = []
-let stageEvents: Array<{ name: string; at: number }> = []
+let stageEvents: Array<{ name: string; at: number; gpuMB?: number }> = []
 const frameTimes: Array<{ at: number; gap: number }> = []
 const tap = document.querySelector<HTMLButtonElement>("#tap")!
 tap.onclick = (event) => {
@@ -378,7 +378,7 @@ async function run() {
       | { type: "bench-profile-done" }
       | { type: "bench-profile-error"; message: string }
       | WorkerResponse
-      | { type: "bench-phase"; name: string }
+      | { type: "bench-phase"; name: string; gpuBytes?: number }
       | {
           type: "bench-gpu"
           name: string
@@ -423,7 +423,7 @@ async function run() {
       return
     }
     if (data.type === "bench-phase") {
-      stageEvents.push({ name: data.name, at: performance.now() })
+      stageEvents.push({ name: data.name, at: performance.now(), ...(data.gpuBytes !== undefined && { gpuMB: Math.round(data.gpuBytes / 1048576) }) })
       return
     }
     if (data.type === "claim") {
@@ -433,6 +433,10 @@ async function run() {
       void end({ timings: data.timings, gpuBytes }).then(() => ready())
     } else if (data.type === "token") {
       reply += data.text
+      for (const lp of data.logprobs ?? []) {
+        const alt = lp.top_logprobs?.find((t) => t.token !== lp.token)
+        log(`lp ${JSON.stringify(lp.token)} ${lp.logprob.toFixed(6)} margin ${alt ? (lp.logprob - alt.logprob).toFixed(6) : "-"}`)
+      }
       if (first) {
         // The first token ends prefill: switch phases synchronously, so the
         // decode measurement never waits on the prefill result's upload.
@@ -524,7 +528,7 @@ async function run() {
         chat: [
           {
             role: "user",
-            content: `Trial ${i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
+            content: `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
           }
         ],
         tools: [],
@@ -536,7 +540,8 @@ async function run() {
         },
         maxTokens: Number(params.get("tokens") ?? 64),
         pipeline: params.get("pipeline") !== "0",
-        speculative: params.get("speculative") !== "0"
+        speculative: params.get("speculative") !== "0",
+        ...(params.get("logprobs") === "1" && { logprobs: true, topLogprobs: 2 })
       })
     })
     await end({

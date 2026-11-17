@@ -83,13 +83,17 @@ export type LoadOnnxOptions = {
   releaseReadBuffers?: boolean
 }
 
-/** Frees the raw rows (QuantMatrix.raw) of the matrices in a layer's weights, each its own buffer. */
+/**
+ * Frees what this loader made for the raw matrices in uploaded weights
+ * (QuantMatrix.raw, and their scales and zero points), each its own buffer.
+ */
 function releaseRaw(value: unknown) {
   if (!value || typeof value !== "object" || ArrayBuffer.isView(value)) return
-  const raw = (value as { raw?: unknown }).raw
-  if (raw instanceof Uint8Array) {
-    if (raw.byteOffset === 0 && raw.byteLength === raw.buffer.byteLength)
-      (raw.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
+  const m = value as Partial<QuantMatrix>
+  if (m.raw instanceof Uint8Array) {
+    for (const view of [m.raw, m.scales, m.zeros])
+      if (view && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength)
+        (view.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
     return
   }
   for (const item of Object.values(value)) releaseRaw(item)
@@ -419,6 +423,7 @@ export async function* loadOnnx(
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
     // (Resumed: the engine has uploaded the rows, `m.raw` included.)
     for (const bytes of [quant, scales, zp]) if (bytes) plan.release(bytes)
+    if (options.releaseReadBuffers) releaseRaw({ ...m, raw: new Uint8Array(0) })
   }
 }
 

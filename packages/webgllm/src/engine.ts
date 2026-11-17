@@ -251,6 +251,7 @@ export const TUNING = {
   onnxReadAheadMiB: 24,
   /** 1: the ONNX loader frees each read's buffer once used (LoadOnnxOptions.releaseReadBuffers). */
   releaseOnnxReads: 1,
+
   /** Uploaded model pieces allowed ahead of the GPU, with periodic presentation drains. */
   uploadAhead: 1,
   /** Packing probe rows: 0 uses the actual prompt batch; positive values are diagnostics. */
@@ -2781,8 +2782,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             { format: GL.RGBA, type: GL.UNSIGNED_SHORT_4_4_4_4, pixels }
           )
         } finally {
-          // This conversion is a private upload temporary, never caller data.
-          if (!m.raw) releaseOwnedBuffer(pixels.buffer)
+          // A private upload temporary either way (rawRgba4 copies the raw
+          // rows too), never caller data: freed now, not left to the
+          // collector (a load's worth of it).
+          releaseOwnedBuffer(pixels.buffer)
         }
       } else
         this.gpu.write(
@@ -2833,6 +2836,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           { x: column * blocks, y, width: blocks, height: run },
           { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: texels }
         )
+        releaseOwnedBuffer(texels.buffer)
       } else
         this.gpu.write(
           gm.scales,
@@ -4473,14 +4477,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     })
   }
 
-  private floatInput(rows: number, mats: GpuMatrix[], allowed = true) {
-    if (!allowed || TUNING.fusePromptInputs <= 0 || !this.quadMatmuls || TUNING.quad <= 0 || rows < TUNING.f16MinRows || (this.f16Pack() & 1) || !mats.length || !mats.every(m => this.takesF16(m))) return null
+  /**
+   * The RGBA16F texture a norm or SwiGLU can draw its output into for
+   * `uses` (each matrix with the texture its matmul writes), if each of
+   * those matmuls reads it: each takes the 4-token f16 matmul, which needs
+   * the output's partner texture (see matmul). Any other reads h2.
+   */
+  private floatInput(rows: number, uses: ReadonlyArray<readonly [GpuMatrix, Texture]>, allowed = true) {
+    if (!allowed || TUNING.fusePromptInputs <= 0 || !this.quadMatmuls || TUNING.quad <= 0 || rows < TUNING.f16MinRows || (this.f16Pack() & 1) || !uses.length || !uses.every(([m, out]) => this.takesF16(m) && this.quads.has(out.id))) return null
     const f = this.f16Scratch()
     return f && f.a ? f.a[f.next] : null
   }
 
-  private normInput(x: Texture, norm: Texture, rows: number, mats: GpuMatrix[], ownSums = true, allowed = true) {
-    const out = this.floatInput(rows, mats, allowed)
+  private normInput(x: Texture, norm: Texture, rows: number, uses: ReadonlyArray<readonly [GpuMatrix, Texture]>, ownSums = true, allowed = true) {
+    const out = this.floatInput(rows, uses, allowed)
     if (!out) {
       this.normToH2(x, norm, this.buffers.normed, rows, -1, ownSums)
       return this.buffers.normed
@@ -6717,12 +6727,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           ? { a: h, norm: prescaled ? "prescaled" : layer.operatorNorm }
           : { a: b.normed }
       if (!opIn.norm) {
-        const mats = [
-          layer.conv?.inProj,
-          layer.attention?.qkvg,
-          layer.linear?.inProj,
-          layer.linear?.ba
-        ].filter((m): m is GpuMatrix => !!m)
+        const mats = ([
+          [layer.conv?.inProj, b.bcx],
+          [layer.attention?.qkvg, b.qkvg],
+          [layer.linear?.inProj, b.lin?.inProj],
+          [layer.linear?.ba, b.lin?.ba]
+        ] as const).filter((use): use is readonly [GpuMatrix, Texture] => !!use[0] && !!use[1])
         opIn.a = this.normInput(
           h,
           layer.operatorNorm,
@@ -6820,7 +6830,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const dest = tail ? next : h
       if (tail) this.copyRow(next, rows - 1, h)
       const ffnInput = !ffnFold
-        ? this.normInput(base, layer.ffnNorm, fr, [layer.gateUp], true, !probe)
+        ? this.normInput(base, layer.ffnNorm, fr, [[layer.gateUp, b.gateUp]], true, !probe)
         : b.normed
       let downInput = b.act
       if (fr <= SPLIT_ROWS) {
@@ -6847,7 +6857,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         })
       } else {
         await this.matmul(ffnInput, layer.gateUp, b.gateUp, rows)
-        downInput = this.floatInput(fr, [layer.down], !probe) ?? b.act
+        downInput = this.floatInput(fr, [[layer.down, b.ffnOut]], !probe) ?? b.act
         const floating = downInput.internal === GL.RGBA16F
         this.gpu.run({
           name: "swiglu",
