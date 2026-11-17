@@ -255,7 +255,7 @@ const release = (engine: Engine) => {
  * slower on an M3, and nothing the GPU reports tells where the room is
  * short (an M3 and an iPhone report the same limits).
  */
-const PROMPT_BATCH = 512
+export const PROMPT_BATCH = 512
 
 class Superseded extends Error {
   constructor() {

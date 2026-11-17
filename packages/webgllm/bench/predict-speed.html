@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>predictSpeed</title>
+    <style>
+      body { font: 13px/1.4 ui-monospace, monospace; margin: 12px; background: #13171c; color: #eef3f8; }
+      pre { white-space: pre-wrap; word-break: break-word; }
+    </style>
+  </head>
+  <body>
+    <h1>predictSpeed</h1>
+    <p>
+      <code>?models=a,b</code> (LFM3 1.7B's GGUF and ONNX by default), <code>&amp;rounds=1</code>: each model measured
+      afresh (<code>force</code>) in predictSpeed's worker, with its timings, then the public API's remembered answer.
+      Compare with <code>webgl-perf.html?rounds=1&amp;model=&lt;id&gt;&amp;tokens=64&amp;render=css</code>.
+    </p>
+    <pre id="out"></pre>
+    <script type="module" src="/bundle/bench/predict-speed.js"></script>
+  </body>
+</html>

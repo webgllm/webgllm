@@ -163,6 +163,19 @@ const webgllm = new WebGLLM({
 webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${model}`))
 ```
 
+### Speed on this device
+
+`predictSpeed` says how fast a model would read prompts and write on this device before its weights download, so an app can choose to run it here or elsewhere. It reads the model's shapes (a GGUF's header, or an ONNX model's graph and config), runs one layer of each kind the model has, with random weights, through the engine's own passes on this GPU, and scales that to the whole model: about a second on a desktop GPU, longer on a phone, and a few hundred MB of GPU memory, freed after. The answer is remembered per GPU, browser, model and webgllm version, so later calls return at once (`force: true` measures again). Call it while no model is loading or answering: they share the GPU.
+
+```ts
+import { predictSpeed } from "webgllm"
+
+const { prompt, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF") // tokens per second
+const local = prompt >= 1000 && decode >= 20
+```
+
+`prompt` is for a prompt of about 512 tokens; `decode` is one token at a time (speculative drafts can make replies faster).
+
 ### Tokens and logits
 
 What OpenAI's API, WebLLM and wllama offer below the chat level:

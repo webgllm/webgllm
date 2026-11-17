@@ -543,7 +543,7 @@ type OnnxRead = { key: string; location: string; offset: number; length: number;
  * blocks of 32, the layer layout, the config's shapes) and lists every read
  * the load makes, in order, without reading the external data.
  */
-function planOnnx(
+export function planOnnx(
   graphBytes: Uint8Array | OnnxGraph,
   configJson: unknown,
   chunkRows: number,

@@ -451,7 +451,7 @@ export function defaultEmbeddingRows(
 }
 
 /** The bits a tensor gets in a QuantMatrix. */
-function bitsOf(info: GgufTensorInfo): 4 | 8 {
+export function bitsOf(info: GgufTensorInfo): 4 | 8 {
   switch (info.type) {
     case GgmlType.Q4_0:
       return 4
@@ -539,7 +539,7 @@ function f32Decimal(value: number): number {
   return Number(value.toPrecision(7))
 }
 
-function ggufConfig(
+export function ggufConfig(
   header: GgufHeader,
   freqFactors: Float32Array | undefined
 ): ModelConfig {

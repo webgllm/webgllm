@@ -92,7 +92,7 @@ function fileSize(file: ModelFile): Promise<number> {
  * sized by fileSize's lookup (shared with the model's size, not a second
  * HEAD request).
  */
-async function source(file: ModelFile): Promise<ByteSource> {
+export async function source(file: ModelFile): Promise<ByteSource> {
   const stored = await storedFile(file)
   if (stored) return blobSource(stored)
   const url = fileUrl(file)
