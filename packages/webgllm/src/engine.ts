@@ -5276,7 +5276,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const fitSegments = Math.max(1, Math.floor((panels * panelRows) / total))
       if (
         rows <= SPLIT_ROWS &&
-        ((this.tuned.flashDecode != null && keys >= (this.tuned.flashDecodeFrom ?? 0) ? this.tuned.flashDecode : TUNING.flashDecode)) > 0 &&
+        // (The choice tune() timed at its long cache applies from there on;
+        // on a GPU whose passes cost little (WebGPU), at any length.)
+        ((this.tuned.flashDecode != null && (keys >= (this.tuned.flashDecodeFrom ?? 0) || this.gpu.cheapPasses) ? this.tuned.flashDecode : TUNING.flashDecode)) > 0 &&
         TUNING.attendChunkTexels > 0 &&
         this.mrt.chunks &&
         kt > (TUNING.flashPast >= 0 ? TUNING.flashPast : chunkPast) &&

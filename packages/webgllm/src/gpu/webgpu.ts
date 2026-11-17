@@ -289,6 +289,12 @@ export class WebGpu extends PacedGpu<Fence> {
   coopThreads = 0
   /** Whether passes can share a texel's K loop among threads (coopThreads). */
   readonly sharesLoops = true
+  /**
+   * Passes cost little: a dependent dispatch about 4 µs on an iPad Pro M4,
+   * against a WebGL render pass's 38 (chain.html), so chunked attention
+   * pays at short contexts too (see Engine.attention).
+   */
+  readonly cheapPasses = true
   /** Whether lanes sum by subgroup shuffles (see wgsl.ts's Variant.subgroups), and the fewest lanes a subgroup has. */
   private subgroups: boolean
   private subgroupSize: number
@@ -417,6 +423,7 @@ export class WebGpu extends PacedGpu<Fence> {
       else f32[4 + i] = x
     })
     const offset = this.pushUniforms(new Uint8Array(block), rect.x, rect.y, rect.width, rect.height)
+    if (this.profile && !WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed(`native ${pass.name ?? ""} ${rect.width}x${rect.height}`)
     const cpass = this.computePassFor(p.pipeline)
     cpass.setBindGroup(0, group, [offset])
     this.markGpuWork()

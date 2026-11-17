@@ -99,6 +99,8 @@ export class Gpu extends PacedGpu<WebGLSync> {
   /** (WebGPU's: see webgpu.ts. A fragment is one thread here.) */
   coopThreads = 0
   readonly sharesLoops = false
+  /** (See WebGpu's: a render pass here costs tens of µs.) */
+  readonly cheapPasses = false
   private boundProgram: WebGLProgram | null = null
   private textureUnit = 0
   private boundTextures = new Map<number, WebGLTexture>()
