@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { fusedAdd } from "./gpu/native.js"
+import { fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -126,6 +126,8 @@ export const TUNING = {
   lanes: 0,
   /** WebGPU: a token's add (y's RMS, the residual, its sums, the next input) in one native pass. */
   fusedAdd: 1,
+  /** WebGPU: the Q6_K word head as a native pass, its activations in workgroup memory. */
+  nativeHead: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -4559,6 +4561,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return "lastWriter" in this.gpu && this.fusedAddPrograms.has(this.gpu.lastWriter(x))
   }
 
+  private nativeHeads = new Map<string, NativeSpec>()
+  private nativeHeadSpec(split: boolean, prescaled: boolean, kbSlice: number) {
+    const key = `${split} ${prescaled} ${kbSlice}`
+    let spec = this.nativeHeads.get(key)
+    if (!spec) this.nativeHeads.set(key, (spec = wordHead({ split, prescaled, kbSlice })))
+    return spec
+  }
+
   /** Native fused adds by shape (see addNormed). */
   private fusedAdds = new Map<string, NativeSpec | null>()
 
@@ -6526,11 +6536,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const prescaled = scaledRow0 !== undefined
     if (prescaled && e.bytes)
       throw new Error("Only word-texel Q6_K heads read the scaled input.")
+    const oneSums = prescaled && this.sumsInOne(b.residual[0])
+    // On WebGPU, the word head as a native pass (activations in workgroup memory: see gpu/native.ts).
+    const native = !e.q6Expanded && !e.bytes && !e.quantPanels && TUNING.nativeHead > 0 && "nativeProgram" in this.gpu
+      ? this.gpu.nativeProgram(this.nativeHeadSpec(split > 1, prescaled, Math.ceil(e.blocks / split)))
+      : null
     await this.weightHead(
       e,
       {
         name: "head",
-        program: this.gpu.program(
+        program: native ?? this.gpu.program(
           K.withRms(this.headWeightSource(
             e,
             e.q6Expanded
@@ -6540,7 +6555,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 : split > 1
                   ? K.MATMUL_Q6_K_HEAD_SPLIT
                   : K.MATMUL_Q6_K_HEAD
-          ), prescaled && this.sumsInOne(b.residual[0]) ? 1 : this.parts)
+          ), oneSums ? 1 : this.parts)
         ),
         inputs: {
           ...(prescaled && { uR: b.residual[0] }),
@@ -6561,7 +6576,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             uRowA0: { int: scaledRow0 },
             uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
             uROff: { int: this.config.hiddenSize / 4 },
-            uParts: { int: this.parts },
+            uParts: { int: oneSums ? 1 : this.parts },
             uTexels: { int: this.config.hiddenSize / 4 },
             uEps: this.config.normEps
           })
