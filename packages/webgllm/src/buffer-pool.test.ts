@@ -5,7 +5,7 @@ import { BufferPool } from "./byte-source.js"
 test("a buffer pool hands back a given buffer for the same length only, up to its cap", () => {
   const pool = new BufferPool(48)
   const a = pool.take(16)
-  pool.give(a.buffer)
+  pool.give(a.buffer as ArrayBuffer)
   assert.equal(pool.take(32).buffer === a.buffer, false, "another length gets a new buffer")
   assert.equal(pool.take(16).buffer, a.buffer)
   // Past the cap, a buffer isn't kept.
