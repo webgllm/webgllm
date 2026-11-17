@@ -96,6 +96,9 @@ export class Gpu extends PacedGpu<WebGLSync> {
    * robust initialization zero-fills it outside the GPU (see zero).
    */
   readonly slowZeroFill = true
+  /** (WebGPU's: see webgpu.ts. A fragment is one thread here.) */
+  coopThreads = 0
+  readonly sharesLoops = false
   private boundProgram: WebGLProgram | null = null
   private textureUnit = 0
   private boundTextures = new Map<number, WebGLTexture>()

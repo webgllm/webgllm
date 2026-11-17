@@ -115,6 +115,14 @@ type GpuLayer = {
 export const TUNING = {
   /** 1: run on WebGPU where the browser has it (see gpu/webgpu.ts); 0: WebGL 2. */
   webgpu: 0,
+  /**
+   * WebGPU: a small pass with a K loop (a token's matmuls) shares each
+   * texel's loop among a workgroup's threads, about this many threads in
+   * all (0: one thread a texel; negative: never, untimed). An M3 Ultra
+   * wrote LFM3 31% faster at 32,768; an iPad Pro M4 and a Pixel 10 Pro
+   * slower: tune() times it.
+   */
+  lanes: 0,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -470,6 +478,8 @@ export type Tuned = {
   flashDecode?: number | null
   /** Context length at which the attention variant was actually measured. */
   flashDecodeFrom?: number
+  /** WebGPU: threads a small pass's K loop is spread over (the GPU's coopThreads), or TUNING.lanes's. */
+  lanes?: number | null
 }
 
 /**
@@ -800,6 +810,7 @@ export class Engine {
     this.precision = options.matmulPrecision ?? "highp"
     this.gpu.hints = TUNING.renderHints
     this.gpu.cacheState = TUNING.cacheState > 0
+    this.gpu.coopThreads = Math.max(0, this.tuned.lanes ?? TUNING.lanes)
     this.gpu.presentationFrames = TUNING.presentationFrames
     this.gpu.configurePacing(this.tuned.submissionReads ?? TUNING.submissionReads, TUNING.submissionMs)
     this.gpu.pollsBeforeSleep = TUNING.fencePolls
@@ -1517,6 +1528,7 @@ export class Engine {
       f16Matmul: before.f16Matmul ?? null,
       f16Pack: before.f16Pack ?? null,
       flashDecode: null,
+      lanes: null,
       streamMatvec: before.streamMatvec,
       submissionReads: before.submissionReads,
       submissionOverlap: before.submissionOverlap,
@@ -1566,7 +1578,7 @@ export class Engine {
     }
     class Stopped extends Error {}
     const choose = async (
-      key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode",
+      key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode" | "lanes",
       candidates: Array<number>,
       sample: () => unknown
     ): Promise<number | null> => {
@@ -1737,11 +1749,28 @@ export class Engine {
           this.gpu.delete(kv)
         }
       }
+      // WebGPU: a token's passes with their K loops shared among threads,
+      // or a thread a texel (see TUNING.lanes), timed on a token's forward
+      // through every layer (a layer's matmuls alone came out even on a Mac
+      // whose whole token ran 31% faster). Forwards need the cache.
+      const lanes = !this.gpu.sharesLoops || TUNING.lanes < 0
+        ? null
+        : free
+          ? await choose("lanes", [TUNING.lanes, TUNING.lanes > 0 ? 0 : 32768], async () => {
+              this.gpu.coopThreads = Math.max(0, this.tuned.lanes ?? TUNING.lanes)
+              forwards = true
+              this.reset()
+              await this.forwardHidden([1000])
+            })
+          : (before.lanes ?? null)
+      this.gpu.coopThreads = Math.max(0, lanes ?? TUNING.lanes)
+      if (forwards) this.reset()
       picked = {
         shortSplit,
         f16Matmul,
         f16Pack,
         flashDecode,
+        lanes,
         flashDecodeFrom: flashDecode == null ? undefined : keys,
         streamMatvec: before.streamMatvec,
         submissionReads: before.submissionReads,
@@ -6611,6 +6640,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const pos0 = this.position
     this.gpu.hints = TUNING.renderHints
     this.gpu.cacheState = TUNING.cacheState > 0
+    this.gpu.coopThreads = Math.max(0, this.tuned.lanes ?? TUNING.lanes)
     this.gpu.presentationFrames = TUNING.presentationFrames
     this.gpu.configurePacing(
       this.tuned.submissionReads ?? TUNING.submissionReads,

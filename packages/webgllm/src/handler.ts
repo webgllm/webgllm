@@ -363,7 +363,9 @@ async function load(
   contextLength: number | undefined,
   /** Without multiple render targets or the chunked recurrence: after a failed self-check. */
   plain = false,
-  reuseTuning = true
+  reuseTuning = true,
+  /** On WebGL 2 even where there's WebGPU: after WebGPU failed this model. */
+  webgl = false
 ): Promise<Loaded> {
   const meta = await resolveModel(model)
   // The GPU first: a browser or GPU that can't run the model says so before
@@ -379,7 +381,7 @@ async function load(
     timings[name] = Math.round(now - mark)
     mark = now
   }
-  const webgpu = TUNING.webgpu > 0 ? await WebGpu.create().catch(() => null) : null
+  const webgpu = TUNING.webgpu > 0 && !webgl ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
@@ -595,13 +597,14 @@ async function load(
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
       if (reusedTuning) throw new GpuError("Previous GPU tuning failed validation.")
+      if (webgpu) throw new GpuError(`WebGPU computes the model wrong (relative error ${error.toExponential(1)}).`)
       if (plain) {
         throw new GpuError(
           `This GPU computes the model wrong: its startup check against the CPU found a relative error of ${error.toExponential(1)}.`
         )
       }
       release(engine)
-      return await load(model, signal, contextLength, true)
+      return await load(model, signal, contextLength, true, true, webgl)
     }
     engine.gpu.resetPacing(true)
     engine.gpu.setPhase("load")
@@ -645,7 +648,10 @@ async function load(
     // A failed or superseded load frees its textures now.
     release(engine)
     if (reusedTuning && !signal.aborted && error instanceof GpuError)
-      return load(model, signal, contextLength, plain, false)
+      return load(model, signal, contextLength, plain, false, webgl)
+    // Whatever WebGPU couldn't do, WebGL 2 may.
+    if (webgpu && !signal.aborted && !(error instanceof Superseded))
+      return load(model, signal, contextLength, plain, reuseTuning, true)
     throw error
   }
 }

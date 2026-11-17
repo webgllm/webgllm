@@ -394,6 +394,12 @@ export type Variant = {
   /** Samplers bound to RGBA4 textures (held as r16uint: see webgpu.ts). */
   rgba4?: ReadonlyArray<string>
   workgroup: [number, number]
+  /**
+   * Threads per output texel (a power of two; see coopLoop): with more than
+   * one, the workgroup is (lanes, workgroup[0] · workgroup[1] / lanes) and
+   * covers that many texels of a row, its threads sharing main's K loop.
+   */
+  lanes?: number
 }
 
 export type Translation = {
@@ -404,6 +410,9 @@ export type Translation = {
   uniforms: Map<string, { type: Type; offset: number }>
   uniformBytes: number
   outputs: number
+  /** Threads per output texel: 1 unless the variant asked for more and main's loop allows it. */
+  lanes: number
+  workgroup: [number, number]
 }
 
 const BUILTIN_SAME = new Set([
@@ -439,6 +448,9 @@ class Emitter {
   private uses = new Map<Fn, { samplers: Set<string>; fns: Set<Fn> }>()
   private current: Fn | null = null
   private rgba4: Set<string>
+  /** The K loop the workgroup's lanes share, and its accumulator (see coopLoop). */
+  private coop: { loop: Stmt; acc: string } | null = null
+  private lanes = 1
 
   constructor(private s: Shader, private variant: Variant) {
     this.rgba4 = new Set(variant.rgba4 ?? [])
@@ -454,6 +466,10 @@ class Emitter {
     for (const o of s.outputs) this.globals.set(o.name, { type: o.type, out: P + o.name })
     for (const g of s.globals) this.globals.set(g.decl.name, { type: g.decl.type, out: P + g.decl.name })
     this.globals.set("gl_FragCoord", { type: "vec4", out: "fc" })
+    if ((variant.lanes ?? 1) > 1) {
+      this.coop = coopLoop(s)
+      if (this.coop) this.lanes = variant.lanes!
+    }
   }
 
   private lookup(name: string) {
@@ -801,6 +817,10 @@ class Emitter {
         return
       }
       case "for": {
+        if (this.coop && s === this.coop.loop) {
+          this.coopFor(s, out, indent)
+          return
+        }
         out.push(`${indent}{`)
         const inner = indent + "  "
         this.scopes.push(new Map())
@@ -842,6 +862,54 @@ class Emitter {
         return
       }
     }
+  }
+
+  /**
+   * main's K loop shared by the workgroup's lanes: lane l takes iterations
+   * l, l + lanes, …, then the lanes sum their accumulators in workgroup
+   * memory. The trip count every lane loops to is the workgroup's largest
+   * (made uniform with workgroupUniformLoad, as the barriers need).
+   */
+  private coopFor(s: Extract<Stmt, { k: "for" }>, out: Array<string>, indent: string) {
+    const init = s.init as Extract<Stmt, { k: "decl" }>
+    const v = init.vars[0]
+    const cond = s.c as Extract<Expr, { k: "bin" }>
+    const L = this.lanes
+    const i = indent + "  "
+    out.push(`${indent}{`)
+    const c: Ctx = { pre: [], hoist: false, indent: i }
+    const lo = this.coerce(v.init!, "int", c)
+    const hi = this.coerce(cond.b, "int", c)
+    const acc = this.lookup(this.coop!.acc)
+    out.push(
+      `${i}let lo_: i32 = ${lo};`,
+      `${i}let hi_: i32 = ${hi};`,
+      `${i}coopTrips[li] = max(0, (hi_ - lo_ - i32(lane) + ${L - 1}) / ${L});`,
+      `${i}workgroupBarrier();`,
+      `${i}if (li == 0u) { var t_ = 0; for (var j_ = 0u; j_ < ${this.coopThreads()}u; j_++) { t_ = max(t_, coopTrips[j_]); } coopMax = t_; }`,
+      `${i}let n_ = workgroupUniformLoad(&coopMax);`,
+      `${i}for (var it_ = 0; it_ < n_; it_++) {`
+    )
+    this.scopes.push(new Map([[v.name, { type: "int", out: `${P}${v.name}` }]]))
+    out.push(`${i}  let ${P}${v.name}: i32 = lo_ + i32(lane) + it_ * ${L};`, `${i}  if (${P}${v.name} < hi_) {`)
+    this.body(s.body, out, i + "    ")
+    this.scopes.pop()
+    out.push(
+      `${i}  }`,
+      `${i}}`,
+      `${i}coopAcc[li] = ${acc.out};`,
+      `${i}workgroupBarrier();`,
+      `${i}for (var s_ = ${L >> 1}u; s_ > 0u; s_ >>= 1u) {`,
+      `${i}  if (lane < s_) { coopAcc[li] += coopAcc[li + s_]; }`,
+      `${i}  workgroupBarrier();`,
+      `${i}}`,
+      `${i}${acc.out} = coopAcc[li - lane];`,
+      `${indent}}`
+    )
+  }
+
+  private coopThreads() {
+    return this.variant.workgroup[0] * this.variant.workgroup[1]
   }
 
   /** Whether a name is a parameter of the current function (WGSL can't redeclare one at its top level). */
@@ -936,6 +1004,18 @@ class Emitter {
       lines.push(`var<private> ${P}${o.name}: ${wgslType(o.type)};`)
     })
     lines.push(`var<private> fc: vec4<f32>;`)
+    const L = this.lanes
+    if (L > 1) {
+      const n = this.coopThreads()
+      const accType = wgslType(this.globalsOfMain(main).get(this.coop!.acc)!)
+      lines.push(
+        `var<private> lane: u32;`,
+        `var<private> li: u32;`,
+        `var<workgroup> coopAcc: array<${accType}, ${n}>;`,
+        `var<workgroup> coopTrips: array<i32, ${n}>;`,
+        `var<workgroup> coopMax: i32;`
+      )
+    }
     if (this.rgba4.size)
       lines.push(`fn rgba4(u: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(u >> 12u, u >> 8u, u >> 4u, u) & vec4<u32>(15u)) / 15.0; }`)
     for (const g of s.globals) {
@@ -946,7 +1026,8 @@ class Emitter {
       else lines.push(`var<private> ${P}${g.decl.name}: ${wgslType(g.decl.type)};`)
     }
     for (const f of s.fns) if (reached.has(f)) lines.push(bodies.get(f)!.join("\n"))
-    const [wx, wy] = this.variant.workgroup
+    const threads = this.coopThreads()
+    const [wx, wy]: [number, number] = L > 1 ? [L, threads / L] : this.variant.workgroup
     const stores = outputs.map((o, i) => {
       const t = shape(o.type)!
       const want = /uint$/.test(this.variant.outputs[i]) ? "u" : /sint$/.test(this.variant.outputs[i]) ? "i" : "f"
@@ -955,24 +1036,133 @@ class Emitter {
       if (t.base !== want) v = `${wgslType(make(want, 4))}(${v})`
       return `  textureStore(out${i}, p, ${v});`
     })
-    lines.push(
-      `@compute @workgroup_size(${wx}, ${wy})`,
-      `fn main(@builtin(global_invocation_id) id: vec3<u32>) {`,
-      `  if (id.x >= U.rect.z || id.y >= U.rect.w) { return; }`,
-      `  let p = id.xy + U.rect.xy;`,
-      `  fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
-      `  ${P}main();`,
-      ...stores,
-      `}`
-    )
+    if (L > 1)
+      // Texel x of the row is lane-group l.y of workgroup w.x; every lane
+      // runs main (for the barriers), lane 0 stores.
+      lines.push(
+        `@compute @workgroup_size(${wx}, ${wy})`,
+        `fn main(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {`,
+        `  lane = l.x;`,
+        `  li = l.y * ${L}u + l.x;`,
+        `  let tx = w.x * ${wy}u + l.y;`,
+        `  let inside = tx < U.rect.z;`,
+        `  let p = vec2<u32>(min(tx, U.rect.z - 1u), w.y) + U.rect.xy;`,
+        `  fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
+        `  ${P}main();`,
+        `  if (inside && lane == 0u) {`,
+        ...stores.map((l) => `  ${l}`),
+        `  }`,
+        `}`
+      )
+    else
+      lines.push(
+        `@compute @workgroup_size(${wx}, ${wy})`,
+        `fn main(@builtin(global_invocation_id) id: vec3<u32>) {`,
+        `  if (id.x >= U.rect.z || id.y >= U.rect.w) { return; }`,
+        `  let p = id.xy + U.rect.xy;`,
+        `  fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
+        `  ${P}main();`,
+        ...stores,
+        `}`
+      )
     return {
       code: lines.join("\n"),
       samplers: samplers.map((t) => ({ name: t.name, kind: this.rgba4.has(t.name) ? "u" : SAMPLERS[t.type] })),
       uniforms,
       uniformBytes,
-      outputs: outputs.length
+      outputs: outputs.length,
+      lanes: L,
+      workgroup: [wx, wy]
     }
   }
+
+  /** The types of the variables main declares at its top level. */
+  private globalsOfMain(main: Fn) {
+    const types = new Map<string, Type>()
+    for (const st of main.body) if (st.k === "decl") for (const v of st.vars) types.set(v.name, v.type)
+    return types
+  }
+}
+
+/**
+ * main's loop the lanes of a workgroup can share, if it has one: a top-level
+ * `for (int k = a; k < b; k++)` whose body only adds into one variable
+ * declared before it (`acc += …`, or a component of it), with no break,
+ * continue or return in it and no return anywhere in main (the lanes meet
+ * at barriers after it). The kernels' K loops (matmuls, the head) are.
+ */
+export function coopLoop(s: Shader): { loop: Stmt; acc: string } | null {
+  const main = s.fns.find((f) => f.name === "main")
+  if (!main) return null
+  let returns = false
+  const walk = (st: Stmt | undefined, f: (st: Stmt) => void) => {
+    if (!st) return
+    f(st)
+    if (st.k === "block") st.body.forEach((x) => walk(x, f))
+    else if (st.k === "if") { walk(st.a, f); walk(st.b, f) }
+    else if (st.k === "for") { walk(st.init, f); walk(st.body, f) }
+    else if (st.k === "while") walk(st.body, f)
+  }
+  main.body.forEach((st) => walk(st, (x) => { if (x.k === "return") returns = true }))
+  if (returns) return null
+  const declared = new Set<string>()
+  for (const st of main.body) {
+    if (st.k === "decl") st.vars.forEach((v) => declared.add(v.name))
+    if (st.k !== "for" || !st.init || st.init.k !== "decl" || st.init.vars.length !== 1) continue
+    const v = st.init.vars[0]
+    if (v.type !== "int" || !v.init) continue
+    const c = st.c
+    if (!c || c.k !== "bin" || c.op !== "<" || c.a.k !== "id" || c.a.v !== v.name) continue
+    const step = st.step
+    if (!step || !((step.k === "post" || step.k === "un") && step.op === "++" && step.a.k === "id" && step.a.v === v.name)) continue
+    // The body: no jumps, only `+=` into one outer variable, nothing else outer written.
+    let ok = true
+    const inner = new Set<string>()
+    const writes = new Map<string, Array<string>>()
+    const target = (e: Expr): string | null => (e.k === "id" ? e.v : e.k === "field" || e.k === "index" ? target(e.a) : null)
+    const exprWrites = (e: Expr | undefined): void => {
+      if (!e) return
+      switch (e.k) {
+        case "assign": { const t = target(e.a); if (t) writes.set(t, [...(writes.get(t) ?? []), e.op]); exprWrites(e.b); return }
+        case "post": case "un": {
+          if (e.op === "++" || e.op === "--") { const t = target(e.a); if (t) writes.set(t, [...(writes.get(t) ?? []), e.op]) }
+          exprWrites(e.a); return
+        }
+        case "bin": exprWrites(e.a); exprWrites(e.b); return
+        case "tern": exprWrites(e.c); exprWrites(e.a); exprWrites(e.b); return
+        case "call": e.args.forEach(exprWrites); return
+        case "field": exprWrites(e.a); return
+        case "index": exprWrites(e.a); exprWrites(e.i); return
+      }
+    }
+    walk(st.body, (x) => {
+      if (x.k === "break" || x.k === "continue" || x.k === "return") ok = false
+      else if (x.k === "decl") x.vars.forEach((d) => { inner.add(d.name); exprWrites(d.init) })
+      else if (x.k === "expr") exprWrites(x.e)
+      else if (x.k === "if") exprWrites(x.c)
+      else if (x.k === "for") { exprWrites(x.c); exprWrites(x.step) }
+      else if (x.k === "while") exprWrites(x.c)
+    })
+    if (!ok) return null
+    const outer = [...writes].filter(([name]) => !inner.has(name))
+    if (outer.length !== 1) return null
+    const [acc, ops] = outer[0]
+    if (acc === v.name || !declared.has(acc) || ops.some((op) => op !== "+=")) return null
+    // The bound mustn't change inside the loop.
+    const reads = new Set<string>()
+    const collect = (e: Expr): void => {
+      if (e.k === "id") reads.add(e.v)
+      else if (e.k === "bin") { collect(e.a); collect(e.b) }
+      else if (e.k === "un" || e.k === "post" || e.k === "field") collect(e.a)
+      else if (e.k === "call") e.args.forEach(collect)
+      else if (e.k === "index") { collect(e.a); collect(e.i) }
+      else if (e.k === "tern") { collect(e.c); collect(e.a); collect(e.b) }
+    }
+    collect(c.b)
+    if (reads.has(acc) || reads.has(v.name)) return null
+    return { loop: st, acc }
+  }
+  return null
 }
 
 /** Whether a statement list assigns to (or increments) `name`. */

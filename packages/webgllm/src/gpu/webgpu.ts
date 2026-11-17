@@ -13,7 +13,7 @@
 import { PacedGpu } from "./paced.js"
 import type { SubmissionBudget } from "./submission-budget.js"
 import { GL, GpuError, type GpuLimits, type Pass, type PendingRead, type Program, type Texture } from "./types.js"
-import { parseGlsl, toWgsl, type Shader, type Translation } from "./wgsl.js"
+import { coopLoop, parseGlsl, toWgsl, type Shader, type Translation } from "./wgsl.js"
 
 type Value = NonNullable<Pass["uniforms"]>[string]
 
@@ -27,6 +27,8 @@ type Variant = {
 
 type WgProgram = Program & {
   shader: Shader
+  /** Whether main has a loop the lanes of a workgroup can share (see wgsl.ts's coopLoop). */
+  coop: boolean
   source: string
   variants: Map<string, Variant>
   /** Uniform values: they persist between passes, as a GL program's do. */
@@ -227,6 +229,7 @@ export class WebGpu extends PacedGpu<Fence> {
     const shader = parseGlsl(source)
     const program: WgProgram = {
       shader,
+      coop: coopLoop(shader) !== null,
       source,
       variants: new Map(),
       values: new Map(),
@@ -248,15 +251,38 @@ export class WebGpu extends PacedGpu<Fence> {
     this.compiled.slowest.length = Math.min(this.compiled.slowest.length, 8)
   }
 
-  private variant(program: WgProgram, outputs: Array<Texture>, inputs: Record<string, Texture>, height: number): Variant {
+  /**
+   * Threads a small pass with a K loop is spread over (0: a thread a
+   * texel): see wgsl.ts's coopLoop, and TUNING.lanes.
+   */
+  coopThreads = 0
+  /** Whether passes can share a texel's K loop among threads (coopThreads). */
+  readonly sharesLoops = true
+  /** Profile whole compute passes (GPU busy time) rather than each pass in its own (see profile). */
+  static coarse = false
+  /** A workgroup shape for every pass (experiments). */
+  static workgroup: [number, number] | null = null
+
+  private variant(program: WgProgram, outputs: Array<Texture>, inputs: Record<string, Texture>, width: number, height: number): Variant {
     const formats = outputs.map((o) => formatOf(o.internal).format)
     const rgba4 = program.samplers.filter((s) => inputs[s]?.internal === GL.RGBA4)
-    const workgroup: [number, number] = height < 4 ? [64, 1] : [16, 4]
-    const key = `${formats.join(",")}|${rgba4.join(",")}|${workgroup.join("x")}`
+    // Rows of 64 for a few rows (a token's), 16 × 4 above that, and 8 × 8
+    // for a prompt's tall passes: an iPad Pro M4 read LFM3 prompts 7%
+    // faster than at 16 × 4, a Pixel 10 Pro 35%; but the Pixel's output
+    // head (a token's, 64 rows) took 11 ms more a token at 8 × 8.
+    const workgroup: [number, number] = WebGpu.workgroup ??
+      (height < 4 ? [64, 1] : height >= 32 && this.phase === "prompt" ? [8, 8] : [16, 4])
+    // A small pass with a K loop shares each texel's loop among lanes, for
+    // about coopThreads threads in all.
+    const texels = width * height
+    const lanes = program.coop && this.coopThreads > 0 && texels * 2 <= this.coopThreads
+      ? Math.min(32, 2 ** Math.floor(Math.log2(this.coopThreads / texels)))
+      : 1
+    const key = `${formats.join(",")}|${rgba4.join(",")}|${workgroup.join("x")}|${lanes}`
     let v = program.variants.get(key)
     if (v) return v
     const started = performance.now()
-    const t = toWgsl(program.shader, { outputs: formats, rgba4, workgroup })
+    const t = toWgsl(program.shader, { outputs: formats, rgba4, workgroup, lanes })
     const device = this.device
     const entries: Array<GPUBindGroupLayoutEntry> = [
       { binding: 0, visibility: COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: t.uniformBytes } }
@@ -281,7 +307,7 @@ export class WebGpu extends PacedGpu<Fence> {
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       compute: { module, entryPoint: "main" }
     })
-    v = { t, pipeline, layout, workgroup, id: this.nextVariant++ }
+    v = { t, pipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
     program.variants.set(key, v)
     this.count(`${key}\n${program.source}`, performance.now() - started)
     return v
@@ -327,8 +353,16 @@ export class WebGpu extends PacedGpu<Fence> {
     rect: { x: number; y: number; width: number; height: number },
     data: { format: number; type: number; pixels: ArrayBufferView }
   ) {
-    this.upload(target, rect, data, !this.encoder)
+    // The queue's write lands before the commands not yet submitted: fine
+    // unless one of them uses the texture (it would see the new contents).
+    // Otherwise staged behind them, which ends the compute pass.
+    this.upload(target, rect, data, !this.encoder || this.touched.get(target.id) !== this.generation)
   }
+
+  /** Submissions sent: the commands being built are generation `generation`. */
+  private generation = 0
+  /** The generation each texture was last read or written by a command in. */
+  private touched = new Map<number, number>()
 
   private upload(
     target: Texture,
@@ -364,6 +398,7 @@ export class WebGpu extends PacedGpu<Fence> {
     else for (let y = 0; y < rect.height; y++) mapped.set(src.subarray(y * row, (y + 1) * row), y * padded)
     buffer.unmap()
     this.endComputePass()
+    this.touched.set(target.id, this.generation)
     this.commands().copyBufferToTexture(
       { buffer, bytesPerRow: padded, rowsPerImage: rect.height },
       { texture: tex, origin: { x: rect.x, y: rect.y } },
@@ -374,6 +409,7 @@ export class WebGpu extends PacedGpu<Fence> {
 
   delete(texture: Texture) {
     for (const key of this.groupsByTexture.get(texture.id) ?? []) this.bindGroups.delete(key)
+    this.touched.delete(texture.id)
     this.groupsByTexture.delete(texture.id)
     // (Passes issued and not yet submitted may read it: destroyed after they're sent.)
     if (this.encoder) this.doomed.push(texture.tex as GPUTexture)
@@ -456,13 +492,19 @@ export class WebGpu extends PacedGpu<Fence> {
   /** Waits for the profiled submissions' timestamps to arrive in `profile`. */
   async profiled() {
     this.flush()
-    await Promise.all(this.profiling)
+    // (Bounded: a browser that never maps some of them still reports the rest.)
+    const pending = this.profiling.length
+    let settled = 0
+    this.profiling.forEach((p) => void p.then(() => settled++, () => settled++))
+    await Promise.race([Promise.allSettled(this.profiling), new Promise((r) => setTimeout(r, 3000))])
+    if (settled < pending) this.errors.push(`${pending - settled} of ${pending} profiled submissions never reported`)
     this.profiling = []
     return this.profile
   }
 
   /** The open compute pass, with this pipeline set. */
   private computePassFor(pipeline: GPUComputePipeline) {
+    if (!this.computePass && this.profile && WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed("busy")
     const cpass = (this.computePass ??= this.commands().beginComputePass())
     if (this.boundPipeline !== pipeline) {
       cpass.setPipeline(pipeline)
@@ -479,7 +521,7 @@ export class WebGpu extends PacedGpu<Fence> {
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
     const rect = pass.rect ?? { x: 0, y: 0, width: outputs[0].width, height: outputs[0].height }
     if (rect.width <= 0 || rect.height <= 0) return
-    const v = this.variant(program, outputs, pass.inputs, rect.height)
+    const v = this.variant(program, outputs, pass.inputs, rect.width, rect.height)
     if (v.t.samplers.length > this.limits.maxTextureUnits)
       throw new GpuError(`This GPU reads ${this.limits.maxTextureUnits} textures in a pass; one needs ${v.t.samplers.length}.`)
     const inputs = v.t.samplers.map(({ name }) => {
@@ -489,6 +531,8 @@ export class WebGpu extends PacedGpu<Fence> {
       return input
     })
     for (const [name, value] of Object.entries(pass.uniforms ?? {})) program.values.set(name, value)
+    for (const t of inputs) this.touched.set(t.id, this.generation)
+    for (const t of outputs) this.touched.set(t.id, this.generation)
     const group = this.bindGroup(v, inputs, outputs)
     const block = this.uniformBlock(program, v)
     this.passes++
@@ -503,11 +547,12 @@ export class WebGpu extends PacedGpu<Fence> {
       for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
         const height = Math.min(rowsPerBand, rect.y + rect.height - y)
         const offset = this.pushUniforms(block, rect.x, y, rect.width, height)
-        if (this.profile && this.device.features.has("timestamp-query")) this.timed(`${pass.name ?? ""} ${rect.width}x${height}`)
+        if (this.profile && !WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed(`${pass.name ?? ""} ${rect.width}x${height}`)
         const cpass = this.computePassFor(v.pipeline)
         cpass.setBindGroup(0, group, [offset])
         this.markGpuWork()
-        cpass.dispatchWorkgroups(Math.ceil(rect.width / wx), Math.ceil(height / wy))
+        if (v.t.lanes > 1) cpass.dispatchWorkgroups(Math.ceil(rect.width / wy), height)
+        else cpass.dispatchWorkgroups(Math.ceil(rect.width / wx), Math.ceil(height / wy))
         this.draws++
         if (this.drawTrace) {
           const key = `${pass.name ?? ""}`
@@ -589,6 +634,7 @@ export class WebGpu extends PacedGpu<Fence> {
     this.device.queue.submit([this.encoder.finish()])
     timestamps?.()
     this.encoder = null
+    this.generation++
     this.ringUsed = 0
     for (const b of this.transient) b.destroy()
     this.transient = []
