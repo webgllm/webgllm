@@ -2658,11 +2658,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const phase = this.gpu.activePhase
     const quota = this.tuned.submissionReads ?? TUNING.submissionReads
     try {
-      // Measure the head as generation uses it, with identical pacing for
-      // every candidate and nonzero hidden values (clear-color inputs can
-      // bias mobile GPU timings).
+      // Measure the heads' GPU work: unpaced, three back to back between
+      // waits (a pace's or a read's fixed wait, 0.4 to 3.6 ms, swamped the
+      // difference on an M3 Ultra and a Pixel 10 Pro), with nonzero hidden
+      // values (clear-color inputs can bias mobile GPU timings).
       this.gpu.setPhase("decode")
-      this.gpu.configurePacing(quota, TUNING.submissionMs)
+      this.gpu.configurePacing(0, TUNING.submissionMs)
       const input = this.buffers.lastNormed,
         seed = new Uint32Array(input.width * 4)
       for (let i = 0; i < seed.length; i++)
@@ -2691,10 +2692,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.setSeen([], matrix.N)
       const sample = async (index: number) => {
         this.headChoice = settings[index]
-        this.gpu.resetPacing()
         this.gpu.setPhase("decode")
         this.embedding = made[settings[index].expanded ? 1 : 0]
-        await this.argmax(0, 1, 1, [], false)
+        await this.head(0, 1)
       }
       for (let i = 0; i < settings.length; i++) await sample(i)
       for (let round = 0; round < (this.incumbent?.head ? 3 : 2); round++)
@@ -4514,7 +4514,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 split: true,
                 normed: norm === "prescaled" ? norm : false,
                 offset: x0 > 0
-              }), this.parts)
+              }), norm === "prescaled" && this.sumsInOne(a) ? 1 : this.parts)
         ),
         inputs: !norm
           ? weights
@@ -4547,6 +4547,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    * matmul's partial sums over `split` slices.
    */
   private get parts() { return this.tuned.rmsParts ?? TUNING.rmsParts }
+
+  /** The native fused adds' programs, which write a row's sum of squares in one column. */
+  private fusedAddPrograms = new Set<unknown>()
+
+  /**
+   * Whether residual texture x's sums of squares are in one column (a fused
+   * add wrote it last), so a norm reads that column alone, not all parts.
+   */
+  private sumsInOne(x: Texture) {
+    return "lastWriter" in this.gpu && this.fusedAddPrograms.has(this.gpu.lastWriter(x))
+  }
 
   /** Native fused adds by shape (see addNormed). */
   private fusedAdds = new Map<string, NativeSpec | null>()
@@ -4670,9 +4681,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     const spec = split > 0 && TUNING.fusedAdd > 0 ? this.fusedAdds.get(key) : null
     if (spec && "nativeProgram" in this.gpu) {
+      const program = this.gpu.nativeProgram(spec)
+      this.fusedAddPrograms.add(program)
       this.gpu.run({
         name: "add",
-        program: this.gpu.nativeProgram(spec),
+        program,
         inputs: { uH: h, uY: y, ...(norm && { uNorm: norm }), ...(next && { uNext: next }) },
         uniforms: {
           uSplitIn: { int: split },
@@ -6527,7 +6540,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 : split > 1
                   ? K.MATMUL_Q6_K_HEAD_SPLIT
                   : K.MATMUL_Q6_K_HEAD
-          ), this.parts)
+          ), prescaled && this.sumsInOne(b.residual[0]) ? 1 : this.parts)
         ),
         inputs: {
           ...(prescaled && { uR: b.residual[0] }),
@@ -6588,7 +6601,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       name: "head",
       work: Math.ceil(e.blocks / split) * 24,
       program: this.gpu.program(
-        K.withRms(K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined }), this.parts)
+        K.withRms(K.headRgba4({ zeros: !!e.zeros, prescaled: scaledRow0 !== undefined }), scaledRow0 !== undefined && this.sumsInOne(b.residual[0]) ? 1 : this.parts)
       ),
       inputs: {
         ...(scaledRow0 !== undefined && { uR: b.residual[0] }),

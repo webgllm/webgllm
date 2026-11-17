@@ -365,6 +365,14 @@ export class WebGpu extends PacedGpu<Fence> {
 
   private natives = new Map<string, NativeProgram>()
 
+  /** The program that last wrote each texture (a write from the CPU clears it). */
+  private writers = new Map<number, Program>()
+
+  /** The program whose pass last wrote `texture`, if a pass did since its last upload. */
+  lastWriter(texture: Texture): Program | undefined {
+    return this.writers.get(texture.id)
+  }
+
   /** Runs a native pass: one dispatch, its groups from the rectangle. */
   private runNative(pass: Pass, program: NativeProgram) {
     this.flushQueue()
@@ -399,7 +407,10 @@ export class WebGpu extends PacedGpu<Fence> {
     })
     for (const [name, value] of Object.entries(pass.uniforms ?? {})) program.values.set(name, value)
     for (const t of inputs) this.touched.set(t.id, this.generation)
-    for (const t of outputs) this.touched.set(t.id, this.generation)
+    for (const t of outputs) {
+      this.touched.set(t.id, this.generation)
+      this.writers.set(t.id, program)
+    }
     const key2 = `n${p.id}|${inputs.map((t) => t.id).join(",")}|${outputs.map((t) => t.id).join(",")}`
     let group = this.bindGroups.get(key2)
     if (!group) {
@@ -493,6 +504,7 @@ export class WebGpu extends PacedGpu<Fence> {
     data: { format: number; type: number; pixels: ArrayBufferView },
     direct: boolean
   ) {
+    this.writers.delete(target.id)
     const f = formatOf(target.internal)
     let pixels = data.pixels
     if (target.internal === GL.RGBA16F && data.type === GL.FLOAT)
@@ -533,6 +545,7 @@ export class WebGpu extends PacedGpu<Fence> {
   delete(texture: Texture) {
     for (const key of this.groupsByTexture.get(texture.id) ?? []) this.bindGroups.delete(key)
     this.touched.delete(texture.id)
+    this.writers.delete(texture.id)
     this.groupsByTexture.delete(texture.id)
     // (Passes issued and not yet submitted may read it: destroyed after they're sent.)
     if (this.encoder) this.doomed.push(texture.tex as GPUTexture)
@@ -657,7 +670,10 @@ export class WebGpu extends PacedGpu<Fence> {
     })
     for (const [name, value] of Object.entries(pass.uniforms ?? {})) program.values.set(name, value)
     for (const t of inputs) this.touched.set(t.id, this.generation)
-    for (const t of outputs) this.touched.set(t.id, this.generation)
+    for (const t of outputs) {
+      this.touched.set(t.id, this.generation)
+      this.writers.set(t.id, program)
+    }
     const block = this.uniformBlock(program, v)
     this.passes++
     this.trace?.push(`${pass.name ?? ""}(${v.t.samplers.map((s) => s.name).join(",")})`)
