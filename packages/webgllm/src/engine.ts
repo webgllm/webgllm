@@ -867,6 +867,7 @@ export class Engine {
     this.loadMs.scratch = performance.now() - started
     this.expandedUpload = new Uint8Array(0)
     this.repackUpload = new Uint32Array(0)
+    this.uploads = new Uint32Array(0)
     started = performance.now()
     await this.choosePromptPacking(signal)
     this.loadMs.packing = performance.now() - started
@@ -2108,6 +2109,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private finalNormValues: Float32Array | null = null
   /** Upload scratch for raw MatMulNBits rows repacked to the bytes layout (quantsFromRaw). */
   private repackUpload = new Uint32Array(0)
+  /**
+   * Upload scratch for texels converted on the CPU (rawRgba4's, packed
+   * scales and zero points): one reused buffer, not one per matrix, whose
+   * freed memory the allocator would keep resident for a while (iOS counts
+   * it against a tab's 2 GB).
+   */
+  private uploads = new Uint32Array(0)
+  private uploadScratch(words: number) {
+    if (this.uploads.length < words) this.uploads = new Uint32Array(words)
+    return this.uploads.subarray(0, words)
+  }
   private embeddingRows = 0
 
   rmsReport: Array<{ parts: number; ms: number }> = []
@@ -2772,7 +2784,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       } else if (gm.rgba4) {
         const t = performance.now()
         const pixels = m.raw
-          ? rawRgba4(m.raw, m.K, local * 4, run * 4)
+          ? rawRgba4(m.raw, m.K, local * 4, run * 4, this.uploadScratch(run * 4 * blocks * 4))
           : q4WordsToRgba4(quants)
         this.loadMs.convert += performance.now() - t
         try {
@@ -2782,10 +2794,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             { format: GL.RGBA, type: GL.UNSIGNED_SHORT_4_4_4_4, pixels }
           )
         } finally {
-          // A private upload temporary either way (rawRgba4 copies the raw
-          // rows too), never caller data: freed now, not left to the
-          // collector (a load's worth of it).
-          releaseOwnedBuffer(pixels.buffer)
+          // A private upload temporary, never caller data: q4WordsToRgba4's
+          // freed now (rawRgba4's is the reused upload scratch).
+          if (!m.raw) releaseOwnedBuffer(pixels.buffer)
         }
       } else
         this.gpu.write(
@@ -2822,7 +2833,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         // Each texel: 4 scales then 4 zero points, as halves.
         const n = run * blocks * 4
         const at = local * blocks * 4
-        const texels = new Uint32Array(n)
+        const texels = this.uploadScratch(n)
         const scales = m.scales
         const zeros = m.zeros
         for (let t = 0, a = at; t < n; t += 4, a += 4) {
@@ -2836,7 +2847,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           { x: column * blocks, y, width: blocks, height: run },
           { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: texels }
         )
-        releaseOwnedBuffer(texels.buffer)
       } else
         this.gpu.write(
           gm.scales,

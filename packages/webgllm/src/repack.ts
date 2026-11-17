@@ -168,12 +168,13 @@ export function quantsFromRaw(raw: Uint8Array, N: number, K: number, out?: Uint3
  * texels of 4 weights, the first in the low nibble): each row's 16-byte
  * block is already those 8 texels, so it's moved into place, not repacked.
  */
-export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number) {
+export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number, scratch?: Uint32Array) {
   const blocks = K / 32
   const src = raw.byteOffset & 3
     ? new Uint32Array(raw.slice(0, raw.byteLength & ~3).buffer)
     : new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2)
-  const out = new Uint32Array(rows * blocks * 4)
+  const words = rows * blocks * 4
+  const out = scratch && scratch.length >= words ? scratch.subarray(0, words) : new Uint32Array(words)
   for (let i = 0; i < rows; i++) {
     let s = (n0 + i) * blocks * 4
     let o = ((i >> 2) * blocks * 4 + (i & 3)) * 4
@@ -184,7 +185,7 @@ export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number) {
       out[o + 3] = src[s + 3]
     }
   }
-  return new Uint16Array(out.buffer)
+  return new Uint16Array(out.buffer, out.byteOffset, words * 2)
 }
 
 /**

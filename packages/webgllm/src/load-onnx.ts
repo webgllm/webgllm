@@ -83,22 +83,6 @@ export type LoadOnnxOptions = {
   releaseReadBuffers?: boolean
 }
 
-/**
- * Frees what this loader made for the raw matrices in uploaded weights
- * (QuantMatrix.raw, and their scales and zero points), each its own buffer.
- */
-function releaseRaw(value: unknown) {
-  if (!value || typeof value !== "object" || ArrayBuffer.isView(value)) return
-  const m = value as Partial<QuantMatrix>
-  if (m.raw instanceof Uint8Array) {
-    for (const view of [m.raw, m.scales, m.zeros])
-      if (view && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength)
-        (view.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
-    return
-  }
-  for (const item of Object.values(value)) releaseRaw(item)
-}
-
 /** The source of a read that needs none (an inline tensor's bytes are in the graph). */
 const NO_SOURCE: ByteSource = { size: 0, read: async () => new Uint8Array(0) }
 
@@ -189,8 +173,15 @@ export async function* loadOnnx(
    * block of 32, symmetric (quantizeQ8), as the GGUF loader stores a
    * matrix that isn't Q4_0 or Q8_0.
    */
+  // Each layer's raw matrices in the same buffers as the last layer's of
+  // their role and size (the engine has uploaded those by the time the
+  // next layer is read): a model's worth of short-lived buffers would
+  // otherwise stay resident in the allocator after they're freed (iOS
+  // counts them against a tab's 2 GB).
+  const pool = new Map<string, { scales: Uint16Array; zeros: Uint8Array | null; raw: Uint8Array }>()
   const matrix = async (
-    parts: Array<{ w: NBits; segments: Array<Segment & { to: number; perm?: Int32Array }> }>
+    parts: Array<{ w: NBits; segments: Array<Segment & { to: number; perm?: Int32Array }> }>,
+    role: string
   ): Promise<QuantMatrix> => {
     const K = parts[0].w.K
     let N = 0
@@ -229,15 +220,18 @@ export async function* loadOnnx(
     // The quants stay as MatMulNBits stores them (rows copied into place):
     // the engine rearranges them on the GPU (QuantMatrix.raw).
     const withZeros = parts.some((p) => p.w.zp)
-    const m: QuantMatrix = {
-      N,
-      K,
-      bits: 4,
-      quants: new Uint32Array(0),
-      scales: new Uint16Array(N * rowBlocks),
-      zeros: withZeros ? new Uint8Array(N * rowBlocks).fill(8) : null,
-      raw: new Uint8Array(N * rowBlocks * 16)
+    const key = `${role}:${N}x${K}:${withZeros}`
+    let buffers = pool.get(key)
+    if (!buffers) {
+      buffers = {
+        scales: new Uint16Array(N * rowBlocks),
+        zeros: withZeros ? new Uint8Array(N * rowBlocks) : null,
+        raw: new Uint8Array(N * rowBlocks * 16)
+      }
+      pool.set(key, buffers)
     }
+    buffers.zeros?.fill(8)
+    const m: QuantMatrix = { N, K, bits: 4, quants: new Uint32Array(0), ...buffers }
     const raw = m.raw as Uint8Array
     for (const { w, segments } of parts) {
       const quant = await plan.take(w.quant.name)
@@ -289,9 +283,9 @@ export async function* loadOnnx(
       if (!lc) throw new Error("ONNX: the config has no Gated DeltaNet shapes")
       const [qkvW, zW, bW, aW, outW] = l.matrices as [NBits, NBits, NBits, NBits, NBits]
       const H = lc.numValueHeads
-      const inProj = await matrix([whole(qkvW), whole(zW, qkvW.N)])
-      const ba = await matrix([whole(bW), whole(aW, H)])
-      const outProj = await matrix([whole(outW)])
+      const inProj = await matrix([whole(qkvW), whole(zW, qkvW.N)], "inProj")
+      const ba = await matrix([whole(bW), whole(aW, H)], "ba")
+      const outProj = await matrix([whole(outW)], "outProj")
       const [convT, aT, dtT, normT] = l.extra as [OnnxTensor, OnnxTensor, OnnxTensor, OnnxTensor]
       linear = {
         inProj,
@@ -307,8 +301,8 @@ export async function* loadOnnx(
       const bcx = l.bcx ?? []
       const inProj = await matrix([
         { w: inProjW, segments: bcx.map((s, j) => ({ ...s, to: j * D })) }
-      ])
-      const outProj = await matrix([whole(outProjW)])
+      ], "inProj")
+      const outProj = await matrix([whole(outProjW)], "outProj")
       // [channels, 1, width]: channel-major, oldest tap first.
       const kernel = await floats(l.extra[0], D * config.convKernel)
       conv = { inProj, outProj, kernel }
@@ -349,16 +343,16 @@ export async function* loadOnnx(
         { w: kW, segments: [{ start: 0, rows: kW.N, to: qRows, ...(kPerm && { perm: kPerm }) }] },
         whole(vW, qRows + kv),
         ...(l.gateWeight ? [whole(l.gateWeight, gateTo)] : [])
-      ])
-      const o = await matrix([whole(oW)])
+      ], "qkvg")
+      const o = await matrix([whole(oW)], "o")
       const reordered = (values: Float32Array) => (normPerm ? Float32Array.from(normPerm, (src) => values[src]) : values)
       const qNorm = reordered(await floats(l.extra[0], headDim))
       const kNorm = reordered(await floats(l.extra[1], headDim))
       attention = { qkvg, o, qNorm, kNorm }
     }
     const [gateW, upW, downW] = l.matrices.slice(-3) as [NBits, NBits, NBits]
-    const gateUp = await matrix([whole(gateW), whole(upW, F)])
-    const down = await matrix([whole(downW)])
+    const gateUp = await matrix([whole(gateW), whole(upW, F)], "gateUp")
+    const down = await matrix([whole(downW)], "down")
     const value: LayerWeights = {
       type: l.type,
       operatorNorm,
@@ -374,12 +368,20 @@ export async function* loadOnnx(
     yield { kind: "layer", layer: i, value, ...(headsReordered && { headsReordered }) }
     // (Resumed: the engine has uploaded the layer.) Its raw rows are this
     // loader's own copies: freed now, as the reads are.
-    if (options.releaseReadBuffers) releaseRaw(value)
+
   }
 
   yield { kind: "finalNorm", value: await floats(finalNorm, D) }
 
   // In chunks of rows, so the embedding is never all in JavaScript memory.
+  let chunkScales: Uint16Array | undefined
+  let chunkZeros: Uint8Array | undefined
+  // (The layers are uploaded: their buffers go now, not at the next collection.)
+  if (options.releaseReadBuffers)
+    for (const buffers of pool.values())
+      for (const view of [buffers.raw, buffers.scales, buffers.zeros])
+        (view?.buffer as (ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }) | undefined)?.transfer?.(0)
+  pool.clear()
   for (let r = 0; r < emb.N; r += chunkRows) {
     const rows = Math.min(chunkRows, emb.N - r)
     if (emb.kind === "float") {
@@ -410,20 +412,22 @@ export async function* loadOnnx(
     // into its RGBA4 texels as they are, instead of a repack there and back.
     const blocks = D / 32
     if (quant.length < rows * blocks * 16) throw new Error("MatMulNBits data is too short")
+    // (One chunk's scales and zero points, reused for every chunk.)
+    chunkScales ??= new Uint16Array(chunkRows * blocks)
+    if (zp) chunkZeros ??= new Uint8Array(chunkRows * blocks)
     const m: QuantMatrix = {
       N: rows,
       K: D,
       bits: 4,
       quants: new Uint32Array(0),
-      scales: new Uint16Array(rows * blocks),
-      zeros: zp ? new Uint8Array(rows * blocks).fill(8) : null,
+      scales: chunkScales.subarray(0, rows * blocks),
+      zeros: zp && chunkZeros ? chunkZeros.subarray(0, rows * blocks).fill(8) : null,
       raw: quant.subarray(0, rows * blocks * 16)
     }
     packMatMulNBitsScales(m, 0, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
     // (Resumed: the engine has uploaded the rows, `m.raw` included.)
     for (const bytes of [quant, scales, zp]) if (bytes) plan.release(bytes)
-    if (options.releaseReadBuffers) releaseRaw({ ...m, raw: new Uint8Array(0) })
   }
 }
 

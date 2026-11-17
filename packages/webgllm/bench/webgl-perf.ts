@@ -508,6 +508,12 @@ async function run() {
     length = Number(params.get("len") ?? 512)
   const filler =
     "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+  const settle = Number(params.get("afterLoadMs") ?? 0)
+  if (settle > 0) {
+    begin("settle")
+    await new Promise((resolve) => setTimeout(resolve, settle))
+    await end()
+  }
   for (let i = 0; i < rounds; i++) {
     const rest = Number(params.get("restMs") ?? 0)
     if (i && rest > 0) {
