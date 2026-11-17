@@ -15,7 +15,7 @@ import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
 import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
-import { quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
+import { matrixRow, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
   LayerType,
   LayerWeights,
@@ -573,6 +573,11 @@ export type EngineOptions = {
 }
 
 /** A layer's intermediate tensors, read back for checking against a reference. */
+/** The self-check's tokens: spread over the vocabulary. */
+const checkToken = (i: number, vocabSize: number) => (i * 7919 + 13) % vocabSize
+/** The self-check's first tokens whose embedding rows and logits headError checks. */
+const HEAD_CHECK_TOKENS = 8
+
 export type LayerProbe = (
   layer: number,
   name: string,
@@ -807,7 +812,9 @@ export class Engine {
             value.K,
             value.bits,
             !!value.zeros,
-            value.bits === 4
+            // RGBA4 where it fits this GPU's textures; else byte texels
+            // (half as wide: Qwen3.5's 248,320 × 2048 on an 8,192-texel GPU).
+            value.bits === 4 && this.fitsRgba4(totalRows, value.K)
           )
         // Written in chunks: zeroed on the GPU first, or the browser
         // zero-fills it on the first chunk's write, far more slowly (430 ms
@@ -816,8 +823,17 @@ export class Engine {
           for (const t of [this.embedding.quants, this.embedding.scales, this.embedding.zeros])
             if (t) this.gpu.zero(t)
         this.writeMatrix(this.embedding, value, row0)
-      } else if (piece.kind === "finalNorm")
+        // The self-check's tokens' rows, as the loader gave them (headError).
+        if (row0 === 0) this.embeddingSamples.clear()
+        for (let i = 0; i < HEAD_CHECK_TOKENS; i++) {
+          const id = checkToken(i, this.config.vocabSize)
+          const row = id >= row0 && id < row0 + value.N ? matrixRow(value, id - row0) : null
+          if (row) this.embeddingSamples.set(id, row)
+        }
+      } else if (piece.kind === "finalNorm") {
         this.finalNorm = this.vector(piece.value)
+        this.finalNormValues = piece.value.slice()
+      }
       else {
         // The weight layout this GPU writes fastest, once, before the
         // first layer's textures (see chooseLayout).
@@ -1874,6 +1890,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     return gm
   }
 
+  /** Whether an N × K 4-bit matrix fits this GPU's textures in RGBA4 (see allocateMatrix). */
+  private fitsRgba4(N: number, K: number) {
+    const max = this.gpu.limits.maxTextureSize
+    return Math.ceil(N / 4 / max) * (K / 32) * 32 <= max
+  }
+
   /**
    * Textures for an N × K matrix, in columns if it has more row groups than
    * a texture is tall.
@@ -1948,7 +1970,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
         ? byteTexels
         : byteTexels / 4
     const rowTexels = blocks * 4 * texelsPerBlockRow
-    const unorm = bytes && bits === 4 && TUNING.unormBytes > 0
+    // (Layer matrices only: the head's and embedding's kernels read integer texels.)
+    const unorm = layer && bytes && bits === 4 && TUNING.unormBytes > 0
     const packed =
       layer && bytes && bits === 4 && withZeros && TUNING.packZeros > 0
     const quantFormat = expanded
@@ -2079,6 +2102,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   private expandedUpload = new Uint8Array(0)
+  /** Embedding rows (by token) and the final norm's weights, for headError. */
+  private embeddingSamples = new Map<number, Float32Array>()
+  private finalNormValues: Float32Array | null = null
   /** Upload scratch for raw MatMulNBits rows repacked to the bytes layout (quantsFromRaw). */
   private repackUpload = new Uint32Array(0)
   private embeddingRows = 0
@@ -3641,7 +3667,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // (The panel check reads one token after them: room for it too.)
     const tokens = Array.from(
       { length: Math.min(40, this.contextLength - 1) },
-      (_, i) => (i * 7919 + 13) % this.config.vocabSize
+      (_, i) => checkToken(i, this.config.vocabSize)
     )
     let worst = 0
     const all = this.layers,
@@ -3703,6 +3729,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           worst = Math.max(worst, await this.panelError(tokens))
         }
       }
+      worst = Math.max(worst, await this.headError())
       // The probes' scratch isn't read again (~29 MB for Qwen3.5 2B at a
       // 512-token batch).
       for (const t of [this.debug, this.kvDebug]) if (t) this.gpu.delete(t)
@@ -3714,6 +3741,62 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.work = null
       this.reset()
     }
+  }
+
+  /**
+   * The embedding lookup and the output head against the CPU: the rows the
+   * GPU looked up for the self-check's first tokens against those the loader
+   * gave (embeddingSamples), and the head's logits for those tokens against
+   * the CPU's from the last layer's output, normed there. A weight layout
+   * the kernels read wrong (texel format, nibble order) fails here instead
+   * of writing gibberish. The largest relative error; 0 without samples
+   * (6-bit embeddings).
+   */
+  private async headError(): Promise<number> {
+    // (Fewer in a context too small for them all.)
+    const ids = [...this.embeddingSamples.keys()].slice(0, Math.max(0, this.contextLength - 1))
+    const weights = this.finalNormValues
+    if (!ids.length || !weights) return 0
+    const D = this.config.hiddenSize
+    const last = this.layers.length - 1
+    let embedded: Float32Array | undefined
+    let out: { data: Float32Array; rows: number } | undefined
+    this.reset()
+    let logits: Float32Array
+    try {
+      logits = await this.forward(ids, async (layer, name, read) => {
+        if (layer === -1 && name === "embedding") embedded = (await read()).data
+        else if (layer === last && name === "l_out") out = await read()
+      })
+    } finally {
+      this.reset()
+    }
+    if (!embedded || !out) return 0
+    let worst = 0
+    ids.forEach((id, r) => {
+      const want = this.embeddingSamples.get(id) as Float32Array
+      let diff = 0
+      let scale = 0
+      for (let k = 0; k < D; k++) {
+        diff = Math.max(diff, Math.abs((embedded as Float32Array)[r * D + k] - want[k]))
+        scale = Math.max(scale, Math.abs(want[k]))
+      }
+      worst = Math.max(worst, scale > 0 ? diff / scale : diff)
+    })
+    // The head reads the last token's output, final-normed (NORM_TO_H2).
+    const x = out.data.subarray((out.rows - 1) * D, out.rows * D)
+    let squares = 0
+    for (let k = 0; k < D; k++) squares += x[k] * x[k]
+    const r = 1 / Math.sqrt(squares / D + this.config.normEps)
+    const want = ids.map((id) => {
+      const row = this.embeddingSamples.get(id) as Float32Array
+      let dot = 0
+      for (let k = 0; k < D; k++) dot += row[k] * x[k] * r * weights[k]
+      return dot
+    })
+    const scale = Math.max(...want.map(Math.abs))
+    const diff = Math.max(...ids.map((id, i) => Math.abs(logits[id] - want[i])))
+    return Math.max(worst, scale > 0 ? diff / scale : diff)
   }
 
   /**

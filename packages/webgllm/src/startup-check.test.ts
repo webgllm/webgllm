@@ -20,6 +20,10 @@ function fake(linear = false) {
     chunkErrors: null as number[] | null,
     debug: null,
     kvDebug: null,
+    // (No embedding rows sampled: headError checks nothing.)
+    embeddingSamples: new Map(),
+    finalNormValues: null,
+    headError: Reflect.get(Engine.prototype, "headError") as () => Promise<number>,
     reset() {
       this.position = 0
     },

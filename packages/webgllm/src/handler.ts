@@ -585,7 +585,7 @@ async function load(
       if (reusedTuning) throw new GpuError("Previous GPU tuning failed validation.")
       if (plain) {
         throw new GpuError(
-          `This GPU computes attention wrong (relative error ${error.toExponential(1)}).`
+          `This GPU computes the model wrong: its startup check against the CPU found a relative error of ${error.toExponential(1)}.`
         )
       }
       release(engine)

@@ -495,8 +495,12 @@ export async function download(
           for (;;) {
             const { done: end, value } = await reader.read()
             if (end) break
-            access.write(value, { at: loaded })
-            loaded += value.byteLength
+            // A write the storage has no room for can come back short
+            // instead of throwing (Firefox for Android): out of room all the same.
+            const wrote = access.write(value, { at: loaded })
+            loaded += wrote
+            if (wrote !== value.byteLength)
+              throw new DOMException(`There's no room to store ${file.path} past ${loaded} bytes.`, "QuotaExceededError")
             onProgress(loaded, total)
           }
           access.flush()

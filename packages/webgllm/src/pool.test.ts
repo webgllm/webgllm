@@ -178,6 +178,29 @@ test("a load error keeps the worker's code; the next load starts a fresh worker"
   assert.equal(workers.workers.length, 2)
 })
 
+test("a load out of room loads again once the browser agrees to keep the site's storage, and only then", async (t) => {
+  for (const granted of [true, false]) {
+    const asked: Array<string> = []
+    t.mock.getter(globalThis, "navigator", () => ({
+      storage: {
+        persisted: async () => false,
+        persist: async () => {
+          asked.push("persist")
+          return granted
+        }
+      }
+    }))
+    let fails = 1
+    const { pool: p, workers } = pool({ downloads: true, loadError: () => (fails-- > 0 ? { message: "no room", code: "storage-full" } : undefined) })
+    if (granted) {
+      await p.load(A)
+      assert.equal(workers.workers.length, 2)
+    } else await assert.rejects(p.load(A), (error: unknown) => error instanceof WebGLLMError && error.code === "storage-full")
+    assert.deepEqual(asked, ["persist"])
+    t.mock.restoreAll()
+  }
+})
+
 test("an uncoded load error is a plain Error", async () => {
   const { pool: p } = pool({ loadError: () => ({ message: "boom" }) })
   await assert.rejects(p.load(A), (error: unknown) => !(error instanceof WebGLLMError) && (error as Error).message === "boom")

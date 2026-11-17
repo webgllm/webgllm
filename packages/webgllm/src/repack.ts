@@ -544,3 +544,37 @@ export function headPermutation(
   }
   return perm
 }
+
+/**
+ * Row `n` of a 4- or 8-bit matrix as floats, as the GPU dequantizes it
+ * (scale · (q − zero point), zero point 8 for 4 bits without them, none for
+ * 8): `raw` MatMulNBits rows or this module's layout. Null for 6-bit
+ * matrices. For checking what the GPU read against the CPU.
+ */
+export function matrixRow(m: QuantMatrix, n: number): Float32Array | null {
+  if (m.bits === 6) return null
+  const half = halfTable()
+  const blocks = m.K / 32
+  const out = new Float32Array(m.K)
+  const q = new Uint8Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength)
+  for (let b = 0; b < blocks; b++) {
+    const si = (n >> 2) * blocks * 4 + (n & 3) + 4 * b
+    const scale = half[m.scales[si]]
+    if (m.bits === 8) {
+      for (let j = 0; j < 32; j++) out[b * 32 + j] = scale * ((q[si * 32 + j] << 24) >> 24)
+      continue
+    }
+    const zero = m.zeros ? m.zeros[si] : 8
+    for (let j = 0; j < 32; j++) {
+      // Raw: element 2i in byte i's low nibble. This module's: elements
+      // 0–15 in their bytes' low nibbles, 16–31 in the high nibbles of 0–15.
+      const nibble = m.raw
+        ? (m.raw[(n * blocks + b) * 16 + (j >> 1)] >> ((j & 1) << 2)) & 15
+        : j < 16
+          ? q[(si - 4 * b) * 16 + b * 64 + j] & 15
+          : q[(si - 4 * b) * 16 + b * 64 + j - 16] >> 4
+      out[b * 32 + j] = scale * (nibble - zero)
+    }
+  }
+  return out
+}

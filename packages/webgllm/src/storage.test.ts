@@ -150,8 +150,12 @@ test("locked calibration writes stop after one retry and release the next queued
   assert.deepEqual(JSON.parse(saved), { [key]: latest })
 })
 
-/** An OPFS folder in memory, with exclusive sync access handles. */
-function fakeFolder() {
+/**
+ * An OPFS folder in memory, with exclusive sync access handles. With `room`,
+ * its files hold that many bytes in all, and a write past it comes back
+ * short, as Firefox for Android's do.
+ */
+function fakeFolder(room = Infinity) {
   const files = new Map<string, Uint8Array<ArrayBuffer>>()
   const locked = new Set<string>()
   let beforeLock: ((name: string) => void) | undefined
@@ -172,11 +176,14 @@ function fakeFolder() {
         truncate: (size: number) => { files.set(name, bytes().slice(0, size)) },
         write: (data: Uint8Array, { at }: { at: number }) => {
           const old = bytes()
-          const next = new Uint8Array(Math.max(old.byteLength, at + data.byteLength))
+          let used = 0
+          for (const file of files.values()) used += file.byteLength
+          const fits = Math.max(0, Math.min(data.byteLength, room - used + old.byteLength - at))
+          const next = new Uint8Array(Math.max(old.byteLength, at + fits))
           next.set(old)
-          next.set(data, at)
+          next.set(data.subarray(0, fits), at)
           files.set(name, next)
-          return data.byteLength
+          return fits
         },
         flush: () => undefined,
         close: () => { locked.delete(name) }
@@ -204,8 +211,8 @@ function fakeFolder() {
   }
 }
 
-function useFolder(t: { mock: { getter: (o: object, k: string, f: () => unknown) => unknown } }) {
-  const fake = fakeFolder()
+function useFolder(t: { mock: { getter: (o: object, k: string, f: () => unknown) => unknown } }, room?: number) {
+  const fake = fakeFolder(room)
   t.mock.getter(globalThis, "navigator", () => ({
     storage: { getDirectory: async () => ({ getDirectoryHandle: async () => fake.folder }) }
   }))
@@ -241,6 +248,15 @@ describe("download", () => {
   const file = { repo, path: "model.gguf" }
   const name = diskName(file)
   const etag = `${name}.etag`
+
+  test("a write that comes back short is out of room, and keeps what it stored to resume from", async (t) => {
+    // (The ETag file takes 4 bytes of the room.)
+    const fake = useFolder(t, 7)
+    useFetch(t, () => ({ status: 200, body: "abcde", headers: { ETag: '"v1"', "Content-Length": "5" } }))
+    await assert.rejects(download(file, () => undefined), (error: unknown) => (error as DOMException).name === "QuotaExceededError")
+    assert.equal(new TextDecoder().decode(fake.files.get(name)), "abc")
+    assert.equal(new TextDecoder().decode(fake.files.get(etag)), '"v1"')
+  })
 
   test("a 416 for another size starts over instead of keeping the stale partial", async (t) => {
     const fake = useFolder(t)

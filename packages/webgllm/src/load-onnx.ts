@@ -83,6 +83,18 @@ export type LoadOnnxOptions = {
   releaseReadBuffers?: boolean
 }
 
+/** Frees the raw rows (QuantMatrix.raw) of the matrices in a layer's weights, each its own buffer. */
+function releaseRaw(value: unknown) {
+  if (!value || typeof value !== "object" || ArrayBuffer.isView(value)) return
+  const raw = (value as { raw?: unknown }).raw
+  if (raw instanceof Uint8Array) {
+    if (raw.byteOffset === 0 && raw.byteLength === raw.buffer.byteLength)
+      (raw.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
+    return
+  }
+  for (const item of Object.values(value)) releaseRaw(item)
+}
+
 /** The source of a read that needs none (an inline tensor's bytes are in the graph). */
 const NO_SOURCE: ByteSource = { size: 0, read: async () => new Uint8Array(0) }
 
@@ -356,6 +368,9 @@ export async function* loadOnnx(
     if (attention) value.attention = attention
     if (linear) value.linear = linear
     yield { kind: "layer", layer: i, value, ...(headsReordered && { headsReordered }) }
+    // (Resumed: the engine has uploaded the layer.) Its raw rows are this
+    // loader's own copies: freed now, as the reads are.
+    if (options.releaseReadBuffers) releaseRaw(value)
   }
 
   yield { kind: "finalNorm", value: await floats(finalNorm, D) }

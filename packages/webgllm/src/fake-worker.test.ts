@@ -25,6 +25,8 @@ type Generate = Extract<WorkerRequest, { type: "generate" }>
 export type FakeOptions = {
   /** Bytes each model claims when it loads. */
   bytes?: (model: string) => number
+  /** A load downloads its files (its progress isn't from storage). */
+  downloads?: boolean
   /** Fails the load with this error. */
   loadError?: (model: string) => { message: string; code?: Extract<WorkerResponse, { type: "load-error" }>["code"] } | undefined
   /** What a generation writes; held open (finish it with `finish`) when undefined. */
@@ -141,7 +143,7 @@ export class FakeWorker {
       // Like handler.ts: after the generations running.
       if (this.open.size) await new Promise<void>((resolve) => this.idlers.push(resolve))
       this.model = message.model
-      this.emit({ type: "progress", model: message.model, progress: 0.5, cached: true })
+      this.emit({ type: "progress", model: message.model, progress: 0.5, cached: !this.options.downloads })
       if (this.options.stored) {
         this.options.stored(message.model)
         this.emit({ type: "stored", model: message.model })

@@ -106,7 +106,8 @@ export class ModelPool {
   private readonly budget: MemoryBudget
   private readonly queue = new TaskQueue()
   private stopFrames: (() => void) | undefined
-  private askedToKeep = false
+  /** Whether the browser agreed, when first asked, to keep this site's storage (see keepDownloads). */
+  private keeping: Promise<boolean> | undefined
   /** Unloads asked for, by model and for every model: a load waiting meanwhile stops (see unloadMark). */
   private readonly unloads = new Map<string, number>()
   private unloadsOfAll = 0
@@ -185,8 +186,15 @@ export class ModelPool {
       since?: number
     } = {}
   ): Promise<void> {
-    const { contextLength, signal } = options
     const since = options.since ?? this.unloadMark(model)
+    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }))
+  }
+
+  private async loadOnce(
+    model: string,
+    options: Parameters<ModelPool["load"]>[1] & { since: number }
+  ): Promise<void> {
+    const { contextLength, signal, since } = options
     throwIfAborted(signal)
     this.throwIfDead()
     // A download of it in another worker: let it finish (they'd write the same files).
@@ -390,7 +398,7 @@ export class ModelPool {
         waiters: 0,
         listeners: new Set()
       }
-      created.promise = this.fetchFiles(model, created).finally(() => {
+      created.promise = this.withStorageRetry(() => this.fetchFiles(model, created)).finally(() => {
         this.endDownload(model, created, new Error("The download ended."))
       })
       created.promise.catch(() => undefined)
@@ -672,15 +680,34 @@ export class ModelPool {
 
   /**
    * Asks the browser to keep this site's storage, so a downloaded model isn't
-   * deleted to free space: once, when a model first downloads. Not in
-   * Firefox, which asks the user with a permission prompt. Browsers may say
-   * no; only pages can ask.
+   * deleted to free space: once, when a model first downloads. Some browsers
+   * also give a site more room once it's kept (Firefox for Android stores
+   * about 360 MB for a site otherwise, less than a model), and some ask the
+   * user first (Firefox, with a permission prompt). Browsers may say no;
+   * only pages can ask.
    */
   private keepDownloads() {
-    if (this.askedToKeep || typeof navigator === "undefined") return
-    this.askedToKeep = true
-    if (/Firefox\//.test(navigator.userAgent)) return
-    navigator.storage?.persist?.().catch(() => undefined)
+    if (this.keeping || typeof navigator === "undefined") return
+    const storage = navigator.storage
+    this.keeping = (async () => {
+      if (!storage?.persist || (await storage.persisted?.())) return false
+      return storage.persist()
+    })().catch(() => false)
+  }
+
+  /**
+   * Runs `attempt`, and once more if it ran out of room and the browser has
+   * since agreed to keep this site's storage (keepDownloads): a user can
+   * answer the prompt after a download has filled the room it had. The
+   * retry resumes the download where it stopped.
+   */
+  private async withStorageRetry(attempt: () => Promise<void>): Promise<void> {
+    try {
+      await attempt()
+    } catch (error) {
+      if (!(error instanceof WebGLLMError && error.code === "storage-full") || !(await this.keeping)) throw error
+      await attempt()
+    }
   }
 }
 
