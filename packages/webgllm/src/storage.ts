@@ -75,7 +75,7 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
     const folder = await dir()
     await folder.getFileHandle(marker(file))
     const handle = await folder.getFileHandle(diskName(file))
-    return withHandle(await handle.getFile(), handle)
+    return withHandle(await handle.getFile(), handle, [DIR])
   } catch {
     return null
   }
@@ -406,7 +406,7 @@ export async function download(
   // Another download may have finished it while this one waited for the lock.
   if (await storedFile(file)) {
     access.close()
-    return withHandle(await handle.getFile(), handle)
+    return withHandle(await handle.getFile(), handle, [DIR])
   }
   /** The bytes on disk, through a new handle if the browser closed this one. */
   const size = async () => {
@@ -540,5 +540,5 @@ export async function download(
     }
   }
   await removeOldVersions(folder, file)
-  return withHandle(await handle.getFile(), handle)
+  return withHandle(await handle.getFile(), handle, [DIR])
 }

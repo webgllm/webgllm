@@ -244,6 +244,13 @@ export const TUNING = {
   ggufReadAhead: 6,
   /** 1: stored weights are read through synchronous access handles in a worker (storedSources); 0: as Blobs. */
   syncReads: 1,
+  /** 1: those reads run in a worker of their own, beside the repacking and uploads (storedSources). */
+  readerWorker: 0,
+  /** ONNX reads in flight ahead of the one in use, and their most MiB. */
+  onnxReadAhead: 3,
+  onnxReadAheadMiB: 24,
+  /** 1: the ONNX loader frees each read's buffer once used (LoadOnnxOptions.releaseReadBuffers). */
+  releaseOnnxReads: 1,
   /** Uploaded model pieces allowed ahead of the GPU, with periodic presentation drains. */
   uploadAhead: 1,
   /** Packing probe rows: 0 uses the actual prompt batch; positive values are diagnostics. */

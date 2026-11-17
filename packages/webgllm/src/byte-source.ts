@@ -102,12 +102,12 @@ export function blobSource(blob: Blob): ByteSource {
   }
 }
 
-/** A stored file's handle (storage.ts), for reading it through a synchronous access handle. */
-const fileHandles = new WeakMap<Blob, FileSystemFileHandle>()
+/** A stored file's handle and folder (storage.ts), for reading it through a synchronous access handle. */
+const fileHandles = new WeakMap<Blob, { handle: FileSystemFileHandle; folder: ReadonlyArray<string> }>()
 
-/** `file`, remembered as `handle`'s (see storedSources). */
-export function withHandle(file: File, handle: FileSystemFileHandle): File {
-  fileHandles.set(file, handle)
+/** `file`, remembered as `handle`'s, in the folder at `folder` from the origin's storage root (see storedSources). */
+export function withHandle(file: File, handle: FileSystemFileHandle, folder: ReadonlyArray<string>): File {
+  fileHandles.set(file, { handle, folder })
   return file
 }
 
@@ -117,20 +117,30 @@ type SyncAccessHandle = {
   close: () => void
 }
 
+type StoredSources = { sources: Array<ByteSource>; close: () => Promise<void>; reader?: boolean }
+
 /**
  * Sources for a load's files. A stored file in a worker is read through a
- * synchronous access handle: on an iPhone 16 Pro Max (Safari, iOS 27.2) its
- * 1,090 MB of Qwen3.5 weights read in ~100 ms that way, against 300–640 ms
- * through `Blob.slice().arrayBuffer()`. Any other file, or one whose handle
- * can't be opened (another reader holds it), is read as a Blob. `close()`
- * releases the handles: call it once the load has read everything.
+ * synchronous access handle: faster than `Blob.slice().arrayBuffer()` (on an
+ * iPhone 16 Pro Max, 1,090 MB of Qwen3.5 weights in ~100 ms from the page
+ * cache, ~650 ms from flash, against 300–640 ms and more as Blobs). With
+ * `reader`, the handles are opened in a worker of their own, so the reads
+ * run beside the caller's repacking and uploads instead of blocking them
+ * (where a worker can't start one, or it fails, the handles are opened
+ * here). Any other file, or one whose handle can't be opened (another
+ * reader holds it), is read as a Blob. `close()` releases the handles: call
+ * it once the load has read everything.
  */
-export async function storedSources(blobs: ReadonlyArray<Blob>): Promise<{ sources: Array<ByteSource>; close: () => void }> {
-  const opened: Array<SyncAccessHandle> = []
+export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reader?: boolean } = {}): Promise<StoredSources> {
   const inWorker = typeof (globalThis as { WorkerGlobalScope?: unknown }).WorkerGlobalScope !== "undefined"
+  if (inWorker && options.reader && typeof Worker !== "undefined") {
+    const read = await readerSources(blobs).catch(() => null)
+    if (read) return read
+  }
+  const opened: Array<SyncAccessHandle> = []
   const sources = await Promise.all(
     blobs.map(async (blob) => {
-      const handle = fileHandles.get(blob) as (FileSystemFileHandle & { createSyncAccessHandle?: () => Promise<SyncAccessHandle> }) | undefined
+      const handle = fileHandles.get(blob)?.handle as (FileSystemFileHandle & { createSyncAccessHandle?: () => Promise<SyncAccessHandle> }) | undefined
       if (inWorker && handle?.createSyncAccessHandle) {
         try {
           const access = await handle.createSyncAccessHandle()
@@ -145,7 +155,7 @@ export async function storedSources(blobs: ReadonlyArray<Blob>): Promise<{ sourc
   )
   return {
     sources,
-    close: () => {
+    close: async () => {
       for (const access of opened.splice(0)) {
         try {
           access.close()
@@ -157,6 +167,120 @@ export async function storedSources(blobs: ReadonlyArray<Blob>): Promise<{ sourc
   }
 }
 
+/**
+ * The reader worker: opens files by path through synchronous access handles
+ * and answers reads with the bytes, transferred. One read at a time, in the
+ * order asked.
+ */
+const READER = `
+const files = []
+onmessage = async ({ data }) => {
+  const { id } = data
+  try {
+    if (data.type === "open") {
+      const root = await navigator.storage.getDirectory()
+      const sizes = []
+      for (const path of data.paths) {
+        if (!path) { files.push(null); sizes.push(-1); continue }
+        let folder = root
+        for (const name of path.slice(0, -1)) folder = await folder.getDirectoryHandle(name)
+        try {
+          const access = await (await folder.getFileHandle(path[path.length - 1])).createSyncAccessHandle()
+          files.push(access)
+          sizes.push(access.getSize())
+        } catch {
+          files.push(null)
+          sizes.push(-1)
+        }
+      }
+      postMessage({ id, sizes })
+    } else if (data.type === "read") {
+      const bytes = new Uint8Array(data.length)
+      const read = files[data.file].read(bytes, { at: data.offset })
+      if (read !== data.length) throw new Error("read " + read + " of " + data.length + " bytes at " + data.offset)
+      postMessage({ id, bytes }, [bytes.buffer])
+    } else if (data.type === "close") {
+      for (const access of files.splice(0)) if (access) access.close()
+      postMessage({ id })
+    }
+  } catch (error) {
+    postMessage({ id, error: String((error && error.message) || error) })
+  }
+}
+`
+
+async function readerSources(blobs: ReadonlyArray<Blob>): Promise<StoredSources> {
+  const url = URL.createObjectURL(new Blob([READER], { type: "text/javascript" }))
+  let worker: Worker
+  try {
+    worker = new Worker(url)
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+  const pending = new Map<number, { resolve: (data: Record<string, unknown>) => void; reject: (error: Error) => void }>()
+  let next = 0
+  let failed: Error | null = null
+  const fail = (error: Error) => {
+    failed ??= error
+    for (const p of pending.values()) p.reject(error)
+    pending.clear()
+    worker.terminate()
+  }
+  worker.onmessage = ({ data }: MessageEvent<Record<string, unknown> & { id: number }>) => {
+    const p = pending.get(data.id)
+    if (!p) return
+    pending.delete(data.id)
+    if (typeof data.error === "string") p.reject(new Error(data.error))
+    else p.resolve(data)
+  }
+  worker.onerror = (event) => {
+    event.preventDefault()
+    fail(new Error(`The file reader worker failed: ${event.message || "it couldn't start"}`))
+  }
+  const ask = (message: Record<string, unknown>, transfer: Array<Transferable> = []) =>
+    new Promise<Record<string, unknown>>((resolve, reject) => {
+      if (failed) return reject(failed)
+      const id = next++
+      pending.set(id, { resolve, reject })
+      worker.postMessage({ ...message, id }, transfer)
+    })
+  const paths = blobs.map((blob) => {
+    const stored = fileHandles.get(blob)
+    return stored ? [...stored.folder, stored.handle.name] : null
+  })
+  let sizes: Array<number>
+  try {
+    sizes = (await ask({ type: "open", paths })).sizes as Array<number>
+  } catch (error) {
+    worker.terminate()
+    throw error
+  }
+  const sources = blobs.map((blob, file): ByteSource => {
+    const size = sizes[file]
+    if (size < 0) return blobSource(blob)
+    return {
+      size,
+      read: async (offset, length) => {
+        if (offset < 0 || offset + length > size) {
+          throw new RangeError(`read of ${length} bytes at ${offset} is outside the file (${size} bytes)`)
+        }
+        return (await ask({ type: "read", file, offset, length })).bytes as Uint8Array
+      }
+    }
+  })
+  return {
+    sources,
+    reader: true,
+    close: async () => {
+      try {
+        await ask({ type: "close" })
+      } catch {
+        // Failed already: terminating closes its handles.
+      }
+      worker.terminate()
+    }
+  }
+}
 function syncSource(access: SyncAccessHandle): ByteSource {
   const size = access.getSize()
   return {

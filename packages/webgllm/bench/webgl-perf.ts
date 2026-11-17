@@ -598,7 +598,7 @@ renderer.addEventListener("submit", (event) => {
 })
 void run().catch(async (e) => {
   document.documentElement.dataset.phase = "error"
-  log(`ERROR ${e.stack}`)
+  log(`ERROR ${e.message} | ${e.stack}`)
   try {
     await (
       globalThis as { __benchShutdown?: () => Promise<boolean> }

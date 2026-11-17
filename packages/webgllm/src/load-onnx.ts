@@ -71,6 +71,16 @@ export type LoadOnnxOptions = {
   config: unknown
   /** Embedding rows converted per step (default 2048). */
   embeddingChunkRows?: number
+  /** Reads kept in flight ahead of the one in use, and their most bytes (default 3, 24 MiB). */
+  readAhead?: { reads: number; bytes: number }
+  /**
+   * Free each read's buffer (ArrayBuffer.transfer(0)) once its bytes are
+   * converted or uploaded, instead of leaving a model's worth of garbage to
+   * the collector (Safari collects large buffers late enough that a 2B
+   * model's prompt then crosses iOS's 2 GB tab limit). Only for sources
+   * whose reads are the caller's to free.
+   */
+  releaseReadBuffers?: boolean
 }
 
 /** The source of a read that needs none (an inline tensor's bytes are in the graph). */
@@ -107,7 +117,7 @@ export async function* loadOnnx(
     options.graph instanceof Uint8Array
       ? options.graph
       : await options.graph.read(0, options.graph.size)
-  const plan = new ReadPlan()
+  const plan = new ReadPlan(options.readAhead?.reads, options.readAhead?.bytes, options.releaseReadBuffers === true)
   const { config, layers, finalNorm, emb, chunkRows } = planOnnx(
     graphBytes,
     options.config,
@@ -133,6 +143,7 @@ export async function* loadOnnx(
     const bytes = await plan.take(t.name)
     if (t.dataType === OnnxDataType.FLOAT16) {
       const values = halvesToFloats(bytes)
+      plan.release(bytes)
       if (values.length !== length)
         throw new Error(
           `ONNX: ${t.name} has ${values.length} values, expected ${length}`
@@ -141,6 +152,7 @@ export async function* loadOnnx(
     }
     if (t.dataType === OnnxDataType.FLOAT) {
       const values = new Float32Array(bytes.slice().buffer)
+      plan.release(bytes)
       if (values.length !== length)
         throw new Error(
           `ONNX: ${t.name} has ${values.length} values, expected ${length}`
@@ -184,7 +196,8 @@ export async function* loadOnnx(
       const row = new Float32Array(K)
       for (const { w, segments } of parts) {
         const quant = await plan.take(w.quant.name)
-        const scales = halfBytes(w.scales, await plan.take(w.scales.name))
+        const scaleBytes = await plan.take(w.scales.name)
+        const scales = halfBytes(w.scales, scaleBytes)
         const zp = w.zp ? await plan.take(w.zp.name) : null
         for (const { start, rows, to, perm } of segments) {
           for (let i = 0; i < rows; i++) {
@@ -192,6 +205,7 @@ export async function* loadOnnx(
             quantizeQ8(m, to + i, row, 1)
           }
         }
+        for (const bytes of [quant, scaleBytes, zp]) if (bytes) plan.release(bytes)
       }
       return m
     }
@@ -211,7 +225,8 @@ export async function* loadOnnx(
     const raw = m.raw as Uint8Array
     for (const { w, segments } of parts) {
       const quant = await plan.take(w.quant.name)
-      const scales = halfBytes(w.scales, await plan.take(w.scales.name))
+      const scaleBytes = await plan.take(w.scales.name)
+      const scales = halfBytes(w.scales, scaleBytes)
       const zp = w.zp ? await plan.take(w.zp.name) : null
       const row = rowBlocks * 16
       for (const { start, rows, to, perm } of segments) {
@@ -228,6 +243,7 @@ export async function* loadOnnx(
           )
         }
       }
+      for (const bytes of [quant, scaleBytes, zp]) if (bytes) plan.release(bytes)
     }
     return m
   }
@@ -367,6 +383,7 @@ export async function* loadOnnx(
         dequantizeNBitsRow(8, D, quant, scales, zp, i, row)
         quantizeQ8(m, i, row, 1)
       }
+      for (const bytes of [quant, scales, zp]) if (bytes) plan.release(bytes)
       yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
       continue
     }
@@ -385,6 +402,8 @@ export async function* loadOnnx(
     }
     packMatMulNBitsScales(m, 0, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
+    // (Resumed: the engine has uploaded the rows, `m.raw` included.)
+    for (const bytes of [quant, scales, zp]) if (bytes) plan.release(bytes)
   }
 }
 

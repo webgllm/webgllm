@@ -390,7 +390,7 @@ async function load(
   lap("context")
   let reusedTuning = false
   // Closes the weights' synchronous access handles, which lock their files (see storedSources).
-  let closeStored = () => {}
+  let closeStored = async () => {}
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -437,8 +437,9 @@ async function load(
     // one already tuned here starts from its tuning.
     // (The header is read once: the load below takes it too.)
     // The weights read through synchronous access handles where they can be (see storedSources).
-    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles) : { sources: weightFiles.map(blobSource), close: () => undefined }
+    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: async () => undefined }
     closeStored = stored.close
+    timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
     const weightSources = stored.sources
     let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
     const shape = ggufHeader && ggufShape(ggufHeader)
@@ -478,6 +479,8 @@ async function load(
               string,
               unknown
             >,
+            readAhead: { reads: TUNING.onnxReadAhead, bytes: TUNING.onnxReadAheadMiB << 20 },
+            releaseReadBuffers: canReleaseStaging && TUNING.releaseOnnxReads > 0,
             graph: weightSources[1],
             data: onnxDataSources(meta.files, weightSources.slice(2))
           })
@@ -626,7 +629,7 @@ async function load(
       timings
     }
   } catch (error) {
-    closeStored()
+    void closeStored()
     // A failed or superseded load frees its textures now.
     release(engine)
     if (reusedTuning && !signal.aborted && error instanceof GpuError)
