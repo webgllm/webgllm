@@ -10,7 +10,8 @@ import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
-import type { WebGpu } from "./gpu/webgpu.js"
+import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
+import { fusedAdd } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -123,6 +124,8 @@ export const TUNING = {
    * slower: tune() times it.
    */
   lanes: 0,
+  /** WebGPU: a token's add (y's RMS, the residual, its sums, the next input) in one native pass. */
+  fusedAdd: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -4543,6 +4546,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   private get parts() { return this.tuned.rmsParts ?? TUNING.rmsParts }
 
+  /** Native fused adds by shape (see addNormed). */
+  private fusedAdds = new Map<string, NativeSpec | null>()
+
   private rms(x: Texture, row0: number, rows: number, split = -1) {
     const texels = this.config.hiddenSize / 4
     this.gpu.run({
@@ -4648,6 +4654,35 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   ) {
     const { hiddenSize } = this.config
     const texels = hiddenSize / 4
+    // On WebGPU, a token's add in one native dispatch (see gpu/native.ts).
+    const key = `${texels} ${!!norm} ${!!next}`
+    if (split > 0 && TUNING.fusedAdd > 0 && "nativeProgram" in this.gpu && !this.fusedAdds.has(key)) {
+      // (Null for a shape it doesn't fit: the passes below.)
+      let spec: NativeSpec | null = null
+      try {
+        spec = fusedAdd({ texels, normed: !!norm, next: !!next })
+      } catch {
+        spec = null
+      }
+      this.fusedAdds.set(key, spec)
+    }
+    const spec = split > 0 && TUNING.fusedAdd > 0 ? this.fusedAdds.get(key) : null
+    if (spec && "nativeProgram" in this.gpu) {
+      this.gpu.run({
+        name: "add",
+        program: this.gpu.nativeProgram(spec),
+        inputs: { uH: h, uY: y, ...(norm && { uNorm: norm }), ...(next && { uNext: next }) },
+        uniforms: {
+          uSplitIn: { int: split },
+          uParts: { int: this.parts },
+          uEps: this.config.normEps,
+          uBase: { int: texels + K.RMS_PARTS }
+        },
+        output: next ? [out, this.scaledOf(out)] : out,
+        rect: { x: 0, y: 0, width: texels, height: rows }
+      })
+      return
+    }
     // Through the sandwich norm (LFM3), y's sums of squares first.
     const normed = !!norm
     if (normed) this.rms(y, 0, rows, split)

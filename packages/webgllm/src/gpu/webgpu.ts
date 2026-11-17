@@ -28,6 +28,25 @@ type Variant = {
   id: number
 }
 
+/**
+ * A hand-written compute shader in the pass model (see nativeProgram):
+ * binding 0 its uniforms (the pass's rectangle, then `uniforms` in order,
+ * 4 bytes each), then `inputs` as textures, then the outputs as storage
+ * textures; `groups` sizes the dispatch from the rectangle.
+ */
+export type NativeSpec = {
+  code: string
+  inputs: Array<{ name: string; kind: "f" | "u" }>
+  uniforms: Array<{ name: string; type: "int" | "float" }>
+  groups: (rect: { width: number; height: number }) => [number, number]
+}
+
+type NativeProgram = Program & {
+  native: NativeSpec
+  pipelines: Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout; id: number }>
+  values: Map<string, Value>
+}
+
 type WgProgram = Program & {
   shader: Shader
   /** Whether main has a loop the lanes of a workgroup can share (see wgsl.ts's coopLoop). */
@@ -329,6 +348,87 @@ export class WebGpu extends PacedGpu<Fence> {
     return v
   }
 
+  /** A hand-written WGSL pass (see NativeSpec), cached by its code. */
+  nativeProgram(spec: NativeSpec): NativeProgram {
+    const cached = this.natives.get(spec.code)
+    if (cached) return cached
+    const program: NativeProgram = { native: spec, pipelines: new Map(), values: new Map(), samplers: spec.inputs.map((i) => i.name) }
+    this.natives.set(spec.code, program)
+    return program
+  }
+
+  private natives = new Map<string, NativeProgram>()
+
+  /** Runs a native pass: one dispatch, its groups from the rectangle. */
+  private runNative(pass: Pass, program: NativeProgram) {
+    this.flushQueue()
+    const spec = program.native
+    const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
+    const rect = pass.rect ?? { x: 0, y: 0, width: outputs[0].width, height: outputs[0].height }
+    const formats = outputs.map((o) => formatOf(o.internal).format)
+    const key = formats.join(",")
+    let p = program.pipelines.get(key)
+    if (!p) {
+      const started = performance.now()
+      const entries: Array<GPUBindGroupLayoutEntry> = [
+        { binding: 0, visibility: COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: this.nativeBytes(spec) } }
+      ]
+      spec.inputs.forEach((s, i) =>
+        entries.push({ binding: i + 1, visibility: COMPUTE, texture: { sampleType: s.kind === "u" ? "uint" : "unfilterable-float" } }))
+      formats.forEach((format, i) =>
+        entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
+      const layout = this.device.createBindGroupLayout({ entries })
+      const pipeline = this.device.createComputePipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        compute: { module: this.device.createShaderModule({ code: spec.code }), entryPoint: "main" }
+      })
+      p = { pipeline, layout, id: this.nextVariant++ }
+      program.pipelines.set(key, p)
+      this.count(`native ${spec.code.slice(0, 40)}`, performance.now() - started)
+    }
+    const inputs = spec.inputs.map(({ name }) => {
+      const t = pass.inputs[name]
+      if (!t) throw new GpuError(`Pass is missing input ${name}.`)
+      return t
+    })
+    for (const [name, value] of Object.entries(pass.uniforms ?? {})) program.values.set(name, value)
+    for (const t of inputs) this.touched.set(t.id, this.generation)
+    for (const t of outputs) this.touched.set(t.id, this.generation)
+    const key2 = `n${p.id}|${inputs.map((t) => t.id).join(",")}|${outputs.map((t) => t.id).join(",")}`
+    let group = this.bindGroups.get(key2)
+    if (!group) {
+      const entries: Array<GPUBindGroupEntry> = [{ binding: 0, resource: { buffer: this.uniformBuffer, size: this.nativeBytes(spec) } }]
+      inputs.forEach((t, i) => entries.push({ binding: i + 1, resource: (t.tex as GPUTexture).createView() }))
+      outputs.forEach((t, i) => entries.push({ binding: inputs.length + 1 + i, resource: (t.tex as GPUTexture).createView() }))
+      group = this.device.createBindGroup({ layout: p.layout, entries })
+      this.bindGroups.set(key2, group)
+      for (const t of [...inputs, ...outputs]) {
+        let keys = this.groupsByTexture.get(t.id)
+        if (!keys) this.groupsByTexture.set(t.id, (keys = new Set()))
+        keys.add(key2)
+      }
+    }
+    const block = new ArrayBuffer(this.nativeBytes(spec))
+    const i32 = new Int32Array(block), f32 = new Float32Array(block)
+    spec.uniforms.forEach(({ name, type }, i) => {
+      const v = program.values.get(name)
+      const x = typeof v === "number" ? v : v && "int" in v ? v.int : 0
+      if (type === "int") i32[4 + i] = x
+      else f32[4 + i] = x
+    })
+    const offset = this.pushUniforms(new Uint8Array(block), rect.x, rect.y, rect.width, rect.height)
+    const cpass = this.computePassFor(p.pipeline)
+    cpass.setBindGroup(0, group, [offset])
+    this.markGpuWork()
+    cpass.dispatchWorkgroups(...spec.groups(rect))
+    this.passes++
+    this.draws++
+  }
+
+  private nativeBytes(spec: NativeSpec) {
+    return align(16 + 4 * spec.uniforms.length, 16)
+  }
+
   // ------------------------------------------------------------ textures
 
   texture(
@@ -534,6 +634,7 @@ export class WebGpu extends PacedGpu<Fence> {
   run(pass: Pass) {
     if (this.lost) throw new GpuError("The GPU device was lost.")
     if (pass.name && this.skip.has(pass.name)) return
+    if ("native" in pass.program) return this.runNative(pass, pass.program as NativeProgram)
     const program = pass.program as WgProgram
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
     const rect = pass.rect ?? { x: 0, y: 0, width: outputs[0].width, height: outputs[0].height }
