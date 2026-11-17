@@ -411,6 +411,36 @@ export const TUNING = {
 type HeadOut = { logits: Texture; split: number; stride: number }
 
 /** The time the load's packing probe may spend on timing pairs past its first two, and the most pairs it takes (see choosePromptPacking). */
+/**
+ * How much faster, in every timed round, another way must be to replace a
+ * choice this GPU made before (Engine.incumbent): 10%. Ways that close on a
+ * fast GPU swap places with the noise of one timing (Chrome on a Mac timed
+ * f16Pack 0 at 0.87-1.17x of 3), and a re-pick changes the kernels' rounding,
+ * so the same model on the same device writes differently.
+ */
+export const KEEP_MARGIN = 0.9
+
+/**
+ * Whether `challenger` (a candidate's timed rounds) replaces `standing`
+ * (the standing choice's, in the same order): faster in every round, by
+ * `margin` (a share of the standing's time).
+ */
+export const replaces = (challenger: ReadonlyArray<number>, standing: ReadonlyArray<number>, margin: number) =>
+  challenger.length > 0 && challenger.length === standing.length &&
+  challenger.every((ms, round) => ms < standing[round] * margin)
+
+/**
+ * The margin a way needs to replace a standing choice timed with these
+ * rounds: KEEP_MARGIN, or more where the timer is noisier than that (how
+ * far one way's own rounds differ, the largest of the ways'). Firefox on a
+ * Pixel times the same kernel up to 30% apart.
+ */
+export const keepMargin = (rounds: ReadonlyArray<ReadonlyArray<number>>) => {
+  let noise = 0
+  for (const r of rounds) if (r.length > 1) noise = Math.max(noise, (Math.max(...r) - Math.min(...r)) / Math.min(...r))
+  return Math.min(KEEP_MARGIN, 1 / (1 + noise))
+}
+
 const PACKING_PROBE_MS = 250
 const PACKING_PROBE_PAIRS = 4
 
@@ -1449,6 +1479,13 @@ export class Engine {
    * prompts take it.
    */
   tuned: Tuned = { shortSplit: null, f16Matmul: null, f16Pack: null, flashDecode: null }
+  /**
+   * This GPU's last checked choices for the model, from a note another
+   * browser version, engine code or settings wrote (the handler's
+   * incumbentGpuTuning): when tuned afresh, each stands unless another way
+   * is faster in every round by KEEP_MARGIN. Null: first choices.
+   */
+  incumbent: { tuned?: Tuned; head?: { expanded: boolean; split: number } } | null = null
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -1578,14 +1615,16 @@ export class Engine {
       this.tuneReport[`${key}Gain`] =
         Math.round((1 - times[1] / times[0]) * 1000) / 10
       this.tuneReport[`${key}Noise`] = Math.round(noise * 1000) / 10
-      // candidates[0] is TUNING's value.
-      // The reversed pairs must independently show a useful gain.
+      // candidates[0] is TUNING's value, the standing choice unless this
+      // GPU chose another before (incumbent), which then needs KEEP_MARGIN
+      // to lose. The reversed pairs must independently show a useful gain.
       // A shared clock drift between rounds is not evidence against a
       // candidate that wins both within-round comparisons.
-      const consistent = rounds[best].every(
-        (time, round) => time < rounds[0][round] * 0.96
-      )
-      return best > 0 && consistent ? candidates[best] : null
+      const earlier = this.incumbent?.tuned?.[key]
+      const standing = earlier == null ? 0 : Math.max(0, candidates.indexOf(earlier))
+      const kept = best === standing || !replaces(rounds[best], rounds[standing], earlier == null ? 0.96 : keepMargin(rounds))
+      const pick = candidates[kept ? standing : best]
+      return pick === candidates[0] ? null : pick
     }
     let picked: Tuned
     try {
@@ -2101,8 +2140,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         stream: i === 1,
         ms: Math.min(...times)
       }))
-      this.tuned.streamMatvec =
-        this.matvecReport[1].ms < this.matvecReport[0].ms * 0.94
+      // This GPU's earlier choice stands unless the other is faster in
+      // every round by KEEP_MARGIN (see incumbent).
+      const earlier = this.incumbent?.tuned?.streamMatvec
+      this.tuned.streamMatvec = earlier == null
+        ? this.matvecReport[1].ms < this.matvecReport[0].ms * 0.94
+        : earlier
+          ? !replaces(samples[0], samples[1], keepMargin(samples))
+          : replaces(samples[1], samples[0], keepMargin(samples))
     } catch (error) {
       this.tuned.streamMatvec = before
       throw error
@@ -2442,10 +2487,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // A clock or compiler transition must not pick the next session's
       // kernel from one favorable sample. Require reversed verification;
       // close results retain both full-size pairs.
+      // The standing way: the first, or this GPU's earlier choice
+      // (incumbent), which another replaces only by KEEP_MARGIN.
+      const earlier = this.incumbent?.tuned
+      const standing = earlier?.f16Pack == null ? 0 : Math.max(0, options.findIndex((o) =>
+        o.pack === earlier.f16Pack && (!native || o.matmul === earlier.f16Matmul)))
+      const margin = earlier?.f16Pack == null ? 0.98 : keepMargin(samples)
       const eligible = this.packingReport.filter((_, i) =>
-        i === 0 || (verifiedWinner >= 0
-          ? i === verifiedWinner
-          : samples[i].every((ms, round) => ms < samples[0][round] * 0.98))
+        i === standing || (verifiedWinner >= 0
+          ? i === verifiedWinner && (earlier?.f16Pack == null || replaces(samples[i], samples[standing], margin))
+          : replaces(samples[i], samples[standing], margin))
       )
       const best = eligible.reduce((a, b) => (b.ms < a.ms ? b : a))
       const selected = this.packingReport.indexOf(best)
@@ -2600,7 +2651,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         await this.argmax(0, 1, 1, [], false)
       }
       for (let i = 0; i < settings.length; i++) await sample(i)
-      for (let round = 0; round < 2; round++)
+      for (let round = 0; round < (this.incumbent?.head ? 3 : 2); round++)
         for (let j = 0; j < settings.length; j++) {
           const i = round ? settings.length - 1 - j : j
           await this.gpu.finish()
@@ -2616,6 +2667,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const best = this.headReport.reduce((a, b) => (b.ms < a.ms ? b : a))
       const chosen = best
       const base = this.headReport[0]
+      // This GPU's earlier head stands unless the other is faster in every
+      // round by KEEP_MARGIN (see incumbent).
+      const earlier = this.incumbent?.head
+      const standing = earlier ? settings.findIndex((s) => s.expanded === earlier.expanded && s.split === earlier.split) : -1
+      if (standing >= 0) {
+        const other = this.headReport.indexOf(best)
+        const keep = other === standing || !replaces(samples[other], samples[standing], keepMargin(samples))
+        const pick = settings[keep ? standing : other]
+        this.headChoice = { expanded: pick.expanded, split: pick.split }
+      } else
       this.headChoice =
         chosen.ms < base.ms * 0.94
           ? { expanded: chosen.expanded, split: chosen.split }

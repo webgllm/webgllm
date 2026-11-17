@@ -184,6 +184,8 @@ export type GpuNote = {
   tuned?: Tuned
   /** The weights' shape (see gguf.ts ggufShape): a model with the same one starts from this tuning (see sharedGpuTuning). */
   shape?: string
+  /** When these choices were first made (Date.now()): the newest are an incumbent's (see incumbentGpuTuning). */
+  at?: number
 }
 
 const NOTES = "gpu-notes.json"
@@ -234,6 +236,29 @@ export function sharedGpuTuning(
     note.calibrated === true && note.tuned &&
     note.selfCheck >= 0 && note.selfCheck <= maxError
   )?.[1]
+}
+
+/**
+ * The newest checked choices for the same GPU (`renderer`), model and
+ * passes, from any browser version, engine code or settings: what a fresh
+ * tuning keeps unless another way is clearly faster (Engine.incumbent), so
+ * a browser update or a new release doesn't re-pick a device's kernels by
+ * the noise of one timing. Undefined where there are none.
+ */
+export function incumbentGpuTuning(
+  notes: Record<string, GpuNote>,
+  renderer: string,
+  model: string,
+  passes: string,
+  maxError: number
+): GpuNote | undefined {
+  let newest: GpuNote | undefined
+  for (const [key, note] of Object.entries(notes)) {
+    if (!key.startsWith(`${renderer}|`) || !key.includes(`|${model}|${passes}|`)) continue
+    if (note?.calibrated !== true || !note.tuned || !(note.selfCheck >= 0 && note.selfCheck <= maxError)) continue
+    if (!newest || (note.at ?? 0) > (newest.at ?? 0)) newest = note
+  }
+  return newest
 }
 
 /**

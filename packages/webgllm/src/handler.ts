@@ -24,7 +24,7 @@ import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
-import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
+import { download, incumbentGpuTuning, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { createThinkingSplitter, THINK_OPEN } from "./reply.js"
@@ -465,6 +465,13 @@ async function load(
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
       if (note.tuned) engine.tuned = retime ? tuningToRetime(note.tuned) : { ...note.tuned }
+    } else if (reuseTuning) {
+      // Tuned afresh (another browser version, engine code or settings):
+      // this GPU's last choices for the model stand unless another way is
+      // clearly faster (see Engine.incumbent).
+      const incumbent = incumbentGpuTuning(notes, engine.gpu.limits.renderer, model, passes, SELF_CHECK_MAX)
+      if (incumbent) engine.incumbent = { ...(incumbent.tuned && { tuned: incumbent.tuned }), ...(incumbent.head && { head: incumbent.head }) }
+      timings.incumbent = incumbent ? 1 : 0
     }
     const pieces =
       meta.files.kind === "gguf"
@@ -576,7 +583,9 @@ async function load(
             pacing: note?.pacing,
             head: engine.headChoice ?? undefined,
             tuned: { ...engine.tuned },
-            ...(shape && { shape })
+            ...(shape && { shape }),
+            // (A note written again unchanged keeps its time: see incumbentGpuTuning.)
+            at: checkedNote && JSON.stringify(checkedNote.tuned) === JSON.stringify(engine.tuned) ? (checkedNote.at ?? Date.now()) : Date.now()
           }
         : null
     timings.total = Math.round(performance.now() - t0)
