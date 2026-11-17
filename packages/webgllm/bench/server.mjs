@@ -56,12 +56,15 @@ const types = {
   ".gguf": "application/octet-stream"
 }
 
-const isolation = {
-  "Cross-Origin-Opener-Policy": "same-origin",
-  "Cross-Origin-Embedder-Policy": "require-corp",
-  "Cross-Origin-Resource-Policy": "same-origin",
-  "Cache-Control": "no-store"
-}
+// NO_ISOLATION=1 serves every page without cross-origin isolation (no SharedArrayBuffer), to time what pages without it get.
+const isolation = process.env.NO_ISOLATION
+  ? { "Cache-Control": "no-store" }
+  : {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "Cache-Control": "no-store"
+    }
 
 /**
  * Whether `file` is `root` or inside it: a path boundary, not a string
@@ -155,6 +158,7 @@ createServer((req, res) => {
     req.on("end", () => {
       if (req.url === "/log") console.log(`[page] ${body}`)
       if (req.url === "/result") appendFileSync(resultsFile, `${body}\n`)
+      if (req.url === "/dump") appendFileSync(resultsFile.replace(/[^/]*$/, "shaders.jsonl"), `${body}\n`)
       res.writeHead(204, isolation).end()
     })
     return

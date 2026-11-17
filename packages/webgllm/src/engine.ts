@@ -10,6 +10,7 @@ import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
+import type { WebGpu } from "./gpu/webgpu.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -112,6 +113,8 @@ type GpuLayer = {
  * defaults are what the engine uses.
  */
 export const TUNING = {
+  /** 1: run on WebGPU where the browser has it (see gpu/webgpu.ts); 0: WebGL 2. */
+  webgpu: 0,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -570,6 +573,8 @@ export type SavedPrefix = {
 type MatIn = { a: Texture; norm?: Texture | "prescaled" }
 
 export type EngineOptions = {
+  /** The GPU to run on: WebGL 2 on the canvas when left out. */
+  gpu?: Gpu | WebGpu
   /**
    * Scale the prompt batch up for smaller models, keeping about the same
    * buffer memory (default true).
@@ -710,7 +715,7 @@ export class Engine {
     return { group: 1, rows: Math.min(most, Math.ceil(N / chunks / 4) * 4) }
   }
 
-  readonly gpu: Gpu
+  readonly gpu: Gpu | WebGpu
   config!: ModelConfig
   /** Most tokens the cache holds: the model's, or options.contextLength (see configure). */
   contextLength = 0
@@ -783,7 +788,7 @@ export class Engine {
     const cap = options.contextLength
     if (cap !== undefined && !(Number.isInteger(cap) && cap >= MIN_CONTEXT_LENGTH))
       throw new Error(`A context length is a whole number of tokens, at least ${MIN_CONTEXT_LENGTH}; got ${cap}.`)
-    this.gpu = new Gpu(canvas)
+    this.gpu = options.gpu ?? new Gpu(canvas)
     this.contextCap = cap ?? Infinity
     this.noMrt = new Set(options.noMrt ?? [])
     this.chunkedRecurrence = options.chunkedRecurrence ?? true
@@ -2048,7 +2053,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     // A single large allocation can stall the browser GPU service while
     // it zero-initializes the embedding. Panels keep that work bounded.
     const panelRows =
-      !layer && bits === 6 && this.gpu.readsPerSlice > 0
+      !layer && bits === 6 && this.gpu.readsPerSlice > 0 && this.gpu.slowZeroFill
         ? TUNING.embeddingPanelRows
         : 0
     const panelCount = panelRows > 0 ? Math.ceil(rowsPerColumn / panelRows) : 1
@@ -3728,7 +3733,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         await this.forward(tokens)
         const layer = this.layers[first].linear
         if (!layer) throw new Error("The model's config has no Gated DeltaNet shapes.")
-        return this.gpu.readNow(layer.state[0])
+        return await this.gpu.readNow(layer.state[0])
       } finally {
         TUNING.linChunk = chunk
       }
@@ -6167,7 +6172,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       if (guess) await this.guessWhile(pending)
       data = await pending()
     } else {
-      data = this.gpu.readNow(this.greedyOut, rect)
+      data = await this.gpu.readNow(this.greedyOut, rect)
     }
     const ids = Int32Array.from({ length: rows }, (_, r) => Math.round(data[r * 4]))
     this.guessedToken = guess ? ids[rows - 1] : -1
@@ -6289,7 +6294,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     } else {
       // Nothing to overlap: a blocking read returns as soon as the GPU is
       // done, where polling a fence adds milliseconds.
-      data = this.gpu.readNow(b.candidates, rect)
+      data = await this.gpu.readNow(b.candidates, rect)
     }
     // The token the GPU guessed (and read forward), as it picked it.
     this.guessedToken = guess ? Math.round(data[(CHUNK / 4 + 1) * 4]) : -1

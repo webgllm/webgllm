@@ -13,6 +13,7 @@ import { ggufShape, readGgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
+import { WebGpu } from "./gpu/webgpu.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta, onnxDataSources, rememberModel } from "./model-meta.js"
@@ -378,7 +379,9 @@ async function load(
     timings[name] = Math.round(now - mark)
     mark = now
   }
+  const webgpu = TUNING.webgpu > 0 ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(new OffscreenCanvas(1, 1), {
+    ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
     ...(plain && {

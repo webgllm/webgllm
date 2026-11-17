@@ -7,6 +7,7 @@
  */
 import { Engine, TUNING } from "./engine.js"
 import { GL, type Gpu } from "./gpu/gl.js"
+import type { WebGpu } from "./gpu/webgpu.js"
 import { GgmlType, readGgufHeader, type GgufHeader } from "./gguf.js"
 import { bytesToFloats, halvesToFloats } from "./half.js"
 import { PROMPT_BATCH } from "./handler.js"
@@ -381,7 +382,7 @@ export const WARM_MS = 150
  * the prompt pacing's calibration) see it at the clock a real load leaves
  * it at, a gigabyte of weights converted, not idle.
  */
-export async function warmGpu(gpu: Gpu, ms = WARM_MS) {
+export async function warmGpu(gpu: Gpu | WebGpu, ms = WARM_MS) {
   const size = 512
   const textures = [0, 1].map(() => gpu.texture(GL.RGBA32F, size, size))
   const program = gpu.program(`#version 300 es
