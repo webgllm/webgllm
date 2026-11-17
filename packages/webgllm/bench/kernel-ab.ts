@@ -131,8 +131,18 @@ try {
     const r = e[which]
     if (!r || (name && !e.names.includes(name)) || r.rect.width * r.rect.height < Number(params.get("min") ?? 2)) continue
     // (alt=<file in bench/alt>: that GLSL instead of the dumped source, for kernel experiments.)
+    // (set=uSplit:4,uKbSlice:16 overrides uniforms; rh=2 multiplies the rectangle's height, for more K-slices.)
+    if (params.has("set") && (!params.has("alti") || Number(params.get("alti")) === i)) {
+      const u = { ...(r.uniforms as Record<string, unknown>) }
+      for (const kv of params.get("set")!.split(",")) {
+        const [k, v] = kv.split(":")
+        u[k] = { int: Number(v) }
+      }
+      r.uniforms = u as Replay["uniforms"]
+      r.rect = { ...r.rect, height: r.rect.height * Number(params.get("rh") ?? 1) }
+    }
     const alt = params.get("alt")
-    if (alt) e.source = await (await fetch(`/alt/${alt}`)).text()
+    if (alt && (!params.has("alti") || Number(params.get("alti")) === i)) e.source = await (await fetch(`/alt/${alt}`)).text()
     const data = new Map(Object.entries(r.inputs).map(([k, s]) => [k, pixels(s)]))
     let a: number, b: number, check: string
     try {

@@ -62,6 +62,38 @@ async function roundTrip(gpu: Gpu | WebGpu, how: "read" | "now" | "finish") {
   return `median ${times[20].toFixed(2)} ms, p10 ${times[4].toFixed(2)}, p90 ${times[36].toFixed(2)}`
 }
 
+/** WebGPU readback round trips, waiting in different ways. */
+async function waits(wg: WebGpu) {
+  const device = wg.device
+  const src = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.STORAGE })
+  const mc = new MessageChannel()
+  const turn = () => new Promise<void>((r) => { mc.port1.onmessage = () => r(); mc.port2.postMessage(0) })
+  for (const how of ["await", "spin", "nudge", "submitDone"]) {
+    const times: number[] = []
+    for (let i = 0; i < 40; i++) {
+      const dst = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
+      const t0 = performance.now()
+      const e = device.createCommandEncoder()
+      e.copyBufferToBuffer(src, 0, dst, 0, 256)
+      device.queue.submit([e.finish()])
+      if (how === "submitDone") await device.queue.onSubmittedWorkDone()
+      else {
+        let done = false
+        const p = dst.mapAsync(GPUMapMode.READ).then(() => { done = true })
+        if (how === "await") await p
+        else while (!done) {
+          if (how === "nudge") device.queue.submit([])
+          await turn()
+        }
+      }
+      times.push(performance.now() - t0)
+      dst.destroy()
+    }
+    times.sort((a, b) => a - b)
+    log(`CHAIN wait ${how}: median ${times[20].toFixed(2)} ms, p10 ${times[4].toFixed(2)}`)
+  }
+}
+
 try {
   const gl = new Gpu(new OffscreenCanvas(1, 1))
   const wg = await WebGpu.create()
@@ -72,6 +104,7 @@ try {
   log(`CHAIN round trip WebGPU read: ${await roundTrip(wg, "read")}`)
   log(`CHAIN round trip WebGL fence: ${await roundTrip(gl, "finish")}`)
   log(`CHAIN round trip WebGPU fence: ${await roundTrip(wg, "finish")}`)
+  await waits(wg)
   for (const [w, h, work] of [[64, 1, 0], [512, 1, 0], [512, 8, 0], [4096, 1, 0], [512, 8, 64], [4096, 4, 64]]) {
     const x = await chain(gl, w, h, 400, work)
     const y = await chain(wg, w, h, 400, work)
