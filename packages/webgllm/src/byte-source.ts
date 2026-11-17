@@ -138,6 +138,7 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
     if (read) return read
   }
   const opened: Array<SyncAccessHandle> = []
+  const pool = new BufferPool()
   const sources = await Promise.all(
     blobs.map(async (blob) => {
       const handle = fileHandles.get(blob)?.handle as (FileSystemFileHandle & { createSyncAccessHandle?: () => Promise<SyncAccessHandle> }) | undefined
@@ -145,7 +146,7 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
         try {
           const access = await handle.createSyncAccessHandle()
           opened.push(access)
-          return syncSource(access)
+          return syncSource(access, pool)
         } catch {
           // Held by another reader or writer: the Blob.
         }
@@ -156,6 +157,7 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
   return {
     sources,
     close: async () => {
+      pool.clear()
       for (const access of opened.splice(0)) {
         try {
           access.close()
@@ -174,6 +176,9 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
  */
 const READER = `
 const files = []
+// Buffers sent back for reuse, by length, up to 64 MiB (see BufferPool).
+const free = new Map()
+let held = 0
 onmessage = async ({ data }) => {
   const { id } = data
   try {
@@ -194,13 +199,24 @@ onmessage = async ({ data }) => {
         }
       }
       postMessage({ id, sizes })
+    } else if (data.type === "recycle") {
+      if (held + data.buffer.byteLength > 64 * 1048576) return
+      held += data.buffer.byteLength
+      const list = free.get(data.buffer.byteLength) || []
+      list.push(data.buffer)
+      free.set(data.buffer.byteLength, list)
+      return
     } else if (data.type === "read") {
-      const bytes = new Uint8Array(data.length)
+      const reused = free.get(data.length)?.pop()
+      if (reused) held -= reused.byteLength
+      const bytes = reused ? new Uint8Array(reused) : new Uint8Array(data.length)
       const read = files[data.file].read(bytes, { at: data.offset })
       if (read !== data.length) throw new Error("read " + read + " of " + data.length + " bytes at " + data.offset)
       postMessage({ id, bytes }, [bytes.buffer])
     } else if (data.type === "close") {
       for (const access of files.splice(0)) if (access) access.close()
+      free.clear()
+      held = 0
       postMessage({ id })
     }
   } catch (error) {
@@ -260,6 +276,9 @@ async function readerSources(blobs: ReadonlyArray<Blob>): Promise<StoredSources>
     if (size < 0) return blobSource(blob)
     return {
       size,
+      recycle: (buffer) => {
+        if (!failed) worker.postMessage({ type: "recycle", buffer }, [buffer])
+      },
       read: async (offset, length) => {
         if (offset < 0 || offset + length > size) {
           throw new RangeError(`read of ${length} bytes at ${offset} is outside the file (${size} bytes)`)
@@ -281,15 +300,46 @@ async function readerSources(blobs: ReadonlyArray<Blob>): Promise<StoredSources>
     }
   }
 }
-function syncSource(access: SyncAccessHandle): ByteSource {
+/**
+ * Buffers given back for reuse (ByteSource.recycle), by length: a model's
+ * layers read the same tensor lengths over and over, so a few buffers serve
+ * a whole load instead of an allocation a read (freed buffers stay
+ * resident in the allocator for a while; iOS counts them against a tab's
+ * 2 GB).
+ */
+export class BufferPool {
+  private free = new Map<number, Array<ArrayBuffer>>()
+  private held = 0
+  constructor(private readonly most = 64 << 20) {}
+  take(length: number): Uint8Array {
+    const buffer = this.free.get(length)?.pop()
+    if (!buffer) return new Uint8Array(length)
+    this.held -= length
+    return new Uint8Array(buffer)
+  }
+  give(buffer: ArrayBuffer) {
+    if (this.held + buffer.byteLength > this.most) return
+    const list = this.free.get(buffer.byteLength) ?? []
+    list.push(buffer)
+    this.free.set(buffer.byteLength, list)
+    this.held += buffer.byteLength
+  }
+  clear() {
+    this.free.clear()
+    this.held = 0
+  }
+}
+
+function syncSource(access: SyncAccessHandle, pool: BufferPool): ByteSource {
   const size = access.getSize()
   return {
     size,
+    recycle: (buffer) => pool.give(buffer),
     read: async (offset, length) => {
       if (offset < 0 || offset + length > size) {
         throw new RangeError(`read of ${length} bytes at ${offset} is outside the file (${size} bytes)`)
       }
-      const bytes = new Uint8Array(length)
+      const bytes = pool.take(length)
       const read = access.read(bytes, { at: offset })
       if (read !== length) throw new Error(`read ${read} of ${length} bytes at ${offset}`)
       return bytes

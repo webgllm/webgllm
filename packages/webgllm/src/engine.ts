@@ -244,11 +244,19 @@ export const TUNING = {
   ggufReadAhead: 6,
   /** 1: stored weights are read through synchronous access handles in a worker (storedSources); 0: as Blobs. */
   syncReads: 1,
-  /** 1: those reads run in a worker of their own, beside the repacking and uploads (storedSources). */
-  readerWorker: 0,
-  /** ONNX reads in flight ahead of the one in use, and their most MiB. */
-  onnxReadAhead: 3,
-  onnxReadAheadMiB: 24,
+  /**
+   * 1: those reads run in a worker of their own, beside the repacking and
+   * uploads (storedSources). Faster loads on an iPhone 16 Pro Max (Safari),
+   * a Mac (Chrome) and a Pixel 10 Pro (Chrome, Firefox): reading 20-60%
+   * shorter.
+   */
+  readerWorker: 1,
+  /**
+   * ONNX reads in flight ahead of the one in use, and their most MiB, where
+   * the reader worker reads (about a layer ahead: most of 128 MiB's gain).
+   */
+  readerAhead: 6,
+  readerAheadMiB: 48,
   /** 1: the ONNX loader frees each read's buffer once used (LoadOnnxOptions.releaseReadBuffers). */
   releaseOnnxReads: 1,
 

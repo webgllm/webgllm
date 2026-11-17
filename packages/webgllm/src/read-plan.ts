@@ -15,7 +15,7 @@ export type PlannedRead = {
  * flight ahead of the one in use (bounded in count and bytes), so network
  * latency overlaps the repacking without holding more than a few tensors.
  */
-type ReadLease = { length: number; remaining: number; borrowed: number }
+type ReadLease = { length: number; remaining: number; borrowed: number; source: ByteSource }
 
 export class ReadPlan {
   private owned = new WeakMap<ArrayBufferLike, ReadLease>()
@@ -69,7 +69,7 @@ export class ReadPlan {
         }
       }
       this.next += batch.length
-      const lease = { length, remaining: batch.length, borrowed: 0 }
+      const lease = { length, remaining: batch.length, borrowed: 0, source: first.source }
       const incoming = first.bytes ? Promise.resolve(first.bytes) : first.source.read(first.offset, length)
       const read = this.retireConsumed ? incoming.then(data => {
         // Only a complete, newly owned read can be retired. Inline tensors
@@ -115,6 +115,9 @@ export class ReadPlan {
     lease.borrowed--
     if (lease.remaining || lease.borrowed) return
     this.owned.delete(buffer)
-    ;(buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
+    // Back to its source for the next read of this length where it takes
+    // it, else freed now.
+    if (lease.source.recycle) lease.source.recycle(buffer as ArrayBuffer)
+    else (buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
   }
 }

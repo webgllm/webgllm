@@ -479,7 +479,7 @@ async function load(
               string,
               unknown
             >,
-            readAhead: { reads: TUNING.onnxReadAhead, bytes: TUNING.onnxReadAheadMiB << 20 },
+            ...(stored.reader && { readAhead: { reads: TUNING.readerAhead, bytes: TUNING.readerAheadMiB << 20 } }),
             releaseReadBuffers: canReleaseStaging && TUNING.releaseOnnxReads > 0,
             graph: weightSources[1],
             data: onnxDataSources(meta.files, weightSources.slice(2))

@@ -224,4 +224,10 @@ export type WeightPiece =
 export type ByteSource = {
   size: number
   read: (offset: number, length: number) => Promise<Uint8Array>
+  /**
+   * Takes back a buffer a read returned, once its bytes are used, for a
+   * later read of the same length (instead of a new allocation). The caller
+   * keeps no view of it.
+   */
+  recycle?: (buffer: ArrayBuffer) => void
 }
