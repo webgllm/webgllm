@@ -115,7 +115,10 @@ ${o.next ? p.map((i) => `  textureStore(out1, vec2<i32>(u.base + j0 + ${i}, m), 
  * texture units). `kbSlice`: super-blocks a slice (the whole row without
  * `split`).
  */
-export function wordHead(o: { split: boolean; prescaled: boolean; kbSlice: number }): NativeSpec {
+export function wordHead(o: { split: boolean; prescaled: boolean; kbSlice: number; ordered?: boolean }): NativeSpec {
+  // ordered: the texels in the order this kernel reads them
+  // (kernels.ts's ORDER_Q6_WORDS), which an iPad streams at 108 GB/s
+  // against 65 for the usual order (bench/webgpu-headread.html).
   const inputs: NativeSpec["inputs"] = [
     { name: "uA", kind: "u" },
     { name: "uW", kind: "u" },
@@ -125,10 +128,13 @@ export function wordHead(o: { split: boolean; prescaled: boolean; kbSlice: numbe
   const C = "xyzw"
   const texels = 32 * o.kbSlice
   const rowBlock = (r: number) => `      {
-        let t = wx + (sb * 4 + ${r}) * 13;
+${o.ordered ? `        let t = wx + sb * 52 + 4 + q * 12 + ${r * 3};
+        let QA = textureLoad(tW, vec2<i32>(t, gr), 0);
+        let QB = textureLoad(tW, vec2<i32>(t + 1, gr), 0);
+        let QH = textureLoad(tW, vec2<i32>(t + 2, gr), 0);` : `        let t = wx + (sb * 4 + ${r}) * 13;
         let QA = textureLoad(tW, vec2<i32>(t + qa, gr), 0);
         let QB = textureLoad(tW, vec2<i32>(t + qa + 2, gr), 0);
-        let QH = textureLoad(tW, vec2<i32>(t + qh, gr), 0);
+        let QH = textureLoad(tW, vec2<i32>(t + qh, gr), 0);`}
         let SS = select(S${r}.zw, S${r}.xy, n == 0);
         var p = vec4<f32>(0.0);
 ${[0, 1, 2, 3].map((wi) => `        p += vec4<f32>(dot(q6v(q6g0(QA.${C[wi]}, QH.${C[wi]})), A${wi}0), dot(q6v(q6g1(QB.${C[wi]}, QH.${C[wi]})), A${wi}1), dot(q6v(q6g2(QA.${C[wi]}, QH.${C[wi]})), A${wi}2), dot(q6v(q6g3(QB.${C[wi]}, QH.${C[wi]})), A${wi}3));`).join("\n")}
@@ -181,10 +187,10 @@ ${o.split ? `  let slice = m / u.rows;
     var acc = vec4<f32>(0.0);
     for (var sb = sb0; sb < sb1; sb++) {
       let d = textureLoad(tS, vec2<i32>(sx + sb, gr), 0);
-      let S0 = textureLoad(tW, vec2<i32>(wx + (sb * 4) * 13 + 12, gr), 0);
-      let S1 = textureLoad(tW, vec2<i32>(wx + (sb * 4 + 1) * 13 + 12, gr), 0);
-      let S2 = textureLoad(tW, vec2<i32>(wx + (sb * 4 + 2) * 13 + 12, gr), 0);
-      let S3 = textureLoad(tW, vec2<i32>(wx + (sb * 4 + 3) * 13 + 12, gr), 0);
+      let S0 = textureLoad(tW, vec2<i32>(${o.ordered ? "wx + sb * 52 + 0" : "wx + (sb * 4) * 13 + 12"}, gr), 0);
+      let S1 = textureLoad(tW, vec2<i32>(${o.ordered ? "wx + sb * 52 + 1" : "wx + (sb * 4 + 1) * 13 + 12"}, gr), 0);
+      let S2 = textureLoad(tW, vec2<i32>(${o.ordered ? "wx + sb * 52 + 2" : "wx + (sb * 4 + 2) * 13 + 12"}, gr), 0);
+      let S3 = textureLoad(tW, vec2<i32>(${o.ordered ? "wx + sb * 52 + 3" : "wx + (sb * 4 + 3) * 13 + 12"}, gr), 0);
       var P = vec4<f32>(0.0);
       for (var q = 0; q < 4; q++) {
         let n = (q >> 1u) & 1;

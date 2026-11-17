@@ -3671,6 +3671,77 @@ void main() {
   o = (d * sc) * (vec4(lo | (hb << 4u)) - 32.0);
 }`
 
+/**
+ * Q6_K word texels in the order the native head reads them (see
+ * ORDER_Q6_WORDS): a super-block's 52 texels are its 4 rows' scale texels,
+ * then per q-step (n, hw) = (q >> 1, q & 1) each row's ql texels 4n + hw
+ * and 4n + hw + 2 and qh texel 8 + 2n + hw. q6Pos: where row r's texel j
+ * (of the 13 in kernels' usual order) went.
+ */
+export const EMBED_Q6_K_WORDS_ORDERED = `${HEADER}${Q6_K_WORDS}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+int q6Pos(int r, int j) {
+  if (j == 12) return r;
+  int slot = j >= 8 ? 2 : (j >> 1) & 1;
+  int n = j >= 8 ? (j - 8) >> 1 : j >> 2;
+  return 4 + (2 * n + (j & 1)) * 12 + r * 3 + slot;
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int sb = c >> 8;
+  int n = (c >> 7) & 1;
+  int grp = (c >> 5) & 3;
+  int w = (c & 31) >> 2;
+  int t0 = col * uRowTexels + sb * 52;
+  // ql uint 16n + w (groups 0, 2) or 16n + 8 + w (1, 3); qh uint 32 + 8n + w.
+  int qi = 16 * n + 8 * (grp & 1) + w;
+  uint q = comp(texelFetch(uW, ivec2(t0 + q6Pos(r, qi >> 2), gr), 0), qi & 3);
+  int hi = 32 + 8 * n + w;
+  uint h = comp(texelFetch(uW, ivec2(t0 + q6Pos(r, hi >> 2), gr), 0), hi & 3);
+  uvec4 lo = ((uvec4(q) >> BYTE_SHIFT) >> uint(4 * (grp >> 1))) & 15u;
+  uvec4 hb = ((uvec4(h) >> BYTE_SHIFT) >> uint(2 * grp)) & 3u;
+  int k = 8 * n + (w >> 2) + 2 * grp;
+  float sc = sc8w(comp(texelFetch(uW, ivec2(t0 + r, gr), 0), k >> 2), uint(k & 3));
+  float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
+  o = (d * sc) * (vec4(lo | (hb << 4u)) - 32.0);
+}`
+
+/** Native Q6_K word texels (13 a super-block row) rearranged into the native head's order (EMBED_Q6_K_WORDS_ORDERED's). */
+export const ORDER_Q6_WORDS = `${HEADER}
+uniform usampler2D uNative;
+uniform int uX0;
+uniform int uY0;
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int sb = p.x / 52;
+  int pos = p.x - sb * 52;
+  int src = pos * 13 + 12;
+  if (pos >= 4) {
+    int k = pos - 4;
+    int q = k / 12;
+    int r = (k - q * 12) / 3;
+    int slot = k - q * 12 - r * 3;
+    int n = q >> 1;
+    int hw = q & 1;
+    src = r * 13 + (slot == 2 ? 8 + 2 * n + hw : 4 * n + hw + 2 * slot);
+  }
+  o = texelFetch(uNative, ivec2(sb * 52 + src, p.y), 0);
+}`
+
 /** Embedding rows for token ids from a Q6_K embedding: `embed`, for 6-bit weights. */
 export const EMBED_Q6_K = `${HEADER}${Q6_K_UNPACK}
 uniform usampler2D uIds;

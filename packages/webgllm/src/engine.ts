@@ -58,6 +58,8 @@ type GpuMatrix = {
   /** Q6_K embedding texture panels, including quants as the first. */
   quantPanels?: Array<Texture>
   q6Expanded?: boolean
+  /** Q6_K word texels in the native head's order (kernels.ts's ORDER_Q6_WORDS). */
+  q6Ordered?: boolean
   scales: Texture
   zeros: Texture | null
 }
@@ -130,6 +132,8 @@ export const TUNING = {
   nativeHead: 1,
   /** ...in this many K-slices (its threads share their activations already). */
   nativeHeadSplit: 1,
+  /** ...its texels uploaded in the order it reads them (kernels.ts's ORDER_Q6_WORDS). */
+  q6Order: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -2081,6 +2085,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
             ? GL.RGBA8
             : GL.RGBA8UI
     const rowsPerColumn = Math.ceil(groups / columns)
+    // A Q6_K head the native word head reads: its texels in that kernel's order.
+    const ordered = bits === 6 && !bytes && !expanded && TUNING.q6Order > 0 && this.nativeHeadOn && !this.gpu.slowZeroFill
     if (columns * rowTexels > max) {
       throw new GpuError(
         `A ${N}×${K} matrix doesn't fit in this GPU's textures.`
@@ -2117,6 +2123,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
         this.gpu.texture(quantFormat, columns * rowTexels, rowsPerColumn),
       ...(quantPanels && { quantPanels }),
       ...(expanded && { q6Expanded: true }),
+      ...(ordered && { q6Ordered: true }),
       scales: this.gpu.texture(
         packed ? GL.RGBA32UI : GL.RGBA16F,
         columns * blocks,
@@ -2885,6 +2892,31 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           output: gm.quantPanels?.[panel] ?? gm.quants,
           rect
         })
+      } else if (gm.q6Ordered) {
+        // Through a staging texture, rearranged into place on the GPU.
+        const stage = (this.orderStage = this.orderStage?.width === rowTexels
+          ? this.orderStage
+          : this.gpu.texture(GL.RGBA32UI, rowTexels, Math.min(256, rowsPerColumn)))
+        for (let r0 = 0; r0 < run; r0 += stage.height) {
+          const h = Math.min(stage.height, run - r0)
+          this.gpu.write(
+            stage,
+            { x: 0, y: 0, width: rowTexels, height: h },
+            { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: quants.subarray(r0 * words, (r0 + h) * words) }
+          )
+          const rect = { x: column * rowTexels, y: y + r0, width: rowTexels, height: h }
+          this.gpu.run({
+            name: "upload",
+            program: this.gpu.program(K.ORDER_Q6_WORDS),
+            inputs: { uNative: stage },
+            uniforms: { uX0: { int: rect.x }, uY0: { int: rect.y } },
+            output: gm.quants,
+            rect
+          })
+          // Sent now: the next chunk's write then goes straight to the queue
+          // (behind an unsent pass reading the stage, it's copied twice).
+          this.gpu.flush()
+        }
       } else if (gm.q6Expanded) {
         const needed = run * blocks * 4 * 256
         if (this.expandedUpload.length < needed)
@@ -4565,14 +4597,22 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** K-slices of a Q6_K head: the native head's on WebGPU (see TUNING.nativeHead). */
   get q6HeadSplit() {
-    return TUNING.nativeHead > 0 && "nativeProgram" in this.gpu ? TUNING.nativeHeadSplit : TUNING.q6HeadSplit
+    return this.nativeHeadOn ? TUNING.nativeHeadSplit : TUNING.q6HeadSplit
   }
 
+  /** Whether Q6_K word heads run as the native pass (see TUNING.nativeHead). */
+  private get nativeHeadOn() {
+    return TUNING.nativeHead > 0 && "nativeProgram" in this.gpu
+  }
+
+  /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
+  private orderStage: Texture | null = null
+
   private nativeHeads = new Map<string, NativeSpec>()
-  private nativeHeadSpec(split: boolean, prescaled: boolean, kbSlice: number) {
-    const key = `${split} ${prescaled} ${kbSlice}`
+  private nativeHeadSpec(split: boolean, prescaled: boolean, kbSlice: number, ordered: boolean) {
+    const key = `${split} ${prescaled} ${kbSlice} ${ordered}`
     let spec = this.nativeHeads.get(key)
-    if (!spec) this.nativeHeads.set(key, (spec = wordHead({ split, prescaled, kbSlice })))
+    if (!spec) this.nativeHeads.set(key, (spec = wordHead({ split, prescaled, kbSlice, ordered })))
     return spec
   }
 
@@ -6545,9 +6585,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       throw new Error("Only word-texel Q6_K heads read the scaled input.")
     const oneSums = prescaled && this.sumsInOne(b.residual[0])
     // On WebGPU, the word head as a native pass (activations in workgroup memory: see gpu/native.ts).
-    const native = !e.q6Expanded && !e.bytes && !e.quantPanels && TUNING.nativeHead > 0 && "nativeProgram" in this.gpu
-      ? this.gpu.nativeProgram(this.nativeHeadSpec(split > 1, prescaled, Math.ceil(e.blocks / split)))
+    const native = !e.q6Expanded && !e.bytes && !e.quantPanels && this.nativeHeadOn && "nativeProgram" in this.gpu
+      ? this.gpu.nativeProgram(this.nativeHeadSpec(split > 1, prescaled, Math.ceil(e.blocks / split), !!e.q6Ordered))
       : null
+    if (e.q6Ordered && !native) throw new GpuError("Only the native head reads ordered Q6_K texels.")
     await this.weightHead(
       e,
       {
@@ -6819,7 +6860,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 ? K.EMBED_Q6_EXPANDED
                 : e.bytes
                   ? K.EMBED_Q6_K
-                  : K.EMBED_Q6_K_WORDS
+                  : e.q6Ordered
+                    ? K.EMBED_Q6_K_WORDS_ORDERED
+                    : K.EMBED_Q6_K_WORDS
               : K.embed({
                   bits: e.bits,
                   zeros: !!e.zeros,
