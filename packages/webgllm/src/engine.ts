@@ -2679,8 +2679,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         this.headChoice = { expanded, split }
         const gm = this.allocateMatrix(matrix.N, matrix.K, 6, false)
         for (let i = 0; i < count; i++) this.writeMatrix(gm, piece, i * piece.N)
-        // Match the panel shader used for the complete embedding.
-        gm.quantPanels ??= [gm.quants]
+        // Match the panel shader used for the complete embedding (where
+        // it has panels: not on WebGPU, whose probe in panels timed one-row
+        // bands no real head runs, and picked the head 3× slower on a Pixel).
+        if (this.gpu.slowZeroFill) gm.quantPanels ??= [gm.quants]
         made.push(gm)
         await this.gpu.pace(0, true)
       }
