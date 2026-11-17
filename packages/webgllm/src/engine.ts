@@ -413,12 +413,15 @@ type HeadOut = { logits: Texture; split: number; stride: number }
 /** The time the load's packing probe may spend on timing pairs past its first two, and the most pairs it takes (see choosePromptPacking). */
 /**
  * How much faster, in every timed round, another way must be to replace a
- * choice this GPU made before (Engine.incumbent): 10%. Ways that close on a
- * fast GPU swap places with the noise of one timing (Chrome on a Mac timed
- * f16Pack 0 at 0.87-1.17x of 3), and a re-pick changes the kernels' rounding,
- * so the same model on the same device writes differently.
+ * choice this GPU made before (Engine.incumbent): 5%, or more where the
+ * timer is noisier (keepMargin). Ways that close on a fast GPU swap places
+ * with the noise of one timing (Chrome on a Mac timed f16Pack 0 at
+ * 0.87-1.17x of 3), and a re-pick changes the kernels' rounding, so the
+ * same model on the same device writes differently. At 10% Firefox on a
+ * Pixel 10 Pro kept f16Pack 3 where 0 read prompts 10% faster (466 against
+ * 518 ms a probe).
  */
-export const KEEP_MARGIN = 0.9
+export const KEEP_MARGIN = 0.95
 
 /**
  * Whether `challenger` (a candidate's timed rounds) replaces `standing`
@@ -1620,9 +1623,13 @@ export class Engine {
       // to lose. The reversed pairs must independently show a useful gain.
       // A shared clock drift between rounds is not evidence against a
       // candidate that wins both within-round comparisons.
-      const earlier = this.incumbent?.tuned?.[key]
+      // (An incumbent that kept TUNING's value stored null: that's its
+      // choice too, as hard to replace as any other.)
+      const prior = this.incumbent?.tuned
+      const chose = !!prior && key in prior
+      const earlier = prior?.[key]
       const standing = earlier == null ? 0 : Math.max(0, candidates.indexOf(earlier))
-      const kept = best === standing || !replaces(rounds[best], rounds[standing], earlier == null ? 0.96 : keepMargin(rounds))
+      const kept = best === standing || !replaces(rounds[best], rounds[standing], chose ? keepMargin(rounds) : 0.96)
       const pick = candidates[kept ? standing : best]
       return pick === candidates[0] ? null : pick
     }

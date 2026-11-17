@@ -5,8 +5,10 @@ import { incumbentGpuTuning, type GpuNote } from "./storage.js"
 
 test("a way replaces the standing choice only when it's faster in every round by the margin", () => {
   assert.equal(replaces([80, 85], [100, 100], KEEP_MARGIN), true)
-  // One round within 10%: the standing choice stays.
-  assert.equal(replaces([80, 95], [100, 100], KEEP_MARGIN), false)
+  // One round within 5%: the standing choice stays.
+  assert.equal(replaces([80, 96], [100, 100], KEEP_MARGIN), false)
+  // 10% faster in every round (Firefox's f16Pack 0 on a Pixel): replaced.
+  assert.equal(replaces([466, 466], [518, 518], KEEP_MARGIN), true)
   // Faster on average but not in every round.
   assert.equal(replaces([50, 105], [100, 100], KEEP_MARGIN), false)
   assert.equal(replaces([], [], KEEP_MARGIN), false)
