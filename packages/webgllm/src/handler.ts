@@ -8,7 +8,7 @@ import type { GpuNote } from "./storage.js"
  * behind a worker's messages (the package's worker.ts, or a caller's).
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
-import { blobSource } from "./byte-source.js"
+import { blobSource, storedSources } from "./byte-source.js"
 import { ggufShape, readGgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
@@ -19,7 +19,7 @@ import { modelMeta, onnxDataSources, rememberModel } from "./model-meta.js"
 import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
-import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
+import type { ModelFile } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
 import { DraftPolicy, lookupDraft } from "./draft.js"
@@ -389,6 +389,8 @@ async function load(
   pacingEngine = engine
   lap("context")
   let reusedTuning = false
+  // Closes the weights' synchronous access handles, which lock their files (see storedSources).
+  let closeStored = () => {}
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -434,7 +436,11 @@ async function load(
     // The weights' shape, from their header: a model of the same shape as
     // one already tuned here starts from its tuning.
     // (The header is read once: the load below takes it too.)
-    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(blobSource(weightFiles[0])) : undefined
+    // The weights read through synchronous access handles where they can be (see storedSources).
+    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles) : { sources: weightFiles.map(blobSource), close: () => undefined }
+    closeStored = stored.close
+    const weightSources = stored.sources
+    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
     const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
@@ -461,7 +467,7 @@ async function load(
     }
     const pieces =
       meta.files.kind === "gguf"
-        ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
+        ? uploadedGgufWeights(loadGguf(weightSources[0], {
             header: ggufHeader,
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
             readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
@@ -472,8 +478,8 @@ async function load(
               string,
               unknown
             >,
-            graph: blobSource(weightFiles[1]),
-            data: onnxData(meta.files, weightFiles.slice(2))
+            graph: weightSources[1],
+            data: onnxDataSources(meta.files, weightSources.slice(2))
           })
     ggufHeader = undefined
     let layers = 0
@@ -495,7 +501,7 @@ async function load(
           cached
         })
       }
-    }, signal)
+    }, signal).finally(stored.close)
     if (signal.aborted) throw new Superseded()
     if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
@@ -508,6 +514,7 @@ async function load(
     })
     timings.weightsReading = Math.round(engine.loadMs.reading)
     timings.weightsUploading = Math.round(engine.loadMs.uploading)
+    timings.weightsPacing = Math.round(engine.loadMs.pacing)
     timings.f16Init = Math.round(engine.loadMs.scratch)
     timings.packingProbe = Math.round(engine.loadMs.packing)
     timings.matvecProbe = Math.round(engine.loadMs.matvec)
@@ -619,6 +626,7 @@ async function load(
       timings
     }
   } catch (error) {
+    closeStored()
     // A failed or superseded load frees its textures now.
     release(engine)
     if (reusedTuning && !signal.aborted && error instanceof GpuError)
@@ -758,9 +766,6 @@ const errorMessage = (error: unknown) =>
     : error instanceof Error
       ? error.message
       : String(error)
-
-/** An ONNX model's external data, as loadOnnx takes it (see onnxDataSources). */
-const onnxData = (files: Extract<WebGlModelMeta["files"], { kind: "onnx" }>, blobs: Array<Blob>) => onnxDataSources(files, blobs.map(blobSource))
 
 /** One of a model's files: stored, or downloaded now. */
 async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {

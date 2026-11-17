@@ -101,3 +101,74 @@ export function blobSource(blob: Blob): ByteSource {
     }
   }
 }
+
+/** A stored file's handle (storage.ts), for reading it through a synchronous access handle. */
+const fileHandles = new WeakMap<Blob, FileSystemFileHandle>()
+
+/** `file`, remembered as `handle`'s (see storedSources). */
+export function withHandle(file: File, handle: FileSystemFileHandle): File {
+  fileHandles.set(file, handle)
+  return file
+}
+
+type SyncAccessHandle = {
+  read: (into: Uint8Array, options: { at: number }) => number
+  getSize: () => number
+  close: () => void
+}
+
+/**
+ * Sources for a load's files. A stored file in a worker is read through a
+ * synchronous access handle: on an iPhone 16 Pro Max (Safari, iOS 27.2) its
+ * 1,090 MB of Qwen3.5 weights read in ~100 ms that way, against 300–640 ms
+ * through `Blob.slice().arrayBuffer()`. Any other file, or one whose handle
+ * can't be opened (another reader holds it), is read as a Blob. `close()`
+ * releases the handles: call it once the load has read everything.
+ */
+export async function storedSources(blobs: ReadonlyArray<Blob>): Promise<{ sources: Array<ByteSource>; close: () => void }> {
+  const opened: Array<SyncAccessHandle> = []
+  const inWorker = typeof (globalThis as { WorkerGlobalScope?: unknown }).WorkerGlobalScope !== "undefined"
+  const sources = await Promise.all(
+    blobs.map(async (blob) => {
+      const handle = fileHandles.get(blob) as (FileSystemFileHandle & { createSyncAccessHandle?: () => Promise<SyncAccessHandle> }) | undefined
+      if (inWorker && handle?.createSyncAccessHandle) {
+        try {
+          const access = await handle.createSyncAccessHandle()
+          opened.push(access)
+          return syncSource(access)
+        } catch {
+          // Held by another reader or writer: the Blob.
+        }
+      }
+      return blobSource(blob)
+    })
+  )
+  return {
+    sources,
+    close: () => {
+      for (const access of opened.splice(0)) {
+        try {
+          access.close()
+        } catch {
+          // Already closed.
+        }
+      }
+    }
+  }
+}
+
+function syncSource(access: SyncAccessHandle): ByteSource {
+  const size = access.getSize()
+  return {
+    size,
+    read: async (offset, length) => {
+      if (offset < 0 || offset + length > size) {
+        throw new RangeError(`read of ${length} bytes at ${offset} is outside the file (${size} bytes)`)
+      }
+      const bytes = new Uint8Array(length)
+      const read = access.read(bytes, { at: offset })
+      if (read !== length) throw new Error(`read ${read} of ${length} bytes at ${offset}`)
+      return bytes
+    }
+  }
+}

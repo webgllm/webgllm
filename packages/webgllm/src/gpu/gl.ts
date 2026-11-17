@@ -1078,6 +1078,30 @@ export class Gpu {
     else gl.finish()
   }
 
+  /**
+   * Fills `texture` with zeros on the GPU, if it can be drawn into. A
+   * texture the loader writes in parts is otherwise zero-filled by the
+   * browser on its first partial write (WebGL's robust initialization),
+   * far more slowly.
+   */
+  zero(texture: Texture) {
+    const gl = this.gl
+    let fb: WebGLFramebuffer
+    try {
+      fb = this.framebuffer(texture)
+    } catch {
+      return
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    this.boundFb = fb
+    gl.disable(gl.SCISSOR_TEST)
+    const unsigned = texture.internal === GL.RGBA32UI || texture.internal === GL.R32UI || texture.internal === GL.R8UI || texture.internal === GL.RGBA8UI
+    if (unsigned) gl.clearBufferuiv(gl.COLOR, 0, new Uint32Array(4))
+    else if (texture.internal === GL.RGBA8I) gl.clearBufferiv(gl.COLOR, 0, new Int32Array(4))
+    else gl.clearBufferfv(gl.COLOR, 0, new Float32Array(4))
+    this.markGpuWork()
+  }
+
   /** Flushes issued passes to the GPU, so it starts on them. */
   flush() {
     this.gl.flush()

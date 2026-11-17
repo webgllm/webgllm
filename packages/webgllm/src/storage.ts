@@ -6,6 +6,7 @@
  * `createWritable`). A file counts as downloaded once its `.done` marker
  * exists, so an interrupted download is never mistaken for a whole one.
  */
+import { withHandle } from "./byte-source.js"
 import type { Tuned } from "./engine.js"
 import { fileUrl, isCatalogModel, WEBGL_MODEL_META } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
@@ -73,7 +74,8 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
   try {
     const folder = await dir()
     await folder.getFileHandle(marker(file))
-    return await (await folder.getFileHandle(diskName(file))).getFile()
+    const handle = await folder.getFileHandle(diskName(file))
+    return withHandle(await handle.getFile(), handle)
   } catch {
     return null
   }
@@ -404,7 +406,7 @@ export async function download(
   // Another download may have finished it while this one waited for the lock.
   if (await storedFile(file)) {
     access.close()
-    return handle.getFile()
+    return withHandle(await handle.getFile(), handle)
   }
   /** The bytes on disk, through a new handle if the browser closed this one. */
   const size = async () => {
@@ -538,5 +540,5 @@ export async function download(
     }
   }
   await removeOldVersions(folder, file)
-  return handle.getFile()
+  return withHandle(await handle.getFile(), handle)
 }

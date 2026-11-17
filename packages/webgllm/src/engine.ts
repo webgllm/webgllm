@@ -242,6 +242,8 @@ export const TUNING = {
   ggufEmbeddingRows: 0,
   /** Concurrent file slices, still bounded by ReadPlan's 24 MiB cap. */
   ggufReadAhead: 6,
+  /** 1: stored weights are read through synchronous access handles in a worker (storedSources); 0: as Blobs. */
+  syncReads: 1,
   /** Uploaded model pieces allowed ahead of the GPU, with periodic presentation drains. */
   uploadAhead: 1,
   /** Packing probe rows: 0 uses the actual prompt batch; positive values are diagnostics. */
@@ -762,15 +764,25 @@ export class Engine {
     this.loadMs = {
       reading: 0,
       uploading: 0,
+      pacing: 0,
       convert: 0,
       scratch: 0,
       packing: 0,
       matvec: 0
     }
+    // The GPU takes a piece's uploads while the next piece is read: each
+    // piece is flushed, not waited for, and the wait (pacing the queue as
+    // before) comes just before the next piece's uploads.
+    let unpaced = false
     for await (const piece of pieces) {
       signal?.throwIfAborted()
       const got = performance.now()
       this.loadMs.reading += got - mark
+      if (unpaced) {
+        unpaced = false
+        await this.gpu.pace(Math.max(0, TUNING.uploadAhead), true)
+        this.loadMs.pacing += performance.now() - got
+      }
       if (piece.kind === "config") this.configure(piece.config)
       else if (piece.kind === "embedding") {
         // Whole, or in chunks of rows: allocated with the first.
@@ -790,6 +802,12 @@ export class Engine {
             !!value.zeros,
             value.bits === 4
           )
+        // Written in chunks: zeroed on the GPU first, or the browser
+        // zero-fills it on the first chunk's write, far more slowly (430 ms
+        // for Qwen3.5 2B's on an iPhone 16 Pro Max, against a 60 ms clear).
+        if (row0 === 0 && value.N < totalRows)
+          for (const t of [this.embedding.quants, this.embedding.scales, this.embedding.zeros])
+            if (t) this.gpu.zero(t)
         this.writeMatrix(this.embedding, value, row0)
       } else if (piece.kind === "finalNorm")
         this.finalNorm = this.vector(piece.value)
@@ -799,8 +817,10 @@ export class Engine {
         if (!this.layoutChoice) await this.chooseLayout(piece.value.gateUp)
         this.layers[piece.layer] = this.layer(piece.value)
       }
-      if (this.gpu.readsPerSlice > 0)
-        await this.gpu.pace(Math.max(0, TUNING.uploadAhead), true)
+      if (this.gpu.readsPerSlice > 0) {
+        this.gpu.flush()
+        unpaced = true
+      }
       onProgress?.(piece)
       if (this.gpu.isLost)
         throw new GpuError("The GPU context was lost while loading.")
@@ -822,6 +842,7 @@ export class Engine {
     await this.gpu.finish()
     this.loadMs.scratch = performance.now() - started
     this.expandedUpload = new Uint8Array(0)
+    this.repackUpload = new Uint32Array(0)
     started = performance.now()
     await this.choosePromptPacking(signal)
     this.loadMs.packing = performance.now() - started
@@ -1665,7 +1686,7 @@ export class Engine {
    * The last load's milliseconds waiting on the weight pieces (reading and
    * repacking them) and turning them into textures.
    */
-  loadMs = { reading: 0, uploading: 0, convert: 0, scratch: 0, packing: 0, matvec: 0 }
+  loadMs = { reading: 0, uploading: 0, pacing: 0, convert: 0, scratch: 0, packing: 0, matvec: 0 }
   /** 4-bit layer weights in RGBA4 (else byte texels): see chooseLayout. */
   private rgba4Layers = true
   /** The layout chooseLayout picked and its timings (ms per writing matmul). */
@@ -2051,6 +2072,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   private expandedUpload = new Uint8Array(0)
+  /** Upload scratch for raw MatMulNBits rows repacked to the bytes layout (quantsFromRaw). */
+  private repackUpload = new Uint32Array(0)
   private embeddingRows = 0
 
   rmsReport: Array<{ parts: number; ms: number }> = []
@@ -2631,8 +2654,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
     // Raw MatMulNBits rows go into RGBA4 as they are (16-byte runs moved
     // into place; see rawRgba4); other layouts get the rows repacked.
-    if (m.raw && !gm.rgba4)
-      m = { ...m, quants: quantsFromRaw(m.raw, m.N, m.K), raw: undefined }
+    if (m.raw && !gm.rgba4) {
+      const words = (m.N * m.K) / 8
+      if (this.repackUpload.length < words) this.repackUpload = new Uint32Array(words)
+      m = { ...m, quants: quantsFromRaw(m.raw, m.N, m.K, this.repackUpload), raw: undefined }
+    }
     const { blocks, rowTexels, rowsPerColumn } = gm
     const g0 = row0 / 4
     const groups = m.N / 4
@@ -2761,13 +2787,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const n = run * blocks * 4
         const at = local * blocks * 4
         const texels = new Uint32Array(n)
-        for (let t = 0; t < n; t += 4) {
-          const d = m.scales.subarray(at + t, at + t + 4)
-          const z = m.zeros.subarray(at + t, at + t + 4)
-          texels[t] = d[0] | (d[1] << 16)
-          texels[t + 1] = d[2] | (d[3] << 16)
-          texels[t + 2] = (HALF_INT[z[0]] | (HALF_INT[z[1]] << 16)) >>> 0
-          texels[t + 3] = (HALF_INT[z[2]] | (HALF_INT[z[3]] << 16)) >>> 0
+        const scales = m.scales
+        const zeros = m.zeros
+        for (let t = 0, a = at; t < n; t += 4, a += 4) {
+          texels[t] = scales[a] | (scales[a + 1] << 16)
+          texels[t + 1] = scales[a + 2] | (scales[a + 3] << 16)
+          texels[t + 2] = HALF_INT[zeros[a]] | (HALF_INT[zeros[a + 1]] << 16)
+          texels[t + 3] = HALF_INT[zeros[a + 2]] | (HALF_INT[zeros[a + 3]] << 16)
         }
         this.gpu.write(
           gm.scales,

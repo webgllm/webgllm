@@ -44,7 +44,6 @@ import { ReadPlan } from "./read-plan.js"
 import {
   headPermutation,
   newQuantMatrix,
-  packMatMulNBits,
   packMatMulNBitsScales,
   quantizeQ8
 } from "./repack.js"
@@ -371,8 +370,20 @@ export async function* loadOnnx(
       yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
       continue
     }
-    const m = newQuantMatrix(rows, D, 4, emb.zp !== null)
-    packMatMulNBits(m, 0, quant, scales, zp, rows)
+    // 4-bit rows stay as stored (QuantMatrix.raw): the engine moves them
+    // into its RGBA4 texels as they are, instead of a repack there and back.
+    const blocks = D / 32
+    if (quant.length < rows * blocks * 16) throw new Error("MatMulNBits data is too short")
+    const m: QuantMatrix = {
+      N: rows,
+      K: D,
+      bits: 4,
+      quants: new Uint32Array(0),
+      scales: new Uint16Array(rows * blocks),
+      zeros: zp ? new Uint8Array(rows * blocks).fill(8) : null,
+      raw: quant.subarray(0, rows * blocks * 16)
+    }
+    packMatMulNBitsScales(m, 0, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }
   }
 }
