@@ -144,11 +144,14 @@ for (const C of [Gpu, WebGpu] as const) {
     return setPhase.call(this, phase)
   }
 }
-const instrumented = () => countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || twiceWhileWriting.size > 0
+const extraWhileWriting = new Set<string>()
+const scratch = new WeakMap<object, Map<string, ReturnType<Gpu["texture"]>>>()
+const instrumented = () => extraWhileWriting.size > 0 || countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || twiceWhileWriting.size > 0
 // Passes while writing, by kind and size, and in independent groups (tune "countWriting:1").
 let countWriting = false
 const writingRuns = new Map<string, number>()
-let group = { written: new Set<number>(), read: new Set<number>(), n: 0 }
+const seq: Array<string> = []
+let group = { written: new Set<number>(), read: new Set<number>(), n: 0, rects: new Map<number, Array<{ x: number; y: number; width: number; height: number }>>() }
 const groups = { count: 0, passes: 0, sizes: new Map<number, number>() }
 const NOTES_DIR = "webgl-models"
 // Lanes forced past the engine's choice (tune "coopThreads:<n>").
@@ -179,21 +182,45 @@ for (const C of [Gpu, WebGpu] as const) {
       // what an earlier one in its group wrote (or writes what it read).
       const ins = Object.values(pass.inputs).map((t) => t.id)
       const outs = (Array.isArray(pass.output) ? pass.output : [pass.output]).map((t) => t.id)
-      if (ins.some((id) => group.written.has(id)) || outs.some((id) => group.written.has(id) || group.read.has(id))) {
+      const o0 = Array.isArray(pass.output) ? pass.output[0] : pass.output
+      const rect = pass.rect ?? { x: 0, y: 0, width: o0.width, height: o0.height }
+      const overlaps = (id: number) => (group.rects.get(id) ?? []).some((q) =>
+        q.x < rect.x + rect.width && rect.x < q.x + q.width && q.y < rect.y + rect.height && rect.y < q.y + q.height)
+      if (ins.some((id) => group.written.has(id)) || outs.some((id) => overlaps(id) || group.read.has(id))) {
         groups.count++
         groups.sizes.set(group.n, (groups.sizes.get(group.n) ?? 0) + 1)
-        group = { written: new Set(), read: new Set(), n: 0 }
+        group = { written: new Set(), read: new Set(), n: 0, rects: new Map() }
       }
       for (const id of ins) group.read.add(id)
-      for (const id of outs) group.written.add(id)
+      for (const id of outs) {
+        group.written.add(id)
+        group.rects.set(id, [...(group.rects.get(id) ?? []), rect])
+      }
       group.n++
       groups.passes++
+      if (groups.passes > 3000 && seq.length < 900) {
+        const r = pass.rect ?? { x: 0, y: 0, width: o0.width, height: o0.height }
+        seq.push(`${pass.name ?? "?"} ${r.x},${r.y} ${r.width}x${r.height} [${ins.join(",")}]>[${outs.join(",")}]`)
+      }
       const r = pass.rect ?? { width: 0, height: 0 }
       const key = `${pass.name ?? "?"} ${r.width}x${r.height}`
       writingRuns.set(key, (writingRuns.get(key) ?? 0) + 1)
     }
     if (pass.name && skipWhileWriting.has(pass.name) && this.activePhase === "decode") return
     if (pass.name && twiceWhileWriting.has(pass.name) && this.activePhase === "decode") run.call(this, pass)
+    // An extra copy into scratch outputs (tune "extra_<name>:1"): its cost
+    // in place, which a repeat into the same target hides on a tile GPU.
+    if (pass.name && extraWhileWriting.has(pass.name) && this.activePhase === "decode") {
+      let pool = scratch.get(this)
+      if (!pool) scratch.set(this, (pool = new Map()))
+      const outs = (Array.isArray(pass.output) ? pass.output : [pass.output]).map((t) => {
+        const key = `${t.internal}:${t.width}x${t.height}`
+        let x = pool!.get(key)
+        if (!x) pool!.set(key, (x = this.texture(t.internal, t.width, t.height)))
+        return x
+      })
+      run.call(this, { ...pass, output: outs.length === 1 ? outs[0] : outs })
+    }
     if (burnUs > 0 && this.activePhase === "decode") for (const t = performance.now(); performance.now() - t < burnUs / 1000;);
     if (dumpShaders) record(this, pass)
     return run.call(this, pass)
@@ -214,8 +241,21 @@ const wgProfiles = { prompt: new Map<string, { ms: number; n: number }>(), decod
   }
 }
 // CPU time spent issuing WebGPU work, by phase.
-const wgCpu = { run: 0, runs: 0, submit: 0, submits: 0 }
+const wgCpu = { run: 0, runs: 0, submit: 0, submits: 0, texture: 0, textures: 0, write: 0, writes: 0, writeBytes: 0 }
 {
+  for (const name of ["texture", "write"] as const) {
+    const original = WebGpu.prototype[name] as (...args: unknown[]) => unknown
+    Object.assign(WebGpu.prototype, {
+      [name]: function (this: WebGpu, ...args: unknown[]) {
+        const t = performance.now()
+        try { return original.apply(this, args) } finally {
+          wgCpu[name] += performance.now() - t
+          wgCpu[name === "texture" ? "textures" : "writes"]++
+          if (name === "write") wgCpu.writeBytes += (args[2] as { pixels: ArrayBufferView }).pixels.byteLength
+        }
+      }
+    })
+  }
   const run = WebGpu.prototype.run
   WebGpu.prototype.run = function (this: WebGpu, pass) {
     const t = performance.now()
@@ -227,18 +267,35 @@ const wgCpu = { run: 0, runs: 0, submit: 0, submits: 0 }
     try { return submit.call(this) } finally { wgCpu.submit += performance.now() - t; wgCpu.submits++ }
   })
 }
+// WebGPU's errors as they come, and the compiles' times (a stalled load says nothing at the end).
+{
+  let seen = 0, lastCompiles = 0
+  setInterval(() => {
+    const gpu = loadedEngine?.gpu
+    if (!(gpu instanceof WebGpu)) return
+    if (gpu.errors.length > seen) {
+      void fetch("/log", { method: "POST", body: `WGERRNOW ${gpu.errors.slice(seen).join(" || ")}` })
+      seen = gpu.errors.length
+    }
+    if (gpu.compiled.count !== lastCompiles) {
+      lastCompiles = gpu.compiled.count
+      void fetch("/log", { method: "POST", body: `WGCOMPILES ${gpu.compiled.count} in ${gpu.compiled.ms.toFixed(0)} ms; slowest ${JSON.stringify(gpu.compiled.slowest.slice(0, 3))}` })
+    }
+  }, 2000)
+}
 const logWgProfile = () =>
   logWgProfileNow().catch((e) => fetch("/log", { method: "POST", body: `WGPROFILE failed: ${(e as Error).stack ?? e}` }))
 const logWgProfileNow = async () => {
   const gpu = loadedEngine?.gpu
+  if (seq.length) await fetch("/log", { method: "POST", body: `SEQ ${seq.join(" ; ")}` })
   await fetch("/log", { method: "POST", body: `GROUPS ${groups.passes} passes in ${groups.count} independent groups; sizes ${[...groups.sizes].sort((x, y) => x[0] - y[0]).map(([k, n]) => `${k}:${n}`).join(" ")}` })
   await fetch("/log", { method: "POST", body: `WRITINGRUNS ${[...writingRuns].sort((x, y) => y[1] - x[1]).map(([k, n]) => `${k}=${n}`).join(", ")}` })
   await fetch("/log", { method: "POST", body: `WRITING draws ${writing.draws} passes ${writing.passes}` })
   await fetch("/log", { method: "POST", body: `TUNED ${JSON.stringify(loadedEngine?.tuned)} report ${JSON.stringify(loadedEngine?.tuneReport)}` })
   if (!(gpu instanceof WebGpu)) return
   await fetch("/log", { method: "POST", body: `WGFEATURES ${[...gpu.device.features].join(",")}` })
-  await fetch("/log", { method: "POST", body: `WGCPU run ${wgCpu.run.toFixed(1)} ms / ${wgCpu.runs}, submit ${wgCpu.submit.toFixed(1)} ms / ${wgCpu.submits}` })
-  Object.assign(wgCpu, { run: 0, runs: 0, submit: 0, submits: 0 })
+  await fetch("/log", { method: "POST", body: `WGCPU run ${wgCpu.run.toFixed(1)} ms / ${wgCpu.runs}, submit ${wgCpu.submit.toFixed(1)} ms / ${wgCpu.submits}, texture ${wgCpu.texture.toFixed(1)} ms / ${wgCpu.textures}, write ${wgCpu.write.toFixed(1)} ms / ${wgCpu.writes} (${(wgCpu.writeBytes / 2 ** 20).toFixed(0)} MB)` })
+  Object.assign(wgCpu, { run: 0, runs: 0, submit: 0, submits: 0, texture: 0, textures: 0, write: 0, writes: 0, writeBytes: 0 })
   if (gpu.errors.length) await fetch("/log", { method: "POST", body: `WGERRORS ${gpu.errors.join(" || ")}` })
   if (!wgProfiling) return
   await gpu.profiled()
@@ -300,6 +357,10 @@ const handle = async (event: MessageEvent) => {
           skipWhileWriting.add(key.slice(5))
           delete event.data.values[key]
         }
+        else if (key.startsWith("extra_")) {
+          extraWhileWriting.add(key.slice(6))
+          delete event.data.values[key]
+        }
         else if (key.startsWith("twice_")) {
           twiceWhileWriting.add(key.slice(6))
           delete event.data.values[key]
@@ -330,6 +391,18 @@ const handle = async (event: MessageEvent) => {
     if (event.data.type === "tune" && event.data.values?.countWriting) {
       countWriting = true
       delete event.data.values.countWriting
+    }
+    if (event.data.type === "tune" && event.data.values?.unroll !== undefined) {
+      WebGpu.unroll = event.data.values.unroll
+      delete event.data.values.unroll
+    }
+    if (event.data.type === "tune" && event.data.values?.subgroups !== undefined) {
+      WebGpu.useSubgroups = event.data.values.subgroups > 0
+      delete event.data.values.subgroups
+    }
+    if (event.data.type === "tune" && event.data.values?.merge !== undefined) {
+      WebGpu.merge = event.data.values.merge > 0
+      delete event.data.values.merge
     }
     if (event.data.type === "tune" && event.data.values?.coarse) {
       WebGpu.coarse = true

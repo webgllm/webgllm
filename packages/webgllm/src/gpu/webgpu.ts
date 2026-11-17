@@ -19,6 +19,9 @@ type Value = NonNullable<Pass["uniforms"]>[string]
 
 type Variant = {
   t: Translation
+  formats: Array<GPUTextureFormat>
+  rgba4: Array<string>
+  unroll: number
   pipeline: GPUComputePipeline
   layout: GPUBindGroupLayout
   workgroup: [number, number]
@@ -34,6 +37,9 @@ type WgProgram = Program & {
   /** Uniform values: they persist between passes, as a GL program's do. */
   values: Map<string, Value>
 }
+
+/** A pass waiting to be merged (see WebGpu.queue). */
+type Queued = { v: Variant; inputs: Array<Texture>; outputs: Array<Texture>; block: Uint8Array; rect: { x: number; y: number; width: number; height: number } }
 
 /** A fence: done once the GPU has finished the work submitted before it. */
 type Fence = { done: boolean; promise: Promise<void> }
@@ -180,7 +186,7 @@ export class WebGpu extends PacedGpu<Fence> {
     const want = (name: keyof GPUSupportedLimits) => adapter.limits[name] as number
     const device = await adapter.requestDevice({
       // (Timestamps only for profiling: see `profile`.)
-      requiredFeatures: adapter.features.has("timestamp-query") ? ["timestamp-query"] : [],
+      requiredFeatures: (["timestamp-query", "subgroups"] as const).filter((f) => adapter.features.has(f) && (f !== "subgroups" || WebGpu.useSubgroups)),
       requiredLimits: {
         maxTextureDimension2D: want("maxTextureDimension2D"),
         maxStorageTexturesPerShaderStage: want("maxStorageTexturesPerShaderStage"),
@@ -189,10 +195,13 @@ export class WebGpu extends PacedGpu<Fence> {
       }
     })
     const info = adapter.info
-    return new WebGpu(device, `WebGPU ${[info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(" ")}`)
+    return new WebGpu(device, `WebGPU ${[info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(" ")}`, info)
   }
 
-  constructor(readonly device: GPUDevice, renderer: string) {
+  /** Lanes sum by subgroup shuffles where the device can (experiments: false keeps workgroup memory). */
+  static useSubgroups = true
+
+  constructor(readonly device: GPUDevice, renderer: string, info?: GPUAdapterInfo) {
     super()
     this.limits = {
       maxTextureSize: device.limits.maxTextureDimension2D,
@@ -201,6 +210,9 @@ export class WebGpu extends PacedGpu<Fence> {
       renderer
     }
     this.uniformAlign = device.limits.minUniformBufferOffsetAlignment
+    const min = (info as GPUAdapterInfo & { subgroupMinSize?: number } | undefined)?.subgroupMinSize ?? 0
+    this.subgroups = WebGpu.useSubgroups && device.features.has("subgroups") && min >= 2
+    this.subgroupSize = Math.min(32, 2 ** Math.floor(Math.log2(Math.max(1, min))))
     this.uniformBuffer = device.createBuffer({
       size: this.ring.byteLength,
       usage: BUFFER.UNIFORM | BUFFER.COPY_DST
@@ -258,6 +270,9 @@ export class WebGpu extends PacedGpu<Fence> {
   coopThreads = 0
   /** Whether passes can share a texel's K loop among threads (coopThreads). */
   readonly sharesLoops = true
+  /** Whether lanes sum by subgroup shuffles (see wgsl.ts's Variant.subgroups), and the fewest lanes a subgroup has. */
+  private subgroups: boolean
+  private subgroupSize: number
   /** Profile whole compute passes (GPU busy time) rather than each pass in its own (see profile). */
   static coarse = false
   /** A workgroup shape for every pass (experiments). */
@@ -276,13 +291,14 @@ export class WebGpu extends PacedGpu<Fence> {
     // about coopThreads threads in all.
     const texels = width * height
     const lanes = program.coop && this.coopThreads > 0 && texels * 2 <= this.coopThreads
-      ? Math.min(32, 2 ** Math.floor(Math.log2(this.coopThreads / texels)))
+      ? Math.min(this.subgroups ? this.subgroupSize : 32, 2 ** Math.floor(Math.log2(this.coopThreads / texels)))
       : 1
-    const key = `${formats.join(",")}|${rgba4.join(",")}|${workgroup.join("x")}|${lanes}`
+    const unroll = this.phase === "prompt" ? 0 : WebGpu.unroll
+    const key = `${formats.join(",")}|${rgba4.join(",")}|${workgroup.join("x")}|${lanes}|${unroll}`
     let v = program.variants.get(key)
     if (v) return v
     const started = performance.now()
-    const t = toWgsl(program.shader, { outputs: formats, rgba4, workgroup, lanes })
+    const t = toWgsl(program.shader, { outputs: formats, rgba4, workgroup, lanes, subgroups: this.subgroups, unroll })
     const device = this.device
     const entries: Array<GPUBindGroupLayoutEntry> = [
       { binding: 0, visibility: COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: t.uniformBytes } }
@@ -307,7 +323,7 @@ export class WebGpu extends PacedGpu<Fence> {
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       compute: { module, entryPoint: "main" }
     })
-    v = { t, pipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
+    v = { t, formats, rgba4, unroll, pipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
     program.variants.set(key, v)
     this.count(`${key}\n${program.source}`, performance.now() - started)
     return v
@@ -445,6 +461,7 @@ export class WebGpu extends PacedGpu<Fence> {
   }
 
   private endComputePass() {
+    this.flushQueue()
     this.computePass?.end()
     this.computePass = null
     this.boundPipeline = null
@@ -533,7 +550,6 @@ export class WebGpu extends PacedGpu<Fence> {
     for (const [name, value] of Object.entries(pass.uniforms ?? {})) program.values.set(name, value)
     for (const t of inputs) this.touched.set(t.id, this.generation)
     for (const t of outputs) this.touched.set(t.id, this.generation)
-    const group = this.bindGroup(v, inputs, outputs)
     const block = this.uniformBlock(program, v)
     this.passes++
     this.trace?.push(`${pass.name ?? ""}(${v.t.samplers.map((s) => s.name).join(",")})`)
@@ -542,6 +558,16 @@ export class WebGpu extends PacedGpu<Fence> {
       Math.floor(Math.min(this.maxFragmentsPerDraw, this.maxReadsPerDraw / Math.max(1, pass.work ?? 1)) / rect.width)
     )
     const times = pass.name && this.repeat.has(pass.name) ? this.repeatTimes : 1
+    // A small pass waits to be merged with the next ones (see queue).
+    if (
+      WebGpu.merge && this.phase === "decode" && times === 1 && rowsPerBand >= rect.height && v.t.lanes === 1 &&
+      rect.width * rect.height <= 65536 && !(this.profile && !WebGpu.coarse)
+    ) {
+      this.queue({ v, inputs, outputs, block, rect })
+      return
+    }
+    this.flushQueue()
+    const group = this.bindGroup(v, inputs, outputs)
     const [wx, wy] = v.workgroup
     for (let n = 0; n < times; n++) {
       for (let y = rect.y; y < rect.y + rect.height; y += rowsPerBand) {
@@ -560,6 +586,171 @@ export class WebGpu extends PacedGpu<Fence> {
         }
       }
     }
+  }
+
+  /** Merge small passes into one dispatch (see queue). */
+  static merge = true
+  /**
+   * A token's passes have constant loops unrolled up to this many
+   * iterations (see wgsl.ts's Variant.unroll). Off: on an iPad Pro M4 it
+   * made no difference to writing, and read prompts 5% slower.
+   */
+  static unroll = 0
+  /** Small passes not yet dispatched: they write disjoint regions of the same outputs and read none of them. */
+  private queued: Array<Queued> = []
+  /** Merged shaders by their members' variants: null while one compiles (see merged). */
+  private mergedPipelines = new Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout; id: number } | null>()
+
+  /**
+   * Queues a small pass: consecutive ones that write disjoint rectangles of
+   * the same outputs, and read none of them, go to the GPU as one dispatch
+   * (a shader running each one's main over its rectangle). The kernels
+   * draw an add's sums, residual and scaled input as three such regions:
+   * three dependent dispatches where one does, and dispatches here don't
+   * overlap the way a WebGL frame's draws do.
+   */
+  private queue(q: Queued) {
+    const g = this.queued
+    if (g.length) {
+      const first = g[0]
+      const same = first.outputs.length === q.outputs.length && first.outputs.every((t, i) => t === q.outputs[i])
+      const reads = same && q.inputs.some((t) => q.outputs.includes(t))
+      const overlaps = g.some((x) =>
+        x.rect.x < q.rect.x + q.rect.width && q.rect.x < x.rect.x + x.rect.width &&
+        x.rect.y < q.rect.y + q.rect.height && q.rect.y < x.rect.y + x.rect.height)
+      const textures = g.reduce((n, x) => n + x.inputs.length, q.inputs.length)
+      if (!same || reads || overlaps || g.length >= 8 || textures > this.limits.maxTextureUnits) this.flushQueue()
+    }
+    this.queued.push(q)
+  }
+
+  /** Dispatches the queued passes. */
+  private flushQueue() {
+    const g = this.queued
+    if (!g.length) return
+    this.queued = []
+    const bytes = g.reduce((n, q) => n + align(q.block.byteLength, this.uniformAlign), 0)
+    if (align(this.ringUsed, this.uniformAlign) + bytes > this.ring.byteLength) this.submit()
+    let merged: { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout; id: number } | null = null
+    if (g.length > 1)
+      try {
+        merged = this.merged(g)
+      } catch (error) {
+        this.errors.push(`merge: ${(error as Error).message}`)
+      }
+    if (!merged) {
+      for (const q of g) {
+        const offset = this.pushUniforms(q.block, q.rect.x, q.rect.y, q.rect.width, q.rect.height)
+        const cpass = this.computePassFor(q.v.pipeline)
+        cpass.setBindGroup(0, this.bindGroup(q.v, q.inputs, q.outputs), [offset])
+        this.markGpuWork()
+        const [wx, wy] = q.v.workgroup
+        cpass.dispatchWorkgroups(Math.ceil(q.rect.width / wx), Math.ceil(q.rect.height / wy))
+        this.draws++
+      }
+      return
+    }
+    const offsets = g.map((q) => this.pushUniforms(q.block, q.rect.x, q.rect.y, q.rect.width, q.rect.height))
+    const key = `m${merged.id}|${g.map((q) => q.inputs.map((t) => t.id).join(",")).join("|")}|${g[0].outputs.map((t) => t.id).join(",")}`
+    let group = this.bindGroups.get(key)
+    if (!group) {
+      const entries: Array<GPUBindGroupEntry> = []
+      let binding = 0
+      for (const q of g) {
+        entries.push({ binding: binding++, resource: { buffer: this.uniformBuffer, size: q.v.t.uniformBytes } })
+        for (const t of q.inputs) entries.push({ binding: binding++, resource: (t.tex as GPUTexture).createView() })
+      }
+      for (const t of g[0].outputs) entries.push({ binding: binding++, resource: (t.tex as GPUTexture).createView() })
+      group = this.device.createBindGroup({ layout: merged.layout, entries })
+      this.bindGroups.set(key, group)
+      for (const t of [...g.flatMap((q) => q.inputs), ...g[0].outputs]) {
+        let keys = this.groupsByTexture.get(t.id)
+        if (!keys) this.groupsByTexture.set(t.id, (keys = new Set()))
+        keys.add(key)
+      }
+    }
+    const cpass = this.computePassFor(merged.pipeline)
+    cpass.setBindGroup(0, group, offsets)
+    this.markGpuWork()
+    cpass.dispatchWorkgroups(g.reduce((n, q) => n + Math.ceil((q.rect.width * q.rect.height) / 64), 0))
+    this.draws++
+  }
+
+  /**
+   * The shader running each queued pass's main over its rectangle, in turn
+   * by workgroup; null until it has compiled, in the background: the
+   * passes go one by one meanwhile (compiled when first needed, a Pixel 10
+   * Pro's load took 1.4 s longer).
+   */
+  private merged(g: Array<Queued>) {
+    const key = g.map((q) => q.v.id).join(",")
+    const m = this.mergedPipelines.get(key)
+    if (m !== undefined) return m
+    // (Null stays where it can't be merged: its passes go one by one.)
+    this.mergedPipelines.set(key, null)
+    const started = performance.now()
+    const lines: Array<string> = []
+    const entries: Array<GPUBindGroupLayoutEntry> = []
+    const calls: Array<string> = []
+    let binding = 0
+    g.forEach((q, i) => {
+      const program = this.programOf(q.v)
+      const t = toWgsl(program.shader, { outputs: q.v.formats, rgba4: q.v.rgba4, workgroup: [64, 1], unroll: q.v.unroll, embed: { prefix: `m${i}_`, binding } })
+      const e = t.embedded!
+      lines.push(t.code)
+      entries.push({ binding, visibility: COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: t.uniformBytes } })
+      t.samplers.forEach((s, j) =>
+        entries.push({ binding: binding + 1 + j, visibility: COMPUTE, texture: { sampleType: s.kind === "u" ? "uint" : s.kind === "i" ? "sint" : "unfilterable-float" } }))
+      binding += 1 + t.samplers.length
+      const U = e.uniforms
+      calls.push(
+        `  {`,
+        `    let n = ${U}.rect.z * ${U}.rect.w;`,
+        `    let groups = (n + 63u) / 64u;`,
+        `    if (g < groups) {`,
+        `      let i = g * 64u + l;`,
+        `      if (i >= n) { return; }`,
+        `      let p = vec2<u32>(${U}.rect.x + i % ${U}.rect.z, ${U}.rect.y + i / ${U}.rect.z);`,
+        `      fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
+        `      ${e.main}();`,
+        ...e.outputs.map((o, k) => `      textureStore(out${k}, p, ${o.name});`),
+        `      return;`,
+        `    }`,
+        `    g -= groups;`,
+        `  }`
+      )
+    })
+    g[0].v.formats.forEach((format, k) => {
+      lines.push(`@group(0) @binding(${binding + k}) var out${k}: texture_storage_2d<${format}, write>;`)
+      entries.push({ binding: binding + k, visibility: COMPUTE, storageTexture: { access: "write-only", format } })
+    })
+    lines.push(
+      `var<private> fc: vec4<f32>;`,
+      `@compute @workgroup_size(64)`,
+      `fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_index) l: u32) {`,
+      `  var g = w.x;`,
+      ...calls,
+      `}`
+    )
+    const layout = this.device.createBindGroupLayout({ entries })
+    const id = this.nextVariant++
+    void this.device
+      .createComputePipelineAsync({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        compute: { module: this.device.createShaderModule({ code: lines.join("\n") }), entryPoint: "main" }
+      })
+      .then(
+        (pipeline) => { if (!this.lost) this.mergedPipelines.set(key, { pipeline, layout, id }) },
+        (error: Error) => this.errors.push(`merge: ${error.message}`)
+      )
+    this.count(`merged ${key}`, performance.now() - started)
+    return null
+  }
+
+  /** The program a variant was made for. */
+  private programOf(v: Variant) {
+    for (const p of this.programs.values()) for (const x of p.variants.values()) if (x === v) return p
+    throw new Error("A variant without its program.")
   }
 
   private bindGroup(v: Variant, inputs: Array<Texture>, outputs: Array<Texture>) {

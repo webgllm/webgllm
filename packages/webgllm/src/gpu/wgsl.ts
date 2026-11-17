@@ -400,6 +400,25 @@ export type Variant = {
    * covers that many texels of a row, its threads sharing main's K loop.
    */
   lanes?: number
+  /**
+   * Lanes sum with subgroup shuffles (the device has "subgroups", and its
+   * subgroups hold whole lane groups) rather than through workgroup memory,
+   * which Safari zero-fills on one thread at every dispatch.
+   */
+  subgroups?: boolean
+  /**
+   * Unroll `for (int i = a; i < b; i++)` with constant bounds, at most this
+   * many iterations and no jumps in its body (0: leave them to the
+   * compiler, which Safari's doesn't unroll: an add's 64 reads of RMS
+   * partials then go out one after another).
+   */
+  unroll?: number
+  /**
+   * For a shader merged with others into one dispatch (see webgpu.ts): its
+   * names' prefix, its first binding (its uniforms; then its samplers),
+   * and no output bindings or entry point of its own (see Embedded).
+   */
+  embed?: { prefix: string; binding: number }
 }
 
 export type Translation = {
@@ -413,6 +432,8 @@ export type Translation = {
   /** Threads per output texel: 1 unless the variant asked for more and main's loop allows it. */
   lanes: number
   workgroup: [number, number]
+  /** With `embed`: the names a merged shader calls and stores from. */
+  embedded?: { main: string; uniforms: string; outputs: Array<{ name: string; type: string }> }
 }
 
 const BUILTIN_SAME = new Set([
@@ -435,8 +456,6 @@ const BITCAST: Record<string, Base> = {
 type Scope = Map<string, { type: Type; out: string }>
 type Ctx = { pre: Array<string>; hoist: boolean; indent: string }
 
-/** Every identifier the shader declares gets this prefix: none collides with WGSL's words. */
-const P = "v_"
 
 class Emitter {
   private scopes: Array<Scope> = []
@@ -451,20 +470,26 @@ class Emitter {
   /** The K loop the workgroup's lanes share, and its accumulator (see coopLoop). */
   private coop: { loop: Stmt; acc: string } | null = null
   private lanes = 1
+  /** The prefix of every name the shader declares (none collides with WGSL's words, or another merged shader's). */
+  private P: string
+  /** The uniforms' variable. */
+  private U: string
 
   constructor(private s: Shader, private variant: Variant) {
     this.rgba4 = new Set(variant.rgba4 ?? [])
+    this.P = `${variant.embed?.prefix ?? ""}v_`
+    this.U = `${variant.embed?.prefix ?? ""}U`
     for (const f of s.fns) {
       const list = this.overloads.get(f.name) ?? []
       list.push(f)
       this.overloads.set(f.name, list)
     }
     for (const [name, list] of this.overloads)
-      list.forEach((f, i) => this.fnOut.set(f, list.length === 1 ? P + name : `${P}${name}_${i}`))
-    for (const u of s.uniforms) this.globals.set(u.name, { type: u.type, out: `U.${P}${u.name}` })
-    for (const t of s.samplers) this.globals.set(t.name, { type: t.type, out: P + t.name })
-    for (const o of s.outputs) this.globals.set(o.name, { type: o.type, out: P + o.name })
-    for (const g of s.globals) this.globals.set(g.decl.name, { type: g.decl.type, out: P + g.decl.name })
+      list.forEach((f, i) => this.fnOut.set(f, list.length === 1 ? this.P + name : `${this.P}${name}_${i}`))
+    for (const u of s.uniforms) this.globals.set(u.name, { type: u.type, out: `${this.U}.${this.P}${u.name}` })
+    for (const t of s.samplers) this.globals.set(t.name, { type: t.type, out: this.P + t.name })
+    for (const o of s.outputs) this.globals.set(o.name, { type: o.type, out: this.P + o.name })
+    for (const g of s.globals) this.globals.set(g.decl.name, { type: g.decl.type, out: this.P + g.decl.name })
     this.globals.set("gl_FragCoord", { type: "vec4", out: "fc" })
     if ((variant.lanes ?? 1) > 1) {
       this.coop = coopLoop(s)
@@ -703,7 +728,7 @@ class Emitter {
       const s = e.args[0]
       const tex = this.expr(s, ctx)
       const load = `textureLoad(${tex}, ${this.expr(e.args[1], ctx)}, ${this.expr(e.args[2], ctx)})`
-      if (s.k === "id" && this.rgba4.has(s.v)) return `rgba4(${load}.x)`
+      if (s.k === "id" && this.rgba4.has(s.v)) return `${this.P}rgba4(${load}.x)`
       return load
     }
     if (f in COMPARE) {
@@ -764,7 +789,7 @@ class Emitter {
           const c = ctx()
           const init = v.init ? this.coerce(v.init, v.type, c) : undefined
           const scope = this.scopes[this.scopes.length - 1]
-          const name = `${P}${v.name}${scope.has(v.name) || this.shadows(v.name) ? `_${this.temps++}` : ""}`
+          const name = `${this.P}${v.name}${scope.has(v.name) || this.shadows(v.name) ? `_${this.temps++}` : ""}`
           scope.set(v.name, { type: v.type, out: name })
           flush(c, init === undefined
             ? `var ${name}: ${wgslType(v.type)};`
@@ -819,6 +844,20 @@ class Emitter {
       case "for": {
         if (this.coop && s === this.coop.loop) {
           this.coopFor(s, out, indent)
+          return
+        }
+        const trips = this.constantTrips(s)
+        if (trips) {
+          // Each iteration in its own block, the counter a constant.
+          const v = (s.init as Extract<Stmt, { k: "decl" }>).vars[0]
+          for (let k = trips.from; k < trips.to; k++) {
+            out.push(`${indent}{`)
+            this.scopes.push(new Map([[v.name, { type: "int", out: `${this.P}${v.name}` }]]))
+            out.push(`${indent}  let ${this.P}${v.name}: i32 = ${k};`)
+            this.body(s.body, out, indent + "  ")
+            this.scopes.pop()
+            out.push(`${indent}}`)
+          }
           return
         }
         out.push(`${indent}{`)
@@ -881,6 +920,23 @@ class Emitter {
     const lo = this.coerce(v.init!, "int", c)
     const hi = this.coerce(cond.b, "int", c)
     const acc = this.lookup(this.coop!.acc)
+    if (this.variant.subgroups) {
+      // Lane l takes iterations l, l + L, …; the L lanes of a texel are
+      // neighbours in a subgroup, so a butterfly of shuffles sums them.
+      out.push(
+        `${i}let lo_: i32 = ${lo};`,
+        `${i}let hi_: i32 = ${hi};`,
+        `${i}for (var it_ = lo_ + i32(lane); it_ < hi_; it_ += ${L}) {`
+      )
+      this.scopes.push(new Map([[v.name, { type: "int", out: `${this.P}${v.name}` }]]))
+      out.push(`${i}  let ${this.P}${v.name}: i32 = it_;`)
+      this.body(s.body, out, i + "  ")
+      this.scopes.pop()
+      out.push(`${i}}`)
+      for (let k = L >> 1; k > 0; k >>= 1) out.push(`${i}${acc.out} += subgroupShuffleXor(${acc.out}, ${k}u);`)
+      out.push(`${indent}}`)
+      return
+    }
     out.push(
       `${i}let lo_: i32 = ${lo};`,
       `${i}let hi_: i32 = ${hi};`,
@@ -890,8 +946,8 @@ class Emitter {
       `${i}let n_ = workgroupUniformLoad(&coopMax);`,
       `${i}for (var it_ = 0; it_ < n_; it_++) {`
     )
-    this.scopes.push(new Map([[v.name, { type: "int", out: `${P}${v.name}` }]]))
-    out.push(`${i}  let ${P}${v.name}: i32 = lo_ + i32(lane) + it_ * ${L};`, `${i}  if (${P}${v.name} < hi_) {`)
+    this.scopes.push(new Map([[v.name, { type: "int", out: `${this.P}${v.name}` }]]))
+    out.push(`${i}  let ${this.P}${v.name}: i32 = lo_ + i32(lane) + it_ * ${L};`, `${i}  if (${this.P}${v.name} < hi_) {`)
     this.body(s.body, out, i + "    ")
     this.scopes.pop()
     out.push(
@@ -906,6 +962,31 @@ class Emitter {
       `${i}${acc.out} = coopAcc[li - lane];`,
       `${indent}}`
     )
+  }
+
+  /** A for loop's constant iteration range, if it is one to unroll (see Variant.unroll). */
+  private constantTrips(s: Extract<Stmt, { k: "for" }>): { from: number; to: number } | null {
+    const max = this.variant.unroll ?? 0
+    if (!max || !s.init || s.init.k !== "decl" || s.init.vars.length !== 1) return null
+    const v = s.init.vars[0]
+    const num = (e: Expr | undefined) => (e && e.k === "num" && /^\d+$/.test(e.v) ? Number(e.v) : null)
+    const from = num(v.init)
+    const c = s.c
+    const to = c && c.k === "bin" && c.op === "<" && c.a.k === "id" && c.a.v === v.name ? num(c.b) : null
+    const step = s.step
+    if (from === null || to === null || to - from > max || to <= from) return null
+    if (!step || !((step.k === "post" || step.k === "un") && step.op === "++" && step.a.k === "id" && step.a.v === v.name)) return null
+    let ok = true
+    const walk = (x: Stmt | undefined) => {
+      if (!x) return
+      if (x.k === "break" || x.k === "continue" || x.k === "return") ok = false
+      else if (x.k === "block") x.body.forEach(walk)
+      else if (x.k === "if") { walk(x.a); walk(x.b) }
+      else if (x.k === "for" || x.k === "while") walk(x.body)
+    }
+    walk(s.body)
+    if (!ok || assigns([s.body], v.name)) return null
+    return { from, to }
   }
 
   private coopThreads() {
@@ -936,17 +1017,17 @@ class Emitter {
     this.current = f
     this.uses.set(f, { samplers: new Set(), fns: new Set() })
     const params = new Map<string, { type: Type; out: string }>()
-    for (const p of f.params) params.set(p.name, { type: p.type, out: P + p.name })
+    for (const p of f.params) params.set(p.name, { type: p.type, out: this.P + p.name })
     this.scopes = [params]
     const out: Array<string> = []
     // (WGSL parameters are constants: those a GLSL function assigns to are copied into variables.)
     const assigned = f.params.filter((p) => !(p.type in SAMPLERS) && assigns(f.body, p.name))
     const sig = f.params
-      .map((p) => `${assigned.includes(p) ? "a_" : P}${p.name}: ${p.type in SAMPLERS ? `texture_2d<${WGSL_BASE[SAMPLERS[p.type]]}>` : wgslType(p.type)}`)
+      .map((p) => `${assigned.includes(p) ? "a_" : this.P}${p.name}: ${p.type in SAMPLERS ? `texture_2d<${WGSL_BASE[SAMPLERS[p.type]]}>` : wgslType(p.type)}`)
       .join(", ")
-    const name = f.name === "main" ? `${P}main` : (this.fnOut.get(f) ?? P + f.name)
+    const name = f.name === "main" ? `${this.P}main` : (this.fnOut.get(f) ?? this.P + f.name)
     out.push(`fn ${name}(${sig})${f.ret === "void" ? "" : ` -> ${wgslType(f.ret)}`} {`)
-    for (const p of assigned) out.push(`  var ${P}${p.name} = a_${p.name};`)
+    for (const p of assigned) out.push(`  var ${this.P}${p.name} = a_${p.name};`)
     this.block(f.body, out, "  ")
     out.push("}")
     this.scopes = []
@@ -985,27 +1066,32 @@ class Emitter {
       offset = Math.ceil(offset / align) * align
       uniforms.set(u.name, { type: u.type, offset })
       offset += arr ? 16 * Number(arr[2]) : 4 * n
-      fields.push(`  ${P}${u.name}: ${wgslType(u.type)},`)
+      fields.push(`  ${this.P}${u.name}: ${wgslType(u.type)},`)
     }
     const uniformBytes = Math.ceil(offset / 16) * 16
 
     const lines: Array<string> = []
-    lines.push(`struct Uniforms {\n${fields.join("\n")}\n}`)
-    lines.push(`@group(0) @binding(0) var<uniform> U: Uniforms;`)
+    const b0 = this.variant.embed?.binding ?? 0
+    lines.push(`struct ${this.U}niforms {\n${fields.join("\n")}\n}`)
+    lines.push(`@group(0) @binding(${b0}) var<uniform> ${this.U}: ${this.U}niforms;`)
     samplers.forEach((t, i) => {
       const kind = this.rgba4.has(t.name) ? "u32" : WGSL_BASE[SAMPLERS[t.type]]
-      lines.push(`@group(0) @binding(${i + 1}) var ${P}${t.name}: texture_2d<${kind}>;`)
+      lines.push(`@group(0) @binding(${b0 + i + 1}) var ${this.P}${t.name}: texture_2d<${kind}>;`)
     })
     const outputs = [...s.outputs].sort((a, b) => a.location - b.location)
     if (outputs.length !== this.variant.outputs.length)
       throw new Error(`The shader writes ${outputs.length} outputs; the pass gives ${this.variant.outputs.length}.`)
     outputs.forEach((o, i) => {
-      lines.push(`@group(0) @binding(${samplers.length + 1 + i}) var out${i}: texture_storage_2d<${this.variant.outputs[i]}, write>;`)
-      lines.push(`var<private> ${P}${o.name}: ${wgslType(o.type)};`)
+      if (!this.variant.embed)
+        lines.push(`@group(0) @binding(${samplers.length + 1 + i}) var out${i}: texture_storage_2d<${this.variant.outputs[i]}, write>;`)
+      lines.push(`var<private> ${this.P}${o.name}: ${wgslType(o.type)};`)
     })
-    lines.push(`var<private> fc: vec4<f32>;`)
+    if (!this.variant.embed) lines.push(`var<private> fc: vec4<f32>;`)
     const L = this.lanes
-    if (L > 1) {
+    if (L > 1 && this.variant.subgroups) {
+      lines.unshift(`enable subgroups;`, `diagnostic(off, subgroup_uniformity);`)
+      lines.push(`var<private> lane: u32;`, `var<private> li: u32;`)
+    } else if (L > 1) {
       const n = this.coopThreads()
       const accType = wgslType(this.globalsOfMain(main).get(this.coop!.acc)!)
       lines.push(
@@ -1017,21 +1103,46 @@ class Emitter {
       )
     }
     if (this.rgba4.size)
-      lines.push(`fn rgba4(u: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(u >> 12u, u >> 8u, u >> 4u, u) & vec4<u32>(15u)) / 15.0; }`)
+      lines.push(`fn ${this.P}rgba4(u: u32) -> vec4<f32> { return vec4<f32>(vec4<u32>(u >> 12u, u >> 8u, u >> 4u, u) & vec4<u32>(15u)) / 15.0; }`)
     for (const g of s.globals) {
       const c: Ctx = { pre: [], hoist: false, indent: "" }
       if (g.konst && g.decl.init)
-        lines.push(`const ${P}${g.decl.name}: ${wgslType(g.decl.type)} = ${this.coerce(g.decl.init, g.decl.type, c)};`)
+        lines.push(`const ${this.P}${g.decl.name}: ${wgslType(g.decl.type)} = ${this.coerce(g.decl.init, g.decl.type, c)};`)
       else if (g.decl.init) throw new Error("Initialized global variables aren't supported.")
-      else lines.push(`var<private> ${P}${g.decl.name}: ${wgslType(g.decl.type)};`)
+      else lines.push(`var<private> ${this.P}${g.decl.name}: ${wgslType(g.decl.type)};`)
     }
     for (const f of s.fns) if (reached.has(f)) lines.push(bodies.get(f)!.join("\n"))
+    if (this.variant.embed) {
+      if (L > 1) throw new Error("A merged shader can't share its loops.")
+      return {
+        code: lines.join("\n"),
+        samplers: samplers.map((t) => ({ name: t.name, kind: this.rgba4.has(t.name) ? "u" : SAMPLERS[t.type] })),
+        uniforms,
+        uniformBytes,
+        outputs: outputs.length,
+        lanes: 1,
+        workgroup: [64, 1],
+        embedded: {
+          main: `${this.P}main`,
+          uniforms: this.U,
+          outputs: outputs.map((o, i) => {
+            const t = shape(o.type)!
+            const fmt = this.variant.outputs[i]
+            const want = /uint$/.test(fmt) ? "u" : /sint$/.test(fmt) ? "i" : "f"
+            let v = `${this.P}${o.name}`
+            if (t.n < 4) v = `${wgslType(make(t.base, 4))}(${v}${t.n === 1 ? ", 0, 0, 1" : t.n === 2 ? ", 0, 1" : ", 1"})`
+            if (t.base !== want) v = `${wgslType(make(want, 4))}(${v})`
+            return { name: v, type: fmt }
+          })
+        }
+      }
+    }
     const threads = this.coopThreads()
     const [wx, wy]: [number, number] = L > 1 ? [L, threads / L] : this.variant.workgroup
     const stores = outputs.map((o, i) => {
       const t = shape(o.type)!
       const want = /uint$/.test(this.variant.outputs[i]) ? "u" : /sint$/.test(this.variant.outputs[i]) ? "i" : "f"
-      let v = `${P}${o.name}`
+      let v = `${this.P}${o.name}`
       if (t.n < 4) v = `${wgslType(make(t.base, 4))}(${v}${t.n === 1 ? ", 0, 0, 1" : t.n === 2 ? ", 0, 1" : ", 1"})`
       if (t.base !== want) v = `${wgslType(make(want, 4))}(${v})`
       return `  textureStore(out${i}, p, ${v});`
@@ -1045,10 +1156,10 @@ class Emitter {
         `  lane = l.x;`,
         `  li = l.y * ${L}u + l.x;`,
         `  let tx = w.x * ${wy}u + l.y;`,
-        `  let inside = tx < U.rect.z;`,
-        `  let p = vec2<u32>(min(tx, U.rect.z - 1u), w.y) + U.rect.xy;`,
+        `  let inside = tx < ${this.U}.rect.z;`,
+        `  let p = vec2<u32>(min(tx, ${this.U}.rect.z - 1u), w.y) + ${this.U}.rect.xy;`,
         `  fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
-        `  ${P}main();`,
+        `  ${this.P}main();`,
         `  if (inside && lane == 0u) {`,
         ...stores.map((l) => `  ${l}`),
         `  }`,
@@ -1058,10 +1169,10 @@ class Emitter {
       lines.push(
         `@compute @workgroup_size(${wx}, ${wy})`,
         `fn main(@builtin(global_invocation_id) id: vec3<u32>) {`,
-        `  if (id.x >= U.rect.z || id.y >= U.rect.w) { return; }`,
-        `  let p = id.xy + U.rect.xy;`,
+        `  if (id.x >= ${this.U}.rect.z || id.y >= ${this.U}.rect.w) { return; }`,
+        `  let p = id.xy + ${this.U}.rect.xy;`,
         `  fc = vec4<f32>(vec2<f32>(p) + 0.5, 0.0, 1.0);`,
-        `  ${P}main();`,
+        `  ${this.P}main();`,
         ...stores,
         `}`
       )

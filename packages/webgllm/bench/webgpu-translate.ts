@@ -27,6 +27,7 @@ try {
         outputs: k.outputs.map((f) => FORMATS[f]),
         rgba4: Object.entries(k.inputs).filter(([, f]) => f === 0x8056).map(([n]) => n),
         workgroup: [64, 1],
+        unroll: 64,
         lanes
       })
       const module = device.createShaderModule({ code: t.code })

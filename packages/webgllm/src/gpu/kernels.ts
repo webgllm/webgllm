@@ -3532,9 +3532,11 @@ float sc8w(uint u, uint b) { return float(int(u << (24u - 8u * b)) >> 24); }`
 
 /**
  * The output head from a Q6_K embedding in word texels (see Q6_K_WORDS):
- * one quarter of a super-block (half n, word positions 4hw..4hw+3) per
- * loop iteration, its activations decoded once for the fragment's 4 rows,
- * then each row's ql, ql + 32 and qh words and its scales word. A loop,
+ * a super-block per outer iteration (its scale and each row's scales word
+ * read once: 18% faster on an iPad Pro M4, 4% on an M3 Ultra), then one
+ * quarter of it (half n, word positions 4hw..4hw+3) per inner iteration,
+ * its activations decoded once for the fragment's 4 rows, then each row's
+ * ql, ql + 32 and qh words. A loop,
  * not unrolled: the same work unrolled a super-block at a time (as
  * MATMUL_Q6_K_HEAD) took 1.3 ms a head on an M3 Ultra against 0.6, its
  * registers the limit. With `split`, a
@@ -3546,10 +3548,8 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
   const C = "xyzw"
   const body: Array<string> = []
   const line = (s: string) => body.push(`    ${s}`)
-  line(`int sb = q >> 2;`)
   line(`int n = (q >> 1) & 1;`)
   line(`int hw = q & 1;`)
-  line(`vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);`)
   // Activations k = 256 sb + 128 n + 32 g + 4 w + i: h2 texel k / 8, the
   // pair of word positions 2wp, 2wp + 1 in its two halves.
   line(
@@ -3571,8 +3571,7 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
     line(`  uvec4 QA = texelFetch(uW, ivec2(t + qa, gr), 0);`)
     line(`  uvec4 QB = texelFetch(uW, ivec2(t + qa + 2, gr), 0);`)
     line(`  uvec4 QH = texelFetch(uW, ivec2(t + qh, gr), 0);`)
-    line(`  uvec4 S = texelFetch(uW, ivec2(t + 12, gr), 0);`)
-    line(`  uvec2 SS = n == 0 ? S.xy : S.zw;`)
+    line(`  uvec2 SS = n == 0 ? S${r}.xy : S${r}.zw;`)
     line(`  vec4 p = vec4(0.0);`)
     for (let wi = 0; wi < 4; wi++) {
       const c = C[wi]
@@ -3581,7 +3580,7 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
       )
     }
     line(
-      `  acc.${C[r]} += d.${C[r]} * dot(p, vec4(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));`
+      `  P.${C[r]} += dot(p, vec4(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));`
     )
     line(`}`)
   }
@@ -3611,8 +3610,17 @@ ${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
   int wx = col * uRowTexels;
   int sx = col * uKb;
   vec4 acc = vec4(0.0);
-  for (int q = sb0 * 4; q < sb1 * 4; q++) {
+  for (int sb = sb0; sb < sb1; sb++) {
+    vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);
+    uvec4 S0 = texelFetch(uW, ivec2(wx + (sb * 4) * 13 + 12, gr), 0);
+    uvec4 S1 = texelFetch(uW, ivec2(wx + (sb * 4 + 1) * 13 + 12, gr), 0);
+    uvec4 S2 = texelFetch(uW, ivec2(wx + (sb * 4 + 2) * 13 + 12, gr), 0);
+    uvec4 S3 = texelFetch(uW, ivec2(wx + (sb * 4 + 3) * 13 + 12, gr), 0);
+    vec4 P = vec4(0.0);
+    for (int q = 0; q < 4; q++) {
 ${body.join("\n")}
+    }
+    acc += d * P;
   }
   o = ${o.prescaled ? `acc * (rmsScale(uRowA0 + m) * ${PRESCALE}.0)` : "acc"};
 }`

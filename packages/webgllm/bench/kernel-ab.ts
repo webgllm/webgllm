@@ -116,7 +116,7 @@ async function time(gpu: Gpu | WebGpu, e: Entry, r: Replay, data: Map<string, Ar
 try {
   const text = await (await fetch("/shaders.jsonl")).text()
   const lines = text.trim().split("\n").filter((l) => l.includes('"last"'))
-  const corpus = JSON.parse(lines[lines.length - 1 - Number(params.get("corpus") ?? 0)]) as Array<Entry>
+  const corpus = JSON.parse(lines[params.has("line") ? Number(params.get("line")) : lines.length - 1 - Number(params.get("corpus") ?? 0)]) as Array<Entry>
   const which = (params.get("which") ?? "last") as "last" | "biggest"
   const name = params.get("name")
   const reps = Number(params.get("reps") ?? 20)
@@ -125,11 +125,14 @@ try {
   const wg = await WebGpu.create()
   if (!wg) throw new Error("No WebGPU here.")
   if (params.has("lanes")) wg.coopThreads = Number(params.get("lanes"))
-  log(`KAB ${navigator.userAgent} | ${gl.limits.renderer} | ${wg.limits.renderer}`)
+  log(`KAB ${navigator.userAgent} | ${gl.limits.renderer} | ${wg.limits.renderer} | features ${[...wg.device.features].join(",")} | subgroups ${Reflect.get(wg, "subgroups")} size ${Reflect.get(wg, "subgroupSize")}`)
   let glSum = 0, wgSum = 0
   for (const [i, e] of corpus.entries()) {
     const r = e[which]
     if (!r || (name && !e.names.includes(name)) || r.rect.width * r.rect.height < Number(params.get("min") ?? 2)) continue
+    // (alt=<file in bench/alt>: that GLSL instead of the dumped source, for kernel experiments.)
+    const alt = params.get("alt")
+    if (alt) e.source = await (await fetch(`/alt/${alt}`)).text()
     const data = new Map(Object.entries(r.inputs).map(([k, s]) => [k, pixels(s)]))
     let a: number, b: number, check: string
     try {
