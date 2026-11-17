@@ -7,6 +7,12 @@ type TransferableBuffer = ArrayBuffer & {
 export const canReleaseStaging =
   typeof (ArrayBuffer.prototype as TransferableBuffer).transfer === "function"
 
+/**
+ * Buffers a loader reuses for the next piece (its pooled matrices): never
+ * released after an upload.
+ */
+export const pooledBuffers = new WeakSet<ArrayBufferLike>()
+
 /** Retire a buffer whose contents are exclusively owned and fully consumed. */
 export function releaseOwnedBuffer(buffer: ArrayBufferLike) {
   const owned = buffer as TransferableBuffer
@@ -29,7 +35,8 @@ function releaseMatrices(piece: WeightPiece) {
         if (
           !view ||
           view.byteOffset ||
-          view.byteLength !== view.buffer.byteLength
+          view.byteLength !== view.buffer.byteLength ||
+          pooledBuffers.has(view.buffer)
         )
           continue
         buffers.add(view.buffer as TransferableBuffer)

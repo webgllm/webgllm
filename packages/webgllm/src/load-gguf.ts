@@ -31,6 +31,7 @@ import {
   type GgufValue
 } from "./gguf.js"
 import { ReadPlan } from "./read-plan.js"
+import { pooledBuffers } from "./upload-staging.js"
 import { headPermutation } from "./repack.js"
 
 export { headPermutation }
@@ -204,6 +205,22 @@ export async function* loadGguf(
     return perm ? permuteVector(values, perm) : values
   }
 
+  // Each layer's matrices in the same buffers as the last layer's of their
+  // role and shape (the engine has uploaded those by the time the next
+  // layer is read): a fresh matrix a layer costs a first touch of every
+  // page (most of what the repack measured: 350 ms of an iPhone's load),
+  // and a model's worth of freed buffers the allocator keeps resident.
+  const pool = new Map<string, QuantMatrix>()
+  const pooled = (key: string, N: number, K: number, bits: 4 | 6 | 8): QuantMatrix => {
+    let m = pool.get(key)
+    if (!m) {
+      m = newQuantMatrix(N, K, bits, false)
+      for (const view of [m.quants, m.scales]) pooledBuffers.add(view.buffer)
+      pool.set(key, m)
+    }
+    return { ...m }
+  }
+
   /** Rows of a matrix: tensors with [K, rows] dims, in order, into one QuantMatrix. */
   const matrix = async (
     K: number,
@@ -223,12 +240,8 @@ export async function* loadGguf(
           `GGUF: ${info.name} can't be combined with ${infos[0].name}`
         )
     }
-    const m = newQuantMatrix(
-      parts.reduce((n, p) => n + p.rows, 0),
-      K,
-      bits,
-      false
-    )
+    const N = parts.reduce((n, p) => n + p.rows, 0)
+    const m = pooled(`${parts.map((p) => p.name.replace(/^blk\.\d+\./, "")).join("+")}:${N}x${K}:${bits}`, N, K, bits)
     let row0 = 0
     // A tensor two parts read (Qwen3.5's q and gate) is taken once.
     const taken = new Map<string, Uint8Array>()
@@ -405,7 +418,7 @@ export async function* loadGguf(
   for (let r = 0; r < vocab; r += chunkRows) {
     const rows = Math.min(chunkRows, vocab - r)
     const bytes = await plan.take(`token_embd.weight@${r}`)
-    const m = newQuantMatrix(rows, D, bits, false)
+    const m = pooled(`token_embd:${rows}x${D}:${bits}`, rows, D, bits)
     if (q6) packQ6_K(m, 0, bytes, rows)
     else if (floats) {
       const values = floats.subarray(0, rows * D)
@@ -415,6 +428,12 @@ export async function* loadGguf(
     plan.release(bytes)
     yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
+  // (Everything is uploaded: the pooled buffers go now, not at the next collection.)
+  if (options.releaseReadBuffers)
+    for (const m of pool.values())
+      for (const view of [m.quants, m.scales])
+        (view.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
+  pool.clear()
 }
 
 /** Keep embedding I/O amortized without exceeding the existing tensor working set. */
