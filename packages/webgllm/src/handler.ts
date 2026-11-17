@@ -521,7 +521,7 @@ async function load(
     if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
-    timings.headSplit = engine.headChoice?.split ?? TUNING.q6HeadSplit
+    timings.headSplit = engine.headChoice?.split ?? engine.q6HeadSplit
     timings.promptPacking = engine.tuned.f16Pack ?? TUNING.f16Pack & 3
     post({
       type: "log",

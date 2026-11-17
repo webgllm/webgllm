@@ -128,6 +128,8 @@ export const TUNING = {
   fusedAdd: 1,
   /** WebGPU: the Q6_K word head as a native pass, its activations in workgroup memory. */
   nativeHead: 1,
+  /** ...in this many K-slices (its threads share their activations already). */
+  nativeHeadSplit: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -865,7 +867,7 @@ export class Engine {
         if (row0 === 0) this.embeddingRows = totalRows
         if (row0 === 0 && value.bits === 6 && TUNING.q6Expanded < 0) {
           if (!this.canExpandHead(value.K))
-            this.headChoice = { expanded: false, split: TUNING.q6HeadSplit }
+            this.headChoice = { expanded: false, split: this.q6HeadSplit }
           else if (!this.headChoice) await this.chooseHead(value)
         }
         if (row0 === 0) this.resizeScoreBuffers(value.bits)
@@ -2309,12 +2311,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       : 0
     const baseSplit = Math.max(
       1,
-      Math.min(TUNING.q6HeadSplit, 4, this.embedding.blocks)
+      Math.min(this.q6HeadSplit, 4, this.embedding.blocks)
     )
     const nextSplit = Math.max(
       1,
       Math.min(
-        this.headChoice?.split ?? TUNING.q6HeadSplit,
+        this.headChoice?.split ?? this.q6HeadSplit,
         4,
         this.embedding.blocks
       )
@@ -2591,7 +2593,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   private canExpandHead(
     K: number,
-    split = TUNING.q6HeadSplit,
+    split = this.q6HeadSplit,
     expanded = true
   ) {
     // A device using the in-place layout has no large dequantization
@@ -2606,7 +2608,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const budget = this.byteF16Budget(expanded)
     const { previous, activation, next } = budget
     const extra = expanded ? this.headGrowthBytes(K) : 0
-    const baselineSplit = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, K / 256))
+    const baselineSplit = Math.max(1, Math.min(this.q6HeadSplit, 4, K / 256))
     const nextSplit = Math.max(1, Math.min(split, 4, K / 256))
     const extraScratch = Math.max(
       0,
@@ -2636,7 +2638,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         piece.K >
       this.gpu.limits.maxTextureSize
     ) {
-      this.headChoice = { expanded: false, split: TUNING.q6HeadSplit }
+      this.headChoice = { expanded: false, split: this.q6HeadSplit }
       return
     }
     const count = Math.max(1, Math.ceil(8192 / piece.N))
@@ -2648,7 +2650,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const made: GpuMatrix[] = []
     // Compare storage formats at the existing split. Probing larger split
     // buffers increased startup work and memory without a measured gain.
-    const split = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, piece.K / 256))
+    const split = Math.max(1, Math.min(this.q6HeadSplit, 4, piece.K / 256))
     const settings = [
       { expanded: false, split },
       { expanded: true, split }
@@ -4559,6 +4561,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   private sumsInOne(x: Texture) {
     return "lastWriter" in this.gpu && this.fusedAddPrograms.has(this.gpu.lastWriter(x))
+  }
+
+  /** K-slices of a Q6_K head: the native head's on WebGPU (see TUNING.nativeHead). */
+  get q6HeadSplit() {
+    return TUNING.nativeHead > 0 && "nativeProgram" in this.gpu ? TUNING.nativeHeadSplit : TUNING.q6HeadSplit
   }
 
   private nativeHeads = new Map<string, NativeSpec>()
@@ -6511,7 +6518,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /**
    * The output head through a Q6_K embedding, split along K in
-   * TUNING.q6HeadSplit slices of super-blocks (as headRgba4's). With
+   * this.q6HeadSplit slices of super-blocks (as headRgba4's). With
    * `scaledRow0` (word texels only; see headScaled), reads the last add's
    * scaled input from that row on instead of lastNormed.
    */
@@ -6526,7 +6533,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       1,
       Math.min(
         (TUNING.q6Expanded < 0 ? this.headChoice?.split : undefined) ??
-          TUNING.q6HeadSplit,
+          this.q6HeadSplit,
         4,
         e.blocks
       )
