@@ -136,8 +136,9 @@ export const TUNING = {
    * LFM3 1.7B's prompts at 5,060 tokens/s with the prompt's fused where
    * 4,920 (its sandwich norm made the add three passes), LFM2.5 350M's at
    * 21,950 where 21,570, 1.2B's at 7,410 where 7,350, Qwen3.5 2B's the same.
+   * 3: a token's, and a prompt's where tune's lanes won (see workgroupFusions).
    */
-  fusedAdd: 2,
+  fusedAdd: 3,
   /** WebGPU: the Q6_K word head as a native pass, its activations in workgroup memory. */
   nativeHead: 1,
   /** ...in this many K-slices (its threads share their activations already). */
@@ -233,9 +234,10 @@ export const TUNING = {
    * the head's squares again for every texel (0). The same bits. An M3
    * Ultra ran a layer's in 0.04 ms where 0.39, and read LFM3 1.7B's
    * prompts at 5,300 tokens/s where 5,155, Qwen3.5 2B's at 4,880 where
-   * 4,765, LFM2.5 1.2B's at 7,680 where 7,610, 350M's the same.
+   * 4,765, LFM2.5 1.2B's at 7,680 where 7,610, 350M's the same. -1: where
+   * tune's lanes won (see workgroupFusions).
    */
-  promptPrep: 1,
+  promptPrep: -1,
   /**
    * WebGPU: a prompt batch's short convolution and its state in one native
    * pass (gpu/native.ts's promptConv: B·x once a token, through workgroup
@@ -243,9 +245,9 @@ export const TUNING = {
    * output texel (0). The same bits. An M3 Ultra ran LFM3's (7 taps) in
    * 0.07 ms a layer where 0.20, and read its prompts at 5,410 tokens/s
    * where 5,330, LFM2.5 1.2B's at 7,750 where 7,690, 350M's at 22,030
-   * where 21,870.
+   * where 21,870. -1: where tune's lanes won (see workgroupFusions).
    */
-  promptConv: 1,
+  promptConv: -1,
   /**
    * WebGPU: a prompt batch's recurrence chunks one after another in one
    * native dispatch (gpu/native.ts's linChunkLoop: a workgroup a value
@@ -5043,6 +5045,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private glColumnBands() {
     return TUNING.glColumnBands > 0 && !("nativeProgram" in this.gpu) ? { bandColumns: 32 } : {}
   }
+  /**
+   * Whether a prompt's add, its queries' prep and its short convolution run
+   * as single native passes, a row's reduction shared by a workgroup's
+   * threads through workgroup memory (TUNING.fusedAdd 3, promptPrep and
+   * promptConv -1): where tune found threads sharing a pass's K loops
+   * faster (its lanes; see TUNING.lanes), the same cooperation. A Pixel 10
+   * Pro, whose lanes lose by 130-900%, read LFM2.5 350M's prompts at
+   * 841-875 tokens/s with the q/k/v pass apart where 720-773 fused, at
+   * 837-838 with the convolution's apart, 800-817 with the add's; an M3
+   * Ultra, whose lanes win, gains 1-3% from each.
+   */
+  private workgroupFusions() {
+    return this.gpu.coopThreads > 0
+  }
   private bufferSpecs = new Map<string, NativeSpec>()
   private promptSpec: NativeSpec | undefined
   private pairSpec8: NativeSpec | undefined
@@ -5278,7 +5294,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const source = split > 0 ? "split" : this.quadOf(y) ? "quad" : "pair"
     const slicing = this.slicing.get(y.id) ?? { split: 1, stride: 0 }
     const slices = split > 0 ? 0 : Math.max(slicing.split, 1)
-    const fused = TUNING.fusedAdd > (split > 0 ? 0 : 1) && "nativeProgram" in this.gpu
+    const fused = (split > 0 ? TUNING.fusedAdd > 0 : TUNING.fusedAdd === 2 || (TUNING.fusedAdd === 3 && this.workgroupFusions())) && "nativeProgram" in this.gpu
     const key = `${texels} ${!!norm} ${!!next} ${source} ${slices}`
     if (fused && !this.fusedAdds.has(key)) {
       // (Null for a shape it doesn't fit: the passes below.)
@@ -5427,7 +5443,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     // A prompt batch's (a pair tensor's rows): the convolution and the
     // state after it in one native pass (see gpu/native.ts's promptConv).
-    const batchConv = !split && rows >= c.convKernel - 1 && TUNING.promptConv > 0 && "nativeProgram" in this.gpu
+    const batchConv = !split && rows >= c.convKernel - 1 && (TUNING.promptConv > 0 || (TUNING.promptConv < 0 && this.workgroupFusions())) && "nativeProgram" in this.gpu
       ? this.promptConvSpec(this.quadOf(bcx) ? "quad" : "pair", this.slicing.get(bcx.id)?.split ?? 1)
       : null
     if (batchConv && "nativeProgram" in this.gpu) {
@@ -5584,7 +5600,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // texture): the queries, keys and values of every token in one native
     // pass (see gpu/native.ts's promptPrep).
     // (Not a batch that wraps around its ring: its later tokens' keys must land last.)
-    const batchPrep = !prep && !split && !inCache && !mrope && (!layer.ring || rows <= layer.ring) && TUNING.promptPrep > 0 && "nativeProgram" in this.gpu
+    const batchPrep = !prep && !split && !inCache && !mrope && (!layer.ring || rows <= layer.ring) && (TUNING.promptPrep > 0 || (TUNING.promptPrep < 0 && this.workgroupFusions())) && "nativeProgram" in this.gpu
       ? this.promptPrepSpec(this.quadOf(qkvgIn) ? "quad" : "pair", this.slicing.get(qkvgIn.id)?.split ?? 1)
       : null
     if (batchPrep && "nativeProgram" in this.gpu) {
