@@ -231,7 +231,11 @@ export abstract class PacedGpu<F> {
       const q = pass.bandColumns
       const perCol = rect.height * Math.max(1, pass.work ?? 1)
       // (At least a band's floor of texels, in whole multiples of q.)
-      const least = Math.max(q, Math.ceil(this.minBandRows(rect.height) / q) * q)
+      // (A column quantum at least, not a band's floor of texels: bands of
+      // 240 columns left an iPhone 16 Pro Max's slices half-filled at each
+      // seam, fences more often than rows, and read Qwen3.5 2B's prompts at
+      // 323-358 tokens/s where 347-363.)
+      const least = q
       for (let x = rect.x; x < rect.x + rect.width;) {
         const fits = Math.floor((this.readsPerSlice - this.sliceReads) / perCol / q) * q
         // (As rows: a small matmul starts a new chunk rather than splitting.)
