@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { DraftPolicy, lookupDraft } from "./draft.js"
+import { DraftPolicy, draftTimes, lookupDraft } from "./draft.js"
 
 describe("lookupDraft", () => {
   test("drafts what followed the latest earlier occurrence of the last 4 tokens", () => {
@@ -79,6 +79,19 @@ function simulate(
 }
 
 describe("DraftPolicy", () => {
+  test("a policy sharing another's times doesn't pay for a slow batch again", () => {
+    const times = draftTimes(7)
+    const first = new DraftPolicy(7, undefined, undefined, undefined, undefined, times)
+    first.alone(50)
+    const drafts = first.choose([1, 2, 3, 4])
+    assert.ok(drafts > 0, "the first reply tries drafts")
+    // A batch 5.6× a token, nothing kept (a Pixel 10 Pro's).
+    first.checkedBatch(drafts, 0, 280)
+    const next = new DraftPolicy(7, undefined, undefined, undefined, undefined, times)
+    assert.equal(next.choose([1, 2, 3, 4]), 0, "the next reply knows what a batch costs")
+    assert.ok(new DraftPolicy(7, undefined, undefined, undefined, undefined, draftTimes(7)).choose([1, 2, 3, 4]) === 0, "unshared: no token timed yet")
+  })
+
   test("times a token alone before drafting", () => {
     const p = new DraftPolicy(7)
     assert.equal(p.choose([1, 2, 3]), 0)

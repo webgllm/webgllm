@@ -23,7 +23,7 @@ import { repackTime } from "./repack.js"
 import type { ModelFile } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { DraftPolicy, lookupDraft } from "./draft.js"
+import { DraftPolicy, draftTimes, lookupDraft, type DraftTimes } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
 import { download, incumbentGpuTuning, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
@@ -231,6 +231,12 @@ const DRAFTS = 7
  */
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
+/**
+ * What tokens and draft batches have cost on each loaded engine, kept from
+ * reply to reply (see DraftPolicy). On a Pixel 10 Pro a batch of a token
+ * and 4 drafts took 5.6× a token alone; each reply paid one to find out.
+ */
+const draftCosts = new WeakMap<object, DraftTimes>()
 
 
 /** FNV-1a of a string, as hex (for note keys). */
@@ -1371,7 +1377,9 @@ async function generate(request: GenerateRequest) {
   }
   // How many drafts to check with each token, by what they've cost and
   // earned (see DraftPolicy).
-  const policy = new DraftPolicy(DRAFTS)
+  let costs = draftCosts.get(engine)
+  if (!costs) draftCosts.set(engine, (costs = draftTimes(DRAFTS)))
+  const policy = new DraftPolicy(DRAFTS, undefined, undefined, undefined, undefined, costs)
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
   const draftsFor = (max: number) => {

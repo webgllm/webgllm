@@ -40,10 +40,10 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
   import { seededUniforms } from './seeded-random.js';
   import { CodedError } from './worker-errors.js';
   import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from './sampler.js';
-  import { DraftPolicy, lookupDraft } from './draft.js';
+  import { DraftPolicy, draftTimes, lookupDraft } from './draft.js';
   import { createThinkingSplitter, THINK_OPEN } from './reply.js';
   const MAX_CHUNKS = 64, TUNING = { draftMatch: 2, guessDrafts: 0 };
-  const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16;
+  const DRAFTS = 7, GUESS_MIN_HITS = 0.6, GUESS_WINDOW = 16, draftCosts = new WeakMap();
   // (Text prompts: the image steps pass the prompt through; image-input.test.ts covers them.)
   const promptImages = async (_model, prompt) => ({ prompt, keys: prompt, images: [] }), encodeImages = async () => 0;
   const abortFor = () => new AbortController().signal;
