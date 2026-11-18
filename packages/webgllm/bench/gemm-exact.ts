@@ -602,7 +602,10 @@ try {
   // (Also "x<tm><tn>_<wx>x<wy>[s][h4|h8]": the engine kernel's shape family, buffer weights, constant trips.)
   const parsed = (pick ?? []).flatMap((name) => {
     const m = /^x(\d)(\d)_(\d+)x(\d+)(s?)(h4|h8)?$/.exec(name)
-    return m ? [{ name, spec: (c: Ctx) => direct({ tm: +m[1], tn: +m[2], wx: +m[3], wy: +m[4], swap: !!m[5], math: m[6] as "h4" | "h8" | undefined, buf: "w", ptr: true, trips: c.kqSlice / 2 }) }] : []
+    if (m) return [{ name, spec: (c: Ctx) => direct({ tm: +m[1], tn: +m[2], wx: +m[3], wy: +m[4], swap: !!m[5], math: m[6] as "h4" | "h8" | undefined, buf: "w", ptr: true, trips: c.kqSlice / 2 }) }]
+    // (Also "t<bm>_<bn>_<tm><tn>_<bk>[h][p][s][f]": tiled through workgroup memory; h2 tiles, prefetch, swap, token quads fastest.)
+    const t = /^t(\d+)_(\d+)_(\d)(\d)_(\d+)(h?)(p?)(s?)(f?)$/.exec(name)
+    return t ? [{ name, spec: () => tiled({ bm: +t[1], bn: +t[2], tm: +t[3], tn: +t[4], bk: +t[5], h2: !!t[6], prefetch: !!t[7], swap: !!t[8], tokFast: !!t[9] }) }] : []
   })
   const variants = [...VARIANTS.filter((v) => !pick || pick.includes(v.name)), ...parsed]
   const rounds = Number(params.get("rounds") ?? 7), reps = Number(params.get("reps") ?? 6)
