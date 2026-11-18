@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { KEEP_MARGIN, keepMargin, replaces } from "./engine.js"
+import { KEEP_MARGIN, keepMargin, replaces, warmRounds } from "./engine.js"
 import { incumbentGpuTuning, type GpuNote } from "./storage.js"
 
 test("a way replaces the standing choice only when it's faster in every round by the margin", () => {
@@ -43,4 +43,19 @@ test("a noisy timer raises the margin: a way must win by more than the timings' 
   assert.equal(replaces([80, 81], [100, 130], keepMargin([[100, 130], [80, 81]])), false)
   // Over 40% faster: it doesn't.
   assert.equal(replaces([55, 56], [100, 130], keepMargin([[100, 130], [55, 56]])), true)
+})
+
+test("a cold first round is dropped from every way's rounds, so a faster way can still replace a standing one", () => {
+  // Chrome on an M3 Ultra: f16Pack 3's first round cold, 0 standing.
+  const rounds = [[16.9, 10.6, 10.5, 10.8], [14.8, 14.8, 14.9, 14.9]]
+  assert.equal(replaces(rounds[0], rounds[1], keepMargin(rounds)), false)
+  const warm = warmRounds(rounds)
+  assert.deepEqual(warm, [[10.6, 10.5, 10.8], [14.8, 14.9, 14.9]])
+  assert.equal(replaces(warm[0], warm[1], keepMargin(warm)), true)
+  // Steady rounds, or a way timed once, keep every round.
+  assert.deepEqual(warmRounds([[11, 10.6], [14.8, 14.9]]), [[11, 10.6], [14.8, 14.9]])
+  assert.deepEqual(warmRounds([[16.9], [14.8]]), [[16.9], [14.8]])
+  // A slow way that is merely noisy isn't helped past a steady standing way.
+  const noisy = warmRounds([[30, 14, 16], [15, 15, 15]])
+  assert.equal(replaces(noisy[0], noisy[1], keepMargin(noisy)), false)
 })

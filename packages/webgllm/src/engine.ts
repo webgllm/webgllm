@@ -507,6 +507,22 @@ export const keepMargin = (rounds: ReadonlyArray<ReadonlyArray<number>>) => {
   return Math.min(KEEP_MARGIN, 1 / (1 + noise))
 }
 
+/**
+ * Timed rounds without their first, where a way's first round was a cold
+ * one (more than COLD_ROUND times its quickest later round): kept, it
+ * failed the faster way's every-round test and widened keepMargin's noise
+ * so far that nothing could replace a standing choice. Chrome on an M3
+ * Ultra timed f16Pack 3 at [16.9, 10.6, 10.5, 10.8] ms against 0's
+ * [14.8, 14.8, 14.9, 14.9]: once 0 stood, prompts stayed 30% slower in
+ * every later session. Each way loses the same round, so rounds still pair
+ * up; a way timed once keeps it.
+ */
+export const warmRounds = (rounds: ReadonlyArray<ReadonlyArray<number>>) =>
+  rounds.every((r) => r.length > 1) && rounds.some((r) => r[0] > COLD_ROUND * Math.min(...r.slice(1)))
+    ? rounds.map((r) => r.slice(1))
+    : rounds
+export const COLD_ROUND = 1.25
+
 const PACKING_PROBE_MS = 250
 const PACKING_PROBE_PAIRS = 4
 
@@ -2627,11 +2643,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const earlier = this.incumbent?.tuned
       const standing = earlier?.f16Pack == null ? 0 : Math.max(0, options.findIndex((o) =>
         o.pack === earlier.f16Pack && (!native || o.matmul === earlier.f16Matmul)))
-      const margin = earlier?.f16Pack == null ? 0.98 : keepMargin(samples)
+      // (A cold first round counts neither as a loss nor as timer noise: see warmRounds.)
+      const warm = warmRounds(samples)
+      const margin = earlier?.f16Pack == null ? 0.98 : keepMargin(warm)
       const eligible = this.packingReport.filter((_, i) =>
         i === standing || (verifiedWinner >= 0
-          ? i === verifiedWinner && (earlier?.f16Pack == null || replaces(samples[i], samples[standing], margin))
-          : replaces(samples[i], samples[standing], margin))
+          ? i === verifiedWinner && (earlier?.f16Pack == null || replaces(warm[i], warm[standing], margin))
+          : replaces(warm[i], warm[standing], margin))
       )
       const best = eligible.reduce((a, b) => (b.ms < a.ms ? b : a))
       const selected = this.packingReport.indexOf(best)
