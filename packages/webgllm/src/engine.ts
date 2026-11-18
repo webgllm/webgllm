@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -147,12 +147,9 @@ export const TUNING = {
   /** WebGPU: the pick's chunk maxima and argmax as native passes, a workgroup a chunk and a row (gpu/native.ts's chunkMax). */
   nativePick: 1,
   /**
-   * WebGPU, where the workgroups' lanes share K loops (the tuned lanes; 2:
-   * anywhere): a few tokens' 4-bit byte matvecs from a storage buffer copy
-   * of their weights (the textures go; prompts dequantize from the
-   * buffer)... An iPhone 16 Pro Max (no lanes) wrote LFM2.5's tokens 3-10%
-   * faster from buffers, but Safari killed the tab at its memory limit for
-   * LFM3 1.7B and Qwen3.5 2B (both load at ~1.3-1.5 GB from textures).
+   * WebGPU: a few tokens' 4-bit byte matvecs from storage buffer copies of
+   * their weights, made as the weights load (see storeQuants; prompts
+   * dequantize from the buffers)...
    */
   bufferMatvec: 1,
   /**
@@ -166,7 +163,7 @@ export const TUNING = {
    */
   bufferPairs: -1,
   bufferMatvecThreads: 64,
-  bufferBlocks: 8,
+  bufferBlocks: 16,
   /**
    * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
    * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
@@ -175,6 +172,16 @@ export const TUNING = {
    * 1.7B's at 155 where 127; an M3 Ultra and an iPhone 16 Pro Max kept 3.
    */
   nativePromptMatmul: 1,
+  /**
+   * WebGPU: writing's Gated DeltaNet delta, output and state in one native
+   * pass, the state read once (gpu/native.ts's linRecurrence). Qwen3.5 2B
+   * wrote 175 tokens/s on an M3 Ultra where the two passes wrote 165, 30.5
+   * on an iPhone 16 Pro Max where 29.6, and 11.9 on a Pixel 10 Pro either
+   * way...
+   */
+  nativeRecurrence: 1,
+  /** ...a thread this many key rows of the state (4, 8 or 16). */
+  recurrenceRows: 16,
   /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
   nativeAttend: 1,
   /** ...in chunks of this many keys (a workgroup's threads). */
@@ -1627,7 +1634,12 @@ export class Engine {
     }
   }
 
-  /** Whether tune is timing choices (storedQuants copies nothing meanwhile). */
+  /**
+   * Whether tune is timing choices: the buffer matvecs stay bufferPairs
+   * meanwhile, so that a GPU whose lanes lose doesn't compile bufferMatvec
+   * for the lanes' trial alone (an iPhone 16 Pro Max's first load of LFM3
+   * spent seconds compiling native pipelines).
+   */
   private tuning = false
 
   private async tuneChoices(
@@ -2089,6 +2101,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
       true
     )
     this.writeMatrix(gm, m, 0)
+    this.storeQuants(gm)
     return gm
   }
 
@@ -4701,7 +4714,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const normed = !norm ? false : norm === "prescaled" ? norm : "weights"
       // bufferPairs: lanes over K about TUNING.bufferBlocks blocks each (a
       // power of 2, at most maxSplit slices); else bufferMatvec, one slice.
-      const pairs = TUNING.bufferPairs < 0 ? (this.tuned.lanes ?? TUNING.lanes) <= 0 : TUNING.bufferPairs > 0
+      const pairs = TUNING.bufferPairs < 0 ? this.tuning || (this.tuned.lanes ?? TUNING.lanes) <= 0 : TUNING.bufferPairs > 0
       const lanes = pairs
         ? Math.max(2, Math.min(TUNING.maxSplit, 2 ** Math.floor(Math.log2(Math.max(1, w.blocks / TUNING.bufferBlocks)))))
         : 1
@@ -4858,19 +4871,35 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    * 4-bit bytes with zero points of 8.
    */
   private storedQuants(w: GpuMatrix): Texture | null {
-    if (w.stored !== undefined) return w.stored
-    // (Not while tune times choices: its passes read the textures.)
-    if (TUNING.bufferMatvec <= 0 || this.tuning || !("toStorage" in this.gpu) || ((this.tuned.lanes ?? TUNING.lanes) <= 0 && TUNING.bufferMatvec < 2)) return null
-    const fits = w.bits === 4 && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels
-    w.stored = fits ? this.gpu.toStorage(w.quants) : null
-    // The texture goes (after the copy: the GPU destroys it once the
-    // commands reading it are sent): every pass reading these weights
-    // reads the buffer from now on (splitPartials, matmul's dequant).
+    return w.stored ?? null
+  }
+
+  /**
+   * A layer matrix's quants to a storage buffer for the buffer matvecs
+   * (TUNING.bufferMatvec) as soon as they're written, and the texture
+   * deleted: before any pass binds it, as Safari keeps a destroyed
+   * texture's memory while a bind group holds it (an iPhone 16 Pro Max's
+   * tab, copying 1.4 GB of textures to buffers, lived when no pass had
+   * bound them and hit its memory limit when one had). From then on every
+   * pass reading these weights reads the buffer (splitPartials, matmul's
+   * dequant). Not on WebGL, nor for weights other than 4-bit bytes with
+   * zero points of 8.
+   */
+  private storeQuants(w: GpuMatrix) {
+    if (TUNING.bufferMatvec <= 0 || !("toStorage" in this.gpu)) return
+    if (!(w.bits === 4 && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels)) return
+    w.stored = this.gpu.toStorage(w.quants)
     if (w.stored) this.gpu.delete(w.quants)
-    return w.stored
   }
   private bufferSpecs = new Map<string, NativeSpec>()
   private promptSpec: NativeSpec | undefined
+  private recurrenceSpecs = new Map<string, NativeSpec>()
+  private recurrenceSpecOf(shape: { keyHeadDim: number; valueHeadDim: number }) {
+    const key = `${shape.keyHeadDim} ${shape.valueHeadDim} ${TUNING.recurrenceRows}`
+    let spec = this.recurrenceSpecs.get(key)
+    if (!spec) this.recurrenceSpecs.set(key, (spec = linRecurrence({ ...shape, rows: TUNING.recurrenceRows })))
+    return spec
+  }
   private bufferDequantSpec(h2: boolean) {
     const key = `dequant ${h2}`
     let spec = this.bufferSpecs.get(key)
@@ -6113,6 +6142,27 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     })
     layer.convState.reverse()
     const shape = { keyHeadDim: dk, valueHeadDim: dv }
+    // WebGPU: delta, the output and the new state in one native pass (see TUNING.nativeRecurrence).
+    if (TUNING.nativeRecurrence > 0 && "nativeProgram" in this.gpu && dk % TUNING.recurrenceRows === 0 && dk / TUNING.recurrenceRows <= 64) {
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.nativeProgram(this.recurrenceSpecOf(shape)),
+        inputs: { uS: layer.state[0], uQKV: small.qkv, uBA: partial, uA: layer.a, uDt: layer.dtBias },
+        uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, uBAx: { int: baX }, uSplitIn: { int: baSplit } },
+        output: [small.o, layer.state[1]],
+        rect: { x: 0, y: 0, width: V4, height: rows }
+      })
+      layer.state.reverse()
+      this.gpu.run({
+        name: "linear",
+        program: read(K.linNorm(dv)),
+        inputs: { uIn: partial, uO: small.o, uNorm: layer.norm },
+        uniforms: { ...inUniforms, uZ: { int: C4 }, uEps: this.config.normEps },
+        output: t.out,
+        rect: { x: 0, y: 0, width: V4 / 2, height: rows }
+      })
+      return this.project(t.out, layer.outProj, b.opOut, rows)
+    }
     this.gpu.run({
       name: "recurrence",
       program: this.gpu.program(K.linDeltaFused(shape)),

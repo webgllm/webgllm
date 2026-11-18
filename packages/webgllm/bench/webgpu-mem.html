@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>webgpu-mem</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px}</style></head>
+<body><pre id="out"></pre>
+<script type="module">
+// Does a destroyed texture's memory come back? Makes `mb` MB of byte textures (written, so their pages are real),
+// then copies each into a storage buffer and destroys it (mode=copy), the engine's toStorage; mode=keep keeps the
+// textures (the expected double), mode=buffers writes buffers directly (the single), mode=tex makes the textures alone, mode=fill fills storage-only buffers (no COPY_DST) by a compute pass. `drop=1` also drops the JS
+// references to destroyed textures; `wait=1` waits for the GPU after each copy. A tab killed at its memory limit
+// stops logging: the last MEM line says how far it got. Query: mb (default 1400), chunk (MB, default 50).
+const out = document.getElementById("out")
+const log = (t) => { out.textContent += `${t}\n`; void fetch("/log", { method: "POST", body: t }).catch(() => undefined) }
+const q = new URLSearchParams(location.search)
+const mb = +(q.get("mb") ?? 1400), chunk = +(q.get("chunk") ?? 50), mode = q.get("mode") ?? "copy"
+const drop = q.get("drop") === "1", wait = q.get("wait") === "1"
+try {
+  const adapter = await navigator.gpu.requestAdapter()
+  const device = await adapter.requestDevice({ requiredLimits: { maxBufferSize: adapter.limits.maxBufferSize, maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize } })
+  log(`MEM ${navigator.userAgent.slice(0, 60)} mode=${mode} mb=${mb} chunk=${chunk} drop=${drop} wait=${wait}`)
+  const width = 4096, rowBytes = width * 4, rows = Math.floor((chunk * 1048576) / rowBytes)
+  const data = new Uint8Array(rowBytes * rows)
+  for (let i = 0; i < data.length; i += 65536) crypto.getRandomValues(data.subarray(i, Math.min(data.length, i + 65536)))
+  const n = Math.floor(mb / chunk)
+  let textures = []
+  const buffers = []
+  if (mode !== "buffers") {
+    for (let i = 0; i < n; i++) {
+      const t = device.createTexture({ size: [width, rows], format: "rgba8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC })
+      device.queue.writeTexture({ texture: t }, data, { bytesPerRow: rowBytes }, [width, rows])
+      textures.push(t)
+      if (i % 4 === 3) await device.queue.onSubmittedWorkDone()
+    }
+    await device.queue.onSubmittedWorkDone()
+    log(`MEM textures ${n * chunk} MB made`)
+  }
+  // mode=fill: storage-only buffers (no COPY_DST) filled from each texture by a compute pass, then the texture destroyed.
+  const fill = mode === "fill" && device.createComputePipeline({ layout: "auto", compute: { entryPoint: "main", module: device.createShaderModule({ code: `
+@group(0) @binding(0) var t: texture_2d<u32>;
+@group(0) @binding(1) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) nw: vec3u) {
+  let i = id.x + id.y * nw.x * 64u;
+  let w = ${width}u; let x = i % w; let y = i / w; if (y >= ${rows}u) { return; }
+  let p = textureLoad(t, vec2u(x, y), 0); b[i] = p.x | (p.y << 8u) | (p.z << 16u) | (p.w << 24u);
+}` }) } })
+  for (let i = 0; i < n; i++) {
+    const b = device.createBuffer({ size: rowBytes * rows, usage: mode === "fill" ? GPUBufferUsage.STORAGE : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+    if (mode === "fill") {
+      const e = device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(fill)
+      p.setBindGroup(0, device.createBindGroup({ layout: fill.getBindGroupLayout(0), entries: [{ binding: 0, resource: textures[i].createView() }, { binding: 1, resource: { buffer: b } }] }))
+      const groups = Math.ceil((width * rows) / 64); p.dispatchWorkgroups(Math.min(groups, 65535), Math.ceil(groups / 65535)); p.end()
+      device.queue.submit([e.finish()]); textures[i].destroy(); if (drop) textures[i] = null
+      if (wait) await device.queue.onSubmittedWorkDone()
+      buffers.push(b)
+      if (i % 4 === 3) { await device.queue.onSubmittedWorkDone(); log(`MEM ${(i + 1) * chunk} MB in buffers`) }
+      continue
+    }
+    if (mode === "tex") break
+    if (mode === "buffers") { device.queue.writeBuffer(b, 0, data); if (wait) await device.queue.onSubmittedWorkDone() }
+    else {
+      const e = device.createCommandEncoder()
+      e.copyTextureToBuffer({ texture: textures[i] }, { buffer: b, bytesPerRow: rowBytes }, [width, rows])
+      device.queue.submit([e.finish()])
+      if (mode === "copy") { textures[i].destroy(); if (drop) textures[i] = null }
+      if (wait) await device.queue.onSubmittedWorkDone()
+    }
+    buffers.push(b)
+    if (i % 4 === 3) { await device.queue.onSubmittedWorkDone(); log(`MEM ${(i + 1) * chunk} MB in buffers`) }
+  }
+  await device.queue.onSubmittedWorkDone()
+  log(mode === "tex" ? `MEM textures only: ${n * chunk} MB; holding 5 s` : `MEM all ${n * chunk} MB in buffers; holding 5 s`)
+  await new Promise((r) => setTimeout(r, 5000))
+  log("MEM ALL DONE")
+} catch (e) { log(`MEM ERROR: ${e?.stack ?? e}`) }
+</script></body></html>

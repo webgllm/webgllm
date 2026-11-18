@@ -1111,3 +1111,106 @@ ${[0, 1, 2, 3].map((t) => `    { let a = textureLoad(tA, vec2<i32>(kq, m0 + ${t}
     groups: (rect) => [Math.ceil(rect.height / 16), Math.ceil(rect.width / 16)]
   }
 }
+
+/**
+ * Writing's Gated DeltaNet recurrence in one pass: kernels.ts's
+ * linDeltaFused and linState (a head's q and k over their L2 norms, beta
+ * and the decay from the b|a projection's split partial sums at texel uBAx,
+ * then the output and S = decay·S + k̂ deltaᵀ), the state read once. A
+ * workgroup takes 4 value texels of one head (y), keyHeadDim / rows
+ * threads each (x), a thread `rows` key rows (4, 8 or 16): their partial sums of S·k and S·q meet in workgroup
+ * memory, then each thread writes its rows of the new state from the
+ * values it holds. linState's pass read the whole state again after
+ * linDeltaFused had (Qwen3.5 2B: 1 MiB a layer each, 18 layers a token).
+ * Heads with as many key as value dims, as many key heads as value heads.
+ */
+export function linRecurrence(o: { keyHeadDim: number; valueHeadDim: number; rows?: number }): NativeSpec {
+  const DK4 = o.keyHeadDim / 4
+  const DV4 = o.valueHeadDim / 4
+  const R = o.rows ?? 8
+  const R4 = R / 4
+  const T = o.keyHeadDim / R
+  if (DK4 !== DV4 || ![4, 8, 16].includes(R) || o.keyHeadDim % R || DV4 % 4 || 4 * T > 256) throw new Error(`No native recurrence for heads of ${o.keyHeadDim}.`)
+  const scale = (1 / Math.sqrt(o.keyHeadDim)).toFixed(9)
+  const J = Array.from({ length: R4 }, (_, j) => j)
+  const S = Array.from({ length: R }, (_, j) => j)
+  const kc = (r: number) => `k${r >> 2}.${"xyzw"[r & 3]}`
+  const qc = (r: number) => `q${r >> 2}.${"xyzw"[r & 3]}`
+  const code = `
+struct Uni { rect: vec4<u32>, k4: i32, h4: i32, bax: i32, splitIn: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tQKV: texture_2d<f32>;
+@group(0) @binding(3) var tBA: texture_2d<f32>;
+@group(0) @binding(4) var tA: texture_2d<f32>;
+@group(0) @binding(5) var tDt: texture_2d<f32>;
+@group(0) @binding(6) var out0: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(7) var out1: texture_storage_2d<rgba32float, write>;
+var<workgroup> nq: array<f32, ${4 * T}>;
+var<workgroup> nk: array<f32, ${4 * T}>;
+var<workgroup> rkv: array<vec4<f32>, ${4 * T}>;
+var<workgroup> rqs: array<vec4<f32>, ${4 * T}>;
+var<workgroup> rqk: array<f32, ${4 * T}>;
+fn pf(x: i32) -> vec4<f32> {
+  var a = vec4<f32>(0.0);
+  for (var k = 0; k < 16; k++) { if (k >= u.splitIn) { break; } a += textureLoad(tBA, vec2<i32>(x, k), 0); }
+  return a;
+}
+@compute @workgroup_size(${T}, 4)
+fn main(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+  let c = i32(l.x);
+  let slot = i32(l.y) * ${T} + c;
+  let x = i32(w.x) * 4 + i32(l.y);
+  let h = x / ${DV4};
+  let kb = h * ${DK4};
+  // The head's q and k norms, then this thread's ${R} keys.
+${J.map((j) => `  let qr${j} = textureLoad(tQKV, vec2<i32>(kb + ${R4} * c + ${j}, 0), 0);
+  let kr${j} = textureLoad(tQKV, vec2<i32>(u.k4 + kb + ${R4} * c + ${j}, 0), 0);`).join("\n")}
+  nq[slot] = ${J.map((j) => `dot(qr${j}, qr${j})`).join(" + ")};
+  nk[slot] = ${J.map((j) => `dot(kr${j}, kr${j})`).join(" + ")};
+  workgroupBarrier();
+  var sq = 0.0;
+  var sk = 0.0;
+  for (var i = 0; i < ${T}; i++) { sq += nq[i32(l.y) * ${T} + i]; sk += nk[i32(l.y) * ${T} + i]; }
+  let invq = inverseSqrt(sq + 1e-6);
+  let invk = inverseSqrt(sk + 1e-6);
+${J.map((j) => `  let q${j} = qr${j} * invq * ${scale};
+  let k${j} = kr${j} * invk;`).join("\n")}
+  let r0 = ${R} * c;
+${S.map((j) => `  let s${j} = textureLoad(tS, vec2<i32>(x, r0 + ${j}), 0);`).join("\n")}
+  rkv[slot] = ${S.map((j) => `s${j} * ${kc(j)}`).join(" + ")};
+  rqs[slot] = ${S.map((j) => `s${j} * ${qc(j)}`).join(" + ")};
+  rqk[slot] = ${J.map((j) => `dot(q${j}, k${j})`).join(" + ")};
+  workgroupBarrier();
+  var kv = vec4<f32>(0.0);
+  var qs = vec4<f32>(0.0);
+  var qk = 0.0;
+  for (var i = 0; i < ${T}; i++) { let j = i32(l.y) * ${T} + i; kv += rkv[j]; qs += rqs[j]; qk += rqk[j]; }
+  let g = h >> 2u;
+  let beta = (1.0 / (1.0 + exp(-pf(u.bax + g))))[h & 3];
+  let t = pf(u.bax + u.h4 + g) + textureLoad(tDt, vec2<i32>(g, 0), 0);
+  let softplus = max(t, vec4<f32>(0.0)) + log(1.0 + exp(-abs(t)));
+  let decay = exp(textureLoad(tA, vec2<i32>(g, 0), 0) * softplus)[h & 3];
+  let v = textureLoad(tQKV, vec2<i32>(2 * u.k4 + x, 0), 0);
+  let d = beta * (v - decay * kv);
+  if (c == 0) { textureStore(out0, vec2<i32>(x, 0), decay * qs + qk * d); }
+${S.map((j) => `  textureStore(out1, vec2<i32>(x, r0 + ${j}), decay * s${j} + ${kc(j)} * d);`).join("\n")}
+}`
+  return {
+    code,
+    inputs: [
+      { name: "uS", kind: "f" },
+      { name: "uQKV", kind: "f" },
+      { name: "uBA", kind: "f" },
+      { name: "uA", kind: "f" },
+      { name: "uDt", kind: "f" }
+    ],
+    uniforms: [
+      { name: "uK4", type: "int" },
+      { name: "uH4", type: "int" },
+      { name: "uBAx", type: "int" },
+      { name: "uSplitIn", type: "int" }
+    ],
+    groups: (rect) => [rect.width / 4, 1]
+  }
+}
