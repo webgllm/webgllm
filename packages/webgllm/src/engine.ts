@@ -3926,9 +3926,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     step("logits")
     await this.argmax(row, 1, 1, [])
     step("argmax")
-    // A batch past f16MinRows: the f16 matmul path full prompts take.
+    // A full batch: the f16 matmul path prompts take, at the size they run
+    // (a pass's WebGPU variant depends on its size: warmed at f16MinRows
+    // rows, a cached load compiled 6 programs mid-reply for its first
+    // prompt; tune, which a cached load skips, forwards full batches).
     // (A cache too small for it never takes that path.)
-    const f16Rows = Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1)
+    const f16Rows = Math.max(TUNING.f16MinRows, SPLIT_ROWS + 1, Math.min(this.batchSize, this.capacity))
     if (TUNING.f16MinRows <= this.capacity && f16Rows <= this.contextLength) {
       await this.forwardHidden(fit(f16Rows))
       step("batchF16")
