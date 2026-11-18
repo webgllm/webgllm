@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, promptMatmulBuffer, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -164,6 +164,14 @@ export const TUNING = {
   bufferPairs: -1,
   bufferMatvecThreads: 64,
   bufferBlocks: 16,
+  /**
+   * WebGPU, f16Pack 3: the dequantized weights in a storage buffer, read by
+   * a native matmul (gpu/native.ts's promptMatmulBuffer). LFM3 1.7B read
+   * prompts at 4,800 tokens/s on an M3 Ultra this way where 4,450, 167 on
+   * a Pixel 10 Pro (whose probe then took f16Pack 3) where 152, and 350 on
+   * an iPhone 16 Pro Max where 340.
+   */
+  bufferGemm: 1,
   /**
    * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
    * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
@@ -4269,6 +4277,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         mib: number
         w?: Texture
         wh2?: Texture
+        /** wh2's h2 texels in a storage buffer, row r at r · width (see bufferGemm). */
+        wbuf?: Texture
         a?: Array<Texture>
         /** Whether RGBA16F can be drawn into (asked when first needed). */
         halfRenders?: boolean
@@ -4336,6 +4346,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.gpu.delete(f.wh2)
       f.wh2 = undefined
     }
+    if (f.wbuf && (none || !(pack & 2))) {
+      this.gpu.delete(f.wbuf)
+      f.wbuf = undefined
+    }
     if (f.a && (none || pack & 1)) {
       for (const t of f.a) this.gpu.delete(t)
       f.a = undefined
@@ -4356,7 +4370,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       !(f.halfRenders ??= this.gpu.canRender([GL.RGBA16F]))
     )
       return false
-    if (pack & 2) f.wh2 ??= this.gpu.texture(GL.RGBA32UI, f.width / 2, f.hd)
+    if (pack & 2 && this.bufferGemm()) f.wbuf ??= (this.gpu as unknown as WebGpu).storage((f.width / 2) * f.hd * 16, f.width / 2, f.hd)
+    else if (pack & 2) f.wh2 ??= this.gpu.texture(GL.RGBA32UI, f.width / 2, f.hd)
     else f.w ??= this.gpu.texture(GL.RGBA16F, f.width, f.hd)
     if (!(pack & 1))
       f.a ??= Array.from(
@@ -4484,7 +4499,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const kq = w.K / 4
         const pack = this.f16Pack()
         const h2W = (pack & 2) !== 0
-        const wOut = h2W ? f.wh2 : f.w
+        const wOut = h2W ? f.wbuf ?? f.wh2 : f.w
         if (!wOut) throw new GpuError("The f16 matmul's scratch is missing.")
         // The activations as RGBA16F, unless the matmul reads their h2.
         let fa = a
@@ -4507,8 +4522,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         }
         // (Weights copied to a storage buffer: the native dequant reads them there; see storedQuants.)
         const stored = this.storedQuants(w)
+        const toBuffer = !!f.wbuf && h2W
+        if (toBuffer && !stored) throw new GpuError("The f16 matmul's buffer scratch needs the weights in a buffer.")
         const storedDequant = stored
-          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W))
+          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W, toBuffer))
           : null
         const dequant = this.gpu.program(
           w.rgba4
@@ -4532,7 +4549,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         )
         // WebGPU, RGBA16F weights and activations (f16Pack 0) in f32 math:
         // the native prompt matmul (TUNING.nativePromptMatmul).
-        const nativeMultiply = TUNING.nativePromptMatmul > 0 && pack === 0 && !(TUNING.f16Half > 0 || this.precision === "mediump") && "nativeProgram" in this.gpu
+        const nativeMultiply = toBuffer && "nativeProgram" in this.gpu
+          // The h2 weights in the buffer scratch: the native matmul reading them there (see bufferGemm).
+          ? this.gpu.nativeProgram(this.promptBufferSpec(w.blocks % kbSlice === 0 ? kbSlice * 4 : 0))
+          : TUNING.nativePromptMatmul > 0 && pack === 0 && !(TUNING.f16Half > 0 || this.precision === "mediump") && "nativeProgram" in this.gpu
           ? this.gpu.nativeProgram((this.promptSpec ??= promptMatmul()))
           : null
         const kqSlice = kbSlice * 8
@@ -4566,7 +4586,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 uKq0: { int: kq0 },
                 uHd: { int: f.hd },
                 uN: { int: n },
-                uRow0: { int: r0 }
+                uRow0: { int: r0 },
+                uStride: { int: wOut.width }
               },
               output: wOut,
               rect: {
@@ -4588,7 +4609,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 uHd: { int: f.hd },
                 uSliceRows: { int: quadRows },
                 uKqSlice: { int: kqSlice },
-                uRow0: { int: r0 }
+                uRow0: { int: r0 },
+                uStride: { int: wOut.width }
               },
               output: [out, partner],
               rect: {
@@ -4919,11 +4941,25 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!spec) this.recurrenceSpecs.set(key, (spec = linRecurrence({ ...shape, rows: TUNING.recurrenceRows })))
     return spec
   }
-  private bufferDequantSpec(h2: boolean) {
-    const key = `dequant ${h2}`
+  private bufferDequantSpec(h2: boolean, toBuffer = false) {
+    const key = `dequant ${h2} ${toBuffer}`
     let spec = this.bufferSpecs.get(key)
-    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2 })))
+    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2, toBuffer })))
     return spec
+  }
+  private promptBufferSpec(trips: number) {
+    const key = `gemm ${trips}`
+    let spec = this.bufferSpecs.get(key)
+    if (!spec) this.bufferSpecs.set(key, (spec = promptMatmulBuffer({ trips })))
+    return spec
+  }
+  /**
+   * Whether f16Pack 3's scratch is a storage buffer, its dequant and matmul
+   * native passes (TUNING.bufferGemm): every f16 matrix's weights in a
+   * buffer (see storeQuants).
+   */
+  private bufferGemm() {
+    return TUNING.bufferGemm > 0 && "storage" in this.gpu && this.f16Mats().every((m) => !!m.stored)
   }
 
   /** The native attention's partial sums (see flashChunks). */

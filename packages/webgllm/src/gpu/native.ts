@@ -988,13 +988,14 @@ ${rms ? `  var s = vec4<f32>(0.0);
  * buffer (see bufferMatvec): output texel x of the f16 layout, or with `h2`
  * texels 2x' and 2x' + 1 of each column as one h2 texel x'.
  */
-export function bufferDequant(o: { h2: boolean }): NativeSpec {
+export function bufferDequant(o: { h2: boolean; toBuffer?: boolean }): NativeSpec {
+  if (o.toBuffer && !o.h2) throw new Error("A dequant into a buffer writes h2 texels.")
   const code = `
-struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32 }
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tS: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read> bW: array<u32>;
-@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;
+${o.toBuffer ? "@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;" : `@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;`}
 fn deq(x: i32, y: i32) -> vec4<f32> {
   let c = x / u.kq;
   let kq = x - c * u.kq + u.kq0;
@@ -1023,7 +1024,8 @@ ${o.h2
   let x = c * u.kq + 2 * (p.x - c * hk);
   let a = clamp(deq(x, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
   let b = clamp(deq(x + 1, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
-  textureStore(out0, p, vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw)));`
+  let v = vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+  ${o.toBuffer ? "out0[p.y * u.stride + p.x] = v;" : "textureStore(out0, p, v);"}`
     : `  textureStore(out0, p, deq(p.x, p.y));`}
 }`
   return {
@@ -1039,7 +1041,8 @@ ${o.h2
       { name: "uKq0", type: "int" },
       { name: "uHd", type: "int" },
       { name: "uN", type: "int" },
-      { name: "uRow0", type: "int" }
+      { name: "uRow0", type: "int" },
+      { name: "uStride", type: "int" }
     ],
     groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
   }
@@ -1289,5 +1292,83 @@ ${[0, 1, 2, 3].map((j) => `      let a${j} = textureLoad(tA, vec2<i32>(kb * 4 + 
       { name: "uWidth", type: "int" }
     ],
     groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
+  }
+}
+
+/**
+ * kernels.ts's matmulF16 with both inputs in h2 texels (its `packed` 3),
+ * the dequantized weights from a storage buffer (bufferDequant's
+ * `toBuffer`: row r at r · uStride h2 texels) and `trips` steps of two K
+ * texels a slice (uKqSlice = 2 · trips: a pipeline a slice length; 0: as
+ * many as the slice has, for a last slice cut short). An M3
+ * Ultra ran LFM3's prompt matmuls 1.14x as fast this way as the GLSL
+ * pass, with the same output (bench/gemm-exact.html).
+ */
+export function promptMatmulBuffer(o: { trips: number }): NativeSpec {
+  const code = `
+struct Uni { rect: vec4<u32>, kq: i32, kqW: i32, kq0: i32, hd: i32, sliceRows: i32, kqSlice: i32, row0: i32, stride: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<u32>;
+@group(0) @binding(2) var<storage, read> bW: array<vec4<u32>>;
+@group(0) @binding(3) var out0: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(4) var out1: texture_storage_2d<rgba32uint, write>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+fn packH2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
+  let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}
+@compute @workgroup_size(16, 4)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  // x: the rectangle's rows (absolute: the pacing may cut it into bands), y: its row groups.
+  if (id.x >= u.rect.w || id.y >= u.rect.z) { return; }
+  let y = i32(id.x + u.rect.y);
+  let g0 = i32(id.y + u.rect.x);
+  let slice = y / u.sliceRows;
+  let m0 = 4 * (y - slice * u.sliceRows);
+  let row = 4 * g0 - u.row0;
+  let c = row / u.hd;
+  let wx = c * u.kqW - u.kq0;
+  let wy = row - c * u.hd;
+  let kq0 = slice * u.kqSlice;
+  var acc0 = vec4<f32>(0.0); var acc1 = vec4<f32>(0.0); var acc2 = vec4<f32>(0.0); var acc3 = vec4<f32>(0.0);
+  let wb = wy * u.stride + ((wx + kq0) >> 1u);
+  ${o.trips > 0 ? "" : "let trips = (min(u.kq, kq0 + u.kqSlice) - kq0) >> 1u;"}
+  for (var it = 0; it < ${o.trips > 0 ? o.trips : "trips"}; it++) {
+    let ta = (kq0 >> 1u) + it;
+    let wp = wb + it;
+    let W0 = bW[wp]; let W1 = bW[wp + u.stride]; let W2 = bW[wp + 2 * u.stride]; let W3 = bW[wp + 3 * u.stride];
+    let A0 = textureLoad(tA, vec2<i32>(ta, m0), 0); let A1 = textureLoad(tA, vec2<i32>(ta, m0 + 1), 0);
+    let A2 = textureLoad(tA, vec2<i32>(ta, m0 + 2), 0); let A3 = textureLoad(tA, vec2<i32>(ta, m0 + 3), 0);
+    { let w0 = lo(W0); let w1 = lo(W1); let w2 = lo(W2); let w3 = lo(W3);
+      { let a = lo(A0); acc0 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = lo(A1); acc1 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = lo(A2); acc2 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = lo(A3); acc3 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); } }
+    { let w0 = hi(W0); let w1 = hi(W1); let w2 = hi(W2); let w3 = hi(W3);
+      { let a = hi(A0); acc0 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = hi(A1); acc1 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = hi(A2); acc2 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
+      { let a = hi(A3); acc3 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); } }
+  }
+  textureStore(out0, vec2<i32>(g0, y), packH2(acc0, acc1));
+  textureStore(out1, vec2<i32>(g0, y), packH2(acc2, acc3));
+}`
+  return {
+    code,
+    inputs: [{ name: "uA", kind: "u" }],
+    buffers: [{ name: "uW" }],
+    uniforms: [
+      { name: "uKq", type: "int" },
+      { name: "uKqW", type: "int" },
+      { name: "uKq0", type: "int" },
+      { name: "uHd", type: "int" },
+      { name: "uSliceRows", type: "int" },
+      { name: "uKqSlice", type: "int" },
+      { name: "uRow0", type: "int" },
+      { name: "uStride", type: "int" }
+    ],
+    groups: (rect) => [Math.ceil(rect.height / 16), Math.ceil(rect.width / 4)]
   }
 }

@@ -61,9 +61,11 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
           })()
         }
       }
+      if (name === "load") warmed = false
       postMessage({ type: "bench-phase", name, gpuBytes: this.gpu.bytes })
       const value = await Reflect.apply(original, this, args)
       postMessage({ type: "bench-phase", name: `${name}:end`, gpuBytes: this.gpu.bytes })
+      if (name === "warmUp") warmed = true
       return value
     }
   })
@@ -146,7 +148,7 @@ for (const C of [Gpu, WebGpu] as const) {
 }
 const extraWhileWriting = new Set<string>()
 const scratch = new WeakMap<object, Map<string, ReturnType<Gpu["texture"]>>>()
-const instrumented = () => extraWhileWriting.size > 0 || countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || twiceWhileWriting.size > 0
+const instrumented = () => extraWhileWriting.size > 0 || countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || skipInPrompts.size > 0 || twiceWhileWriting.size > 0
 // Passes while writing, by kind and size, and in independent groups (tune "countWriting:1").
 let countWriting = false
 const writingRuns = new Map<string, number>()
@@ -173,6 +175,10 @@ const twiceWhileWriting = new Set<string>()
 let burnUs = 0
 // Pass kinds not run while writing (tune "skip_<name>:1"): what each costs a token.
 const skipWhileWriting = new Set<string>()
+// Passes left out of prompts once the model is loaded and warmed (tune "pskip_<name>:1"): their share of a prompt's
+// time (loading's own prompt-sized passes, tune's and the probes', still run).
+const skipInPrompts = new Set<string>()
+let warmed = false
 for (const C of [Gpu, WebGpu] as const) {
   const run = C.prototype.run
   C.prototype.run = function (this: Gpu & WebGpu, pass) {
@@ -207,6 +213,7 @@ for (const C of [Gpu, WebGpu] as const) {
       writingRuns.set(key, (writingRuns.get(key) ?? 0) + 1)
     }
     if (pass.name && skipWhileWriting.has(pass.name) && this.activePhase === "decode") return
+    if (pass.name && warmed && skipInPrompts.has(pass.name) && this.activePhase === "prompt") return
     if (pass.name && twiceWhileWriting.has(pass.name) && this.activePhase === "decode") run.call(this, pass)
     // An extra copy into scratch outputs (tune "extra_<name>:1"): its cost
     // in place, which a repeat into the same target hides on a tile GPU.
@@ -355,6 +362,10 @@ const handle = async (event: MessageEvent) => {
       for (const key of Object.keys(event.data.values ?? {}))
         if (key.startsWith("skip_")) {
           skipWhileWriting.add(key.slice(5))
+          delete event.data.values[key]
+        }
+        else if (key.startsWith("pskip_")) {
+          skipInPrompts.add(key.slice(6))
           delete event.data.values[key]
         }
         else if (key.startsWith("extra_")) {

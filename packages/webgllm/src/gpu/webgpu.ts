@@ -435,7 +435,8 @@ export class WebGpu extends PacedGpu<Fence> {
     const buffers = spec.buffers ?? []
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
     const rect = pass.rect ?? { x: 0, y: 0, width: outputs[0].width, height: outputs[0].height }
-    const formats = outputs.map((o) => formatOf(o.internal).format)
+    // (A storage buffer output (see storage) binds read-write.)
+    const formats = outputs.map((o) => (o.internal === STORAGE_BUFFER ? "buffer" : formatOf(o.internal).format))
     const key = formats.join(",")
     let p = program.pipelines.get(key)
     if (!p) {
@@ -448,7 +449,9 @@ export class WebGpu extends PacedGpu<Fence> {
       buffers.forEach((_, i) =>
         entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, buffer: { type: "read-only-storage" } }))
       formats.forEach((format, i) =>
-        entries.push({ binding: spec.inputs.length + buffers.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
+        entries.push(format === "buffer"
+          ? { binding: spec.inputs.length + buffers.length + 1 + i, visibility: COMPUTE, buffer: { type: "storage" } }
+          : { binding: spec.inputs.length + buffers.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format: format as GPUTextureFormat } }))
       const layout = this.device.createBindGroupLayout({ entries })
       const descriptor = {
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
@@ -477,7 +480,7 @@ export class WebGpu extends PacedGpu<Fence> {
     if (!group) {
       const entries: Array<GPUBindGroupEntry> = [{ binding: 0, resource: { buffer: this.uniformBuffer, size: this.nativeBytes(spec) } }]
       inputs.forEach((t, i) => entries.push({ binding: i + 1, resource: t.internal === STORAGE_BUFFER ? { buffer: t.tex as GPUBuffer } : (t.tex as GPUTexture).createView() }))
-      outputs.forEach((t, i) => entries.push({ binding: inputs.length + 1 + i, resource: (t.tex as GPUTexture).createView() }))
+      outputs.forEach((t, i) => entries.push({ binding: inputs.length + 1 + i, resource: t.internal === STORAGE_BUFFER ? { buffer: t.tex as GPUBuffer } : (t.tex as GPUTexture).createView() }))
       group = this.device.createBindGroup({ layout: p.layout, entries })
       this.bindGroups.set(key2, group)
       for (const t of [...inputs, ...outputs]) {
@@ -638,6 +641,19 @@ export class WebGpu extends PacedGpu<Fence> {
     this.touched.set(texture.id, this.generation)
     this.bytes += bytes
     const stored: Texture = { id: this.nextId++, tex: buffer, width: texture.width, height: texture.height, internal: STORAGE_BUFFER, bytes }
+    this.live.add(stored)
+    return stored
+  }
+
+  /** An empty storage buffer of `bytes` (a native pass's output; see NativeSpec), as a `width` × `height` texture's stand-in. */
+  storage(bytes: number, width: number, height: number): Texture {
+    this.device.pushErrorScope("out-of-memory")
+    const buffer = this.device.createBuffer({ size: bytes, usage: BUFFER.STORAGE | BUFFER.COPY_DST })
+    void this.device.popErrorScope().then((e) => {
+      if (e) this.oom = true
+    })
+    this.bytes += bytes
+    const stored: Texture = { id: this.nextId++, tex: buffer, width, height, internal: STORAGE_BUFFER, bytes }
     this.live.add(stored)
     return stored
   }
