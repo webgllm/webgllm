@@ -4347,6 +4347,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return TUNING.bufferGemm8 > 0 && w.bits === 8 && !!w.stored && !!f.wbuf && w.K <= f.kMax
   }
 
+  /** The f16 scratch 8-bit matrix `w` goes through into `out` (a 4-token matmul's output: it has a second texture), or false. */
+  private eightScratch(w: GpuMatrix, out: Texture) {
+    if (w.bits !== 8 || !w.stored || !this.quads.has(out.id) || TUNING.quad <= 0 || !this.usesF16() || !(this.f16Pack() & 2)) return false
+    const f = this.f16Scratch()
+    return f && this.eightTakesF16(w, f) ? f : false
+  }
+
   /** The layer matrices prompt matmuls read. */
   private layerMats() {
     return this.layers
@@ -4528,8 +4535,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     const partner = this.quads.get(out.id)
     // (An 8-bit matrix among 4-bit ones that take the buffer scratch: through it too.)
-    const scratch8 = bits === 8 && !!w.stored && partner && TUNING.quad > 0 && this.usesF16() && (this.f16Pack() & 2) !== 0 ? this.f16Scratch() : false
-    const eight = !!scratch8 && this.eightTakesF16(w, scratch8)
+    const scratch8 = this.eightScratch(w, out)
+    const eight = !!scratch8
     if ((w.rgba4 || w.bits === 4 || eight) && partner && TUNING.quad > 0) {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
@@ -6098,8 +6105,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       rows >= Math.max(2, TUNING.linChunkMin) &&
       lin.l.numKeyHeads === lin.l.numValueHeads
     // beta and decay (its log, for chunks).
-    const baSplit = await this.project(input.a, layer.ba, t.ba, rows, input.norm)
-    const baIn = baSplit ? this.partials() : t.ba
+    // (An 8-bit `ba` that goes through the scratch buffer writes a 4-token
+    // matmul's two textures: the block's output's, free until out_proj.
+    // Its 32 rows over all of K took a prompt 0.25 ms a layer as a pair
+    // matmul on an M3 Ultra, 0.05 ms dequantized and in 4 K-slices.)
+    const baOut = rows > SPLIT_ROWS && this.eightScratch(layer.ba, b.opOut) ? b.opOut : t.ba
+    const baSplit = await this.project(input.a, layer.ba, baOut, rows, input.norm)
+    const baIn = baSplit ? this.partials() : baOut
     this.gpu.run({
       name: "linear",
       program: reader("uBA", baIn, baSplit)(K.linGates(H4, chunked)),

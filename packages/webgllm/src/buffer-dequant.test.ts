@@ -57,3 +57,23 @@ test("an 8-bit matrix takes the buffer scratch only where the 4-bit ones' holds 
   assert.equal(takes({ bits: 8, stored, K: 2048 }, { kMax: 6144 }), false)
   assert.equal(takes({ bits: 4, stored, K: 2048 }, { kMax: 6144, wbuf }), false)
 })
+
+test("an 8-bit matrix goes through the scratch only into an output with a second texture", () => {
+  const scratch = Reflect.get(Engine.prototype, "eightScratch") as (this: unknown, w: unknown, out: unknown) => unknown
+  const f = { kMax: 6144, wbuf: {} }
+  const state = {
+    quads: new Map([[1, {}]]),
+    usesF16: () => true,
+    f16Pack: () => 3,
+    f16Scratch: () => f,
+    eightTakesF16: Reflect.get(Engine.prototype, "eightTakesF16")
+  }
+  const w = { bits: 8, stored: {}, K: 2048 }
+  assert.equal(scratch.call(state, w, { id: 1 }), f)
+  // A pair tensor of one texture (Gated DeltaNet's beta|decay buffer), 4-bit weights, or a scratch that isn't a buffer of h2 texels.
+  assert.equal(scratch.call(state, w, { id: 2 }), false)
+  assert.equal(scratch.call(state, { ...w, bits: 4 }, { id: 1 }), false)
+  assert.equal(scratch.call({ ...state, f16Pack: () => 0 }, w, { id: 1 }), false)
+  assert.equal(scratch.call({ ...state, f16Scratch: () => ({ kMax: 6144 }) }, w, { id: 1 }), false)
+  assert.equal(scratch.call({ ...state, usesF16: () => false }, w, { id: 1 }), false)
+})
