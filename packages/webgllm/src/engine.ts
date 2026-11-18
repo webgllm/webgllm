@@ -120,8 +120,8 @@ type GpuLayer = {
  * defaults are what the engine uses.
  */
 export const TUNING = {
-  /** 1: run on WebGPU where the browser has it (see gpu/webgpu.ts); 0: WebGL 2. */
-  webgpu: 0,
+  /** 1: run on WebGPU where the browser has it, else WebGL 2 (see gpu/webgpu.ts); 0: WebGL 2. */
+  webgpu: 1,
   /**
    * WebGPU: a small pass with a K loop (a token's matmuls) shares each
    * texel's loop among a workgroup's threads, about this many threads in
