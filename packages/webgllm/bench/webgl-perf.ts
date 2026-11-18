@@ -402,7 +402,7 @@ async function run() {
       return
     }
     if (data.type === "bench-pacing") {
-      void result({ phase: "pacing", when: data.when, states: data.states })
+      void result({ phase: "pacing", when: data.when, states: data.states, paces: (data as { paces?: object }).paces, runCpu: (data as { runCpu?: object }).runCpu })
       return
     }
     if (data.type === "bench-profile-data") {
