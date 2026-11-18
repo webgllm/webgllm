@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -167,6 +167,14 @@ export const TUNING = {
   bufferPairs: -1,
   bufferMatvecThreads: 64,
   bufferBlocks: 8,
+  /**
+   * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
+   * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
+   * probe times it against f16Pack 3's: a Pixel 10 Pro took it and read
+   * LFM2.5 1.2B's prompts at 230 tokens/s where the GLSL pass read 194, LFM3
+   * 1.7B's at 155 where 127; an M3 Ultra and an iPhone 16 Pro Max kept 3.
+   */
+  nativePromptMatmul: 1,
   /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
   nativeAttend: 1,
   /** ...in chunks of this many keys (a workgroup's threads). */
@@ -4506,6 +4514,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             packed: pack
           })
         )
+        // WebGPU, RGBA16F weights and activations (f16Pack 0) in f32 math:
+        // the native prompt matmul (TUNING.nativePromptMatmul).
+        const nativeMultiply = TUNING.nativePromptMatmul > 0 && pack === 0 && !(TUNING.f16Half > 0 || this.precision === "mediump") && "nativeProgram" in this.gpu
+          ? this.gpu.nativeProgram((this.promptSpec ??= promptMatmul()))
+          : null
         const kqSlice = kbSlice * 8
         // The matrix through the scratch in chunks (the whole of it if it
         // fits): `group` K-slices at a time, and within those, rows r0 ..
@@ -4550,7 +4563,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             })
             await this.gpu.runAsync({
               name: "matmul",
-              program: multiply,
+              program: nativeMultiply ?? multiply,
               inputs: { uW: wOut, uA: fa },
               uniforms: {
                 uKq: { int: kq },
@@ -4857,6 +4870,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return w.stored
   }
   private bufferSpecs = new Map<string, NativeSpec>()
+  private promptSpec: NativeSpec | undefined
   private bufferDequantSpec(h2: boolean) {
     const key = `dequant ${h2}`
     let spec = this.bufferSpecs.get(key)

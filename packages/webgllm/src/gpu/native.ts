@@ -1029,3 +1029,85 @@ ${o.h2
     groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
   }
 }
+
+/**
+ * kernels.ts's matmulF16 (RGBA16F weights and activations: its `packed` 0)
+ * as 8 rows (two row groups) × 4 tokens an invocation, workgroups of 8 row
+ * pairs × 16 token quads, the quads varying fastest from workgroup to
+ * workgroup, so that one block of rows meets every token block in turn.
+ * Outputs as matmulF16's: row group g's texel at row y (slice · uSliceRows
+ * + q) of o0 holds tokens 4q, 4q + 1 and of o1 4q + 2, 4q + 3, as h2. A
+ * Pixel 10 Pro ran LFM3's gate|up at 581 GFLOP/s this way where 4 × 4 ran
+ * 442, its down at 544 where 4 × 4 ran 452 (bench/webgpu-prompt-mm.html).
+ */
+export function promptMatmul(): NativeSpec {
+  const code = `
+struct Uni { rect: vec4<u32>, kq: i32, kqW: i32, kq0: i32, hd: i32, sliceRows: i32, kqSlice: i32, row0: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tW: texture_2d<f32>;
+@group(0) @binding(2) var tA: texture_2d<f32>;
+@group(0) @binding(3) var out0: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(4) var out1: texture_storage_2d<rgba32uint, write>;
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(8, 16)
+fn main(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+  // Row y of the rectangle (absolute: the pacing may cut it into bands), row groups g and g + 1.
+  let yr = w.x * 16u + l.y;
+  let gp = 2u * (w.y * 8u + l.x);
+  if (yr >= u.rect.w || gp >= u.rect.z) { return; }
+  let y = i32(yr + u.rect.y);
+  let g = i32(gp + u.rect.x);
+  let two = gp + 1u < u.rect.z;
+  let slice = y / u.sliceRows;
+  let m0 = 4 * (y - slice * u.sliceRows);
+  let row = 4 * g - u.row0;
+  let c = row / u.hd;
+  let wx = c * u.kqW - u.kq0;
+  let wy = row - c * u.hd;
+  let c2 = (row + 4) / u.hd;
+  let wx2 = c2 * u.kqW - u.kq0;
+  let wy2 = row + 4 - c2 * u.hd;
+  let kq0 = slice * u.kqSlice;
+  let kq1 = min(u.kq, kq0 + u.kqSlice);
+  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0); var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0);
+  var b0 = vec4<f32>(0.0); var b1 = vec4<f32>(0.0); var b2 = vec4<f32>(0.0); var b3 = vec4<f32>(0.0);
+  for (var kq = kq0; kq < kq1; kq++) {
+    let w0 = textureLoad(tW, vec2<i32>(wx + kq, wy), 0);
+    let w1 = textureLoad(tW, vec2<i32>(wx + kq, wy + 1), 0);
+    let w2 = textureLoad(tW, vec2<i32>(wx + kq, wy + 2), 0);
+    let w3 = textureLoad(tW, vec2<i32>(wx + kq, wy + 3), 0);
+    let w4 = textureLoad(tW, vec2<i32>(wx2 + kq, wy2), 0);
+    let w5 = textureLoad(tW, vec2<i32>(wx2 + kq, wy2 + 1), 0);
+    let w6 = textureLoad(tW, vec2<i32>(wx2 + kq, wy2 + 2), 0);
+    let w7 = textureLoad(tW, vec2<i32>(wx2 + kq, wy2 + 3), 0);
+${[0, 1, 2, 3].map((t) => `    { let a = textureLoad(tA, vec2<i32>(kq, m0 + ${t}), 0);
+      a${t} += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a));
+      b${t} += vec4<f32>(dot(w4, a), dot(w5, a), dot(w6, a), dot(w7, a)); }`).join("\n")}
+  }
+  textureStore(out0, vec2<i32>(g, y), h2(a0, a1));
+  textureStore(out1, vec2<i32>(g, y), h2(a2, a3));
+  if (two) {
+    textureStore(out0, vec2<i32>(g + 1, y), h2(b0, b1));
+    textureStore(out1, vec2<i32>(g + 1, y), h2(b2, b3));
+  }
+}`
+  return {
+    code,
+    inputs: [{ name: "uW", kind: "f" }, { name: "uA", kind: "f" }],
+    uniforms: [
+      { name: "uKq", type: "int" },
+      { name: "uKqW", type: "int" },
+      { name: "uKq0", type: "int" },
+      { name: "uHd", type: "int" },
+      { name: "uSliceRows", type: "int" },
+      { name: "uKqSlice", type: "int" },
+      { name: "uRow0", type: "int" }
+    ],
+    // (Token rows across workgroups x, row-group pairs across y.)
+    groups: (rect) => [Math.ceil(rect.height / 16), Math.ceil(rect.width / 16)]
+  }
+}
