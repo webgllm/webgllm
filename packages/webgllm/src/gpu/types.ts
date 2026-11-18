@@ -89,5 +89,11 @@ export type Pass = {
    * by fragments times this, so a heavy pass never runs long in one draw.
    */
   work?: number
+  /**
+   * Paced (runAsync), cut into bands of whole columns, in multiples of this
+   * many, rather than rows: a matmul whose rows are tokens keeps every
+   * token in each band.
+   */
+  bandColumns?: number
 }
 

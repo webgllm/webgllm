@@ -1298,7 +1298,19 @@ ${[0, 1, 2, 3].map((j) => `      let a${j} = textureLoad(tA, vec2<i32>(kb * 4 + 
  * Ultra ran LFM3's prompt matmuls 1.14x as fast this way as the GLSL
  * pass, with the same output (bench/gemm-exact.html).
  */
-export function promptMatmulBuffer(o: { trips: number }): NativeSpec {
+export function promptMatmulBuffer(o: { trips: number; rowGroups?: number }): NativeSpec {
+  // rowGroups a thread (adjacent row groups: 4 rows each), workgroups of
+  // wx rect rows by wy threads' row groups.
+  const tm = o.rowGroups ?? 1
+  const [wx, wy] = tm > 1 ? [8, 8] : [16, 4]
+  const I = Array.from({ length: tm }, (_, i) => i)
+  const T = [0, 1, 2, 3]
+  const half = (h: "lo" | "hi") => `    {
+${I.map((i) => `      let w${i}_0 = ${h}(W${i}_0); let w${i}_1 = ${h}(W${i}_1); let w${i}_2 = ${h}(W${i}_2); let w${i}_3 = ${h}(W${i}_3);`).join("\n")}
+${T.map((t) => `      { let a = ${h}(A${t});
+${I.map((i) => `        acc${t}_${i} += vec4<f32>(dot(w${i}_0, a), dot(w${i}_1, a), dot(w${i}_2, a), dot(w${i}_3, a));`).join("\n")}
+      }`).join("\n")}
+    }`
   const code = `
 struct Uni { rect: vec4<u32>, kq: i32, kqW: i32, kq0: i32, hd: i32, sliceRows: i32, kqSlice: i32, row0: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
@@ -1313,41 +1325,32 @@ fn packH2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
   let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
   return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
 }
-@compute @workgroup_size(16, 4)
+@compute @workgroup_size(${wx}, ${wy})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  // x: the rectangle's rows (absolute: the pacing may cut it into bands), y: its row groups.
-  if (id.x >= u.rect.w || id.y >= u.rect.z) { return; }
+  // x: the rectangle's rows (absolute: the pacing may cut it into bands), y: its row groups, ${tm} a thread.
+  if (id.x >= u.rect.w || id.y * ${tm}u >= u.rect.z) { return; }
   let y = i32(id.x + u.rect.y);
-  let g0 = i32(id.y + u.rect.x);
+  let g0 = i32(id.y * ${tm}u + u.rect.x);
   let slice = y / u.sliceRows;
   let m0 = 4 * (y - slice * u.sliceRows);
-  let row = 4 * g0 - u.row0;
-  let c = row / u.hd;
-  let wx = c * u.kqW - u.kq0;
-  let wy = row - c * u.hd;
   let kq0 = slice * u.kqSlice;
-  var acc0 = vec4<f32>(0.0); var acc1 = vec4<f32>(0.0); var acc2 = vec4<f32>(0.0); var acc3 = vec4<f32>(0.0);
-  let wb = wy * u.stride + ((wx + kq0) >> 1u);
+${I.map((i) => `  let ok${i} = ${i === 0 ? "true" : `g0 + ${i} < i32(u.rect.x + u.rect.z)`};
+  let row${i} = 4 * ${i === 0 ? "g0" : `select(g0, g0 + ${i}, ok${i})`} - u.row0;
+  let c${i} = row${i} / u.hd;
+  let wb${i} = (row${i} - c${i} * u.hd) * u.stride + ((c${i} * u.kqW - u.kq0 + kq0) >> 1u);
+${T.map((t) => `  var acc${t}_${i} = vec4<f32>(0.0);`).join("\n")}`).join("\n")}
   ${o.trips > 0 ? "" : "let trips = (min(u.kq, kq0 + u.kqSlice) - kq0) >> 1u;"}
   for (var it = 0; it < ${o.trips > 0 ? o.trips : "trips"}; it++) {
     let ta = (kq0 >> 1u) + it;
-    let wp = wb + it;
-    let W0 = bW[wp]; let W1 = bW[wp + u.stride]; let W2 = bW[wp + 2 * u.stride]; let W3 = bW[wp + 3 * u.stride];
-    let A0 = textureLoad(tA, vec2<i32>(ta, m0), 0); let A1 = textureLoad(tA, vec2<i32>(ta, m0 + 1), 0);
-    let A2 = textureLoad(tA, vec2<i32>(ta, m0 + 2), 0); let A3 = textureLoad(tA, vec2<i32>(ta, m0 + 3), 0);
-    { let w0 = lo(W0); let w1 = lo(W1); let w2 = lo(W2); let w3 = lo(W3);
-      { let a = lo(A0); acc0 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = lo(A1); acc1 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = lo(A2); acc2 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = lo(A3); acc3 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); } }
-    { let w0 = hi(W0); let w1 = hi(W1); let w2 = hi(W2); let w3 = hi(W3);
-      { let a = hi(A0); acc0 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = hi(A1); acc1 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = hi(A2); acc2 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); }
-      { let a = hi(A3); acc3 += vec4<f32>(dot(w0, a), dot(w1, a), dot(w2, a), dot(w3, a)); } }
+${I.map((i) => `    let W${i}_0 = bW[wb${i} + it]; let W${i}_1 = bW[wb${i} + it + u.stride]; let W${i}_2 = bW[wb${i} + it + 2 * u.stride]; let W${i}_3 = bW[wb${i} + it + 3 * u.stride];`).join("\n")}
+${T.map((t) => `    let A${t} = textureLoad(tA, vec2<i32>(ta, m0 + ${t}), 0);`).join("\n")}
+${half("lo")}
+${half("hi")}
   }
-  textureStore(out0, vec2<i32>(g0, y), packH2(acc0, acc1));
-  textureStore(out1, vec2<i32>(g0, y), packH2(acc2, acc3));
+${I.map((i) => `  if (ok${i}) {
+    textureStore(out0, vec2<i32>(g0 + ${i}, y), packH2(acc0_${i}, acc1_${i}));
+    textureStore(out1, vec2<i32>(g0 + ${i}, y), packH2(acc2_${i}, acc3_${i}));
+  }`).join("\n")}
 }`
   return {
     code,
@@ -1363,6 +1366,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       { name: "uRow0", type: "int" },
       { name: "uStride", type: "int" }
     ],
-    groups: (rect) => [Math.ceil(rect.height / 16), Math.ceil(rect.width / 4)]
+    groups: (rect) => [Math.ceil(rect.height / wx), Math.ceil(rect.width / (wy * tm))]
   }
 }

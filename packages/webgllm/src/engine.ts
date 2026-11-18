@@ -174,6 +174,25 @@ export const TUNING = {
    */
   bufferGemm: 1,
   /**
+   * bufferGemm's matmul: row groups a thread (see gpu/native.ts's
+   * promptMatmulBuffer); 0: one where tune's lanes won (threads sharing K
+   * loops: a GPU that wants more threads), else two. Two read LFM3's
+   * prompts 1.42x as fast on a Pixel 10 Pro (bench/gemm-exact.html), 3%
+   * faster on an iPhone 16 Pro Max, and LFM2.5 350M's 5% slower on an M3
+   * Ultra, whose lanes win.
+   */
+  gemmRowGroups: 0,
+  /**
+   * 1: bufferGemm's matmuls are paced in bands of columns, every token in
+   * each, not of rows (see Pass.bandColumns): a Pixel 10 Pro paced LFM3's
+   * prompt in bands of 128 tokens, at 0.6 TFLOP/s where 1.0 for 512. It
+   * read LFM2.5 350M's prompts at 996 tokens/s this way where 724, 1.2B's
+   * at 320 where 254, LFM3's at 200 where 170 and Qwen3.5 2B's at 122
+   * where 109, at 60 frames a second; an M3 Ultra no faster, an iPhone 16
+   * Pro Max 0 to 2% slower.
+   */
+  gemmColumnBands: 1,
+  /**
    * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
    * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
    * probe times it against f16Pack 3's: a Pixel 10 Pro took it and read
@@ -4625,7 +4644,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 height: quadRows * (s1 - s0)
               },
               // (Per K texel: 4 rows' weights and 4 tokens' activations.)
-              work: kqSlice * 8
+              work: kqSlice * 8,
+              ...(nativeMultiply && TUNING.gemmColumnBands > 0 && { bandColumns: 16 })
             })
           }
         }
@@ -4953,9 +4973,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return spec
   }
   private promptBufferSpec(trips: number) {
-    const key = `gemm ${trips}`
+    const rowGroups = TUNING.gemmRowGroups > 0 ? TUNING.gemmRowGroups : this.gpu.coopThreads > 0 ? 1 : 2
+    const key = `gemm ${trips} ${rowGroups}`
     let spec = this.bufferSpecs.get(key)
-    if (!spec) this.bufferSpecs.set(key, (spec = promptMatmulBuffer({ trips })))
+    if (!spec) this.bufferSpecs.set(key, (spec = promptMatmulBuffer({ trips, rowGroups })))
     return spec
   }
   /**

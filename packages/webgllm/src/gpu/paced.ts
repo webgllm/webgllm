@@ -216,6 +216,38 @@ export abstract class PacedGpu<F> {
     if (pass.name === "matmul" && rect.height > 8) this.submissionBudget?.work()
     const perRow = rect.width * Math.max(1, pass.work ?? 1)
     this.sliceCalibrates &&= pass.name !== "head" && maxRows === Infinity
+    const endSlice = async () => {
+      const work =
+        this.sliceCalibrates &&
+        this.sliceMatrixReads >= this.sliceReads * 0.75
+          ? this.sliceReads
+          : 0
+      this.sliceReads = this.sliceMatrixReads = 0
+      this.sliceCalibrates = true
+      await this.pace(1, true, work)
+    }
+    if (pass.bandColumns && maxRows === Infinity) {
+      const q = pass.bandColumns
+      const perCol = rect.height * Math.max(1, pass.work ?? 1)
+      // (At least a band's floor of texels, in whole multiples of q.)
+      const least = Math.max(q, Math.ceil(this.minBandRows(rect.height) / q) * q)
+      for (let x = rect.x; x < rect.x + rect.width;) {
+        const fits = Math.floor((this.readsPerSlice - this.sliceReads) / perCol / q) * q
+        // (As rows: a small matmul starts a new chunk rather than splitting.)
+        const small = x === rect.x && rect.width * perCol <= this.readsPerSlice / 8 && fits < rect.width
+        if ((fits < least || small) && this.sliceReads > 0) {
+          await endSlice()
+          continue
+        }
+        const width = Math.min(Math.max(fits, least), rect.x + rect.width - x)
+        this.run({ ...pass, rect: { ...rect, x, width } })
+        this.sliceReads += width * perCol
+        if (pass.name === "matmul") this.sliceMatrixReads += width * perCol
+        x += width
+        if (this.sliceReads + least * perCol > this.readsPerSlice) await endSlice()
+      }
+      return
+    }
     for (let y = rect.y; y < rect.y + rect.height;) {
       const rows = Math.max(
         this.minBandRows(rect.width),

@@ -414,7 +414,12 @@ try {
   log(`${navigator.userAgent} | ${gpu.limits.renderer} | device features ${[...gpu.device.features].join(",")} | M ${M}`)
   const shapes = params.get("shapes") ? ALL_SHAPES.filter((s) => params.get("shapes")!.split(",").includes(s.name)) : ALL_SHAPES
   const pick = params.get("v")?.split(",")
-  const variants = VARIANTS.filter((v) => !pick || pick.includes(v.name))
+  // (Also "x<tm><tn>_<wx>x<wy>[s][h4|h8]": the engine kernel's shape family, buffer weights, constant trips.)
+  const parsed = (pick ?? []).flatMap((name) => {
+    const m = /^x(\d)(\d)_(\d+)x(\d+)(s?)(h4|h8)?$/.exec(name)
+    return m ? [{ name, spec: (c: Ctx) => direct({ tm: +m[1], tn: +m[2], wx: +m[3], wy: +m[4], swap: !!m[5], math: m[6] as "h4" | "h8" | undefined, buf: "w", ptr: true, trips: c.kqSlice / 2 }) }] : []
+  })
+  const variants = [...VARIANTS.filter((v) => !pick || pick.includes(v.name)), ...parsed]
   const rounds = Number(params.get("rounds") ?? 7), reps = Number(params.get("reps") ?? 6)
   const rows = M, quadRows = Math.ceil(rows / 4)
   // The engine's programs.
@@ -465,13 +470,11 @@ try {
     const scratchBuf = gpu.toStorage(scratch)!, aBuf = gpu.toStorage(A)!
     // The native dequant writing a storage buffer (rows SW texels) rather than the scratch texture: raw WebGPU, its own timestamps.
     const dev = gpu.device
-    const dqBufCode = bufferDequant({ h2: true }).code
-      .replace("var out0: texture_storage_2d<rgba32uint, write>;", "var<storage, read_write> outB: array<vec4<u32>>;")
-      .replace(/textureStore\(out0, p, (vec4<u32>\(.*\))\);/, `outB[u32(p.y) * ${SW}u + u32(p.x)] = $1;`)
+    const dqBufCode = bufferDequant({ h2: true, toBuffer: true }).code
     const dqPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: dqBufCode }), entryPoint: "main" } })
     const uniBuf = dev.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     const uniData = new Int32Array(16)
-    uniData.set([0, 0, dqRect.width, dqRect.height, blocks, groups, rowTexels, rowTexels, kqW, 0, HD, N, 0])
+    uniData.set([0, 0, dqRect.width, dqRect.height, blocks, groups, rowTexels, rowTexels, kqW, 0, HD, N, 0, SW])
     dev.queue.writeBuffer(uniBuf, 0, uniData)
     const outB = dev.createBuffer({ size: SW * HD * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
     const dqGroup = dev.createBindGroup({ layout: dqPipe.getBindGroupLayout(0), entries: [
@@ -560,7 +563,17 @@ try {
         // (All reps in one compute pass between two timestamps: back to back, as a prompt's dispatches run.)
         gpu.profile = new Map()
         WebGpu.coarse = true
-        for (let i = 0; i < reps; i++) gpu.run(r.pass!)
+        // (?bands=n&by=rows|cols: each run as n bands of the rectangle, as the pacing cuts a prompt's matmuls; cols in 16s.)
+        const bands = r.name.startsWith("dq_") || r.name === "base" ? 1 : Number(params.get("bands") ?? 1)
+        const rect = r.pass!.rect!
+        const cuts = Array.from({ length: bands + 1 }, (_, b) => params.get("by") === "cols"
+          ? Math.min(rect.width, Math.ceil((rect.width * b) / bands / 16) * 16)
+          : Math.round((rect.height * b) / bands))
+        for (let i = 0; i < reps; i++)
+          for (let b = 0; b < bands; b++)
+            gpu.run({ ...r.pass!, rect: params.get("by") === "cols"
+              ? { ...rect, x: rect.x + cuts[b], width: cuts[b + 1] - cuts[b] }
+              : { ...rect, y: rect.y + cuts[b], height: cuts[b + 1] - cuts[b] } })
         const prof = await gpu.profiled()
         WebGpu.coarse = false
         gpu.profile = null
