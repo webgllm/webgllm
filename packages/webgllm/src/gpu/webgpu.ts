@@ -300,6 +300,37 @@ export class WebGpu extends PacedGpu<Fence> {
   private subgroupSize: number
   /** Profile whole compute passes (GPU busy time) rather than each pass in its own (see profile). */
   static coarse = false
+  /** What a pass whose pipeline is still compiling dispatches to (see deferPipelines). */
+  private static noPass = { setBindGroup() {}, dispatchWorkgroups() {} } as unknown as GPUComputePassEncoder
+
+  /**
+   * While set, new pipelines compile in the background
+   * (createComputePipelineAsync), several at once, and the passes that
+   * need them don't run: for a warm-up, whose results are thrown away,
+   * where each pipeline compiled when first used, one after another (a
+   * Pixel 10 Pro's took 2.2 s). settlePipelines waits for them.
+   */
+  deferPipelines = false
+  private pendingPipelines: Array<Promise<unknown>> = []
+
+  /** Waits for the pipelines deferPipelines left compiling. */
+  async settlePipelines() {
+    const pending = this.pendingPipelines
+    this.pendingPipelines = []
+    await Promise.all(pending)
+  }
+
+  /** A compute pipeline: made now, or (deferPipelines) in the background, handed to `set` when it's done. */
+  private makePipeline(descriptor: GPUComputePipelineDescriptor, set: (p: GPUComputePipeline) => void): GPUComputePipeline | undefined {
+    if (!this.deferPipelines) return this.device.createComputePipeline(descriptor)
+    this.pendingPipelines.push(
+      this.device.createComputePipelineAsync(descriptor).then(set, (error: Error) => {
+        this.errors.push(`pipeline: ${error.message}`)
+        set(this.device.createComputePipeline(descriptor))
+      })
+    )
+    return undefined
+  }
   /** A workgroup shape for every pass (experiments). */
   static workgroup: [number, number] | null = null
 
@@ -344,11 +375,13 @@ export class WebGpu extends PacedGpu<Fence> {
     )
     const layout = device.createBindGroupLayout({ entries })
     const module = device.createShaderModule({ code: t.code })
-    const pipeline = device.createComputePipeline({
+    const made: Variant = { t, formats, rgba4, unroll, pipeline: undefined as unknown as GPUComputePipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
+    const pipeline = this.makePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       compute: { module, entryPoint: "main" }
-    })
-    v = { t, formats, rgba4, unroll, pipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
+    }, (p) => { made.pipeline = p })
+    if (pipeline) made.pipeline = pipeline
+    v = made
     program.variants.set(key, v)
     this.count(`${key}\n${program.source}`, performance.now() - started)
     return v
@@ -392,11 +425,13 @@ export class WebGpu extends PacedGpu<Fence> {
       formats.forEach((format, i) =>
         entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
       const layout = this.device.createBindGroupLayout({ entries })
-      const pipeline = this.device.createComputePipeline({
+      const made = { pipeline: undefined as unknown as GPUComputePipeline, layout, id: this.nextVariant++ }
+      const pipeline = this.makePipeline({
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         compute: { module: this.device.createShaderModule({ code: spec.code }), entryPoint: "main" }
-      })
-      p = { pipeline, layout, id: this.nextVariant++ }
+      }, (q) => { made.pipeline = q })
+      if (pipeline) made.pipeline = pipeline
+      p = made
       program.pipelines.set(key, p)
       this.count(`native ${spec.code.slice(0, 40)}`, performance.now() - started)
     }
@@ -640,7 +675,9 @@ export class WebGpu extends PacedGpu<Fence> {
   }
 
   /** The open compute pass, with this pipeline set. */
-  private computePassFor(pipeline: GPUComputePipeline) {
+  private computePassFor(pipeline: GPUComputePipeline | undefined) {
+    // (A pipeline still compiling while pipelines are deferred: nothing runs.)
+    if (!pipeline) return WebGpu.noPass
     if (!this.computePass && this.profile && WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed("busy")
     const cpass = (this.computePass ??= this.commands().beginComputePass())
     if (this.boundPipeline !== pipeline) {

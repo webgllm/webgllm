@@ -408,6 +408,8 @@ export const TUNING = {
   lastRowOnly: 1,
   /** 1: the warm-up reads through one layer of each kind (see warmUp); 0: all. */
   warmSubset: 1,
+  /** WebGPU: the warm-up compiles pipelines in the background without running them (see warmUp). */
+  deferWarmUp: 1,
   /**
    * Gated DeltaNet prompt batches run the recurrence in chunks of this
    * many tokens (a multiple of 4; see delta-rule.ts), two dependent passes
@@ -3750,9 +3752,26 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       kinds.add(kind)
       return keep
     })
-    try {
+    // On WebGPU nothing need run: the pipelines compile in the background,
+    // several at once (see WebGpu.deferPipelines), and are waited for.
+    const defer = !!this.gpu && "deferPipelines" in this.gpu && TUNING.deferWarmUp > 0
+    const steps = async () => {
       if (options.shortOnly) await this.forwardHidden(new Array(Math.min(SPLIT_ROWS + 1, this.contextLength)).fill(0))
       else await this.warmUpLayers()
+    }
+    // (Running them too once compiled, for the first prompt's sake, cost a
+    // Pixel 10 Pro 380 ms more load and saved an M-series Mac 13 ms of a
+    // 548-token prompt against its 25.)
+    try {
+      if (defer) {
+        this.gpu.deferPipelines = true
+        try {
+          await steps()
+        } finally {
+          this.gpu.deferPipelines = false
+          await this.gpu.settlePipelines()
+        }
+      } else await steps()
     } finally {
       this.layers = all
       // (Per-layer work for pacing, counted over the subset.)
