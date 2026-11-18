@@ -3352,38 +3352,62 @@ void main() {
  * qh texel 32 + 8n + w. The bits come apart with float math (exact on
  * integers up to 255), which mobile GPUs run faster than integer shifts.
  */
-/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
-export const EXPAND_Q6_BYTES = `${HEADER}
+/** The expanded head's 4 bytes at weights j .. j + 3 of row `row`'s super-block `block` (see EXPAND_Q6_BYTES). */
+const EXPAND_Q6_AT = `
 uniform usampler2D uNative;
 uniform int uX0;
 uniform int uY0;
-out vec4 o;
 uint nativeWord(int base, int y, int word) {
   return comp(texelFetch(uNative, ivec2(base + (word >> 2), y), 0), word & 3);
 }
-void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
-  int block = p.x >> 8;
-  int row = (p.x >> 6) & 3;
-  int j = (p.x & 63) * 4;
+uvec4 expandQ6(int block, int row, int j, int y) {
   int base = (block * 4 + row) * 13;
   int n = j >> 7;
   int part = (j >> 5) & 3;
   int lane = j & 31;
-  uint ql = nativeWord(base, p.y, (n * 64 + lane + (part & 1) * 32) >> 2);
-  uint qh = nativeWord(base, p.y, (128 + n * 32 + lane) >> 2);
+  uint ql = nativeWord(base, y, (n * 64 + lane + (part & 1) * 32) >> 2);
+  uint qh = nativeWord(base, y, (128 + n * 32 + lane) >> 2);
   uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
   uvec4 lo = (uvec4(ql) >> shifts) & 255u;
   uvec4 hi = (uvec4(qh) >> shifts) & 255u;
   uvec4 q = ((lo >> uint((part >> 1) * 4)) & 15u) | (((hi >> uint(part * 2)) & 3u) << 4u);
   if ((j & 15) == 0) {
     int at = 192 + (j >> 4);
-    uint scale = (nativeWord(base, p.y, at >> 2) >> uint((at & 3) * 8)) & 255u;
+    uint scale = (nativeWord(base, y, at >> 2) >> uint((at & 3) * 8)) & 255u;
     q |= ((uvec4(scale) >> uvec4(0u, 2u, 4u, 6u)) & 3u) << 6u;
   }
-  o = vec4(q) / 255.0;
-}
-`
+  return q;
+}`
+
+/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
+export const EXPAND_Q6_BYTES = `${HEADER}${EXPAND_Q6_AT}
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  o = vec4(expandQ6(p.x >> 8, (p.x >> 6) & 3, (p.x & 63) * 4, p.y)) / 255.0;
+}`
+
+/**
+ * The expanded head's bytes as RGBA32UI, 16 (a 16-weight run) a texel, in
+ * the order the native expanded head reads them (gpu/native.ts's
+ * expandedHead): a super-block's 64 texels are, per 32-block q and half h,
+ * its 4 rows' runs, texel q · 8 + h · 4 + row.
+ */
+export const EXPAND_Q6_WORDS = `${HEADER}${EXPAND_Q6_AT}
+uint dot4(uvec4 v) { return v.x | v.y | v.z | v.w; }
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int block = p.x >> 6;
+  int k = p.x & 63;
+  int j0 = (k >> 3) * 32 + ((k >> 2) & 1) * 16;
+  uvec4 b0 = expandQ6(block, k & 3, j0, p.y);
+  uvec4 b1 = expandQ6(block, k & 3, j0 + 4, p.y);
+  uvec4 b2 = expandQ6(block, k & 3, j0 + 8, p.y);
+  uvec4 b3 = expandQ6(block, k & 3, j0 + 12, p.y);
+  uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
+  o = uvec4(dot4(b0 << shifts), dot4(b1 << shifts), dot4(b2 << shifts), dot4(b3 << shifts));
+}`
 
 const Q6_K_UNPACK = `
 // Low nibbles (lo) and high nibbles (hi) of 4 bytes.
@@ -3982,6 +4006,24 @@ vec4 acc=vec4(0);for(int q=sb0*8;q<sb1*8;q++){
 ${body.join("\n")}
 }o=${o.prescaled ? `acc*(rmsScale(uRowA0+m)*${PRESCALE}.0)` : "acc"};}`
 }
+
+/** EMBED_Q6_EXPANDED for the RGBA32UI layout (EXPAND_Q6_WORDS's). */
+export const EMBED_Q6_EXPANDED_WORDS = `${HEADER}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels;
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),id=int(texelFetch(uIds,ivec2(0,y),0).x);
+int g=id>>2,r=id&3,col=g/uH,gr=g-col*uH,sb=x>>6,q=x&63;
+uvec4 t=texelFetch(uW,ivec2(col*uRowTexels+sb*64+(q>>3)*8+((q>>2)&1)*4+r,gr),0);
+uvec4 shifts=uvec4(0u,8u,16u,24u);
+uvec4 b=(uvec4(comp(t,q&3))>>shifts)&255u;
+uvec4 s=((uvec4(t.x)>>shifts)>>6u)&3u;
+float sc=float(s.x+4u*s.y+16u*s.z+64u*s.w);
+sc=sc>=128.0?sc-256.0:sc;
+vec4 quant=vec4((q&3)==0?b&63u:b)-32.0;
+float d=comp(texelFetch(uS,ivec2(col*uKb+sb,gr),0),r);o=(d*sc)*quant;}`
 
 export const EMBED_Q6_EXPANDED = `${HEADER}${Q6_EXPANDED}
 uniform usampler2D uIds;

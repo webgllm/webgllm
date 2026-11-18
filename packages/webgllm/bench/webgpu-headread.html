@@ -10,26 +10,33 @@
 //   aos:   a storage buffer, each group's texels together (thread-major);
 //   soa:   a storage buffer, texel k of every group together (index k · groups + g: a warp's load is contiguous).
 const out = document.getElementById("out")
-const log = (t) => { out.textContent += `${t}\n`; void fetch("/log", { method: "POST", body: t }).catch(() => undefined) }
+const dev = /iPad/.test(navigator.userAgent) ? "ipad" : /Android/.test(navigator.userAgent) ? "pixel" : "mac"
+const log = (t) => { t = t.replace("HEADREAD", `HEADREAD ${dev}`); out.textContent += `${t}\n`; void fetch("/log", { method: "POST", body: t }).catch(() => undefined) }
 try {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" })
   const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize, maxBufferSize: adapter.limits.maxBufferSize } })
-  const G = 32000, SB = 8, PER = SB * 52, C = 4, H = G / C
+  device.addEventListener("uncapturederror", (e) => log(`HEADREAD GPU ERROR: ${e.error.message}`))
+  const G = Number(new URLSearchParams(location.search).get("g") ?? 32000), SB = 8, PER = SB * 52, C = Number(new URLSearchParams(location.search).get("c") ?? 4), H = G / C
+  log(`limits: storage binding ${adapter.limits.maxStorageBufferBindingSize}, buffer ${adapter.limits.maxBufferSize}`)
   const bytes = G * PER * 16
   log(`HEADREAD ${navigator.userAgent} ${(bytes / 2 ** 20).toFixed(0)} MB`)
   const tex = device.createTexture({ size: [PER * C, H], format: "rgba32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+  // texT: transposed: row groups along x, a group's texels down a column (a warp's load: adjacent texels).
+  const texT = device.createTexture({ size: [H, PER * C], format: "rgba32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
   const buf = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
   {
     const chunk = new Uint32Array(PER * C * 4 * 100)
     for (let i = 0; i < chunk.length; i += 16384) crypto.getRandomValues(chunk.subarray(i, i + 16384))
     for (let y = 0; y < H; y += 100) device.queue.writeTexture({ texture: tex, origin: [0, y] }, chunk, { bytesPerRow: PER * C * 16 }, [PER * C, Math.min(100, H - y)])
+    const tRows = Math.floor(chunk.byteLength / (H * 16))
+    for (let y = 0; y < PER * C; y += tRows) device.queue.writeTexture({ texture: texT, origin: [0, y] }, chunk, { bytesPerRow: H * 16 }, [H, Math.min(tRows, PER * C - y)])
     for (let o = 0; o < bytes; o += chunk.byteLength) device.queue.writeBuffer(buf, o, chunk, 0, Math.min(chunk.length, (bytes - o) / 4))
   }
-  const ob = device.createBuffer({ size: G * 16, usage: GPUBufferUsage.STORAGE })
-  const load = (v, k) => v.startsWith("tex") ? `textureLoad(tW, vec2u(col * ${PER}u + ${k}, gr), 0)` : v === "aos" ? `bW[g * ${PER}u + ${k}]` : `bW[(${k}) * ${G}u + g]`
+  const ob = device.createBuffer({ size: G * 16 * 8, usage: GPUBufferUsage.STORAGE })
+  const load = (v, k) => v.startsWith("texT") ? `textureLoad(tW, vec2u(gr, col * ${PER}u + ${k}), 0)` : v.startsWith("tex") ? `textureLoad(tW, vec2u(col * ${PER}u + ${k}, gr), 0)` : v.startsWith("aos") ? `bW[g * ${PER}u + ${k}]` : `bW[(${k}) * ${G}u + g]`
   // texq: the kernel's order over a layout permuted to match it: S0..S3, then per q four rows' QA, QB, QH.
-  const body = (v) => v === "texq"
-    ? `for (var sb = 0u; sb < ${SB}u; sb++) {
+  const body = (v) => v === "texq" || v === "texTq" || v === "soaq" || v === "aosq"
+    ? `let per = ${SB}u / SPLIT; for (var sb = id.y * per; sb < id.y * per + per; sb++) {
     let t = sb * 52u;
     for (var r = 0u; r < 4u; r++) { acc ^= ${load(v, "t + r")}; }
     for (var q = 0u; q < 4u; q++) {
@@ -51,31 +58,34 @@ try {
       }
     }
   }`
-  const kernel = (v, wg) => `
+  const kernel = (v, wg, split) => `
 @group(0) @binding(0) ${v.startsWith("tex") ? "var tW: texture_2d<u32>;" : "var<storage, read> bW: array<vec4<u32>>;"}
 @group(0) @binding(1) var<storage, read_write> o: array<vec4<u32>>;
+const SPLIT = ${split}u;
 @compute @workgroup_size(${wg})
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let g = id.x;
-  if (g >= ${G}u) { return; }
+  if (g >= ${G}u || id.y >= SPLIT) { return; }
   let col = g / ${H}u; let gr = g - col * ${H}u;
   var acc = vec4<u32>(0u);
   ${body(v)}
-  o[g] = acc;
+  o[id.y * ${G}u + g] = acc;
 }`
-  for (const wg of [64])
-    for (const v of ["tex", "texq", "texr", "tex", "texq"]) {
-      const pipe = await device.createComputePipelineAsync({ layout: "auto", compute: { module: device.createShaderModule({ code: kernel(v, wg) }), entryPoint: "main" } })
-      const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: v.startsWith("tex") ? tex.createView() : { buffer: buf } }, { binding: 1, resource: { buffer: ob } }] })
+  // Shapes "v:split:wx:wy": a workgroup of wx groups × wy slices.
+  for (const shape of (new URLSearchParams(location.search).get("v") ?? "tex,texq,texr").split(",")) {
+      const [v, split = 1, wx = 64, wy = 1] = shape.split(":").map((x, i) => i ? Number(x) : x)
+      const wg = `${wx}, ${wy}`
+      const pipe = await device.createComputePipelineAsync({ layout: "auto", compute: { module: device.createShaderModule({ code: kernel(v, wg, split) }), entryPoint: "main" } })
+      const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: v.startsWith("texT") ? texT.createView() : v.startsWith("tex") ? tex.createView() : { buffer: buf } }, { binding: 1, resource: { buffer: ob } }] })
       const run = async (n) => {
         const e = device.createCommandEncoder(); const p = e.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg)
-        for (let i = 0; i < n; i++) p.dispatchWorkgroups(Math.ceil(G / wg))
+        for (let i = 0; i < n; i++) p.dispatchWorkgroups(Math.ceil(G / wx), Math.ceil(split / wy))
         p.end(); device.queue.submit([e.finish()]); await device.queue.onSubmittedWorkDone()
       }
       await run(3)
       let best = Infinity
       for (let i = 0; i < 5; i++) { const t = performance.now(); await run(10); best = Math.min(best, (performance.now() - t) / 10) }
-      log(`HEADREAD ${v} wg ${wg}: ${best.toFixed(2)} ms, ${(bytes / best / 1e6).toFixed(1)} GB/s`)
+      log(`HEADREAD ${shape}: ${best.toFixed(2)} ms, ${(bytes / best / 1e6).toFixed(1)} GB/s`)
     }
   log("HEADREAD ALL DONE")
 } catch (e) { log(`HEADREAD ERROR: ${e?.stack ?? e}`) }

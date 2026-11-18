@@ -221,3 +221,89 @@ ${o.prescaled ? `    var s = vec4<f32>(0.0);
     groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
   }
 }
+
+/**
+ * The output head through an expanded Q6_K embedding in RGBA32UI texels
+ * (kernels.ts's EXPAND_Q6_WORDS: a weight a byte, 16 a texel, in this
+ * kernel's reading order), the math of kernels.ts's q6ExpandedHead: a
+ * run's first word carries its signed 8-bit scale in its bytes' top 2
+ * bits. unpack4x8unorm splits a word's 4 bytes; the 255 it divides by and
+ * the -32 come out of the activations, once a run for the 4 rows. On a
+ * Pixel 10 Pro (whose texture unit unpacks RGBA8 for free but fetches 4 of
+ * them a texel), 16 bytes a fetch make the head 1.4× faster.
+ */
+export function expandedHead(o: { split: boolean; prescaled: boolean; wg: number }): NativeSpec {
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uA", kind: "u" },
+    { name: "uW", kind: "u" },
+    { name: "uS", kind: "f" },
+    ...(o.prescaled ? [{ name: "uR", kind: "f" as const }] : [])
+  ]
+  const WG = o.wg
+  const code = `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, g: i32, outW: i32, logitRows: i32, kbSlice: i32, rows: i32, aOff: i32, rowA0: i32, rOff: i32, parts: i32, texels: i32, eps: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<u32>;
+@group(0) @binding(2) var tW: texture_2d<u32>;
+@group(0) @binding(3) var tS: texture_2d<f32>;
+${o.prescaled ? "@group(0) @binding(4) var tR: texture_2d<f32>;" : ""}
+@group(0) @binding(${inputs.length + 1}) var out0: texture_storage_2d<rgba32float, write>;
+fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
+fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
+@compute @workgroup_size(${WG})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let x = i32(u.rect.x + w.x * ${WG}u + l);
+  var y = i32(u.rect.y + w.y);
+  var m = y / u.logitRows;
+  y -= m * u.logitRows;
+${o.split ? `  let slice = m / u.rows;
+  m -= slice * u.rows;
+  let sb0 = slice * u.kbSlice;
+  let sb1 = min(u.kb, sb0 + u.kbSlice);` : `  let sb0 = 0;
+  let sb1 = u.kb;`}
+  let row = ${o.prescaled ? "u.rowA0 + m" : "m"};
+  let g = y * u.outW + x;
+  var o = vec4<f32>(0.0);
+  if (g < u.g && x < i32(u.rect.x + u.rect.z)) {
+    let col = g / u.h;
+    let gr = g - col * u.h;
+    let wx = col * u.rowTexels;
+    let sx = col * u.kb;
+    var acc = vec4<f32>(0.0);
+    for (var sb = sb0; sb < sb1; sb++) {
+      let d = textureLoad(tS, vec2<i32>(sx + sb, gr), 0);
+      var P = vec4<f32>(0.0);
+      for (var q = 0; q < 8; q++) {
+        for (var hf = 0; hf < 2; hf++) {
+          let a = u.aOff + sb * 32 + q * 4 + hf * 2;
+          let a0 = textureLoad(tA, vec2<i32>(a, row), 0);
+          let a1 = textureLoad(tA, vec2<i32>(a + 1, row), 0);
+          let A0 = lo(a0); let A1 = hi(a0); let A2 = lo(a1); let A3 = hi(a1);
+          let c = -32.0 * dot(A0 + A1 + A2 + A3, vec4<f32>(1.0));
+          let B0 = A0 * 255.0; let B1 = A1 * 255.0; let B2 = A2 * 255.0; let B3 = A3 * 255.0;
+          let t = wx + sb * 64 + q * 8 + hf * 4;
+${[0, 1, 2, 3].map((r) => `          {
+            let T = textureLoad(tW, vec2<i32>(t + ${r}, gr), 0);
+            let s = dot(unpack4x8unorm((T.x >> 6u) & 0x03030303u), vec4<f32>(255.0, 1020.0, 4080.0, 16320.0));
+            P.${"xyzw"[r]} += select(s, s - 256.0, s >= 128.0) * (dot(unpack4x8unorm(T.x & 0x3F3F3F3Fu), B0) + dot(unpack4x8unorm(T.y), B1) + dot(unpack4x8unorm(T.z), B2) + dot(unpack4x8unorm(T.w), B3) + c);
+          }`).join("\n")}
+        }
+      }
+      acc += d * P;
+    }
+${o.prescaled ? `    var s = vec4<f32>(0.0);
+    for (var p = 0; p < u.parts; p++) { s += textureLoad(tR, vec2<i32>(u.rOff + p, u.rowA0 + m), 0); }
+    o = acc * (inverseSqrt(dot(s, vec4<f32>(1.0)) / f32(u.texels * 4) + u.eps) * 32.0);` : "    o = acc;"}
+  }
+  if (x < i32(u.rect.x + u.rect.z)) { textureStore(out0, vec2<i32>(x, i32(u.rect.y + w.y)), o); }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: ["uKb", "uH", "uRowTexels", "uG", "uOutW", "uLogitRows", "uKbSlice", "uRows", "uAOff", "uRowA0", "uROff", "uParts", "uTexels"]
+      .map((name): NativeSpec["uniforms"][number] => ({ name, type: "int" }))
+      .concat([{ name: "uEps", type: "float" }]),
+    groups: (rect) => [Math.ceil(rect.width / WG), rect.height]
+  }
+}

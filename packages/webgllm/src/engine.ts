@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { fusedAdd, wordHead } from "./gpu/native.js"
+import { expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -60,6 +60,8 @@ type GpuMatrix = {
   q6Expanded?: boolean
   /** Q6_K word texels in the native head's order (kernels.ts's ORDER_Q6_WORDS). */
   q6Ordered?: boolean
+  /** An expanded Q6_K head in RGBA32UI texels for the native expanded head (kernels.ts's EXPAND_Q6_WORDS). */
+  q6ExpandedWords?: boolean
   scales: Texture
   zeros: Texture | null
 }
@@ -134,6 +136,10 @@ export const TUNING = {
   nativeHeadSplit: 1,
   /** ...its texels uploaded in the order it reads them (kernels.ts's ORDER_Q6_WORDS). */
   q6Order: 1,
+  /** WebGPU: an expanded Q6_K head in RGBA32UI texels, read by a native pass (gpu/native.ts's expandedHead)... */
+  nativeExpanded: 1,
+  /** ...this many threads a workgroup. */
+  nativeExpandedThreads: 32,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -444,6 +450,8 @@ type HeadOut = { logits: Texture; split: number; stride: number }
  * 518 ms a probe).
  */
 export const KEEP_MARGIN = 0.95
+/** A fresh head choice takes the native expanded Q6_K head only below this fraction of the compact one's time (see chooseHead). */
+export const EXPANDED_MARGIN = 0.8
 
 /**
  * Whether `challenger` (a candidate's timed rounds) replaces `standing`
@@ -711,6 +719,26 @@ const SPLIT_ROWS = 8
  * of two tokens and one token after it.
  */
 export const MIN_CONTEXT_LENGTH = 3
+
+/**
+ * expandQ6's bytes (RGBA8 texels, a row group's row: per super-block, each
+ * row's 64) rearranged as EXPAND_Q6_WORDS lays them out: 16-byte runs, run
+ * (row, q, half) of a super-block at q · 8 + half · 4 + row.
+ */
+function expandedWordsOrder(bytes: Uint8Array, rows: number, blocks: number) {
+  const src = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)
+  const out = new Uint32Array(src.length)
+  for (let y = 0; y < rows; y++)
+    for (let sb = 0; sb < blocks; sb++) {
+      const base = (y * blocks + sb) * 256
+      for (let r = 0; r < 4; r++)
+        for (let k = 0; k < 16; k++) {
+          const from = base + (r * 16 + k) * 4, to = base + ((k >> 1) * 8 + (k & 1) * 4 + r) * 4
+          out[to] = src[from]; out[to + 1] = src[from + 1]; out[to + 2] = src[from + 2]; out[to + 3] = src[from + 3]
+        }
+    }
+  return out
+}
 
 export class Engine {
   /**
@@ -2065,8 +2093,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
       (TUNING.q6Expanded > 0 ||
         (TUNING.q6Expanded < 0 && this.headChoice?.expanded)) &&
       columns * K <= max
+    // (An expanded head the native pass reads: 16 bytes a texel.)
+    const expandedWords = expanded && TUNING.nativeExpanded > 0 && this.nativeHeadOn && !this.gpu.slowZeroFill
     const texelsPerBlockRow = expanded
-      ? 64
+      ? expandedWords ? 16 : 64
       : bytes
         ? byteTexels
         : byteTexels / 4
@@ -2076,7 +2106,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     const packed =
       layer && bytes && bits === 4 && withZeros && TUNING.packZeros > 0
     const quantFormat = expanded
-      ? GL.RGBA8
+      ? expandedWords ? GL.RGBA32UI : GL.RGBA8
       : !bytes
         ? GL.RGBA32UI
         : bits === 8
@@ -2124,6 +2154,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
       ...(quantPanels && { quantPanels }),
       ...(expanded && { q6Expanded: true }),
       ...(ordered && { q6Ordered: true }),
+      ...(expandedWords && { q6ExpandedWords: true }),
       scales: this.gpu.texture(
         packed ? GL.RGBA32UI : GL.RGBA16F,
         columns * blocks,
@@ -2734,8 +2765,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const pick = settings[keep ? standing : other]
         this.headChoice = { expanded: pick.expanded, split: pick.split }
       } else
+      // The native expanded head costs a fifth more memory: taken only when
+      // it's clearly faster (a Pixel 10 Pro's: 43%; an M-series Mac's timed
+      // 12% faster on the probe's slice but ran 1.5% slower whole).
       this.headChoice =
-        chosen.ms < base.ms * 0.94
+        chosen.ms < base.ms * (chosen.expanded && this.nativeHeadOn && TUNING.nativeExpanded > 0 ? EXPANDED_MARGIN : 0.94)
           ? { expanded: chosen.expanded, split: chosen.split }
           : { expanded: false, split }
     } finally {
@@ -2883,7 +2917,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         }
         this.gpu.run({
           name: "upload",
-          program: this.gpu.program(K.EXPAND_Q6_BYTES),
+          program: this.gpu.program(gm.q6ExpandedWords ? K.EXPAND_Q6_WORDS : K.EXPAND_Q6_BYTES),
           inputs: { uNative: stage },
           uniforms: {
             uX0: { int: rect.x },
@@ -2930,7 +2964,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             width: rowTexels,
             height: run
           },
-          { format: GL.RGBA, type: GL.UNSIGNED_BYTE, pixels: data.quants }
+          gm.q6ExpandedWords
+            ? { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: expandedWordsOrder(data.quants, run, blocks) }
+            : { format: GL.RGBA, type: GL.UNSIGNED_BYTE, pixels: data.quants }
         )
       } else if (gm.rgba4) {
         const t = performance.now()
@@ -4607,6 +4643,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
   private orderStage: Texture | null = null
+
+  private nativeExpandedSpec(split: boolean, prescaled: boolean) {
+    const wg = TUNING.nativeExpandedThreads
+    const key = `expanded ${split} ${prescaled} ${wg}`
+    let spec = this.nativeHeads.get(key)
+    if (!spec) this.nativeHeads.set(key, (spec = expandedHead({ split, prescaled, wg })))
+    return spec
+  }
 
   private nativeHeads = new Map<string, NativeSpec>()
   private nativeHeadSpec(split: boolean, prescaled: boolean, kbSlice: number, ordered: boolean) {
@@ -6585,10 +6629,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       throw new Error("Only word-texel Q6_K heads read the scaled input.")
     const oneSums = prescaled && this.sumsInOne(b.residual[0])
     // On WebGPU, the word head as a native pass (activations in workgroup memory: see gpu/native.ts).
-    const native = !e.q6Expanded && !e.bytes && !e.quantPanels && this.nativeHeadOn && "nativeProgram" in this.gpu
-      ? this.gpu.nativeProgram(this.nativeHeadSpec(split > 1, prescaled, Math.ceil(e.blocks / split), !!e.q6Ordered))
-      : null
-    if (e.q6Ordered && !native) throw new GpuError("Only the native head reads ordered Q6_K texels.")
+    const native = !("nativeProgram" in this.gpu)
+      ? null
+      : e.q6ExpandedWords
+        ? this.gpu.nativeProgram(this.nativeExpandedSpec(split > 1, prescaled))
+        : !e.q6Expanded && !e.bytes && !e.quantPanels && this.nativeHeadOn
+          ? this.gpu.nativeProgram(this.nativeHeadSpec(split > 1, prescaled, Math.ceil(e.blocks / split), !!e.q6Ordered))
+          : null
+    if ((e.q6Ordered || e.q6ExpandedWords) && !native) throw new GpuError("Only the native heads read ordered Q6_K texels.")
     await this.weightHead(
       e,
       {
@@ -6857,7 +6905,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             e,
             e.bits === 6
               ? e.q6Expanded
-                ? K.EMBED_Q6_EXPANDED
+                ? e.q6ExpandedWords ? K.EMBED_Q6_EXPANDED_WORDS : K.EMBED_Q6_EXPANDED
                 : e.bytes
                   ? K.EMBED_Q6_K
                   : e.q6Ordered
