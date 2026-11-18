@@ -9,6 +9,8 @@ const { predictSpeed } = (await import(entry)) as typeof import("../src/index.js
 const params = new URLSearchParams(location.search)
 const models = (params.get("models") ?? "LiquidAI/LFM3-1.7B-GGUF,onnx-community/LFM3-1.7B-ONNX").split(",")
 const rounds = Number(params.get("rounds") ?? 1)
+// (?webgpu=0|1: the backend predictSpeed's worker measures on; left out, its default.)
+const backend = params.get("webgpu")
 const out = document.getElementById("out")!
 const log = (text: string) => {
   out.textContent += `${text}\n`
@@ -17,7 +19,7 @@ const log = (text: string) => {
 const round1 = (n: number) => Math.round(n * 10) / 10
 
 /** One forced measurement in predictSpeed's own worker (the page's frames reported to it), with its report. */
-const measure = (model: string) => inWorker(model, { force: true }, new Worker("/bundle/src/predict-speed-worker.js", { type: "module" }))
+const measure = (model: string) => inWorker(model, { force: true }, new Worker(backend === null ? "/bundle/src/predict-speed-worker.js" : `/bundle/bench/predict-speed-bench-worker.js?webgpu=${backend}`, { type: "module" }))
 
 try {
   log(`UA ${navigator.userAgent}`)

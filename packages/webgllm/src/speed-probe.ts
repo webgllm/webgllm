@@ -7,7 +7,7 @@
  */
 import { Engine, TUNING } from "./engine.js"
 import { GL, type Gpu } from "./gpu/gl.js"
-import type { WebGpu } from "./gpu/webgpu.js"
+import { WebGpu } from "./gpu/webgpu.js"
 import { GgmlType, readGgufHeader, type GgufHeader } from "./gguf.js"
 import { bytesToFloats, halvesToFloats } from "./half.js"
 import { PROMPT_BATCH } from "./handler.js"
@@ -433,9 +433,12 @@ export async function probeSpeed(
 ): Promise<Omit<ProbeReport, "shapeMs">> {
   const { signal, onEngine } = options
   const started = performance.now()
-  // As the worker makes its engine (handler.ts load): the same batch, the
-  // model's own context length (the cache starts small and grows).
+  // As the worker makes its engine (handler.ts load): on WebGPU where the
+  // browser has it (WebGL 2 elsewhere, or on a canvas handed in), the same
+  // batch, the model's own context length (the cache starts small and grows).
+  const webgpu = !options.canvas && TUNING.webgpu > 0 ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(options.canvas ?? new OffscreenCanvas(1, 1), {
+    ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH
   })
   let peak = 0

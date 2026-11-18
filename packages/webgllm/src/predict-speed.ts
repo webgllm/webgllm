@@ -232,8 +232,18 @@ async function speedFile() {
   return dir.getFileHandle(SPEED_NOTES, { create: true })
 }
 
-/** The GPU's renderer string, from a context of its own. */
+/**
+ * The GPU's renderer string, from a context of its own, and the backend a
+ * model's worker runs on here (WebGPU where the browser has it: see
+ * TUNING.webgpu), so a prediction made on one isn't kept for the other.
+ */
 function rendererHere() {
+  const backend = TUNING.webgpu > 0 && typeof navigator !== "undefined" && "gpu" in navigator ? "webgpu" : "webgl"
+  return `${webglRenderer()}|${backend}`
+}
+
+/** The GPU's WebGL renderer string, from a context of its own. */
+function webglRenderer() {
   const gl = new OffscreenCanvas(1, 1).getContext("webgl2")
   if (!gl) throw new Error("This browser has no WebGL 2.")
   const debug = gl.getExtension("WEBGL_debug_renderer_info")
