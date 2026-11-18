@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -183,7 +183,8 @@ export const TUNING = {
    * bufferGemm for the 8-bit matrices among 4-bit ones too (unsloth's
    * Qwen3.5 2B has 21: Q5_K and Q4_1 tensors the loader keeps as 8-bit):
    * dequantized into the same scratch, through the same matmul, where the
-   * native pair matmul ran them at a third of its speed. An M3 Ultra read
+   * native pair matmul ran them at 2.7 TFLOP/s (the f16 matmul: 17 to 19).
+   * An M3 Ultra read
    * Qwen3.5 2B's prompts at 4,285 tokens/s this way where 3,504, with the
    * same replies.
    */
@@ -235,6 +236,16 @@ export const TUNING = {
    * 4,765, LFM2.5 1.2B's at 7,680 where 7,610, 350M's the same.
    */
   promptPrep: 1,
+  /**
+   * WebGPU: a prompt batch's short convolution and its state in one native
+   * pass (gpu/native.ts's promptConv: B·x once a token, through workgroup
+   * memory), where two passes multiplied it again for each tap of every
+   * output texel (0). The same bits. An M3 Ultra ran LFM3's (7 taps) in
+   * 0.07 ms a layer where 0.20, and read its prompts at 5,410 tokens/s
+   * where 5,330, LFM2.5 1.2B's at 7,750 where 7,690, 350M's at 22,030
+   * where 21,870.
+   */
+  promptConv: 1,
   /**
    * WebGPU: a prompt batch's recurrence chunks one after another in one
    * native dispatch (gpu/native.ts's linChunkLoop: a workgroup a value
@@ -5096,6 +5107,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return spec
   }
 
+  /** The native prompt conv for an in_proj output read as `y` in `slices` K-slices, or null where it doesn't fit. */
+  private promptConvSpec(y: "pair" | "quad", slices: number) {
+    const key = `conv ${y} ${slices}`
+    let spec = this.promptPreps.get(key)
+    if (spec === undefined) {
+      try {
+        spec = promptConv({ width: this.config.convKernel, y, slices })
+      } catch {
+        spec = null
+      }
+      this.promptPreps.set(key, spec)
+    }
+    return spec
+  }
   /** The native prompt prep for a q|k|v|gate projection read as `y` in `slices` K-slices, or null where it doesn't fit. */
   private promptPrepSpec(y: "pair" | "quad", slices: number) {
     const c = this.config
@@ -5389,27 +5414,43 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       layer.state.reverse()
       return this.project(b.convSmall, layer.outProj, b.opOut, rows)
     }
-    this.gpu.run({
-      name: "conv",
-      program: read(K.shortConv(c.convKernel)),
-      inputs: { ...bcxIn, uState: layer.state[0], uConv: layer.kernel },
-      uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
-      output: b.convOut,
-      rect: { x: 0, y: 0, width: c.hiddenSize / 8, height: rows }
-    })
-    this.gpu.run({
-      name: "conv",
-      program: read(K.convState(c.convKernel)),
-      inputs: { ...bcxIn, uState: layer.state[0] },
-      uniforms: {
-        uDt: { int: dt },
-        uM: { int: rows },
-        uSplitIn: { int: split },
-        ...this.pairIn(bcx)
-      },
-      output: layer.state[1],
-      rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
-    })
+    // A prompt batch's (a pair tensor's rows): the convolution and the
+    // state after it in one native pass (see gpu/native.ts's promptConv).
+    const batchConv = !split && rows >= c.convKernel - 1 && TUNING.promptConv > 0 && "nativeProgram" in this.gpu
+      ? this.promptConvSpec(this.quadOf(bcx) ? "quad" : "pair", this.slicing.get(bcx.id)?.split ?? 1)
+      : null
+    if (batchConv && "nativeProgram" in this.gpu) {
+      this.gpu.run({
+        name: "conv",
+        program: this.gpu.nativeProgram(batchConv),
+        inputs: { ...bcxIn, uState: layer.state[0], uConv: layer.kernel },
+        uniforms: { uDt: { int: dt }, uSliceStride: { int: this.slicing.get(bcx.id)?.stride ?? 0 } },
+        output: [b.convOut, layer.state[1]],
+        rect: { x: 0, y: 0, width: c.hiddenSize / 8, height: rows }
+      })
+    } else {
+      this.gpu.run({
+        name: "conv",
+        program: read(K.shortConv(c.convKernel)),
+        inputs: { ...bcxIn, uState: layer.state[0], uConv: layer.kernel },
+        uniforms: { uDt: { int: dt }, uSplitIn: { int: split }, ...this.pairIn(bcx) },
+        output: b.convOut,
+        rect: { x: 0, y: 0, width: c.hiddenSize / 8, height: rows }
+      })
+      this.gpu.run({
+        name: "conv",
+        program: read(K.convState(c.convKernel)),
+        inputs: { ...bcxIn, uState: layer.state[0] },
+        uniforms: {
+          uDt: { int: dt },
+          uM: { int: rows },
+          uSplitIn: { int: split },
+          ...this.pairIn(bcx)
+        },
+        output: layer.state[1],
+        rect: { x: 0, y: 0, width: dt, height: c.convKernel - 1 }
+      })
+    }
     this.convPrefixes(layer, rows, bcxIn, read, split)
     layer.state.reverse()
     return this.project(b.convOut, layer.outProj, b.opOut, rows)

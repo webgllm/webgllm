@@ -454,6 +454,142 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3
 }
 
 /**
+ * A prompt batch's short convolution and its state in one dispatch
+ * (kernels.ts's shortConv and convState, the same products and sums): from
+ * in_proj's output B | C | x (uDt texels each; a pair tensor, `y` "pair", or
+ * a 4-token matmul's two textures, "quad", in `slices` K-slices
+ * uSliceStride rows apart), z = C · Σ_k w[k] · (B·x)[t - (width-1) + k]
+ * as h2 into the first output, and the last width-1 tokens' B·x into the
+ * second (the state: f32, oldest first). A workgroup takes an h2 texel of
+ * the output and a block of tokens, a thread a row of the tensor (2 or 4
+ * tokens): B·x once a token, through workgroup memory, where every output
+ * texel of the GLSL pass multiplied its `width` tokens' again; tokens
+ * before the batch come from the state (uState). For batches of at least
+ * width-1 tokens.
+ */
+export function promptConv(o: { width: number; y: "pair" | "quad"; slices: number }): NativeSpec {
+  const quad = o.y === "quad"
+  // Tokens a row of the tensor, rows a workgroup, and the rows before a block that hold the width-1 tokens before it.
+  const T = quad ? 4 : 2
+  const L = 64
+  const W = o.width
+  const HR = Math.ceil((W - 1) / T)
+  const H = HR * T
+  if (W < 2 || HR > L) throw new Error(`No prompt conv for a kernel of ${W}.`)
+  const tk = Array.from({ length: T }, (_, t) => t)
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uBCx", kind: "u" },
+    ...(quad ? [{ name: "uBCx_B", kind: "u" as const }] : []),
+    { name: "uState", kind: "f" },
+    { name: "uConv", kind: "f" }
+  ]
+  const binding = (name: string) => inputs.findIndex((i) => i.name === name) + 1
+  const code = `
+struct Uni { rect: vec4<u32>, dt: i32, stride: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(${binding("uBCx")}) var tP: texture_2d<u32>;
+${quad ? `@group(0) @binding(${binding("uBCx_B")}) var tPB: texture_2d<u32>;` : ""}
+@group(0) @binding(${binding("uState")}) var tState: texture_2d<f32>;
+@group(0) @binding(${binding("uConv")}) var tConv: texture_2d<f32>;
+@group(0) @binding(${inputs.length + 1}) var outZ: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(${inputs.length + 2}) var outState: texture_storage_2d<rgba32float, write>;
+/* B·x of the block's tokens and the ${H} before them: token (block's first - ${H} + i)'s two texels at 2i, 2i + 1. */
+var<workgroup> Y: array<vec4<f32>, ${2 * (L * T + H)}>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* Texel x of row q's tokens (its K-slices added, as pf adds them). */
+struct Row { ${tk.map((t) => `t${t}: vec4<f32>`).join(", ")} }
+fn row(x: i32, q: i32) -> Row {
+  var r = Row();
+  for (var k = 0; k < ${Math.max(o.slices, 1)}; k++) {
+    let at = vec2<i32>(x, q + k * u.stride);
+    let a = textureLoad(tP, at, 0);
+    r.t0 += lo(a);
+    r.t1 += hi(a);${quad ? `
+    let b = textureLoad(tPB, at, 0);
+    r.t2 += lo(b);
+    r.t3 += hi(b);` : ""}
+  }
+  return r;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${L})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let l = i32(li);
+  let x = i32(w.x);
+  let c0 = 2 * x;
+  let rows = i32(u.rect.w);
+  // The block's first row of the tensor, and this thread's.
+  let q0 = i32(w.y) * ${L};
+  let q = q0 + l;
+  let m0 = ${T} * q;
+  // This row's B, x and C, texels c0 and c0 + 1.
+  let B0 = row(c0, q);
+  let B1 = row(c0 + 1, q);
+  let X0 = row(2 * u.dt + c0, q);
+  let X1 = row(2 * u.dt + c0 + 1, q);
+  let C0 = row(u.dt + c0, q);
+  let C1 = row(u.dt + c0 + 1, q);
+${tk.map((t) => `  let y0_${t} = B0.t${t} * X0.t${t};
+  let y1_${t} = B1.t${t} * X1.t${t};
+  Y[2 * (${H} + ${T} * l + ${t})] = y0_${t};
+  Y[2 * (${H} + ${T} * l + ${t}) + 1] = y1_${t};`).join("\n")}
+  // The ${H} tokens before the block (its first threads take a row of them each): the batch's, or the state's.
+  if (l < ${HR}) {
+    let qh = q0 - ${HR} + l;
+    if (qh >= 0) {
+      let b0 = row(c0, qh);
+      let b1 = row(c0 + 1, qh);
+      let x0 = row(2 * u.dt + c0, qh);
+      let x1 = row(2 * u.dt + c0 + 1, qh);
+${tk.map((t) => `      Y[2 * (${T} * l + ${t})] = b0.t${t} * x0.t${t};
+      Y[2 * (${T} * l + ${t}) + 1] = b1.t${t} * x1.t${t};`).join("\n")}
+    } else {
+${tk.map((t) => `      {
+        // Token ${T} * qh + ${t} (before the batch): the state's row ${W - 1} + it, if it holds it.
+        let s = ${W - 1} + ${T} * qh + ${t};
+        Y[2 * (${T} * l + ${t})] = select(vec4<f32>(0.0), textureLoad(tState, vec2<i32>(c0, s), 0), s >= 0);
+        Y[2 * (${T} * l + ${t}) + 1] = select(vec4<f32>(0.0), textureLoad(tState, vec2<i32>(c0 + 1, s), 0), s >= 0);
+      }`).join("\n")}
+    }
+  }
+  workgroupBarrier();
+${Array.from({ length: W }, (_, k) => `  let w0_${k} = textureLoad(tConv, vec2<i32>(c0, ${k}), 0);
+  let w1_${k} = textureLoad(tConv, vec2<i32>(c0 + 1, ${k}), 0);`).join("\n")}
+${tk.map((t) => `  if (m0 + ${t} < rows) {
+    // Token m0 + ${t}: taps from ${W - 1} tokens back to its own (Y's index of token m is ${H} + m - ${T} * q0).
+    let at = 2 * (${H} + ${T} * l + ${t} - ${W - 1});
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+${Array.from({ length: W }, (_, k) => `    a0 = fma(w0_${k}, Y[at + ${2 * k}], a0);
+    a1 = fma(w1_${k}, Y[at + ${2 * k + 1}], a1);`).join("\n")}
+    textureStore(outZ, vec2<i32>(x, m0 + ${t}), h2(C0.t${t} * a0, C1.t${t} * a1));
+    // The batch's last ${W - 1} tokens are the state after it.
+    let i = m0 + ${t} - (rows - ${W - 1});
+    if (i >= 0) {
+      textureStore(outState, vec2<i32>(c0, i), y0_${t});
+      textureStore(outState, vec2<i32>(c0 + 1, i), y1_${t});
+    }
+  }`).join("\n")}
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uDt", type: "int" },
+      { name: "uSliceStride", type: "int" }
+    ],
+    // A workgroup an h2 texel of the output and a block of the tensor's rows.
+    groups: (rect) => [rect.width, Math.ceil(rect.height / (L * T))]
+  }
+}
+
+/**
  * A prompt batch's attention inputs in one dispatch (kernels.ts's headPrep
  * for the queries and for the keys, and its `values`: three passes, each
  * texel summing its head's squares for itself): a workgroup a head of a
