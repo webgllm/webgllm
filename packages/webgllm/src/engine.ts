@@ -192,6 +192,8 @@ export const TUNING = {
    * Pro Max 0 to 2% slower.
    */
   gemmColumnBands: 1,
+  /** 1: WebGL's prompt matmuls are paced in bands of 32 columns, every token in each, as gemmColumnBands. */
+  glColumnBands: 0,
   /**
    * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
    * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
@@ -4645,7 +4647,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
               },
               // (Per K texel: 4 rows' weights and 4 tokens' activations.)
               work: kqSlice * 8,
-              ...(nativeMultiply && TUNING.gemmColumnBands > 0 && { bandColumns: 16 })
+              ...(nativeMultiply ? TUNING.gemmColumnBands > 0 && { bandColumns: 16 } : this.glColumnBands())
             })
           }
         }
@@ -4667,7 +4669,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           output: [out, partner],
           rect: { x: 0, y: 0, width: w.groups, height: quadRows * slices },
           // (Per block: 4 rows' weights and 4 tokens' activations.)
-          work: kbSlice * 40
+          work: kbSlice * 40,
+          ...this.glColumnBands()
         })
         this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
         return
@@ -4696,7 +4699,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         },
         output: out,
         rect: { x: 0, y: 0, width, height: pairRows * slices },
-        work: Math.ceil(w.blocks / slices) * 24
+        work: Math.ceil(w.blocks / slices) * 24,
+        ...this.glColumnBands()
       })
       this.slicing.set(out.id, { split: slices, stride: pairRows })
       return
@@ -4712,7 +4716,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         uniforms: { ...shape, uWidth: { int: w.quants.width } },
         output: out,
         rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
-        work: w.blocks * 24
+        work: w.blocks * 24,
+        ...this.glColumnBands()
       })
       return
     }
@@ -4734,7 +4739,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uniforms: shape,
       output: out,
       rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
-      work: w.blocks * 24
+      work: w.blocks * 24,
+      ...this.glColumnBands()
     })
   }
 
@@ -4955,6 +4961,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!((w.bits === 4 || w.bits === 8) && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels)) return
     w.stored = this.gpu.toStorage(w.quants)
     if (w.stored) this.gpu.delete(w.quants)
+  }
+  /** WebGL's prompt matmuls (rows of tokens) paced in bands of columns, every token in each (TUNING.glColumnBands). */
+  private glColumnBands() {
+    return TUNING.glColumnBands > 0 && !("nativeProgram" in this.gpu) ? { bandColumns: 32 } : {}
   }
   private bufferSpecs = new Map<string, NativeSpec>()
   private promptSpec: NativeSpec | undefined

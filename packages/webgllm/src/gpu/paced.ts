@@ -226,7 +226,8 @@ export abstract class PacedGpu<F> {
       this.sliceCalibrates = true
       await this.pace(1, true, work)
     }
-    if (pass.bandColumns && maxRows === Infinity) {
+    // (Prompts only: a token's one-row passes keep the row path's pacing.)
+    if (pass.bandColumns && maxRows === Infinity && rect.height >= 8) {
       const q = pass.bandColumns
       const perCol = rect.height * Math.max(1, pass.work ?? 1)
       // (At least a band's floor of texels, in whole multiples of q.)
