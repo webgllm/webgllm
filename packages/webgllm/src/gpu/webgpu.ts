@@ -26,6 +26,8 @@ type Variant = {
   layout: GPUBindGroupLayout
   workgroup: [number, number]
   id: number
+  /** What made the pipeline: made again, at once, by a pass that can't wait for it (see deferPipelines). */
+  descriptor?: GPUComputePipelineDescriptor
 }
 
 /**
@@ -43,7 +45,7 @@ export type NativeSpec = {
 
 type NativeProgram = Program & {
   native: NativeSpec
-  pipelines: Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout; id: number }>
+  pipelines: Map<string, { pipeline: GPUComputePipeline; layout: GPUBindGroupLayout; id: number; descriptor?: GPUComputePipelineDescriptor }>
   values: Map<string, Value>
 }
 
@@ -313,6 +315,20 @@ export class WebGpu extends PacedGpu<Fence> {
   deferPipelines = false
   private pendingPipelines: Array<Promise<unknown>> = []
 
+  /** Whether pipelines deferPipelines asked for are still compiling. */
+  get compiling() {
+    return this.pendingPipelines.length > 0
+  }
+
+  /**
+   * `x`'s pipeline: made at once if it's still compiling in the background
+   * and a pass needs it now (outside deferPipelines, where it can't wait).
+   */
+  private pipelineOf(x: { pipeline: GPUComputePipeline; descriptor?: GPUComputePipelineDescriptor }): GPUComputePipeline | undefined {
+    if (!x.pipeline && !this.deferPipelines && x.descriptor) x.pipeline = this.device.createComputePipeline(x.descriptor)
+    return x.pipeline
+  }
+
   /** Waits for the pipelines deferPipelines left compiling. */
   async settlePipelines() {
     const pending = this.pendingPipelines
@@ -375,11 +391,12 @@ export class WebGpu extends PacedGpu<Fence> {
     )
     const layout = device.createBindGroupLayout({ entries })
     const module = device.createShaderModule({ code: t.code })
-    const made: Variant = { t, formats, rgba4, unroll, pipeline: undefined as unknown as GPUComputePipeline, layout, workgroup: t.workgroup, id: this.nextVariant++ }
-    const pipeline = this.makePipeline({
+    const descriptor = {
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       compute: { module, entryPoint: "main" }
-    }, (p) => { made.pipeline = p })
+    }
+    const made: Variant = { t, formats, rgba4, unroll, pipeline: undefined as unknown as GPUComputePipeline, layout, workgroup: t.workgroup, id: this.nextVariant++, descriptor }
+    const pipeline = this.makePipeline(descriptor, (p) => { made.pipeline ??= p })
     if (pipeline) made.pipeline = pipeline
     v = made
     program.variants.set(key, v)
@@ -425,11 +442,12 @@ export class WebGpu extends PacedGpu<Fence> {
       formats.forEach((format, i) =>
         entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
       const layout = this.device.createBindGroupLayout({ entries })
-      const made = { pipeline: undefined as unknown as GPUComputePipeline, layout, id: this.nextVariant++ }
-      const pipeline = this.makePipeline({
+      const descriptor = {
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         compute: { module: this.device.createShaderModule({ code: spec.code }), entryPoint: "main" }
-      }, (q) => { made.pipeline = q })
+      }
+      const made = { pipeline: undefined as unknown as GPUComputePipeline, layout, id: this.nextVariant++, descriptor }
+      const pipeline = this.makePipeline(descriptor, (q) => { made.pipeline ??= q })
       if (pipeline) made.pipeline = pipeline
       p = made
       program.pipelines.set(key, p)
@@ -470,7 +488,7 @@ export class WebGpu extends PacedGpu<Fence> {
     })
     const offset = this.pushUniforms(new Uint8Array(block), rect.x, rect.y, rect.width, rect.height)
     if (this.profile && !WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed(`native ${pass.name ?? ""} ${rect.width}x${rect.height}`)
-    const cpass = this.computePassFor(p.pipeline)
+    const cpass = this.computePassFor(this.pipelineOf(p))
     cpass.setBindGroup(0, group, [offset])
     this.markGpuWork()
     cpass.dispatchWorkgroups(...spec.groups(rect))
@@ -735,7 +753,7 @@ export class WebGpu extends PacedGpu<Fence> {
         const height = Math.min(rowsPerBand, rect.y + rect.height - y)
         const offset = this.pushUniforms(block, rect.x, y, rect.width, height)
         if (this.profile && !WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed(`${pass.name ?? ""} ${rect.width}x${height}`)
-        const cpass = this.computePassFor(v.pipeline)
+        const cpass = this.computePassFor(this.pipelineOf(v))
         cpass.setBindGroup(0, group, [offset])
         this.markGpuWork()
         if (v.t.lanes > 1) cpass.dispatchWorkgroups(Math.ceil(rect.width / wy), height)
@@ -802,7 +820,7 @@ export class WebGpu extends PacedGpu<Fence> {
     if (!merged) {
       for (const q of g) {
         const offset = this.pushUniforms(q.block, q.rect.x, q.rect.y, q.rect.width, q.rect.height)
-        const cpass = this.computePassFor(q.v.pipeline)
+        const cpass = this.computePassFor(this.pipelineOf(q.v))
         cpass.setBindGroup(0, this.bindGroup(q.v, q.inputs, q.outputs), [offset])
         this.markGpuWork()
         const [wx, wy] = q.v.workgroup
@@ -1026,7 +1044,13 @@ export class WebGpu extends PacedGpu<Fence> {
 
   protected deleteFence() {}
 
+  async pace(ahead: number, messages = false, reads = 0, layers = 0) {
+    if (this.deferPipelines) return
+    return super.pace(ahead, messages, reads, layers)
+  }
+
   protected async wait(fence: Fence | null, budget: SubmissionBudget = this.submissionBudget, at = performance.now()) {
+    if (this.deferPipelines) return
     if (this.lost) throw new GpuError("The GPU device was lost.")
     if (!fence || fence.done) return
     budget.waiting(at)
@@ -1092,6 +1116,8 @@ export class WebGpu extends PacedGpu<Fence> {
     if (texture.internal !== GL.RGBA32F)
       throw new Error(`Can't read back a texture of format ${texture.internal} as floats.`)
     const out = new Float32Array(rect.width * rect.height * 4)
+    // (Nothing ran while pipelines are deferred: nothing to wait for.)
+    if (this.deferPipelines) return Object.assign(async () => out, { cancel: () => undefined })
     const { buffer, bytes } = this.copyOut(texture, rect)
     const budget = this.submissionBudget, at = performance.now()
     let freed = false
@@ -1119,6 +1145,7 @@ export class WebGpu extends PacedGpu<Fence> {
 
   /** A whole RGBA32F or RGBA32UI texture's bytes (see gl.ts). */
   async readBytes(texture: Texture): Promise<Uint8Array> {
+    if (this.deferPipelines) return new Uint8Array(texture.width * texture.height * 16)
     if (texture.internal !== GL.RGBA32UI && texture.internal !== GL.RGBA32F)
       throw new Error(`Can't read back a texture of format ${texture.internal}.`)
     const out = new Uint8Array(texture.width * texture.height * 16)

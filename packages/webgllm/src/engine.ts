@@ -3771,12 +3771,48 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           this.gpu.deferPipelines = false
           await this.gpu.settlePipelines()
         }
+        // Full draft batches' pipelines go on compiling after the load (the
+        // next forward waits for any still compiling): awaited here they
+        // cost a Pixel 10 Pro 330 ms more load; left to its first draft
+        // batch, 9 programs compiled mid-reply.
+        if (!options.shortOnly && this.canDraft) {
+          this.reset()
+          this.gpu.deferPipelines = true
+          try {
+            await this.warmDraftBatches()
+          } finally {
+            this.gpu.deferPipelines = false
+          }
+        }
       } else await steps()
     } finally {
       this.layers = all
       // (Per-layer work for pacing, counted over the subset.)
       this.work = null
       this.reset()
+    }
+  }
+
+  /** A full draft batch, plain and with chunked attention, its rows read both ways with a guess (see warmUp). */
+  private async warmDraftBatches() {
+    const rows = Math.min(SPLIT_ROWS, this.contextLength - 1)
+    await this.forwardHidden(new Array<number>(rows).fill(0), { draft: true })
+    await this.pick(0, rows, 1, 1, [], true)
+    this.dropGuess()
+    await this.argmax(0, rows, 1, [], true)
+    this.dropGuess()
+    this.accept(1)
+    if (TUNING.attendChunkTexels > 0) {
+      const saved = [TUNING.attendChunkTexels, TUNING.attendChunkTexelsDecode, TUNING.flashPast]
+      TUNING.attendChunkTexels = TUNING.attendChunkTexelsDecode = 1
+      TUNING.flashPast = 0
+      try {
+        this.reset()
+        await this.forwardHidden(new Array<number>(rows).fill(0), { draft: true })
+        this.accept(1)
+      } finally {
+        ;[TUNING.attendChunkTexels, TUNING.attendChunkTexelsDecode, TUNING.flashPast] = saved
+      }
     }
   }
 
@@ -3811,8 +3847,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     if (this.canDraft) {
       await this.forwardHidden(fit(2), { draft: true })
-      step("draft")
       this.accept(1)
+      step("draft")
     }
     await this.logits(await this.forwardHidden(fit(1)))
     step("token")
@@ -6052,6 +6088,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       prefixAt?: number
     } = {}
   ): Promise<number> {
+    // Pipelines the warm-up left compiling (see warmUp): done before this reads.
+    if ("compiling" in this.gpu && this.gpu.compiling && !this.gpu.deferPipelines) await this.gpu.settlePipelines()
     if (options.draft) return this.forwardDraft(Array.from(tokens))
     if (this.guessAt !== null)
       throw new Error("Forward while a guessed token is pending.")
