@@ -770,3 +770,164 @@ ${o.gate === "dim"
     groups: (rect) => [rect.width, 1]
   }
 }
+
+/**
+ * A few tokens' 4-bit matvec from weights in a storage buffer (WebGpu.toStorage
+ * of the byte texels: the texture's rows one after another), into a split
+ * matmul's partial sums as one slice: a workgroup a row group (x) and token
+ * (y), its threads striding over the K blocks so that neighbours read
+ * neighbouring bytes, then the workgroup's sum. Texture reads top out far
+ * below buffer reads on some GPUs (an M3 Ultra's byte texels ~300-390 GB/s,
+ * its buffers past 600). Row r's block is 16 bytes: byte i of word w holds
+ * weight 4w + i in its low nibble and 16 + 4w + i in its high one; zero
+ * points are 8. `normed`: "weights" reads the f32 residual times the norm
+ * weights (uNorm), "prescaled" the add's h2(x · weights / 32) at column
+ * uAOff of uA; either way the sums are times the row's 1 / RMS, from uR's
+ * partial sums of squares (kernels.ts's matmulSplitRgba4 alike).
+ */
+export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: number; format: "rgba16float" | "rgba32float" }): NativeSpec {
+  const weights = o.normed === "weights"
+  const rms = !!o.normed
+  const A = weights
+    ? Array.from({ length: 8 }, (_, j) => `    let A${j} = textureLoad(tA, vec2<i32>(kb * 8 + ${j}, m), 0) * textureLoad(tNorm, vec2<i32>(kb * 8 + ${j}, 0), 0);`).join("\n")
+    : [0, 1, 2, 3].map((j) => `    let a${j} = textureLoad(tA, vec2<i32>(u.aOff + kb * 4 + ${j}, m), 0);
+    let A${2 * j} = lo(a${j});
+    let A${2 * j + 1} = hi(a${j});`).join("\n")
+  const rows = [0, 1, 2, 3].map((r) => `    {
+      let q = bW[base + kb * 4 + ${r}];
+      let L0 = vec4<f32>((vec4<u32>(q.x) >> SL) & vec4<u32>(15u)); let H0 = vec4<f32>((vec4<u32>(q.x) >> SH) & vec4<u32>(15u));
+      let L1 = vec4<f32>((vec4<u32>(q.y) >> SL) & vec4<u32>(15u)); let H1 = vec4<f32>((vec4<u32>(q.y) >> SH) & vec4<u32>(15u));
+      let L2 = vec4<f32>((vec4<u32>(q.z) >> SL) & vec4<u32>(15u)); let H2 = vec4<f32>((vec4<u32>(q.z) >> SH) & vec4<u32>(15u));
+      let L3 = vec4<f32>((vec4<u32>(q.w) >> SL) & vec4<u32>(15u)); let H3 = vec4<f32>((vec4<u32>(q.w) >> SH) & vec4<u32>(15u));
+      b.${"xyzw"[r]} = dot(L0, A0) + dot(L1, A1) + dot(L2, A2) + dot(L3, A3) + dot(H0, A4) + dot(H1, A5) + dot(H2, A6) + dot(H3, A7);
+    }`).join("\n")
+  const code = `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<${weights ? "f32" : "u32"}>;
+@group(0) @binding(2) var tS: texture_2d<f32>;
+${weights ? "@group(0) @binding(3) var tNorm: texture_2d<f32>;" : ""}
+${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
+@group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 1}) var<storage, read> bW: array<vec4<u32>>;
+@group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 2}) var out0: texture_storage_2d<${o.format}, write>;
+var<workgroup> red: array<vec4<f32>, ${o.wg}>;
+const SL = vec4<u32>(0u, 8u, 16u, 24u);
+const SH = vec4<u32>(4u, 12u, 20u, 28u);
+fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
+fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
+@compute @workgroup_size(${o.wg})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let g = i32(w.x);
+  let m = i32(w.y);
+  let col = g / u.h;
+  let gr = g - col * u.h;
+  let base = (gr * u.width + col * u.rowTexels) / 4;
+  let sx = col * u.kb;
+  var acc = vec4<f32>(0.0);
+  for (var kb = i32(l); kb < u.kb; kb += ${o.wg}) {
+    let d = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+${A}
+    let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4<f32>(1.0));
+    var b = vec4<f32>(0.0);
+${rows}
+    acc += d * (b - 8.0 * sa);
+  }
+  red[l] = acc;
+  workgroupBarrier();
+  for (var st = ${o.wg / 2}u; st > 0u; st >>= 1u) {
+    if (l < st) { red[l] += red[l + st]; }
+    workgroupBarrier();
+  }
+  if (l == 0u) {
+    var r = red[0];
+${rms ? `    var s = vec4<f32>(0.0);
+    for (var p = 0; p < u.parts; p++) { s += textureLoad(tR, vec2<i32>(u.rOff + p, m), 0); }
+    r *= inverseSqrt(dot(s, vec4<f32>(1.0)) / f32(u.texels * 4) + u.eps)${o.normed === "prescaled" ? " * 32.0" : ""};` : ""}
+    textureStore(out0, vec2<i32>(g + i32(u.rect.x), m), r);
+  }
+}`
+  return {
+    code,
+    inputs: [
+      { name: "uA", kind: weights ? "f" : "u" },
+      { name: "uS", kind: "f" },
+      ...(weights ? [{ name: "uNorm", kind: "f" as const }] : []),
+      ...(rms ? [{ name: "uR", kind: "f" as const }] : [])
+    ],
+    buffers: [{ name: "uW" }],
+    uniforms: [
+      { name: "uKb", type: "int" },
+      { name: "uH", type: "int" },
+      { name: "uRowTexels", type: "int" },
+      { name: "uWidth", type: "int" },
+      { name: "uAOff", type: "int" },
+      { name: "uROff", type: "int" },
+      { name: "uTexels", type: "int" },
+      { name: "uParts", type: "int" },
+      { name: "uEps", type: "float" }
+    ],
+    groups: (rect) => [rect.width, rect.height]
+  }
+}
+
+/**
+ * kernels.ts's dequantBytes (no zero points: 8) from weights in a storage
+ * buffer (see bufferMatvec): output texel x of the f16 layout, or with `h2`
+ * texels 2x' and 2x' + 1 of each column as one h2 texel x'.
+ */
+export function bufferDequant(o: { h2: boolean }): NativeSpec {
+  const code = `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> bW: array<u32>;
+@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;
+fn deq(x: i32, y: i32) -> vec4<f32> {
+  let c = x / u.kq;
+  let kq = x - c * u.kq + u.kq0;
+  var row = c * u.hd + y;
+  if (row >= u.n) { return vec4<f32>(0.0); }
+  row += u.row0;
+  let g = row / 4;
+  let r = row - g * 4;
+  let col = g / u.h;
+  let gr = g - col * u.h;
+  let kb = kq / 8;
+  let j = kq - kb * 8;
+  let word = bW[gr * u.width + col * u.rowTexels + kb * 16 + r * 4 + (j & 3)];
+  let b = (vec4<u32>(word) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
+  let q = vec4<f32>(select(b >> vec4<u32>(4u), b & vec4<u32>(15u), j < 4));
+  let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];
+  return (q - 8.0) * d;
+}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= u.rect.z || id.y >= u.rect.w) { return; }
+  let p = vec2<i32>(id.xy + u.rect.xy);
+${o.h2
+    ? `  let hk = u.kq >> 1u;
+  let c = p.x / hk;
+  let x = c * u.kq + 2 * (p.x - c * hk);
+  let a = clamp(deq(x, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(deq(x + 1, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  textureStore(out0, p, vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw)));`
+    : `  textureStore(out0, p, deq(p.x, p.y));`}
+}`
+  return {
+    code,
+    inputs: [{ name: "uS", kind: "f" }],
+    buffers: [{ name: "uW" }],
+    uniforms: [
+      { name: "uKb", type: "int" },
+      { name: "uH", type: "int" },
+      { name: "uRowTexels", type: "int" },
+      { name: "uWidth", type: "int" },
+      { name: "uKq", type: "int" },
+      { name: "uKq0", type: "int" },
+      { name: "uHd", type: "int" },
+      { name: "uN", type: "int" },
+      { name: "uRow0", type: "int" }
+    ],
+    groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
+  }
+}

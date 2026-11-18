@@ -39,6 +39,8 @@ type Variant = {
 export type NativeSpec = {
   code: string
   inputs: Array<{ name: string; kind: "f" | "u" }>
+  /** Storage buffers it reads (see toStorage), bound after the textures as read-only storage. */
+  buffers?: Array<{ name: string }>
   uniforms: Array<{ name: string; type: "int" | "float" }>
   groups: (rect: { width: number; height: number }) => [number, number]
 }
@@ -85,8 +87,11 @@ function formatOf(internal: number) {
 }
 
 /** WebGPU's flag values (the global namespaces aren't in TypeScript's DOM types, nor in Node). */
-const BUFFER = { MAP_READ: 1, COPY_SRC: 4, COPY_DST: 8, UNIFORM: 64, QUERY_RESOLVE: 512 }
+const BUFFER = { MAP_READ: 1, COPY_SRC: 4, COPY_DST: 8, UNIFORM: 64, STORAGE: 128, QUERY_RESOLVE: 512 }
 const TEXTURE = { COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8 }
+
+/** The internal format of a storage buffer in a texture's place (see WebGpu.toStorage). */
+export const STORAGE_BUFFER = -1
 const COMPUTE = 4
 const MAP_READ = 1
 
@@ -189,7 +194,7 @@ export class WebGpu extends PacedGpu<Fence> {
   private computePass: GPUComputePassEncoder | null = null
   /** Buffers and textures to destroy once the submission that uses them is sent. */
   private transient: Array<GPUBuffer> = []
-  private doomed: Array<GPUTexture> = []
+  private doomed: Array<GPUTexture | GPUBuffer> = []
   /** Uniform blocks of the submission being built (copied to `uniformBuffer` at submit). */
   private ring = new Uint8Array(1 << 20)
   private ringUsed = 0
@@ -408,7 +413,7 @@ export class WebGpu extends PacedGpu<Fence> {
   nativeProgram(spec: NativeSpec): NativeProgram {
     const cached = this.natives.get(spec.code)
     if (cached) return cached
-    const program: NativeProgram = { native: spec, pipelines: new Map(), values: new Map(), samplers: spec.inputs.map((i) => i.name) }
+    const program: NativeProgram = { native: spec, pipelines: new Map(), values: new Map(), samplers: [...spec.inputs, ...(spec.buffers ?? [])].map((i) => i.name) }
     this.natives.set(spec.code, program)
     return program
   }
@@ -427,6 +432,7 @@ export class WebGpu extends PacedGpu<Fence> {
   private runNative(pass: Pass, program: NativeProgram) {
     this.flushQueue()
     const spec = program.native
+    const buffers = spec.buffers ?? []
     const outputs = Array.isArray(pass.output) ? pass.output : [pass.output]
     const rect = pass.rect ?? { x: 0, y: 0, width: outputs[0].width, height: outputs[0].height }
     const formats = outputs.map((o) => formatOf(o.internal).format)
@@ -439,8 +445,10 @@ export class WebGpu extends PacedGpu<Fence> {
       ]
       spec.inputs.forEach((s, i) =>
         entries.push({ binding: i + 1, visibility: COMPUTE, texture: { sampleType: s.kind === "u" ? "uint" : "unfilterable-float" } }))
+      buffers.forEach((_, i) =>
+        entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, buffer: { type: "read-only-storage" } }))
       formats.forEach((format, i) =>
-        entries.push({ binding: spec.inputs.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
+        entries.push({ binding: spec.inputs.length + buffers.length + 1 + i, visibility: COMPUTE, storageTexture: { access: "write-only", format } }))
       const layout = this.device.createBindGroupLayout({ entries })
       const descriptor = {
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
@@ -453,7 +461,7 @@ export class WebGpu extends PacedGpu<Fence> {
       program.pipelines.set(key, p)
       this.count(`native ${spec.code.slice(0, 40)}`, performance.now() - started)
     }
-    const inputs = spec.inputs.map(({ name }) => {
+    const inputs = [...spec.inputs, ...buffers].map(({ name }) => {
       const t = pass.inputs[name]
       if (!t) throw new GpuError(`Pass is missing input ${name}.`)
       return t
@@ -468,7 +476,7 @@ export class WebGpu extends PacedGpu<Fence> {
     let group = this.bindGroups.get(key2)
     if (!group) {
       const entries: Array<GPUBindGroupEntry> = [{ binding: 0, resource: { buffer: this.uniformBuffer, size: this.nativeBytes(spec) } }]
-      inputs.forEach((t, i) => entries.push({ binding: i + 1, resource: (t.tex as GPUTexture).createView() }))
+      inputs.forEach((t, i) => entries.push({ binding: i + 1, resource: t.internal === STORAGE_BUFFER ? { buffer: t.tex as GPUBuffer } : (t.tex as GPUTexture).createView() }))
       outputs.forEach((t, i) => entries.push({ binding: inputs.length + 1 + i, resource: (t.tex as GPUTexture).createView() }))
       group = this.device.createBindGroup({ layout: p.layout, entries })
       this.bindGroups.set(key2, group)
@@ -601,9 +609,37 @@ export class WebGpu extends PacedGpu<Fence> {
     this.writers.delete(texture.id)
     this.groupsByTexture.delete(texture.id)
     // (Passes issued and not yet submitted may read it: destroyed after they're sent.)
-    if (this.encoder) this.doomed.push(texture.tex as GPUTexture)
-    else (texture.tex as GPUTexture).destroy()
+    if (this.encoder) this.doomed.push(texture.tex as GPUTexture | GPUBuffer)
+    else (texture.tex as GPUTexture | GPUBuffer).destroy()
     if (this.live.delete(texture)) this.bytes -= texture.bytes
+  }
+
+  /**
+   * A copy of `texture`'s bytes in a storage buffer, row after row, for
+   * native passes that read it as an array (NativeSpec.buffers), after the
+   * passes issued so far; null where a row isn't a whole multiple of 256
+   * bytes (a texture-to-buffer copy's alignment).
+   */
+  toStorage(texture: Texture): Texture | null {
+    const rowBytes = texture.width * formatOf(texture.internal).bytes
+    if (rowBytes % 256) return null
+    const bytes = rowBytes * texture.height
+    this.device.pushErrorScope("out-of-memory")
+    const buffer = this.device.createBuffer({ size: bytes, usage: BUFFER.STORAGE | BUFFER.COPY_DST })
+    void this.device.popErrorScope().then((e) => {
+      if (e) this.oom = true
+    })
+    this.endComputePass()
+    this.commands().copyTextureToBuffer(
+      { texture: texture.tex as GPUTexture },
+      { buffer, bytesPerRow: rowBytes },
+      { width: texture.width, height: texture.height }
+    )
+    this.touched.set(texture.id, this.generation)
+    this.bytes += bytes
+    const stored: Texture = { id: this.nextId++, tex: buffer, width: texture.width, height: texture.height, internal: STORAGE_BUFFER, bytes }
+    this.live.add(stored)
+    return stored
   }
 
   /** Whether passes can write textures of these formats at once (one output each). */

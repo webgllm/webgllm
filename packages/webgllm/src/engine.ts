@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -55,6 +55,8 @@ type GpuMatrix = {
   /** Quant texels per row group in one column. */
   rowTexels: number
   quants: Texture
+  /** The quants in a storage buffer for the native buffer matvec (see TUNING.bufferMatvec); null where they can't be. */
+  stored?: Texture | null
   /** Q6_K embedding texture panels, including quants as the first. */
   quantPanels?: Array<Texture>
   q6Expanded?: boolean
@@ -144,6 +146,14 @@ export const TUNING = {
   nativePrep: 1,
   /** WebGPU: the pick's chunk maxima and argmax as native passes, a workgroup a chunk and a row (gpu/native.ts's chunkMax). */
   nativePick: 1,
+  /**
+   * WebGPU, where the workgroups' lanes share K loops (the tuned lanes): a
+   * few tokens' 4-bit byte matvecs from a storage buffer copy of their
+   * weights (gpu/native.ts's bufferMatvec)...
+   */
+  bufferMatvec: 1,
+  /** ...this many threads a row group. */
+  bufferMatvecThreads: 64,
   /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
   nativeAttend: 1,
   /** ...in chunks of this many keys (a workgroup's threads). */
@@ -1571,6 +1581,22 @@ export class Engine {
     stop: () => boolean = () => false,
     options: { keepCache?: boolean; alreadyBusy?: boolean } = {}
   ): Promise<Tuned | null> {
+    this.tuning = true
+    try {
+      // (Through the prototype: tests call tune on a stand-in engine.)
+      return await Engine.prototype.tuneChoices.call(this, stop, options)
+    } finally {
+      this.tuning = false
+    }
+  }
+
+  /** Whether tune is timing choices (storedQuants copies nothing meanwhile). */
+  private tuning = false
+
+  private async tuneChoices(
+    stop: () => boolean,
+    options: { keepCache?: boolean; alreadyBusy?: boolean }
+  ): Promise<Tuned | null> {
     const before = { ...this.tuned }
     this.tuned = {
       shortSplit: null,
@@ -1935,7 +1961,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
         prefill = await this.layoutPrefill(made)
     } finally {
       for (const gm of made)
-        for (const texture of [gm.quants, gm.scales, gm.zeros]) if (texture) this.gpu.delete(texture)
+        for (const texture of [gm.quants, gm.scales, gm.zeros, gm.stored]) if (texture) this.gpu.delete(texture)
       for (const texture of scratch) this.gpu.delete(texture)
     }
     // Native storage must win in both phases and both decode rounds.
@@ -4424,6 +4450,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             }
           })
         }
+        // (Weights copied to a storage buffer: the native dequant reads them there; see storedQuants.)
+        const stored = this.storedQuants(w)
+        const storedDequant = stored
+          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W))
+          : null
         const dequant = this.gpu.program(
           w.rgba4
             ? this.scalesOf(
@@ -4458,16 +4489,19 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             const n = Math.min(plan.rows, w.N - r0)
             await this.gpu.runAsync({
               name: "dequant",
-              program: dequant,
-              inputs: {
-                uW: w.quants,
-                uS: w.scales,
-                ...(w.zeros && { uZ: w.zeros })
-              },
+              program: stored ? storedDequant! : dequant,
+              inputs: stored
+                ? { uW: stored, uS: w.scales }
+                : {
+                    uW: w.quants,
+                    uS: w.scales,
+                    ...(w.zeros && { uZ: w.zeros })
+                  },
               uniforms: {
                 uKb: { int: w.blocks },
                 uH: { int: w.rowsPerColumn },
                 uRowTexels: { int: w.rowTexels },
+                uWidth: { int: w.quants.width },
                 uKq: { int: kqW },
                 uKq0: { int: kq0 },
                 uHd: { int: f.hd },
@@ -4616,6 +4650,38 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uRowTexels: { int: w.rowTexels },
       uG: { int: w.groups }
     }
+    const stored = this.storedQuants(w)
+    if (stored) {
+      const gpu = this.gpu as unknown as { nativeProgram(spec: NativeSpec): unknown }
+      const format = this.buffers.partial.internal === GL.RGBA16F ? "rgba16float" : "rgba32float"
+      const normed = !norm ? false : norm === "prescaled" ? norm : "weights"
+      const key = `${normed} ${format} ${TUNING.bufferMatvecThreads}`
+      let spec = this.bufferSpecs.get(key)
+      if (!spec) this.bufferSpecs.set(key, (spec = bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format })))
+      this.gpu.run({
+        name: "matmul",
+        program: gpu.nativeProgram(spec) as Program,
+        inputs: !norm
+          ? { uA: a, uS: w.scales, uW: stored }
+          : norm === "prescaled"
+            ? { uA: this.scaledOf(a), uS: w.scales, uR: a, uW: stored }
+            : { uA: a, uS: w.scales, uNorm: norm, uR: a, uW: stored },
+        uniforms: {
+          uKb: { int: w.blocks },
+          uH: { int: w.rowsPerColumn },
+          uRowTexels: { int: w.rowTexels },
+          uWidth: { int: w.quants.width },
+          uAOff: { int: norm === "prescaled" ? this.config.hiddenSize / 4 + K.RMS_PARTS : 0 },
+          uROff: { int: this.config.hiddenSize / 4 },
+          uTexels: { int: this.config.hiddenSize / 4 },
+          uParts: { int: norm === "prescaled" && this.sumsInOne(a) ? 1 : this.parts },
+          uEps: this.config.normEps
+        },
+        output: this.buffers.partial,
+        rect: { x: x0, y: 0, width: w.groups, height: rows }
+      })
+      return 1
+    }
     {
       const split = Math.max(
         1,
@@ -4731,6 +4797,32 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
   }
   private pickSpecs = new Map<string, NativeSpec>()
+
+  /**
+   * w's quants in a storage buffer for bufferMatvec (copied on first use),
+   * or null: not on WebGL, nor without shared K loops, nor for weights other
+   * than 4-bit bytes with zero points of 8.
+   */
+  private storedQuants(w: GpuMatrix): Texture | null {
+    if (w.stored !== undefined) return w.stored
+    // (Not while tune times the lanes both ways: a GPU that keeps neither
+    // copy's work shouldn't hold the weights twice.)
+    if (TUNING.bufferMatvec <= 0 || this.tuning || !("toStorage" in this.gpu) || (this.tuned.lanes ?? TUNING.lanes) <= 0) return null
+    const fits = w.bits === 4 && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels
+    w.stored = fits ? this.gpu.toStorage(w.quants) : null
+    // The texture goes (after the copy: the GPU destroys it once the
+    // commands reading it are sent): every pass reading these weights
+    // reads the buffer from now on (splitPartials, matmul's dequant).
+    if (w.stored) this.gpu.delete(w.quants)
+    return w.stored
+  }
+  private bufferSpecs = new Map<string, NativeSpec>()
+  private bufferDequantSpec(h2: boolean) {
+    const key = `dequant ${h2}`
+    let spec = this.bufferSpecs.get(key)
+    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2 })))
+    return spec
+  }
 
   /** The native attention's partial sums (see flashChunks). */
   private flashPartial: Texture | null = null
