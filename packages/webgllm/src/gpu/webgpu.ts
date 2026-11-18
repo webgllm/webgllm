@@ -1044,7 +1044,7 @@ export class WebGpu extends PacedGpu<Fence> {
 
   protected deleteFence() {}
 
-  async pace(ahead: number, messages = false, reads = 0, layers = 0) {
+  override async pace(ahead: number, messages = false, reads = 0, layers = 0) {
     if (this.deferPipelines) return
     return super.pace(ahead, messages, reads, layers)
   }
