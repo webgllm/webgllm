@@ -435,7 +435,7 @@ async function run() {
       reply += data.text
       for (const lp of data.logprobs ?? []) {
         const alt = lp.top_logprobs?.find((t) => t.token !== lp.token)
-        log(`lp ${JSON.stringify(lp.token)} ${lp.logprob.toFixed(6)} margin ${alt ? (lp.logprob - alt.logprob).toFixed(6) : "-"}`)
+        log(`lp ${JSON.stringify(lp.token)} ${lp.logprob.toFixed(6)} margin ${alt ? (lp.logprob - alt.logprob).toFixed(6) : "-"}${alt ? ` vs ${JSON.stringify(alt.token)} ${alt.logprob.toFixed(6)}` : ""}`)
       }
       if (first) {
         // The first token ends prefill: switch phases synchronously, so the
@@ -548,7 +548,7 @@ async function run() {
         sampling: {
           temperature: Number(params.get("temperature") ?? 0),
           top_k: Number(params.get("topk") ?? 1),
-          repetition_penalty: 1.1
+          repetition_penalty: params.get("rp") ? Number(params.get("rp")) : params.get("ask") === "copy" ? 1 : 1.1
         },
         maxTokens: Number(params.get("tokens") ?? 64),
         pipeline: params.get("pipeline") !== "0",
