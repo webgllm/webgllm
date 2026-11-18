@@ -16,7 +16,7 @@ self.onmessage = async ({ data }: MessageEvent<SpeedWorkerRequest>) => {
   if (data?.type !== "predict-speed") return
   let reply: SpeedWorkerReply
   try {
-    const { prediction, report } = await predictHere(data.model, { force: data.force }, realSpeedDeps((engine) => (probing = engine)))
+    const { prediction, report } = await predictHere(data.model, { force: data.force, decode: data.decode !== false }, realSpeedDeps((engine) => (probing = engine)))
     reply = { type: "speed", prediction, report }
   } catch (error) {
     const e = error instanceof Error ? error : new Error(String(error))

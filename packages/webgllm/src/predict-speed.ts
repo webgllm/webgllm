@@ -23,13 +23,20 @@ import type { LayerType } from "./weights.js"
 export type SpeedPrediction = {
   /** Prompt tokens read per second, for a prompt of about 512 tokens. */
   prompt: number
-  /** Tokens written per second, one at a time (no speculative drafts). */
-  decode: number
+  /** Tokens written per second, one at a time (no speculative drafts); absent when measured with `decode: false`. */
+  decode?: number
 }
 
 export type PredictSpeedOptions = {
   /** Measure again, even if this device's result for the model is remembered. */
   force?: boolean
+  /**
+   * false: the prompt speed alone, faster (the writing and the head aren't
+   * timed): enough to decide whether a model reads prompts fast enough here
+   * to download it. Firefox on a Pixel 10 Pro answers for LFM3 1.7B in
+   * about 1.6 s this way, where 2.1 s with writing.
+   */
+  decode?: boolean
   signal?: AbortSignal
 }
 
@@ -49,14 +56,16 @@ export type PredictSpeedOptions = {
  * @example
  * ```ts
  * const { prompt, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF")
- * const local = prompt >= 200 && decode >= 10
+ * const local = prompt >= 200 && decode! >= 10
+ * // Only whether prompts are fast enough, sooner:
+ * const fast = (await predictSpeed("LiquidAI/LFM3-1.7B-GGUF", { decode: false })).prompt >= 300
  * ```
  */
 export async function predictSpeed(model: WebGlModelId, options: PredictSpeedOptions = {}): Promise<SpeedPrediction> {
   throwIfAborted(options.signal)
   if (typeof model !== "string" || !model) throw new TypeError("model is required.")
   const remembered = !options.force && inPage.get(model)
-  if (remembered) return remembered
+  if (remembered && (options.decode === false || remembered.decode !== undefined)) return remembered
   const run = typeof document !== "undefined" && typeof Worker !== "undefined"
     ? inWorker(model, options).then((r) => r.prediction)
     : predictHere(model, options).then((r) => r.prediction)
@@ -70,7 +79,7 @@ const inPage = new Map<string, SpeedPrediction>()
 
 /** What a worker of predictSpeed's own is sent, and answers. */
 export type SpeedWorkerRequest =
-  | { type: "predict-speed"; model: string; force: boolean }
+  | { type: "predict-speed"; model: string; force: boolean; decode?: boolean }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
 export type SpeedWorkerReply =
   | { type: "speed"; prediction: SpeedPrediction; report: SpeedReport }
@@ -111,7 +120,7 @@ export function inWorker(
       done()
       reject(new Error(event.message || "predictSpeed's worker failed to start."))
     }
-    post({ type: "predict-speed", model, force: !!options.force })
+    post({ type: "predict-speed", model, force: !!options.force, decode: options.decode !== false })
   })
 }
 
@@ -133,8 +142,8 @@ export type SpeedDeps = {
   renderer: () => string
   userAgent: string
   store: SpeedStore
-  /** Shapes, then timings: the GPU's part. */
-  measure: (model: string, signal?: AbortSignal) => Promise<{ shape: SpeedShape; report: ProbeReport }>
+  /** Shapes, then timings: the GPU's part (`decode` false: the prompt's alone). */
+  measure: (model: string, signal?: AbortSignal, decode?: boolean) => Promise<{ shape: SpeedShape; report: ProbeReport }>
 }
 
 /** FNV-1a of a string, as hex (as the worker's note keys). */
@@ -168,8 +177,9 @@ export function speedFromTimes(times: ProbeTimes, layerTypes: ReadonlyArray<Laye
   const middleMs = times.stackLayers > 0 ? (Math.max(0, times.promptStack - times.promptBase) * middle) / times.stackLayers : 0
   // (The prompt's last token goes through the head too.)
   const promptMs = times.promptBase + middleMs + head
-  const decodeMs = times.decodeLayers + head
-  return { prompt: (1000 * times.promptTokens) / promptMs, decode: 1000 / decodeMs }
+  const prompt = (1000 * times.promptTokens) / promptMs
+  // (Writing untimed: a prompt-only measurement, see PredictSpeedOptions.decode.)
+  return Number.isFinite(times.decodeLayers) ? { prompt, decode: 1000 / (times.decodeLayers + head) } : { prompt }
 }
 
 const SPEED_NOTES = "speed-notes.json"
@@ -184,7 +194,7 @@ export const opfsSpeedStore: SpeedStore = {
     try {
       const notes = JSON.parse(await (await (await speedFile()).getFile()).text()) as Record<string, SpeedNote>
       const note = notes[key]
-      return note && note.prompt > 0 && note.decode > 0 ? note : undefined
+      return note && note.prompt > 0 && (note.decode === undefined || note.decode > 0) ? note : undefined
     } catch {
       return undefined
     }
@@ -260,13 +270,13 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
   renderer: rendererHere,
   userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
   store: opfsSpeedStore,
-  measure: async (model, signal) => {
+  measure: async (model, signal, decode = true) => {
     const started = performance.now()
     const meta = await resolveModel(model, signal)
     const shape = await speedShape(meta)
     const shapeMs = performance.now() - started
     throwIfAborted(signal)
-    const report = await probeSpeed(shape, { signal, onEngine })
+    const report = await probeSpeed(shape, { signal, onEngine, decode })
     return { shape, report: { ...report, shapeMs } }
   }
 })
@@ -284,20 +294,23 @@ export function predictHere(
   deps: SpeedDeps = realSpeedDeps()
 ): Promise<{ prediction: SpeedPrediction; report: SpeedReport }> {
   const key = speedKey(deps.renderer(), deps.userAgent, model)
-  const running = pending.get(key)
+  const decode = options.decode !== false
+  // (A prompt-only measurement doesn't answer a call that wants writing too.)
+  const running = pending.get(`${key}|${decode}`) ?? (decode ? undefined : pending.get(`${key}|true`))
   if (running) return running
   const run = (async () => {
     if (!options.force) {
       const note = await deps.store.read(key)
-      if (note) return { prediction: { prompt: note.prompt, decode: note.decode }, report: { cached: true as const } }
+      if (note && (!decode || note.decode !== undefined))
+        return { prediction: { prompt: note.prompt, ...(note.decode !== undefined && { decode: note.decode }) }, report: { cached: true as const } }
     }
-    const { shape, report } = await deps.measure(model, options.signal)
+    const { shape, report } = await deps.measure(model, options.signal, decode)
     const prediction = speedFromTimes(report.times, shape.config.layerTypes, shape.config.vocabSize)
     await deps.store.write(key, { ...prediction, at: Date.now() })
     return { prediction, report: { ...report, cached: false as const } }
   })()
-  pending.set(key, run)
-  const clear = () => pending.delete(key)
+  pending.set(`${key}|${decode}`, run)
+  const clear = () => pending.delete(`${key}|${decode}`)
   run.then(clear, clear)
   return run
 }

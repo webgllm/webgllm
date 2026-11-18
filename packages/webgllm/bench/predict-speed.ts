@@ -11,6 +11,8 @@ const models = (params.get("models") ?? "LiquidAI/LFM3-1.7B-GGUF,onnx-community/
 const rounds = Number(params.get("rounds") ?? 1)
 // (?webgpu=0|1: the backend predictSpeed's worker measures on; left out, its default.)
 const backend = params.get("webgpu")
+// (?decode=0: predictSpeed's prompt-only measurement.)
+const decode = params.get("decode") !== "0"
 const out = document.getElementById("out")!
 const log = (text: string) => {
   out.textContent += `${text}\n`
@@ -19,7 +21,7 @@ const log = (text: string) => {
 const round1 = (n: number) => Math.round(n * 10) / 10
 
 /** One forced measurement in predictSpeed's own worker (the page's frames reported to it), with its report. */
-const measure = (model: string) => inWorker(model, { force: true }, new Worker(backend === null ? "/bundle/src/predict-speed-worker.js" : `/bundle/bench/predict-speed-bench-worker.js?webgpu=${backend}`, { type: "module" }))
+const measure = (model: string) => inWorker(model, { force: true, decode }, new Worker(backend === null ? "/bundle/src/predict-speed-worker.js" : `/bundle/bench/predict-speed-bench-worker.js?webgpu=${backend}`, { type: "module" }))
 
 try {
   log(`UA ${navigator.userAgent}`)
@@ -32,6 +34,7 @@ try {
         ? {
             shapeMs: Math.round(report.shapeMs),
             loadMs: Math.round(report.loadMs),
+            loadParts: report.loadParts,
             measureMs: Math.round(report.measureMs),
             peakMiB: Math.round(report.peakBytes / 2 ** 20),
             phases: Object.fromEntries(Object.entries(report.phases).map(([k, v]) => [k, Math.round(v)])),
@@ -45,13 +48,13 @@ try {
             }
           }
         : report
-      log(`PREDICT ${model} round ${r} prompt ${round1(prediction.prompt)} tok/s decode ${round1(prediction.decode)} tok/s wall ${Math.round(wall)} ms ${JSON.stringify(detail)}`)
+      log(`PREDICT ${model} round ${r} prompt ${round1(prediction.prompt)} tok/s decode ${prediction.decode === undefined ? "-" : round1(prediction.decode)} tok/s wall ${Math.round(wall)} ms ${JSON.stringify(detail)}`)
     }
     // The public API: remembered (OPFS) on the first call in this page, then in memory.
     for (const which of ["remembered", "in page"]) {
       const t = performance.now()
-      const p = await predictSpeed(model)
-      log(`API ${model} ${which} prompt ${round1(p.prompt)} decode ${round1(p.decode)} in ${round1(performance.now() - t)} ms`)
+      const p = await predictSpeed(model, { decode })
+      log(`API ${model} ${which} prompt ${round1(p.prompt)} decode ${p.decode === undefined ? "-" : round1(p.decode)} in ${round1(performance.now() - t)} ms`)
     }
   }
   log("ALL DONE")

@@ -34,7 +34,7 @@ describe("speedFromTimes", () => {
     const head = 0.5 + (128000 - 65536) * 0.0001
     const { prompt, decode } = speedFromTimes(times, types, 128000)
     assert.ok(Math.abs(prompt - (1000 * 512) / (20 + head)) < 1e-9)
-    assert.ok(Math.abs(decode - 1000 / (9 + head)) < 1e-9)
+    assert.ok(Math.abs(decode! - 1000 / (9 + head)) < 1e-9)
   })
 
   test("a vocabulary no bigger than the probe's adds nothing", () => {
@@ -167,7 +167,7 @@ function fakeDeps(notes = new Map<string, SpeedNote>(), renderer = "Apple M3") {
     measure: async () => {
       measured++
       await new Promise((r) => setTimeout(r, 5))
-      return { shape, report: { times, shapeMs: 1, measureMs: 2, loadMs: 1, peakBytes: 0, phases: { prompt: 0, decode: 0, head: 0 } } }
+      return { shape, report: { times, shapeMs: 1, measureMs: 2, loadMs: 1, loadParts: {}, peakBytes: 0, phases: { prompt: 0, decode: 0, head: 0 } } }
     }
   }
   return { deps, notes, measured: () => measured }

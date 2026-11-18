@@ -40,11 +40,20 @@ export type SpeedShape = {
   embedding: MatrixStorage
 }
 
-/** Prompt tokens predictSpeed times (one prompt batch). */
-export const PROMPT_TOKENS = 512
+/** (The engine's: a prompt's rows a split matmul takes.) */
+const SPLIT_ROWS = 8
 
-/** Most middle layers the probe's prompts run (see middleStack). */
-export const PROMPT_STACK = 6
+/**
+ * Prompt tokens predictSpeed times: half a batch, the fewest that take a
+ * prompt's own kernels (TUNING.quadMinBatch's 4-token matmuls; 128 took
+ * others, and guessed a Pixel 10 Pro's Chrome at half its speed and an M3
+ * Ultra's at 40%), a fast guess where a full batch of 512 took the Pixel's
+ * Firefox 8 s of the probe's 14.
+ */
+export const PROMPT_TOKENS = 256
+
+/** Most middle layers the probe's prompts run (see middleStack): about one of each kind. */
+export const PROMPT_STACK = 2
 
 /**
  * Up to `slots` of a model's middle layers (all but its first and last),
@@ -78,7 +87,7 @@ export function middleStack(layerTypes: ReadonlyArray<LayerType>, slots: number)
  * it) and grows in proportion only from about 32,768, so fewer rows would
  * scale from a GPU not yet full.
  */
-export const PROBE_VOCAB = 65536
+export const PROBE_VOCAB = 8192
 
 /** The engine's per-matrix storage for a GGUF tensor type. */
 const ggufMatrix = (header: GgufHeader, name: string): MatrixStorage => {
@@ -365,8 +374,10 @@ export type ProbeReport = {
   shapeMs: number
   /** Milliseconds on the GPU side: the synthetic load and the timings. */
   measureMs: number
-  /** Of which the synthetic load (the engine's own load-time choices included). */
+  /** Of which the synthetic load. */
   loadMs: number
+  /** The engine's own load times by part (Engine.loadMs). */
+  loadParts: Record<string, number>
   /** The most texture bytes the probe held. */
   peakBytes: number
   /** Milliseconds in each part of the timings: prompts, writing, the head. */
@@ -374,7 +385,7 @@ export type ProbeReport = {
 }
 
 /** Milliseconds of GPU work before the probe's load (see warmGpu). */
-export const WARM_MS = 150
+export const WARM_MS = 0
 
 /**
  * Keeps the GPU busy for `ms` (each pass reading the last one's output,
@@ -429,9 +440,11 @@ export async function probeSpeed(
     signal?: AbortSignal
     /** Told of the probe's engine while it measures, and of null after (to report the page's frames to it). */
     onEngine?: (engine: Engine | null) => void
+    /** false: the prompt alone (writing and the head untimed: decodeLayers NaN, the head's times 0). */
+    decode?: boolean
   } = {}
 ): Promise<Omit<ProbeReport, "shapeMs">> {
-  const { signal, onEngine } = options
+  const { signal, onEngine, decode = true } = options
   const started = performance.now()
   // As the worker makes its engine (handler.ts load): on WebGPU where the
   // browser has it (WebGL 2 elsewhere, or on a canvas handed in), the same
@@ -441,11 +454,19 @@ export async function probeSpeed(
     ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH
   })
+  // A guess, fast: the load's own timed choices for prompts and the head
+  // (the prompt packing, the head's layout) skipped, their defaults taken;
+  // the writing matvec's too where writing isn't timed (its choice is the
+  // writing speed: skipped, an M3 Ultra's was guessed at a third).
+  engine.tuned.f16Pack = TUNING.f16Pack >= 0 ? TUNING.f16Pack & 3 : 3
+  engine.tuned.f16Matmul = null
+  if (!decode) engine.tuned.streamMatvec = false
+  Reflect.set(engine, "headChoice", { expanded: false, split: TUNING.q6HeadSplit })
   let peak = 0
   const sample = () => (peak = Math.max(peak, engine.gpu.bytes))
   onEngine?.(engine)
   try {
-    await warmGpu(engine.gpu)
+    if (WARM_MS > 0) await warmGpu(engine.gpu)
     await engine.load(probePieces(shape, new Noise()), sample, signal)
     sample()
     const loadMs = performance.now() - started
@@ -475,14 +496,14 @@ export async function probeSpeed(
     // Prompts, `count` back to back (the cache reset before each), waited
     // for once: the GPU kept busy as through a whole prompt, its clock up
     // and no readback's wait in each.
-    const prompts = async (layers: Array<unknown>, count: number) => {
+    const prompts = async (layers: Array<unknown>, count: number, rows = tokens) => {
       signal?.throwIfAborted()
       use(layers)
       await engine.gpu.finish()
       const t = performance.now()
       for (let i = 0; i < count; i++) {
         engine.reset()
-        await engine.forwardNoLogits(tokens)
+        await engine.forwardNoLogits(rows)
       }
       await engine.gpu.finish()
       sample()
@@ -498,31 +519,43 @@ export async function probeSpeed(
     const base = types.length > 1 ? [first, last] : [first]
     const middle = middleStack(types, PROMPT_STACK)
     const stack = [first, ...middle.map((t) => byKind.get(t)!), last]
-    // Once each untimed (programs compile), then rounds in alternating
-    // order, the best of each.
-    await prompts(base, 1)
-    if (middle.length) await prompts(stack, 1)
-    let promptBase = Infinity
-    let promptStack = Infinity
-    for (let round = 0; round < 3; round++) {
-      const order = round % 2 ? ["stack", "base"] : ["base", "stack"]
-      for (const which of order) {
-        if (which === "base") promptBase = Math.min(promptBase, await prompts(base, 1))
-        else if (middle.length) promptStack = Math.min(promptStack, await prompts(stack, 1))
-      }
-    }
-    if (!middle.length) promptStack = promptBase
+    // A fast guess: the stack once untimed (programs compile; as short a
+    // prompt as takes the same kernels, see TUNING.f16MinRows), then once
+    // timed, every layer taken to cost what the stack's do on average (the
+    // base, the first and last layers' own variants, not timed apart: they
+    // differ by little, and each timing cost a Pixel 10 Pro's Firefox a
+    // tenth of a second).
+    const timedLayers = middle.length ? stack : base
+    // (Compiled through the base where its first and last layers are of
+    // every kind the stack has: their programs are the stack's, at half the
+    // work; a Pixel 10 Pro's Firefox spent a quarter second more on the
+    // stack's.)
+    const baseKinds = new Set([types[0], types[types.length - 1]])
+    const compiles = middle.every((t) => baseKinds.has(t)) ? base : timedLayers
+    await prompts(compiles, 1, tokens.slice(0, Math.min(tokens.length, Math.max(SPLIT_ROWS + 1, TUNING.f16MinRows))))
+    const promptStack = await prompts(timedLayers, 1)
+    const promptBase = (promptStack * base.length) / timedLayers.length
     const promptPhase = lap()
+    if (!decode)
+      return {
+        times: { promptBase, promptStack, stackLayers: middle.length, decodeLayers: NaN, headAt: 0, headPerRow: 0, vocab, promptTokens: PROMPT_TOKENS },
+        measureMs: performance.now() - started,
+        loadMs,
+        loadParts: Object.fromEntries(Object.entries(Reflect.get(engine, "loadMs") as Record<string, number>).map(([k, v]) => [k, Math.round(v)])),
+        peakBytes: peak,
+        phases: { prompt: promptPhase, decode: 0, head: 0 }
+      }
 
-    // Writing: one-token forwards through every layer after the prompt,
-    // queued, then waited for once. (The worker reads each token forward
-    // while the last one's pick goes back: its steps follow each other on
-    // the GPU like these.)
-    const all = types.map((t) => byKind.get(t)!)
-    use(all)
-    engine.reset()
-    const forwards = async (count: number) => {
+    // Writing: one-token forwards after the prompt, queued, then waited for
+    // once (the worker reads each token forward while the last one's pick
+    // goes back: its steps follow each other on the GPU like these),
+    // through the base and the stack, the middle layers scaled from their
+    // difference as the prompt's: a forward through every layer cost a
+    // Pixel 10 Pro's Firefox 140 ms a token.
+    const forwards = async (layers: Array<unknown>, count: number) => {
       signal?.throwIfAborted()
+      use(layers)
+      engine.reset()
       engine.position = PROMPT_TOKENS
       await engine.gpu.finish()
       const t = performance.now()
@@ -531,9 +564,13 @@ export async function probeSpeed(
       sample()
       return (performance.now() - t) / count
     }
-    await forwards(2)
-    let decodeLayers = Infinity
-    for (let round = 0; round < 2; round++) decodeLayers = Math.min(decodeLayers, await forwards(6))
+    // (Through every layer, six queued: a forward through a few, scaled,
+    // guessed an M3 Ultra's writing at a third of its speed and Firefox's
+    // at a third to a half. Prompt-only predictions skip this: see
+    // PredictSpeedOptions.decode.)
+    const all = types.map((t) => byKind.get(t)!)
+    await forwards(all, 1)
+    const decodeLayers = await forwards(all, 6)
     const decodePhase = lap()
 
     // The head over the probe's rows and over half of them (as chooseHead
@@ -556,11 +593,13 @@ export async function probeSpeed(
     // The GPU's own time: no pacing slices (each a fence's round trip).
     engine.gpu.configurePacing(0, TUNING.submissionMs)
     try {
-      await heads(vocab, 2)
-      await heads(half, 2)
-      for (let round = 0; round < 3; round++)
-        for (const which of round % 2 ? (["half", "full"] as const) : (["full", "half"] as const))
-          at[which] = Math.min(at[which], await heads(which === "full" ? vocab : half, 8))
+      // (Two sizes: a row's share from their difference; the head's time over
+      // its rows, mostly fixed costs at these sizes, guessed an M3 Ultra's
+      // writing at a third.)
+      await heads(vocab, 1)
+      await heads(half, 1)
+      at.full = await heads(vocab, 4)
+      at.half = await heads(half, 4)
     } finally {
       engine.config.vocabSize = vocab
       engine.gpu.configurePacing(engine.tuned.submissionReads ?? TUNING.submissionReads, TUNING.submissionMs)
@@ -570,6 +609,7 @@ export async function probeSpeed(
       times: { promptBase, promptStack, stackLayers: middle.length, decodeLayers, headAt: at.full, headPerRow, vocab, promptTokens: PROMPT_TOKENS },
       measureMs: performance.now() - started,
       loadMs,
+      loadParts: Object.fromEntries(Object.entries(Reflect.get(engine, "loadMs") as Record<string, number>).map(([k, v]) => [k, Math.round(v)])),
       peakBytes: peak,
       phases: { prompt: promptPhase, decode: decodePhase, head: lap() }
     }

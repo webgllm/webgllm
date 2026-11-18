@@ -165,16 +165,22 @@ webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${mo
 
 ### Speed on this device
 
-`predictSpeed` says how fast a model would read prompts and write on this device before its weights download, so an app can choose to run it here or elsewhere. It reads the model's shapes (a GGUF's header, or an ONNX model's graph and config), runs one layer of each kind the model has, with random weights, through the engine's own passes on this GPU, and scales that to the whole model: about a second on a desktop GPU, longer on a phone, and a few hundred MB of GPU memory, freed after. The answer is remembered per GPU, browser, model and webgllm version, so later calls return at once (`force: true` measures again). Call it while no model is loading or answering: they share the GPU.
+`predictSpeed` says how fast a model would read prompts and write on this device before its weights download, so an app can choose to run it here or in the cloud. It reads the model's shapes (a GGUF's header, or an ONNX model's graph and config), runs one layer of each kind the model has, with random weights, through the engine's own passes on this GPU (WebGPU where the browser has it, else WebGL 2, as a model would run), and scales that to the whole model. It's a quick guess, not a benchmark. The answer is remembered per GPU, browser, backend, model and webgllm version, so later calls return at once (`force: true` measures again). Call it while no model is loading or answering: they share the GPU.
 
 ```ts
 import { predictSpeed } from "webgllm"
 
-const { prompt, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF") // tokens per second
-const local = prompt >= 1000 && decode >= 20
+// Whether prompts are fast enough to download the model: prompt speed only, sooner.
+const { prompt } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF", { decode: false })
+const downloadLocal = prompt >= 300
+
+// Prompt and writing speed.
+const { prompt: p, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF")
 ```
 
-`prompt` is for a prompt of about 512 tokens; `decode` is one token at a time (speculative drafts can make replies faster).
+`prompt` is tokens read per second; `decode` is tokens written per second, one at a time (speculative drafts can make replies faster), absent with `decode: false`.
+
+The first call for LFM3 1.7B GGUF, prompt only: about 0.2 s on an M3 Ultra (Chrome), 0.3-0.9 s on an iPad Pro M4 (Safari), 1.3-1.5 s on a Pixel 10 Pro in Chrome and 1.7-1.9 s in Firefox. With writing: 0.25 s on the M3 Ultra, 2.7-2.8 s in the Pixel's Firefox.
 
 ### Tokens and logits
 
