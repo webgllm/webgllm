@@ -1025,48 +1025,67 @@ ${rms ? `  var s = vec4<f32>(0.0);
 
 /**
  * kernels.ts's dequantBytes (no zero points: 8) from weights in a storage
- * buffer (see bufferMatvec): output texel x of the f16 layout, or with `h2`
- * texels 2x' and 2x' + 1 of each column as one h2 texel x'.
+ * buffer (see bufferMatvec): the f16 layout's texels, or with `h2` texels
+ * 2x' and 2x' + 1 of each column as one h2 texel x' (into a texture, or
+ * with `toBuffer` a storage buffer, row y at y · uStride). A thread takes a
+ * row's block of 32 weights (x: the block, column after column; the
+ * rectangle starts at x 0), so it fetches the block's words and scale once:
+ * 4-bit, a word's low nibbles are one texel and its high nibbles the texel 4
+ * on. An M3 Ultra dequantized LFM3's four prompt matrices in 156 µs this
+ * way where 266 a thread an h2 texel, the same bits
+ * (bench/gemm-exact.html). `bits` 8: bufferMatvec's 8-bit layout (a word a
+ * texel).
  */
-export function bufferDequant(o: { h2: boolean; toBuffer?: boolean }): NativeSpec {
+export function bufferDequant(o: { h2: boolean; toBuffer?: boolean; bits?: 4 | 8 }): NativeSpec {
   if (o.toBuffer && !o.h2) throw new Error("A dequant into a buffer writes h2 texels.")
+  const bits = o.bits ?? 4
+  // Texels a block: 8 of the f16 layout, 4 of h2.
+  const per = o.h2 ? 4 : 8
+  const J = [0, 1, 2, 3, 4, 5, 6, 7]
+  const words = bits === 8 ? J : [0, 1, 2, 3]
+  const store = (i: number, v: string) => o.toBuffer ? `  out0[at + ${i}] = ${v};` : `  textureStore(out0, vec2<i32>(x + ${i}, y), ${v});`
+  const stores = (v: (j: number) => string) =>
+    (o.h2 ? [0, 1, 2, 3].map((i) => store(i, `h2(${v(2 * i)}, ${v(2 * i + 1)})`)) : J.map((j) => store(j, v(j)))).join("\n")
   const code = `
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tS: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read> bW: array<u32>;
 ${o.toBuffer ? "@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;" : `@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;`}
-fn deq(x: i32, y: i32) -> vec4<f32> {
-  let c = x / u.kq;
-  let kq = x - c * u.kq + u.kq0;
+${bits === 8
+    ? "fn q(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u)); }"
+    : "fn q(w: u32, s: vec4<u32>) -> vec4<f32> { return vec4<f32>((vec4<u32>(w) >> s) & vec4<u32>(15u)) - 8.0; }"}
+${o.h2 ? `fn h2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
+  let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}` : ""}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  // Blocks a column, and this thread's: block kbl of column c.
+  let kbs = u.kq >> 3u;
+  let c = i32(id.x) / kbs;
+  let kbl = i32(id.x) - c * kbs;
+  let x = ${o.h2 ? "c * (u.kq >> 1u) + 4 * kbl" : "c * u.kq + 8 * kbl"};
+  if (id.y >= u.rect.w || x >= i32(u.rect.z)) { return; }
+  let y = i32(id.y + u.rect.y);
+  ${o.toBuffer ? "let at = y * u.stride + x;" : ""}
   var row = c * u.hd + y;
-  if (row >= u.n) { return vec4<f32>(0.0); }
+  if (row >= u.n) {
+${stores(() => "vec4<f32>(0.0)")}
+    return;
+  }
   row += u.row0;
   let g = row / 4;
   let r = row - g * 4;
   let col = g / u.h;
   let gr = g - col * u.h;
-  let kb = kq / 8;
-  let j = kq - kb * 8;
-  let word = bW[gr * u.width + col * u.rowTexels + kb * 16 + r * 4 + (j & 3)];
-  let b = (vec4<u32>(word) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
-  let q = vec4<f32>(select(b >> vec4<u32>(4u), b & vec4<u32>(15u), j < 4));
+  let kb = (u.kq0 >> 3u) + kbl;
   let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];
-  return (q - 8.0) * d;
-}
-@compute @workgroup_size(64, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  if (id.x >= u.rect.z || id.y >= u.rect.w) { return; }
-  let p = vec2<i32>(id.xy + u.rect.xy);
-${o.h2
-    ? `  let hk = u.kq >> 1u;
-  let c = p.x / hk;
-  let x = c * u.kq + 2 * (p.x - c * hk);
-  let a = clamp(deq(x, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
-  let b = clamp(deq(x + 1, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
-  let v = vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
-  ${o.toBuffer ? "out0[p.y * u.stride + p.x] = v;" : "textureStore(out0, p, v);"}`
-    : `  textureStore(out0, p, deq(p.x, p.y));`}
+  let wb = gr * u.width + col * u.rowTexels + kb * ${4 * words.length} + r * ${words.length};
+${words.map((j) => `  let w${j} = bW[wb + ${j}];`).join("\n")}
+${J.map((j) => `  let v${j} = ${bits === 8 ? `q(w${j})` : `q(w${j & 3}, vec4<u32>(${j < 4 ? "0u, 8u, 16u, 24u" : "4u, 12u, 20u, 28u"}))`} * d;`).join("\n")}
+${stores((j) => `v${j}`)}
 }`
   return {
     code,
@@ -1084,7 +1103,7 @@ ${o.h2
       { name: "uRow0", type: "int" },
       { name: "uStride", type: "int" }
     ],
-    groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
+    groups: (rect) => [Math.ceil(rect.width / per / 64), rect.height]
   }
 }
 

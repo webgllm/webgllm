@@ -4982,10 +4982,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!spec) this.recurrenceSpecs.set(key, (spec = linRecurrence({ ...shape, rows: TUNING.recurrenceRows })))
     return spec
   }
-  private bufferDequantSpec(h2: boolean, toBuffer = false) {
-    const key = `dequant ${h2} ${toBuffer}`
+  private bufferDequantSpec(h2: boolean, toBuffer = false, bits: 4 | 8 = 4) {
+    const key = `dequant ${h2} ${toBuffer} ${bits}`
     let spec = this.bufferSpecs.get(key)
-    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2, toBuffer })))
+    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2, toBuffer, bits })))
     return spec
   }
   private promptBufferSpec(trips: number) {
