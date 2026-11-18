@@ -210,7 +210,10 @@ for (const C of [Gpu, WebGpu] as const) {
 }
 const extraWhileWriting = new Set<string>()
 const scratch = new WeakMap<object, Map<string, ReturnType<Gpu["texture"]>>>()
-const instrumented = () => extraWhileWriting.size > 0 || countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || skipInPrompts.size > 0 || twiceWhileWriting.size > 0
+// CPU time inside run, by phase (tune "cpuRuns:1"): what issuing a pass costs this browser.
+let cpuRuns = false
+const runCpu: Record<string, { runs: number; ms: number }> = {}
+const instrumented = () => cpuRuns || extraWhileWriting.size > 0 || countWriting || dumpShaders || burnUs > 0 || skipWhileWriting.size > 0 || skipInPrompts.size > 0 || twiceWhileWriting.size > 0
 // Passes while writing, by kind and size, and in independent groups (tune "countWriting:1").
 let countWriting = false
 const writingRuns = new Map<string, number>()
@@ -245,6 +248,11 @@ for (const C of [Gpu, WebGpu] as const) {
   const run = C.prototype.run
   C.prototype.run = function (this: Gpu & WebGpu, pass) {
     if (!instrumented()) return run.call(this, pass)
+    if (cpuRuns) {
+      const x = (runCpu[this.activePhase] ??= { runs: 0, ms: 0 })
+      const t = performance.now()
+      try { return run.call(this, pass) } finally { x.runs++; x.ms += performance.now() - t }
+    }
     if (countWriting && this.activePhase === "decode") {
       // Greedy groups of consecutive passes none of which reads or writes
       // what an earlier one in its group wrote (or writes what it read).
@@ -426,6 +434,10 @@ const handle = async (event: MessageEvent) => {
           skipWhileWriting.add(key.slice(5))
           delete event.data.values[key]
         }
+        else if (key === "cpuRuns") {
+          cpuRuns = event.data.values[key] > 0
+          delete event.data.values[key]
+        }
         else if (key.startsWith("pskip_")) {
           skipInPrompts.add(key.slice(6))
           delete event.data.values[key]
@@ -497,6 +509,22 @@ const handle = async (event: MessageEvent) => {
   }
 }
 
+// What pace cost each phase (reported with bench-pacing).
+const paceStats: Record<string, { calls: number; waited: number; ms: number; drains: number }> = {}
+for (const C of [Gpu, WebGpu] as const) {
+  const pace = C.prototype.pace
+  C.prototype.pace = async function (this: Gpu & WebGpu, ...args: Parameters<typeof pace>) {
+    const x = (paceStats[this.activePhase] ??= { calls: 0, waited: 0, ms: 0, drains: 0 })
+    const t = performance.now()
+    await pace.apply(this, args)
+    const ms = performance.now() - t
+    x.calls++
+    if (ms > 0.5) x.waited++
+    x.ms += ms
+    if ((Reflect.get(this, "paced") as Array<unknown>).length === 0) x.drains++
+  }
+}
+
 const send = postMessage.bind(self)
 const reported = new Set<string>()
 postMessage = (message) => {
@@ -524,11 +552,21 @@ postMessage = (message) => {
             ceiling: Reflect.get(b, "ceiling"),
             initial: Reflect.get(b, "initial"),
             healthy: Reflect.get(b, "healthyFrame"),
-            frameMs: Reflect.get(b, "frameMs")
+            frameMs: Reflect.get(b, "frameMs"),
+            window: Reflect.get(b, "presentationWindow"),
+            maxWindow: Reflect.get(b, "presentationMax"),
+            relaxation: Reflect.get(b, "relaxedReadsAllowed"),
+            recovery: Reflect.get(b, "recovery"),
+            computeFrames: Reflect.get(b, "computeFrames")
           }
         ])
-      )
+      ),
+      // Waits since the last report, by phase: pace calls, those that waited, the ms they waited, and full drains.
+      paces: Object.fromEntries(Object.entries(paceStats).map(([phase, x]) => [phase, { ...x, ms: Math.round(x.ms) }])),
+      runCpu: Object.fromEntries(Object.entries(runCpu).map(([phase, x]) => [phase, { ...x, ms: Math.round(x.ms) }]))
     })
+    for (const x of Object.values(runCpu)) x.runs = x.ms = 0
+    for (const x of Object.values(paceStats)) x.calls = x.waited = x.ms = x.drains = 0
   }
 }
 

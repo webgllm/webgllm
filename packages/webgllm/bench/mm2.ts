@@ -1048,13 +1048,17 @@ void main() { o = texelFetch(uX, ivec2(0), 0) * 0.0 + float(vSlice); }`)
  * only dots in the loop; outputs h2 pairs.
  */
 function pureKernel(
-  R: 4 | 8,
-  T: 4 | 8,
+  R: 4 | 8 | 16,
+  T: 4 | 8 | 12 | 16,
   half: boolean,
   unroll = 2,
   acts: "f16" | "h2" = "f16",
   /** The weights as RGBA16F (4 a texel) or h2 (RGBA32UI, 8 a texel: texel (wx + q) / 2). */
-  wts: "f16" | "h2" = "f16"
+  wts: "f16" | "h2" = "f16",
+  /** The loop's trip count as a constant (0: the uniform). */
+  trips = 0,
+  /** How a token's 4 rows are summed: dots, a vector times the rows' matrix, or the matrix's columns scaled and added. */
+  form: "dot" | "mat" | "axpy" = "dot"
 ) {
   const P = half ? "mediump " : ""
   const L: Array<string> = []
@@ -1079,10 +1083,16 @@ function pureKernel(
           ? `  { ${P}vec4 a = ${u & 1 ? "h2hi" : "h2lo"}(u${t}_${u & ~1});`
           : `  { ${P}vec4 a = texelFetch(uA, ivec2(q, m0 + ${t}), 0);`
       )
-      for (let h = 0; h < R / 4; h++)
-        line(
-          `    acc${t}_${h} += vec4(${[0, 1, 2, 3].map((r) => `dot(w${4 * h + r}, a)`).join(", ")}); }`.replace(/ }$/, h === R / 4 - 1 ? " }" : "")
-        )
+      for (let h = 0; h < R / 4; h++) {
+        const w = [0, 1, 2, 3].map((r) => `w${4 * h + r}`)
+        const sum =
+          form === "mat"
+            ? `a * mat4(${w.join(", ")})`
+            : form === "axpy"
+              ? ["x", "y", "z", "w"].map((c) => `vec4(${w.map((x) => `${x}.${c}`).join(", ")}) * a.${c}`).join(" + ")
+              : `vec4(${w.map((x) => `dot(${x}, a)`).join(", ")})`
+        line(`    acc${t}_${h} += ${sum}; }`.replace(/ }$/, h === R / 4 - 1 ? " }" : ""))
+      }
     }
     line(`}`)
   }
@@ -1109,7 +1119,7 @@ void main() {
   int wx = c * uKq;
   int wy = row - c * uH;
   ${accs.map((a) => `vec4 ${a} = vec4(0.0);`).join(" ")}
-  for (int kq = 0; kq < uKq; kq += ${unroll}) {
+  for (int kq = 0; kq < ${trips > 0 ? trips : "uKq"}; kq += ${unroll}) {
 ${L.join("\n")}
   }
   ${writes.join("\n  ")}
@@ -1447,17 +1457,45 @@ void main() { o = ${read}; }`)
           [4, 4, false, 2, "f16", "h2"],
           [4, 8, true, 2, "f16", "f16"],
           [4, 8, true, 2, "h2", "f16"],
-          [8, 4, true, 2, "h2", "f16"]
-        ] as Array<[4 | 8, 4 | 8, boolean, number, "f16" | "h2", "f16" | "h2"]>).filter(
-          ([R, T, half, , acts, wts]) =>
-            !picked || picked.test(`PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}`)
+          [8, 4, true, 2, "h2", "f16"],
+          [8, 4, false, 2, "f16", "f16"],
+          [8, 4, false, 2, "h2", "h2"],
+          [8, 4, false, 2, "h2", "f16"],
+          [16, 4, false, 2, "f16", "f16"],
+          [4, 8, false, 2, "f16", "f16"],
+          [8, 8, false, 2, "f16", "f16"],
+          [4, 4, false, 2, "f16", "f16", 1],
+          [8, 4, false, 2, "f16", "f16", 1],
+          [4, 4, false, 1, "f16", "f16"],
+          [4, 4, false, 4, "f16", "f16"],
+          [4, 4, false, 4, "f16", "f16", 1],
+          [8, 4, false, 4, "f16", "f16", 1],
+          [8, 4, true, 2, "f16", "f16"],
+          [4, 4, false, 2, "f16", "f16", 0, "mat"],
+          [4, 4, false, 2, "f16", "f16", 0, "axpy"],
+          [8, 4, false, 2, "f16", "f16", 0, "mat"],
+          [8, 4, false, 2, "f16", "f16", 0, "axpy"],
+          [8, 8, false, 2, "f16", "f16", 0, "mat"],
+          [8, 8, false, 2, "f16", "f16", 0, "axpy"],
+          [4, 8, false, 2, "f16", "f16", 0, "axpy"],
+          [4, 8, false, 2, "f16", "f16", 0, "mat"],
+          [8, 4, false, 1, "f16", "f16", 0, "axpy"],
+          [4, 8, false, 1, "f16", "f16", 0, "axpy"],
+          [8, 4, false, 2, "h2", "h2", 0, "axpy"],
+          [4, 8, false, 2, "h2", "h2", 0, "axpy"],
+          [4, 12, false, 2, "f16", "f16", 0, "axpy"],
+          [4, 16, false, 2, "f16", "f16", 0, "axpy"],
+          [4, 16, false, 2, "f16", "f16", 0, "dot"]
+        ] as Array<[4 | 8 | 16, 4 | 8 | 12 | 16, boolean, number, "f16" | "h2", "f16" | "h2", number?, ("dot" | "mat" | "axpy")?]>).filter(
+          ([R, T, half, unroll, acts, wts, fixed, form]) =>
+            !picked || picked.test(`PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}${unroll !== 2 ? ` unroll ${unroll}` : ""}${fixed ? " const" : ""}${form ? ` ${form}` : ""}`)
         )
-        for (const [R, T, half, unroll, acts, wts] of picked ? [...pures, ...pures, ...pures] : pures) {
+        for (const [R, T, half, unroll, acts, wts, fixed, form] of picked ? [...pures, ...pures, ...pures] : pures) {
           const count = (R * T) / 8
           const outs = [0, 1].map(() =>
-            Array.from({ length: count }, () => gpu.texture(gl.RGBA32UI, N / R, M / T))
+            Array.from({ length: count }, () => gpu.texture(gl.RGBA32UI, N / R, Math.ceil(M / T)))
           )
-          const program = gpu.program(pureKernel(R, T, half, unroll, acts, wts))
+          const program = gpu.program(pureKernel(R, T, half, unroll, acts, wts, fixed ? K / 4 : 0, form))
           const run = (i: number) =>
             gpu.run({
               name: "mm",
@@ -1477,7 +1515,7 @@ void main() { o = ${read}; }`)
             best = Math.min(best, (performance.now() - t0) / 10)
           }
           log(
-            `MM2 ${label} ${N}x${K} M=${M} PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
+            `MM2 ${label} ${N}x${K} M=${M} PURE ${R}x${T}${half ? " half" : ""} acts ${acts} w ${wts}${unroll !== 2 ? ` unroll ${unroll}` : ""}${fixed ? " const" : ""}${form ? ` ${form}` : ""}: ${best.toFixed(3)} ms, ${(flops / best / 1e6).toFixed(0)} GFLOP/s`
           )
           for (const set of outs) for (const t of set) gpu.delete(t)
         }
