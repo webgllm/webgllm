@@ -307,3 +307,102 @@ ${o.prescaled ? `    var s = vec4<f32>(0.0);
     groups: (rect) => [Math.ceil(rect.width / WG), rect.height]
   }
 }
+
+/**
+ * A token's attention inputs in one pass (kernels.ts's headPrep for the
+ * queries, into the cache's slots, and the keys, and values(): the same
+ * math), from the q|k|v projection's `split` partial sums: a workgroup a
+ * head, its threads a texel each. The head is read once and its sum of
+ * squares added up in workgroup memory, where each output texel of the
+ * GLSL passes read the whole head again (twice, for its RoPE partner).
+ * Queries go to texel (uQX0 + q % kvWidth, uQRow0 + q / kvWidth), keys to
+ * row uKRow0 from uKX0, values beside them.
+ */
+export function attentionPrep(o: { headDim: number; heads: number; kvHeads: number; kvWidth: number; split: number; ropeLow: number }): NativeSpec {
+  const T = o.headDim / 4
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uQKVG", kind: "f" },
+    { name: "uQNorm", kind: "f" },
+    { name: "uKNorm", kind: "f" },
+    { name: "uRope", kind: "f" }
+  ]
+  const qT = o.heads * T, kvT = o.kvHeads * T
+  const code = `
+struct Uni { rect: vec4<u32>, pos: i32, pairTexels: i32, qx0: i32, qRow0: i32, kx0: i32, kRow0: i32, eps: f32, scale: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tP: texture_2d<f32>;
+@group(0) @binding(2) var tQN: texture_2d<f32>;
+@group(0) @binding(3) var tKN: texture_2d<f32>;
+@group(0) @binding(4) var tRope: texture_2d<f32>;
+@group(0) @binding(5) var out0: texture_storage_2d<rgba32uint, write>;
+var<workgroup> sq: array<vec4<f32>, ${T}>;
+var<workgroup> nv: array<vec4<f32>, ${T}>;
+fn pf(x: i32) -> vec4<f32> {
+  var acc = vec4<f32>(0.0);
+  for (var k = 0; k < ${o.split}; k++) { acc += textureLoad(tP, vec2<i32>(x, k), 0); }
+  return acc;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${T})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let t = i32(li);
+  let unit = i32(w.x);
+  let isQ = unit < ${o.heads};
+  let isK = !isQ && unit < ${o.heads + o.kvHeads};
+  let head = select(select(unit - ${o.heads + o.kvHeads}, unit - ${o.heads}, isK), unit, isQ);
+  let base = select(select(${qT + kvT}, ${qT}, isK), 0, isQ) + head * ${T};
+  let v = pf(base + t);
+  sq[t] = v * v;
+  workgroupBarrier();
+  // (Summed as the GLSL pass sums: texels in order, then the 4 lanes.)
+  var s4 = vec4<f32>(0.0);
+  for (var i = 0; i < ${T}; i++) { s4 += sq[i]; }
+  let inv = inverseSqrt(dot(s4, vec4<f32>(1.0)) / ${o.headDim}.0 + u.eps);
+  let n = v * inv * select(textureLoad(tKN, vec2<i32>(t, 0), 0), textureLoad(tQN, vec2<i32>(t, 0), 0), isQ);
+  nv[t] = n;
+  workgroupBarrier();
+  var r = n;
+  if (t < 2 * u.pairTexels) {
+    let first = t < u.pairTexels;
+    let tp = select(t - u.pairTexels, t + u.pairTexels, first);
+    let f = select(tp, t, first);
+    let p = nv[tp];
+    let lo = u.pos & ${o.ropeLow - 1};
+    let hi = ${o.ropeLow} + (u.pos >> ${Math.log2(o.ropeLow)}u);
+    let c1 = textureLoad(tRope, vec2<i32>(f, lo), 0);
+    let s1 = textureLoad(tRope, vec2<i32>(${T / 2} + f, lo), 0);
+    let c2 = textureLoad(tRope, vec2<i32>(f, hi), 0);
+    let s2 = textureLoad(tRope, vec2<i32>(${T / 2} + f, hi), 0);
+    let cs = c1 * c2 - s1 * s2;
+    let sn = s1 * c2 + c1 * s2;
+    r = select(n * cs + p * sn, n * cs - p * sn, first);
+  }
+  workgroupBarrier();
+  nv[t] = r;
+  workgroupBarrier();
+  if (isQ) {
+    let q = head * ${T} + t;
+    textureStore(out0, vec2<i32>(u.qx0 + q % ${o.kvWidth}, u.qRow0 + q / ${o.kvWidth}), bitcast<vec4<u32>>(r * u.scale));
+  } else if (t < ${T / 2}) {
+    if (isK) {
+      textureStore(out0, vec2<i32>(u.kx0 + head * ${T / 2} + t, u.kRow0), h2(nv[2 * t], nv[2 * t + 1]));
+    } else {
+      textureStore(out0, vec2<i32>(u.kx0 + ${kvT / 2} + head * ${T / 2} + t, u.kRow0), h2(pf(base + 2 * t), pf(base + 2 * t + 1)));
+    }
+  }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uPos0", type: "int" }, { name: "uPairTexels", type: "int" }, { name: "uQX0", type: "int" }, { name: "uQRow0", type: "int" },
+      { name: "uKX0", type: "int" }, { name: "uKRow0", type: "int" }, { name: "uEps", type: "float" }, { name: "uScale", type: "float" }
+    ],
+    groups: () => [o.heads + 2 * o.kvHeads, 1]
+  }
+}

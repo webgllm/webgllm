@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -140,6 +140,8 @@ export const TUNING = {
   nativeExpanded: 1,
   /** ...this many threads a workgroup. */
   nativeExpandedThreads: 32,
+  /** WebGPU: a token's queries, keys and values in one native pass (gpu/native.ts's attentionPrep). */
+  nativePrep: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -4644,6 +4646,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
   private orderStage: Texture | null = null
 
+  private attentionPreps = new Map<string, NativeSpec>()
+  private attentionPrepSpec(split: number, kvWidth: number) {
+    const c = this.config
+    const key = `${split} ${kvWidth}`
+    let spec = this.attentionPreps.get(key)
+    if (!spec)
+      this.attentionPreps.set(key, (spec = attentionPrep({ headDim: c.headDim, heads: c.numHeads, kvHeads: c.numKvHeads, kvWidth, split, ropeLow: K.ROPE_LOW })))
+    return spec
+  }
+
   private nativeExpandedSpec(split: boolean, prescaled: boolean) {
     const wg = TUNING.nativeExpandedThreads
     const key = `expanded ${split} ${prescaled} ${wg}`
@@ -5044,6 +5056,33 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // Queries: normalized, rotated, scaled by 1/sqrt(head dim); into the
     // cache's slots from qSlot0 (in runs, as the keys below), or b.q.
     const cacheShape = { kvWidth, slots: qSlots, texels: qDims / 4 }
+    // One token's, from split partial sums, its queries in one run of slots
+    // and its key in one row: a native pass for all three (see attentionPrep).
+    const qRuns = inCache ? slotRuns(qSlot0, qSlots * rows, blockRows, layer.ring) : []
+    const kSlot = layer.ring ? pos0 % layer.ring : pos0
+    const prep = rows === 1 && split > 0 && split <= 16 && !mrope && inCache && qRuns.length === 1 && TUNING.nativePrep > 0 &&
+      c.headDim / 4 <= 64 && "nativeProgram" in this.gpu
+      ? this.gpu.nativeProgram(this.attentionPrepSpec(split, kvWidth))
+      : null
+    if (prep) {
+      this.gpu.run({
+        name: "heads",
+        program: prep,
+        inputs: { uQKVG: qkvgIn, uQNorm: layer.qNorm, uKNorm: layer.kNorm, uRope: ropeTable },
+        uniforms: {
+          ...rope.uniforms,
+          uPairTexels: { int: pairTexels },
+          uQX0: { int: qRuns[0].block * kvWidth },
+          uQRow0: { int: qRuns[0].row0 },
+          uKX0: { int: Math.floor(kSlot / blockRows) * kvWidth },
+          uKRow0: { int: kSlot % blockRows },
+          uEps: c.normEps,
+          uScale: 1 / Math.sqrt(c.headDim)
+        },
+        output: layer.kv,
+        rect: { x: 0, y: 0, width: 1, height: 1 }
+      })
+    } else {
     if (inCache)
       for (const { s0, row0, block, run } of slotRuns(
         qSlot0,
@@ -5151,6 +5190,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         rect: { x: x0 + kvDims / 8, y: row0, width: kvDims / 8, height: run }
       })
       m0 += run
+    }
     }
     await this.attention(layer, type, rows, pos0, split, qkvgIn, paced, inCache)
     if (this.panelErrors || this.chunkErrors) {
