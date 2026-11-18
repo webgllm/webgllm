@@ -663,6 +663,19 @@ async function load(
 }
 
 /**
+ * The context length a request runs at: its own, or (left out) the one its
+ * model is loaded or loading at. A request that left it out used to load the
+ * model again at its whole window: a second copy of LFM3 1.7B beside one
+ * loaded at 8,192 tokens took an iPhone's tab past its 2 GB.
+ */
+function requestedContext(request: { model: string; contextLength?: number }) {
+  if (request.contextLength !== undefined) return request.contextLength
+  if (loading?.model === request.model) return loading.contextLength
+  if (current?.model === request.model) return current.contextLength
+  return undefined
+}
+
+/**
  * Loads `model` for chats of up to `contextLength` tokens unless it's loaded
  * (or loading) for them, replacing any other. Rejects with Superseded if
  * another load replaces this one first.
@@ -988,7 +1001,7 @@ async function generate(request: GenerateRequest) {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   // The model this request is for: loaded again if its GPU context was
   // lost, or loaded if another was asked for since.
-  const model = await startLoad(request.model, request.contextLength)
+  const model = await startLoad(request.model, requestedContext(request))
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   const calibration = model.engine.gpu.calibratePromptPacing()
   if (calibration) {
@@ -1814,7 +1827,7 @@ async function generate(request: GenerateRequest) {
  * the caller passes it in next.
  */
 async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }>) {
-  const model = await startLoad(request.model, request.contextLength)
+  const model = await startLoad(request.model, requestedContext(request))
   const { engine } = model
   const ids = request.inputIds
   if (!ids.length) throw new Error("forwardTokensAndSample needs at least one token.")

@@ -485,7 +485,8 @@ async function run() {
   await new Promise<void>((r, j) => {
     ready = r
     reject = j
-    send({ type: "load", model, loadId: 1 })
+    // `?ctx=`: the context length to load for (the app's 8,192 on iOS; the model's whole window when left out).
+    send({ type: "load", model, loadId: 1, ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }) })
   })
   if (baseline && params.get("waitTune") === "1") {
     begin("calibration")
@@ -529,12 +530,17 @@ async function run() {
       reject = j
       send({
         type: "generate",
+        // (The load's context length: another one would load the model again.)
+        ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }),
         id: `run${i}`,
         model,
         chat: [
           {
             role: "user",
-            content: `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
+            // TEMP: ?ask=copy has the reply repeat a passage from the prompt (a quoting / summarizing style reply).
+            content: params.get("ask") === "copy"
+              ? `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nHere is a note from the miller:\n"${COPY_PASSAGE}"\nRepeat the miller's note exactly, word for word.`
+              : `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
           }
         ],
         tools: [],

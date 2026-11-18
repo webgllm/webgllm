@@ -54,6 +54,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     const RECLAIM_BYTES = state.reclaimBytes ?? Infinity;
     let current = state.model;
     const startLoad = async () => state.model, createConstraint = async () => state.constraint();
+    const requestedContext = (request) => request.contextLength;
     ${source.slice(start, end)}
     generate.forward = forwardTokens;
     generate.reset = resetChat;
