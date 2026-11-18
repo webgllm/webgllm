@@ -11,43 +11,65 @@ import type { NativeSpec } from "./webgpu.js"
 const PRESCALE = 32
 
 /**
- * A token's add, in one dispatch, a workgroup per row (the passes it
- * replaces: Engine.addNormed's rms of y, then the add, its sums of squares
- * and its scaled copy, drawn as regions). For row m:
- * - y = the split matmul's partial sums over uSplit slices (rows m·uSplit + k);
+ * A residual add, in one dispatch (the passes it replaces: Engine.addNormed's
+ * rms of y, then the add, its sums of squares and its scaled copy, drawn as
+ * regions). For token m:
+ * - y = a matmul's output, as `y` says: "split", a split matmul's partial
+ *   sums over uSplitIn slices (rows m·uSplitIn + k); "pair", a pair tensor
+ *   (tokens 2q, 2q + 1 the halves of row q's h2 texels); "quad", a 4-token
+ *   matmul's two textures (tokens 4q, 4q + 1 in uY, 4q + 2, 4q + 3 in
+ *   uY_B, row q). The last two add up `slices` K-slices, uSliceStride rows
+ *   apart (kernels.ts's pf and pfq);
  * - with `normed` (LFM3's sandwich norm), y · 1/rms(y) · uNorm;
  * - out = uH + that, into columns [0, texels) of the first output;
  * - its sum of squares into column texels (the next norm sums `parts`
  *   columns from there: the rest are zeros);
  * - with `next`, h2(out · uNext / PRESCALE) into the second output from
  *   column uBase (texel j: features 8j..8j+7).
- * Each thread takes texel pairs; the two sums go through workgroup memory.
+ * A workgroup takes the tokens one row of y holds (1, 2 or 4), so each texel
+ * of y is fetched once; each thread takes texel pairs; the sums go through
+ * workgroup memory.
  */
-export function fusedAdd(o: { texels: number; normed: boolean; next: boolean }): NativeSpec {
+export function fusedAdd(o: { texels: number; normed: boolean; next: boolean; y?: "split" | "pair" | "quad"; slices?: number }): NativeSpec {
+  const source = o.y ?? "split"
+  const T = source === "quad" ? 4 : source === "pair" ? 2 : 1
+  const slices = Math.max(o.slices ?? 1, 1)
   const pairs = o.texels / 2
-  const threads = Math.min(256, pairs)
+  if (!Number.isInteger(pairs) || pairs < 1) throw new Error(`No fused add for ${o.texels} texels.`)
+  // A power of two (the sums halve their way down), each thread as many texel pairs.
+  let threads = 256
+  while (pairs % threads) threads >>= 1
   const per = pairs / threads
-  if (!Number.isInteger(per) || o.texels % 2) throw new Error(`No fused add for ${o.texels} texels.`)
   const inputs: NativeSpec["inputs"] = [
     { name: "uH", kind: "f" },
-    { name: "uY", kind: "f" },
+    { name: "uY", kind: source === "split" ? "f" : "u" },
+    ...(source === "quad" ? [{ name: "uY_B", kind: "u" as const }] : []),
     ...(o.normed ? [{ name: "uNorm", kind: "f" as const }] : []),
     ...(o.next ? [{ name: "uNext", kind: "f" as const }] : [])
   ]
   const binding = (name: string) => inputs.findIndex((i) => i.name === name) + 1
   const outBase = inputs.length + 1
   const p = Array.from({ length: per }, (_, i) => i)
+  const tk = Array.from({ length: T }, (_, t) => t)
+  // The tokens' sums: a float, or a vector of them.
+  const R = T === 1 ? "f32" : `vec${T}<f32>`
+  const of = (v: string, t: number) => (T === 1 ? v : `${v}[${t}]`)
+  const squares = (v: string) =>
+    `${R}(${tk.map((t) => p.map((i) => `dot(${v}a${i}_${t}, ${v}a${i}_${t}) + dot(${v}b${i}_${t}, ${v}b${i}_${t})`).join(" + ")).join(", ")})`
+  const stores = (lines: (t: number) => string) =>
+    tk.map((t) => (T === 1 ? lines(t) : `  if (m${t} < end) {\n${lines(t)}\n  }`)).join("\n")
   const code = `
-struct U { rect: vec4<u32>, split: i32, parts: i32, eps: f32, base: i32 }
+struct U { rect: vec4<u32>, split: i32, parts: i32, eps: f32, base: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(${binding("uH")}) var tH: texture_2d<f32>;
-@group(0) @binding(${binding("uY")}) var tY: texture_2d<f32>;
+@group(0) @binding(${binding("uY")}) var tY: texture_2d<${source === "split" ? "f32" : "u32"}>;
+${source === "quad" ? `@group(0) @binding(${binding("uY_B")}) var tYB: texture_2d<u32>;` : ""}
 ${o.normed ? `@group(0) @binding(${binding("uNorm")}) var tNorm: texture_2d<f32>;` : ""}
 ${o.next ? `@group(0) @binding(${binding("uNext")}) var tNext: texture_2d<f32>;` : ""}
 @group(0) @binding(${outBase}) var out0: texture_storage_2d<rgba32float, write>;
 ${o.next ? `@group(0) @binding(${outBase + 1}) var out1: texture_storage_2d<rgba32uint, write>;` : ""}
-var<workgroup> red: array<f32, ${threads}>;
-fn total(v: f32, l: u32) -> f32 {
+var<workgroup> red: array<${R}, ${threads}>;
+fn total(v: ${R}, l: u32) -> ${R} {
   red[l] = v;
   workgroupBarrier();
   for (var s = ${threads >> 1}u; s > 0u; s >>= 1u) {
@@ -58,10 +80,24 @@ fn total(v: f32, l: u32) -> f32 {
   workgroupBarrier();
   return t;
 }
-fn y(x: i32, m: i32) -> vec4<f32> {
-  var a = vec4<f32>(0.0);
-  for (var k = 0; k < u.split; k++) { a += textureLoad(tY, vec2<i32>(x, m * u.split + k), 0); }
-  return a;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* Texel x of y for the tokens of its row q. */
+struct Y { ${tk.map((t) => `t${t}: vec4<f32>`).join(", ")} }
+fn y(x: i32, q: i32) -> Y {
+  var r = Y();
+${source === "split"
+    ? `  for (var k = 0; k < u.split; k++) { r.t0 += textureLoad(tY, vec2<i32>(x, q * u.split + k), 0); }`
+    : `  for (var k = 0; k < ${slices}; k++) {
+    let at = vec2<i32>(x, q + k * u.stride);
+    let a = textureLoad(tY, at, 0);
+    r.t0 += lo(a);
+    r.t1 += hi(a);${source === "quad" ? `
+    let b = textureLoad(tYB, at, 0);
+    r.t2 += lo(b);
+    r.t3 += hi(b);` : ""}
+  }`}
+  return r;
 }
 fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
   let x = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
@@ -70,25 +106,34 @@ fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
 }
 @compute @workgroup_size(${threads})
 fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
-  let m = i32(u.rect.y + w.x);
+  let q = i32(u.rect.y) / ${T} + i32(w.x);
+  let end = i32(u.rect.y + u.rect.w);
+${tk.map((t) => `  let m${t} = ${T} * q + ${t};`).join("\n")}
   let j0 = i32(l) * ${per};
-${p.map((i) => `  let ya${i} = y(2 * (j0 + ${i}), m);
-  let yb${i} = y(2 * (j0 + ${i}) + 1, m);`).join("\n")}
+${p.map((i) => `  let xa${i} = 2 * (j0 + ${i});
+  let xb${i} = xa${i} + 1;
+  let Ya${i} = y(xa${i}, q);
+  let Yb${i} = y(xb${i}, q);
+${tk.map((t) => `  let ya${i}_${t} = Ya${i}.t${t};
+  let yb${i}_${t} = Yb${i}.t${t};`).join("\n")}`).join("\n")}
 ${o.normed
-    ? `  let rs = inverseSqrt(total(${p.map((i) => `dot(ya${i}, ya${i}) + dot(yb${i}, yb${i})`).join(" + ")}, l) / ${o.texels * 4}.0 + u.eps);
-${p.map((i) => `  let va${i} = textureLoad(tH, vec2<i32>(2 * (j0 + ${i}), m), 0) + ya${i} * rs * textureLoad(tNorm, vec2<i32>(2 * (j0 + ${i}), 0), 0);
-  let vb${i} = textureLoad(tH, vec2<i32>(2 * (j0 + ${i}) + 1, m), 0) + yb${i} * rs * textureLoad(tNorm, vec2<i32>(2 * (j0 + ${i}) + 1, 0), 0);`).join("\n")}`
-    : p.map((i) => `  let va${i} = textureLoad(tH, vec2<i32>(2 * (j0 + ${i}), m), 0) + ya${i};
-  let vb${i} = textureLoad(tH, vec2<i32>(2 * (j0 + ${i}) + 1, m), 0) + yb${i};`).join("\n")}
-${p.map((i) => `  textureStore(out0, vec2<i32>(2 * (j0 + ${i}), m), va${i});
-  textureStore(out0, vec2<i32>(2 * (j0 + ${i}) + 1, m), vb${i});`).join("\n")}
-  let sum = total(${p.map((i) => `dot(va${i}, va${i}) + dot(vb${i}, vb${i})`).join(" + ")}, l);
-  if (i32(l) < u.parts) {
-    textureStore(out0, vec2<i32>(${o.texels} + i32(l), m), select(vec4<f32>(0.0), vec4<f32>(sum, 0.0, 0.0, 0.0), l == 0u));
+    ? `  let rs = inverseSqrt(total(${squares("y")}, l) / ${o.texels * 4}.0 + u.eps);
+${p.map((i) => `  let na${i} = textureLoad(tNorm, vec2<i32>(xa${i}, 0), 0);
+  let nb${i} = textureLoad(tNorm, vec2<i32>(xb${i}, 0), 0);
+${tk.map((t) => `  let va${i}_${t} = textureLoad(tH, vec2<i32>(xa${i}, m${t}), 0) + ya${i}_${t} * ${of("rs", t)} * na${i};
+  let vb${i}_${t} = textureLoad(tH, vec2<i32>(xb${i}, m${t}), 0) + yb${i}_${t} * ${of("rs", t)} * nb${i};`).join("\n")}`).join("\n")}`
+    : p.map((i) => tk.map((t) => `  let va${i}_${t} = textureLoad(tH, vec2<i32>(xa${i}, m${t}), 0) + ya${i}_${t};
+  let vb${i}_${t} = textureLoad(tH, vec2<i32>(xb${i}, m${t}), 0) + yb${i}_${t};`).join("\n")).join("\n")}
+${stores((t) => p.map((i) => `  textureStore(out0, vec2<i32>(xa${i}, m${t}), va${i}_${t});
+  textureStore(out0, vec2<i32>(xb${i}, m${t}), vb${i}_${t});`).join("\n"))}
+  let sum = total(${squares("v")}, l);
+  // (Every column the next norm sums: fewer threads than those take several each.)
+  for (var c = i32(l); c < u.parts; c += ${threads}) {
+${stores((t) => `    textureStore(out0, vec2<i32>(${o.texels} + c, m${t}), select(vec4<f32>(0.0), vec4<f32>(${of("sum", t)}, 0.0, 0.0, 0.0), c == 0));`)}
   }
-${o.next ? p.map((i) => `  textureStore(out1, vec2<i32>(u.base + j0 + ${i}, m), h2(
-    va${i} * textureLoad(tNext, vec2<i32>(2 * (j0 + ${i}), 0), 0) * ${1 / PRESCALE},
-    vb${i} * textureLoad(tNext, vec2<i32>(2 * (j0 + ${i}) + 1, 0), 0) * ${1 / PRESCALE}));`).join("\n") : ""}
+${o.next ? `${p.map((i) => `  let ta${i} = textureLoad(tNext, vec2<i32>(xa${i}, 0), 0) * ${1 / PRESCALE};
+  let tb${i} = textureLoad(tNext, vec2<i32>(xb${i}, 0), 0) * ${1 / PRESCALE};`).join("\n")}
+${stores((t) => p.map((i) => `  textureStore(out1, vec2<i32>(u.base + j0 + ${i}, m${t}), h2(va${i}_${t} * ta${i}, vb${i}_${t} * tb${i}));`).join("\n"))}` : ""}
 }
 `
   return {
@@ -98,10 +143,11 @@ ${o.next ? p.map((i) => `  textureStore(out1, vec2<i32>(u.base + j0 + ${i}, m), 
       { name: "uSplitIn", type: "int" },
       { name: "uParts", type: "int" },
       { name: "uEps", type: "float" },
-      { name: "uBase", type: "int" }
+      { name: "uBase", type: "int" },
+      { name: "uSliceStride", type: "int" }
     ],
-    // A workgroup per row of the rectangle.
-    groups: (rect) => [rect.height, 1]
+    // A workgroup per row of y in the rectangle.
+    groups: (rect) => [Math.ceil(rect.height / T), 1]
   }
 }
 
@@ -404,6 +450,268 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3
       { name: "uKX0", type: "int" }, { name: "uKRow0", type: "int" }, { name: "uEps", type: "float" }, { name: "uScale", type: "float" }
     ],
     groups: () => [o.heads + 2 * o.kvHeads, 1]
+  }
+}
+
+/**
+ * A prompt batch's short convolution and its state in one dispatch
+ * (kernels.ts's shortConv and convState, the same products and sums): from
+ * in_proj's output B | C | x (uDt texels each; a pair tensor, `y` "pair", or
+ * a 4-token matmul's two textures, "quad", in `slices` K-slices
+ * uSliceStride rows apart), z = C · Σ_k w[k] · (B·x)[t - (width-1) + k]
+ * as h2 into the first output, and the last width-1 tokens' B·x into the
+ * second (the state: f32, oldest first). A workgroup takes an h2 texel of
+ * the output and a block of tokens, a thread a row of the tensor (2 or 4
+ * tokens): B·x once a token, through workgroup memory, where every output
+ * texel of the GLSL pass multiplied its `width` tokens' again; tokens
+ * before the batch come from the state (uState). For batches of at least
+ * width-1 tokens.
+ */
+export function promptConv(o: { width: number; y: "pair" | "quad"; slices: number }): NativeSpec {
+  const quad = o.y === "quad"
+  // Tokens a row of the tensor, rows a workgroup, and the rows before a block that hold the width-1 tokens before it.
+  const T = quad ? 4 : 2
+  const L = 64
+  const W = o.width
+  const HR = Math.ceil((W - 1) / T)
+  const H = HR * T
+  if (W < 2 || HR > L) throw new Error(`No prompt conv for a kernel of ${W}.`)
+  const tk = Array.from({ length: T }, (_, t) => t)
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uBCx", kind: "u" },
+    ...(quad ? [{ name: "uBCx_B", kind: "u" as const }] : []),
+    { name: "uState", kind: "f" },
+    { name: "uConv", kind: "f" }
+  ]
+  const binding = (name: string) => inputs.findIndex((i) => i.name === name) + 1
+  const code = `
+struct Uni { rect: vec4<u32>, dt: i32, stride: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(${binding("uBCx")}) var tP: texture_2d<u32>;
+${quad ? `@group(0) @binding(${binding("uBCx_B")}) var tPB: texture_2d<u32>;` : ""}
+@group(0) @binding(${binding("uState")}) var tState: texture_2d<f32>;
+@group(0) @binding(${binding("uConv")}) var tConv: texture_2d<f32>;
+@group(0) @binding(${inputs.length + 1}) var outZ: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(${inputs.length + 2}) var outState: texture_storage_2d<rgba32float, write>;
+/* B·x of the block's tokens and the ${H} before them: token (block's first - ${H} + i)'s two texels at 2i, 2i + 1. */
+var<workgroup> Y: array<vec4<f32>, ${2 * (L * T + H)}>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* Texel x of row q's tokens (its K-slices added, as pf adds them). */
+struct Row { ${tk.map((t) => `t${t}: vec4<f32>`).join(", ")} }
+fn row(x: i32, q: i32) -> Row {
+  var r = Row();
+  for (var k = 0; k < ${Math.max(o.slices, 1)}; k++) {
+    let at = vec2<i32>(x, q + k * u.stride);
+    let a = textureLoad(tP, at, 0);
+    r.t0 += lo(a);
+    r.t1 += hi(a);${quad ? `
+    let b = textureLoad(tPB, at, 0);
+    r.t2 += lo(b);
+    r.t3 += hi(b);` : ""}
+  }
+  return r;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${L})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let l = i32(li);
+  let x = i32(w.x);
+  let c0 = 2 * x;
+  let rows = i32(u.rect.w);
+  // The block's first row of the tensor, and this thread's.
+  let q0 = i32(w.y) * ${L};
+  let q = q0 + l;
+  let m0 = ${T} * q;
+  // This row's B, x and C, texels c0 and c0 + 1.
+  let B0 = row(c0, q);
+  let B1 = row(c0 + 1, q);
+  let X0 = row(2 * u.dt + c0, q);
+  let X1 = row(2 * u.dt + c0 + 1, q);
+  let C0 = row(u.dt + c0, q);
+  let C1 = row(u.dt + c0 + 1, q);
+${tk.map((t) => `  let y0_${t} = B0.t${t} * X0.t${t};
+  let y1_${t} = B1.t${t} * X1.t${t};
+  Y[2 * (${H} + ${T} * l + ${t})] = y0_${t};
+  Y[2 * (${H} + ${T} * l + ${t}) + 1] = y1_${t};`).join("\n")}
+  // The ${H} tokens before the block (its first threads take a row of them each): the batch's, or the state's.
+  if (l < ${HR}) {
+    let qh = q0 - ${HR} + l;
+    if (qh >= 0) {
+      let b0 = row(c0, qh);
+      let b1 = row(c0 + 1, qh);
+      let x0 = row(2 * u.dt + c0, qh);
+      let x1 = row(2 * u.dt + c0 + 1, qh);
+${tk.map((t) => `      Y[2 * (${T} * l + ${t})] = b0.t${t} * x0.t${t};
+      Y[2 * (${T} * l + ${t}) + 1] = b1.t${t} * x1.t${t};`).join("\n")}
+    } else {
+${tk.map((t) => `      {
+        // Token ${T} * qh + ${t} (before the batch): the state's row ${W - 1} + it, if it holds it.
+        let s = ${W - 1} + ${T} * qh + ${t};
+        Y[2 * (${T} * l + ${t})] = select(vec4<f32>(0.0), textureLoad(tState, vec2<i32>(c0, s), 0), s >= 0);
+        Y[2 * (${T} * l + ${t}) + 1] = select(vec4<f32>(0.0), textureLoad(tState, vec2<i32>(c0 + 1, s), 0), s >= 0);
+      }`).join("\n")}
+    }
+  }
+  workgroupBarrier();
+${Array.from({ length: W }, (_, k) => `  let w0_${k} = textureLoad(tConv, vec2<i32>(c0, ${k}), 0);
+  let w1_${k} = textureLoad(tConv, vec2<i32>(c0 + 1, ${k}), 0);`).join("\n")}
+${tk.map((t) => `  if (m0 + ${t} < rows) {
+    // Token m0 + ${t}: taps from ${W - 1} tokens back to its own (Y's index of token m is ${H} + m - ${T} * q0).
+    let at = 2 * (${H} + ${T} * l + ${t} - ${W - 1});
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+${Array.from({ length: W }, (_, k) => `    a0 = fma(w0_${k}, Y[at + ${2 * k}], a0);
+    a1 = fma(w1_${k}, Y[at + ${2 * k + 1}], a1);`).join("\n")}
+    textureStore(outZ, vec2<i32>(x, m0 + ${t}), h2(C0.t${t} * a0, C1.t${t} * a1));
+    // The batch's last ${W - 1} tokens are the state after it.
+    let i = m0 + ${t} - (rows - ${W - 1});
+    if (i >= 0) {
+      textureStore(outState, vec2<i32>(c0, i), y0_${t});
+      textureStore(outState, vec2<i32>(c0 + 1, i), y1_${t});
+    }
+  }`).join("\n")}
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uDt", type: "int" },
+      { name: "uSliceStride", type: "int" }
+    ],
+    // A workgroup an h2 texel of the output and a block of the tensor's rows.
+    groups: (rect) => [rect.width, Math.ceil(rect.height / (L * T))]
+  }
+}
+
+/**
+ * A prompt batch's attention inputs in one dispatch (kernels.ts's headPrep
+ * for the queries and for the keys, and its `values`: three passes, each
+ * texel summing its head's squares for itself): a workgroup a head of a
+ * token (the q heads, then the k, then the v), a thread a texel, the head's
+ * sum of squares through workgroup memory (summed as the GLSL pass sums,
+ * so the same bits: texels in order, then the 4 lanes). The q|k|v|gate projection is a pair
+ * tensor (`y` "pair") or a 4-token matmul's two textures ("quad"), in
+ * `slices` K-slices uSliceStride rows apart (kernels.ts's pf and pfq).
+ * Queries (normalized, rotated, times uScale) go to the first output, f32
+ * texel (head · T + t, m); keys (normalized, rotated) and values to the
+ * second, the KV cache, as h2 at token m's slot: uSlot0 + m, wrapped at
+ * uRing if there is one, in blocks of 2^uKvShift rows uKvWidth texels apart.
+ */
+export function promptPrep(o: { headDim: number; heads: number; kvHeads: number; y: "pair" | "quad"; slices: number; ropeLow: number }): NativeSpec {
+  const T = o.headDim / 4
+  if (T > 256 || T % 2) throw new Error(`No prompt prep for heads of ${o.headDim}.`)
+  const quad = o.y === "quad"
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uQKVG", kind: "u" },
+    ...(quad ? [{ name: "uQKVG_B", kind: "u" as const }] : []),
+    { name: "uQNorm", kind: "f" },
+    { name: "uKNorm", kind: "f" },
+    { name: "uRope", kind: "f" }
+  ]
+  const binding = (name: string) => inputs.findIndex((i) => i.name === name) + 1
+  const qT = o.heads * T, kvT = o.kvHeads * T
+  const code = `
+struct Uni { rect: vec4<u32>, pos0: i32, pairTexels: i32, stride: i32, ring: i32, kvShift: i32, kvWidth: i32, slot0: i32, eps: f32, scale: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(${binding("uQKVG")}) var tP: texture_2d<u32>;
+${quad ? `@group(0) @binding(${binding("uQKVG_B")}) var tPB: texture_2d<u32>;` : ""}
+@group(0) @binding(${binding("uQNorm")}) var tQN: texture_2d<f32>;
+@group(0) @binding(${binding("uKNorm")}) var tKN: texture_2d<f32>;
+@group(0) @binding(${binding("uRope")}) var tRope: texture_2d<f32>;
+@group(0) @binding(${inputs.length + 1}) var outQ: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(${inputs.length + 2}) var outKV: texture_storage_2d<rgba32uint, write>;
+var<workgroup> sq: array<vec4<f32>, ${T}>;
+var<workgroup> nv: array<vec4<f32>, ${T}>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* Texel x of token m. */
+fn pf(x: i32, m: i32) -> vec4<f32> {
+  var acc = vec4<f32>(0.0);
+  for (var k = 0; k < ${Math.max(o.slices, 1)}; k++) {
+    let at = vec2<i32>(x, (m >> ${quad ? 2 : 1}u) + k * u.stride);
+${quad
+    ? `    var t: vec4<u32>;
+    if (((m >> 1u) & 1) == 1) { t = textureLoad(tPB, at, 0); } else { t = textureLoad(tP, at, 0); }`
+    : `    let t = textureLoad(tP, at, 0);`}
+    acc += select(lo(t), hi(t), (m & 1) == 1);
+  }
+  return acc;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${T})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let t = i32(li);
+  let unit = i32(w.x);
+  let m = i32(w.y + u.rect.y);
+  let isQ = unit < ${o.heads};
+  let isK = !isQ && unit < ${o.heads + o.kvHeads};
+  let head = select(select(unit - ${o.heads + o.kvHeads}, unit - ${o.heads}, isK), unit, isQ);
+  let base = select(select(${qT + kvT}, ${qT}, isK), 0, isQ) + head * ${T};
+  let v = pf(base + t, m);
+  sq[t] = v;
+  workgroupBarrier();
+  // (Summed as the GLSL pass sums: texels in order, each a fused multiply-add, as its \`s += v * v\` compiles; then the 4 lanes.)
+  var s4 = vec4<f32>(0.0);
+  for (var i = 0; i < ${T}; i++) { s4 = fma(sq[i], sq[i], s4); }
+  let inv = inverseSqrt(dot(s4, vec4<f32>(1.0)) / ${o.headDim}.0 + u.eps);
+  let n = v * inv * select(textureLoad(tKN, vec2<i32>(t, 0), 0), textureLoad(tQN, vec2<i32>(t, 0), 0), isQ);
+  nv[t] = n;
+  workgroupBarrier();
+  var r = n;
+  if (t < 2 * u.pairTexels) {
+    let first = t < u.pairTexels;
+    let tp = select(t - u.pairTexels, t + u.pairTexels, first);
+    let f = select(tp, t, first);
+    let p = nv[tp];
+    let pos = u.pos0 + m;
+    let pl = pos & ${o.ropeLow - 1};
+    let ph = ${o.ropeLow} + (pos >> ${Math.log2(o.ropeLow)}u);
+    let c1 = textureLoad(tRope, vec2<i32>(f, pl), 0);
+    let s1 = textureLoad(tRope, vec2<i32>(${T / 2} + f, pl), 0);
+    let c2 = textureLoad(tRope, vec2<i32>(f, ph), 0);
+    let s2 = textureLoad(tRope, vec2<i32>(${T / 2} + f, ph), 0);
+    let cs = c1 * c2 - s1 * s2;
+    let sn = s1 * c2 + c1 * s2;
+    r = select(n * cs + p * sn, n * cs - p * sn, first);
+  }
+  workgroupBarrier();
+  nv[t] = r;
+  workgroupBarrier();
+  if (isQ) {
+    textureStore(outQ, vec2<i32>(head * ${T} + t, m), r * u.scale);
+  } else if (t < ${T / 2}) {
+    // Token m's slot of the cache.
+    var slot = u.slot0 + m;
+    if (u.ring > 0) { slot = slot % u.ring; }
+    let kx = (slot >> u32(u.kvShift)) * u.kvWidth + head * ${T / 2} + t;
+    let ky = slot & ((1 << u32(u.kvShift)) - 1);
+    if (isK) {
+      textureStore(outKV, vec2<i32>(kx, ky), h2(nv[2 * t], nv[2 * t + 1]));
+    } else {
+      textureStore(outKV, vec2<i32>(kx + ${kvT / 2}, ky), h2(pf(base + 2 * t, m), pf(base + 2 * t + 1, m)));
+    }
+  }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uPos0", type: "int" }, { name: "uPairTexels", type: "int" }, { name: "uSliceStride", type: "int" }, { name: "uRing", type: "int" },
+      { name: "uKvShift", type: "int" }, { name: "uKvWidth", type: "int" }, { name: "uSlot0", type: "int" }, { name: "uEps", type: "float" }, { name: "uScale", type: "float" }
+    ],
+    // A workgroup a head of a token: the q heads, the k heads, the v heads; the rectangle's rows are the tokens.
+    groups: (rect) => [o.heads + 2 * o.kvHeads, rect.height]
   }
 }
 
@@ -979,48 +1287,67 @@ ${rms ? `  var s = vec4<f32>(0.0);
 
 /**
  * kernels.ts's dequantBytes (no zero points: 8) from weights in a storage
- * buffer (see bufferMatvec): output texel x of the f16 layout, or with `h2`
- * texels 2x' and 2x' + 1 of each column as one h2 texel x'.
+ * buffer (see bufferMatvec): the f16 layout's texels, or with `h2` texels
+ * 2x' and 2x' + 1 of each column as one h2 texel x' (into a texture, or
+ * with `toBuffer` a storage buffer, row y at y · uStride). A thread takes a
+ * row's block of 32 weights (x: the block, column after column; the
+ * rectangle starts at x 0), so it fetches the block's words and scale once:
+ * 4-bit, a word's low nibbles are one texel and its high nibbles the texel 4
+ * on. An M3 Ultra dequantized LFM3's four prompt matrices in 156 µs this
+ * way where 266 a thread an h2 texel, the same bits
+ * (bench/gemm-exact.html). `bits` 8: bufferMatvec's 8-bit layout (a word a
+ * texel).
  */
-export function bufferDequant(o: { h2: boolean; toBuffer?: boolean }): NativeSpec {
+export function bufferDequant(o: { h2: boolean; toBuffer?: boolean; bits?: 4 | 8 }): NativeSpec {
   if (o.toBuffer && !o.h2) throw new Error("A dequant into a buffer writes h2 texels.")
+  const bits = o.bits ?? 4
+  // Texels a block: 8 of the f16 layout, 4 of h2.
+  const per = o.h2 ? 4 : 8
+  const J = [0, 1, 2, 3, 4, 5, 6, 7]
+  const words = bits === 8 ? J : [0, 1, 2, 3]
+  const store = (i: number, v: string) => o.toBuffer ? `  out0[at + ${i}] = ${v};` : `  textureStore(out0, vec2<i32>(x + ${i}, y), ${v});`
+  const stores = (v: (j: number) => string) =>
+    (o.h2 ? [0, 1, 2, 3].map((i) => store(i, `h2(${v(2 * i)}, ${v(2 * i + 1)})`)) : J.map((j) => store(j, v(j)))).join("\n")
   const code = `
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tS: texture_2d<f32>;
 @group(0) @binding(2) var<storage, read> bW: array<u32>;
 ${o.toBuffer ? "@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;" : `@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;`}
-fn deq(x: i32, y: i32) -> vec4<f32> {
-  let c = x / u.kq;
-  let kq = x - c * u.kq + u.kq0;
+${bits === 8
+    ? "fn q(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u)); }"
+    : "fn q(w: u32, s: vec4<u32>) -> vec4<f32> { return vec4<f32>((vec4<u32>(w) >> s) & vec4<u32>(15u)) - 8.0; }"}
+${o.h2 ? `fn h2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
+  let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}` : ""}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  // Blocks a column, and this thread's: block kbl of column c.
+  let kbs = u.kq >> 3u;
+  let c = i32(id.x) / kbs;
+  let kbl = i32(id.x) - c * kbs;
+  let x = ${o.h2 ? "c * (u.kq >> 1u) + 4 * kbl" : "c * u.kq + 8 * kbl"};
+  if (id.y >= u.rect.w || x >= i32(u.rect.z)) { return; }
+  let y = i32(id.y + u.rect.y);
+  ${o.toBuffer ? "let at = y * u.stride + x;" : ""}
   var row = c * u.hd + y;
-  if (row >= u.n) { return vec4<f32>(0.0); }
+  if (row >= u.n) {
+${stores(() => "vec4<f32>(0.0)")}
+    return;
+  }
   row += u.row0;
   let g = row / 4;
   let r = row - g * 4;
   let col = g / u.h;
   let gr = g - col * u.h;
-  let kb = kq / 8;
-  let j = kq - kb * 8;
-  let word = bW[gr * u.width + col * u.rowTexels + kb * 16 + r * 4 + (j & 3)];
-  let b = (vec4<u32>(word) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
-  let q = vec4<f32>(select(b >> vec4<u32>(4u), b & vec4<u32>(15u), j < 4));
+  let kb = (u.kq0 >> 3u) + kbl;
   let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];
-  return (q - 8.0) * d;
-}
-@compute @workgroup_size(64, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  if (id.x >= u.rect.z || id.y >= u.rect.w) { return; }
-  let p = vec2<i32>(id.xy + u.rect.xy);
-${o.h2
-    ? `  let hk = u.kq >> 1u;
-  let c = p.x / hk;
-  let x = c * u.kq + 2 * (p.x - c * hk);
-  let a = clamp(deq(x, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
-  let b = clamp(deq(x + 1, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
-  let v = vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
-  ${o.toBuffer ? "out0[p.y * u.stride + p.x] = v;" : "textureStore(out0, p, v);"}`
-    : `  textureStore(out0, p, deq(p.x, p.y));`}
+  let wb = gr * u.width + col * u.rowTexels + kb * ${4 * words.length} + r * ${words.length};
+${words.map((j) => `  let w${j} = bW[wb + ${j}];`).join("\n")}
+${J.map((j) => `  let v${j} = ${bits === 8 ? `q(w${j})` : `q(w${j & 3}, vec4<u32>(${j < 4 ? "0u, 8u, 16u, 24u" : "4u, 12u, 20u, 28u"}))`} * d;`).join("\n")}
+${stores((j) => `v${j}`)}
 }`
   return {
     code,
@@ -1038,7 +1365,7 @@ ${o.h2
       { name: "uRow0", type: "int" },
       { name: "uStride", type: "int" }
     ],
-    groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
+    groups: (rect) => [Math.ceil(rect.width / per / 64), rect.height]
   }
 }
 
@@ -1224,6 +1551,105 @@ ${S.map((j) => `  textureStore(out1, vec2<i32>(x, r0 + ${j}), decay * s${j} + ${
       { name: "uSplitIn", type: "int" }
     ],
     groups: (rect) => [rect.width / 4, 1]
+  }
+}
+
+/**
+ * A prompt batch's chunked recurrence (kernels.ts's linChunkOut and
+ * linChunkState, the same sums in the same order), chunk after chunk in
+ * one dispatch where those are two dependent passes a chunk: rows
+ * [uC0, uC1) of the batch, whole chunks (of `chunk` rows after a first one
+ * of uFirst, as chunkStart has them). A workgroup takes a value texel x and
+ * holds its column of the state (a thread a key row k) in workgroup memory
+ * from chunk to chunk:
+ * - a thread a token of the chunk: delta D = U - W S0 into workgroup
+ *   memory, and the output O = Oi + Q' S0 into the first output;
+ * - a thread a key row: S = exp(G_last) S0 + Σ_s exp(G_last - G_s) k̂_s D_s;
+ * and the last chunk's state goes to the second output (texel (x, k)).
+ */
+export function linChunkLoop(o: { keyHeadDim: number; valueHeadDim: number; chunk: number }): NativeSpec {
+  const dk = o.keyHeadDim
+  const DK4 = dk / 4
+  const DV4 = o.valueHeadDim / 4
+  if (dk > 256 || o.chunk > dk || dk % 4 || o.valueHeadDim % 4) throw new Error(`No chunk loop for ${dk} key dims and chunks of ${o.chunk}.`)
+  const code = `
+struct Uni { rect: vec4<u32>, k4: i32, c0: i32, c1: i32, first: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tU: texture_2d<f32>;
+@group(0) @binding(3) var tW: texture_2d<f32>;
+@group(0) @binding(4) var tOi: texture_2d<f32>;
+@group(0) @binding(5) var tQp: texture_2d<f32>;
+@group(0) @binding(6) var tQK: texture_2d<f32>;
+@group(0) @binding(7) var tCum: texture_2d<f32>;
+@group(0) @binding(8) var outO: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(9) var outS: texture_storage_2d<rgba32float, write>;
+var<workgroup> S: array<vec4<f32>, ${dk}>;
+var<workgroup> D: array<vec4<f32>, ${o.chunk}>;
+fn G(h: i32, r: i32) -> f32 { return textureLoad(tCum, vec2<i32>(h >> 2u, r), 0)[h & 3]; }
+@compute @workgroup_size(${dk})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let x = i32(w.x + u.rect.x);
+  let k = i32(l);
+  let h = x / ${DV4};
+  let kb = h * ${DK4};
+  let kc = h * ${dk} + k;
+  S[k] = textureLoad(tS, vec2<i32>(x, k), 0);
+  workgroupBarrier();
+  var c0 = u.c0;
+  while (c0 < u.c1) {
+    let c1 = min(c0 + select(${o.chunk}, u.first, c0 == 0), u.c1);
+    if (k < c1 - c0) {
+      let t = c0 + k;
+      var ws = vec4<f32>(0.0);
+      var qs = vec4<f32>(0.0);
+      for (var i = 0; i < ${DK4}; i++) {
+        let wv = textureLoad(tW, vec2<i32>(kb + i, t), 0);
+        let q = textureLoad(tQp, vec2<i32>(kb + i, t), 0);
+        let s0 = S[4 * i];
+        let s1 = S[4 * i + 1];
+        let s2 = S[4 * i + 2];
+        let s3 = S[4 * i + 3];
+        ws += s0 * wv.x + s1 * wv.y + s2 * wv.z + s3 * wv.w;
+        qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+      }
+      D[k] = textureLoad(tU, vec2<i32>(x, t), 0) - ws;
+      textureStore(outO, vec2<i32>(x, t), textureLoad(tOi, vec2<i32>(x, t), 0) + qs);
+    }
+    workgroupBarrier();
+    let last = G(h, c1 - 1);
+    var acc = exp(last) * S[k];
+    for (var s = c0; s < c1; s++) {
+      let kk = textureLoad(tQK, vec2<i32>(u.k4 + (kc >> 2u), s), 0)[kc & 3];
+      acc += exp(last - G(h, s)) * kk * D[s - c0];
+    }
+    // (Its own row: the others read theirs alone here, and all of them only after the barrier.)
+    S[k] = acc;
+    workgroupBarrier();
+    c0 = c1;
+  }
+  textureStore(outS, vec2<i32>(x, k), S[k]);
+}
+`
+  return {
+    code,
+    inputs: [
+      { name: "uS", kind: "f" },
+      { name: "uU", kind: "f" },
+      { name: "uW", kind: "f" },
+      { name: "uOi", kind: "f" },
+      { name: "uQp", kind: "f" },
+      { name: "uQK", kind: "f" },
+      { name: "uCum", kind: "f" }
+    ],
+    uniforms: [
+      { name: "uK4", type: "int" },
+      { name: "uC0", type: "int" },
+      { name: "uC1", type: "int" },
+      { name: "uFirst", type: "int" }
+    ],
+    // A workgroup a value texel of the rectangle's width.
+    groups: (rect) => [rect.width, 1]
   }
 }
 

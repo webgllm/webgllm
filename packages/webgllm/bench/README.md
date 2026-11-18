@@ -135,6 +135,36 @@ Textures (M3, a 535-token prompt; LFM3 GGUF / Qwen3.5 GGUF, at load and the peak
 | bytes, f16Pack 0 (before) | 1,316 / 1,384 | 1,549 / 1,604 |
 | bytes, f16Pack 3 | 1,299 / 1,367 | 1,535 / 1,590 |
 
+## A prompt's other passes on WebGPU (M3 Ultra, Chrome, Nov 18)
+
+Where a 548-token prompt's time went with the matmuls native (`webgl-perf.html?…&tune=webgpu:1,pskip_<pass>:1`, each kind of pass left out in turn; LFM3 1.7B, 104 ms): matmuls 79%, the dequantization passes 5%, attention 6% (its head passes 2.5%, scores 1%, the weighted values 2.7%), conv 2.6%, SwiGLU 1.7%, the adds 1.4%, the norms 0.9%. LFM2.5 350M (24 ms): matmuls 67%, dequantization 7%, attention's weighted values 7%, conv 3%, SwiGLU 3%. Qwen3.5 2B (117 ms after its 8-bit matrices went through the scratch): matmuls 68%, the recurrence 14%, dequantization 5%, the Gated DeltaNet block's other passes 3%, attention 5%. A small pass costs 20 to 40 µs whatever it does (the recurrence's 34 chunk passes a layer 0.75 ms, the 350M's 64 dequantizations 1.7 ms), so a chain of small dependent passes is paid by the pass.
+
+What paid (medians of rounds 2 to 4, arms alternating load by load; tokens/s):
+
+| | LFM2.5 350M | LFM2.5 1.2B | LFM3 1.7B | Qwen3.5 2B |
+|---|---|---|---|---|
+| The residual add in one native pass (`fusedAdd` 2 against 1, where y's sums, the add and its sums were three) | 21,570 → 21,950 | 7,350 → 7,410 | 4,920 → 5,060 | 3,426 → 3,433 |
+| The buffer dequant a row's block a thread (4 words and the scale fetched once for 4 h2 texels) | 22,060 → 22,320 | 7,470 → 7,640 | 5,090 → 5,180 | 3,420 → 3,470 |
+| 8-bit matrices through the f16 scratch and the native matmul (`bufferGemm8`) | none | none | none | 3,504 → 4,285 |
+| …the 8-bit beta\|decay matmul too, into the block's output textures | | | | 4,450 → 4,530 |
+| The recurrence's chunks in one dispatch (`chunkLoop`) | | | | 4,440 → 4,590 |
+| Queries, keys and values in one pass (`promptPrep`) | 21,960 → 21,820 (noise) | 7,610 → 7,680 | 5,155 → 5,300 | 4,765 → 4,880 |
+| The short convolution and its state in one pass (`promptConv`) | 21,870 → 22,030 | 7,690 → 7,750 | 5,330 → 5,410 | none |
+
+- The dequant, the chunk loop, the prompt prep and the prompt conv compute the same bits as the passes they replace (`gemm-exact.html` compares the dequant's buffers; for the others, every token's logprob over two 128-token replies agrees to 6 decimals: `webgl-perf.html?…&logprobs=1`). The GLSL passes' `s += v * v` compiles to a fused multiply-add on Metal: a native pass that stores the squares and adds them moves logprobs by up to 0.012, one that sums with `fma` by nothing.
+- The fused add and the 8-bit matrices' f16 weights round differently: logprobs move by up to 0.014, as much as regrouping the norms' partial sums does (`rmsParts` 16 against 64: 0.024). A near-tie can flip a token deep in a reply.
+- Unsloth's Qwen3.5 2B Q4_0 has 18 Q5_K `ssm_out` and 3 Q4_1 `ffn_down` tensors, kept as 8-bit: the native pair matmul ran them at 2.7 TFLOP/s (2.1 ms a pass) where the dequantized f16 matmul runs 17 to 19, a quarter of the prompt's time for a twelfth of its multiply-adds.
+- The chunk loop is bound by its threads' own chains, not by the GPU's throughput: 17 chunks of two 32-step loops take 0.38 ms a layer (each loop 0.16), the same with the decays shared through workgroup memory or constant loop bounds, and 0.43 with a thread 4 key rows (a quarter of the fetches, more work a step).
+
+What lost:
+
+- A matmul straight from the 4-bit weights (no dequantization pass; `gemm-exact.html?v=q1_16x4,q1_8x8,q2_8x8,q1e_16x4`): 0.37 to 0.41× the f16 matmul's speed with one row group a thread, 0.09× with two. Every token tile decodes the weights again; the dequant pass decodes them once.
+- The f16 matmul's products in half floats (`shader-f16`; `gemm-exact.html?v=x11_16x4h4,x11_16x4h8`): 3.5% faster, 6e-4 off.
+- Row groups a thread pinned (`gemmRowGroups` 1 against 2) on Qwen3.5 2B: 4,785 against 4,748 tokens/s, noise.
+- The dequant a block of a row group a thread (16 words): no faster than a row's block.
+
+What's left is mostly the matmuls (17.5 to 18.9 TFLOP/s alone in `gemm-exact.html`), then the dequantization passes, attention's scores and weighted values, and SwiGLU. This Chrome (157) doesn't list WebGPU's subgroup matrix feature among the adapter's.
+
 ## Writing experiments that lost (Pixel 10 Pro, Oct 31)
 
 - gate|up and SwiGLU in one pass with no K-split (576 fragments for the 350M, each over all of K): 3× slower on the Pixel and 1.8× on an M3. Writing passes need thousands of fragments; a pass fewer doesn't pay for that.

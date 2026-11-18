@@ -13,7 +13,7 @@
 import { GL, type Pass, type Texture } from "../src/gpu/types.js"
 import { WebGpu, type NativeSpec } from "../src/gpu/webgpu.js"
 import * as K from "../src/gpu/kernels.js"
-import { bufferDequant } from "../src/gpu/native.js"
+import { bufferDequant, promptMatmulBuffer } from "../src/gpu/native.js"
 
 const params = new URLSearchParams(location.search)
 const out = document.querySelector("#out")!
@@ -342,8 +342,185 @@ ${S.join("\n")}
   }
 }
 
+/**
+ * No dequantization: the 4-bit weights straight from their storage buffer
+ * (16 bytes a row a block, as vec4<u32>), each block's sums scaled by the
+ * rows' scales (binding uS) as they're added. TM row groups × 4 tokens a
+ * thread, workgroups WX rect rows × WY threads' row groups, `trips` blocks a
+ * slice. A block in 4 steps of one h2 texel of activations (8 values): the
+ * low nibbles of two words, then the high nibbles.
+ */
+function quant(o: { tm: number; wx: number; wy: number; trips: number; late?: boolean }): NativeSpec {
+  const I = Array.from({ length: o.tm }, (_, i) => i), T = [0, 1, 2, 3], R = [0, 1, 2, 3]
+  const late = o.late !== false
+  const step = (e: number) => {
+    const nib = e < 2 ? "nlo" : "nhi", c = "xyzw"[2 * (e & 1)], c1 = "xyzw"[2 * (e & 1) + 1]
+    return `    {
+${T.map((t) => `      let A${t} = textureLoad(tA, vec2<i32>(4 * kb + ${e}, m0 + ${t}), 0);`).join("\n")}
+${["lo", "hi"].map((h, k) => `      {
+${I.map((i) => R.map((r) => `        let w${i}_${r} = ${nib}(Q${i}_${r}.${k ? c1 : c})${late ? "" : ` * d${i}.${"xyzw"[r]}`};`).join("\n")).join("\n")}
+${T.map((t) => `        { let a = ${h}(A${t});
+${I.map((i) => `          ${late ? "bd" : "acc"}${t}_${i} += vec4<f32>(dot(w${i}_0, a), dot(w${i}_1, a), dot(w${i}_2, a), dot(w${i}_3, a));`).join("\n")}
+        }`).join("\n")}
+      }`).join("\n")}
+    }`
+  }
+  const code = `
+struct Uni { rect: vec4<u32>, kq: i32, kqW: i32, kq0: i32, hd: i32, sliceRows: i32, kqSlice: i32, row0: i32, kb: i32, h: i32, rowTexels: i32, width: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<u32>;
+@group(0) @binding(2) var tS: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> bQ: array<vec4<u32>>;
+@group(0) @binding(4) var out0: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(5) var out1: texture_storage_2d<rgba32uint, write>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* A word's 4 low (high) nibbles less 8: each flipped at its top bit, then sign-extended. */
+fn nlo(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w ^ 0x88888888u) << vec4<u32>(28u, 20u, 12u, 4u)) >> vec4<u32>(28u)); }
+fn nhi(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w ^ 0x88888888u) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(28u)); }
+fn packH2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
+  let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}
+@compute @workgroup_size(${o.wx}, ${o.wy})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= u.rect.w || id.y * ${o.tm}u >= u.rect.z) { return; }
+  let y = i32(id.x + u.rect.y);
+  let g0 = i32(id.y * ${o.tm}u + u.rect.x);
+  let slice = y / u.sliceRows;
+  let m0 = 4 * (y - slice * u.sliceRows);
+  let kb0 = slice * (u.kqSlice >> 3u);
+${I.map((i) => `  let ok${i} = ${i === 0 ? "true" : `g0 + ${i} < i32(u.rect.x + u.rect.z)`};
+  let gg${i} = ${i === 0 ? "g0" : `select(g0, g0 + ${i}, ok${i})`};
+  let col${i} = gg${i} / u.h;
+  let gr${i} = gg${i} - col${i} * u.h;
+  let qb${i} = (gr${i} * u.width + col${i} * u.rowTexels) >> 2u;
+  let sx${i} = col${i} * u.kb;
+${T.map((t) => `  var acc${t}_${i} = vec4<f32>(0.0);`).join("\n")}`).join("\n")}
+  for (var it = 0; it < ${o.trips}; it++) {
+    let kb = kb0 + it;
+${I.map((i) => `    let d${i} = textureLoad(tS, vec2<i32>(sx${i} + kb, gr${i}), 0);
+${R.map((r) => `    let Q${i}_${r} = bQ[qb${i} + 4 * kb + ${r}];`).join("\n")}
+${late ? T.map((t) => `    var bd${t}_${i} = vec4<f32>(0.0);`).join("\n") : ""}`).join("\n")}
+${[0, 1, 2, 3].map(step).join("\n")}
+${late ? I.map((i) => T.map((t) => `    acc${t}_${i} += d${i} * bd${t}_${i};`).join("\n")).join("\n") : ""}
+  }
+${I.map((i) => `  if (ok${i}) {
+    textureStore(out0, vec2<i32>(g0 + ${i}, y), packH2(acc0_${i}, acc1_${i}));
+    textureStore(out1, vec2<i32>(g0 + ${i}, y), packH2(acc2_${i}, acc3_${i}));
+  }`).join("\n")}
+}`
+  return {
+    code,
+    inputs: [{ name: "uA", kind: "u" }, { name: "uS", kind: "f" }],
+    buffers: [{ name: "bQ" }],
+    uniforms: [...UNIFORMS, ...["uKb", "uH", "uRowTexels", "uWidth"].map((name) => ({ name, type: "int" as const }))],
+    groups: (rect) => [Math.ceil(rect.height / o.wx), Math.ceil(rect.width / (o.wy * o.tm))]
+  }
+}
+
+/**
+ * The buffer dequant a thread an h2 texel, as the engine ran it before a
+ * thread took a row's block (native.ts's bufferDequant): each texel fetches
+ * its two words and the row's scale twice.
+ */
+function dequantTexels(): string {
+  return `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> bW: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;
+fn deq(x: i32, y: i32) -> vec4<f32> {
+  let c = x / u.kq;
+  let kq = x - c * u.kq + u.kq0;
+  var row = c * u.hd + y;
+  if (row >= u.n) { return vec4<f32>(0.0); }
+  row += u.row0;
+  let g = row / 4;
+  let r = row - g * 4;
+  let col = g / u.h;
+  let gr = g - col * u.h;
+  let kb = kq / 8;
+  let j = kq - kb * 8;
+  let word = bW[gr * u.width + col * u.rowTexels + kb * 16 + r * 4 + (j & 3)];
+  let b = (vec4<u32>(word) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
+  let q = vec4<f32>(select(b >> vec4<u32>(4u), b & vec4<u32>(15u), j < 4));
+  let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];
+  return (q - 8.0) * d;
+}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= u.rect.z || id.y >= u.rect.w) { return; }
+  let p = vec2<i32>(id.xy + u.rect.xy);
+  let hk = u.kq >> 1u;
+  let c = p.x / hk;
+  let x = c * u.kq + 2 * (p.x - c * hk);
+  let a = clamp(deq(x, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(deq(x + 1, p.y), vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  out0[p.y * u.stride + p.x] = vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}`
+}
+
+/**
+ * The buffer dequant with a thread a pair of words (`words` 2: their low
+ * nibbles are one h2 texel and their high nibbles the texel two on) or,
+ * with `rows` 4, a block of a row group (16 words, 16 texels). The engine's
+ * is between them: a thread a row's block (4 words).
+ */
+function dequantPairs(words: 2 | 4, rows: 1 | 4 = 1): string {
+  const P = words === 4 ? [0, 1] : [0]
+  const R = rows === 4 ? [0, 1, 2, 3] : [0]
+  return `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> bW: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;
+fn nib(w: u32, s: vec4<u32>) -> vec4<f32> { return vec4<f32>((vec4<u32>(w) >> s) & vec4<u32>(15u)) - 8.0; }
+fn h2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
+  let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw));
+}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  // Threads a column: its h2 texels (kq / 2) over ${words}.
+  let per = u.kq / ${2 * words};
+  let c = i32(id.x) / per;
+  let t = i32(id.x) - c * per;
+  let y = ${rows} * i32(id.y);
+  if (y >= i32(u.rect.w) || c * (u.kq >> 1u) >= i32(u.rect.z)) { return; }
+  let kbl = t ${words === 4 ? "" : ">> 1u"};
+  let at = y * u.stride + c * (u.kq >> 1u) + 4 * kbl${words === 4 ? "" : " + (t & 1)"};
+  var row = c * u.hd + y;
+  if (row >= u.n) {
+${R.map((r) => P.map((p) => `    out0[at + ${r} * u.stride + ${p}] = vec4<u32>(0u); out0[at + ${r} * u.stride + ${p} + 2] = vec4<u32>(0u);`).join("\n")).join("\n")}
+    return;
+  }
+  row += u.row0;
+  let g = row / 4;
+  let r = row - g * 4;
+  let col = g / u.h;
+  let gr = g - col * u.h;
+  let kb = (u.kq0 >> 3u) + kbl;
+  let ds = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0);
+  let wb = gr * u.width + col * u.rowTexels + kb * 16 + r * 4${words === 4 ? "" : " + 2 * (t & 1)"};
+${R.map((rr) => `  {
+    let d = ds[${rows === 4 ? rr : "r"}];
+${P.map((p) => `    {
+      let w0 = bW[wb + ${4 * rr + 2 * p}];
+      let w1 = bW[wb + ${4 * rr + 2 * p + 1}];
+      out0[at + ${rr} * u.stride + ${p}] = h2(nib(w0, vec4<u32>(0u, 8u, 16u, 24u)) * d, nib(w1, vec4<u32>(0u, 8u, 16u, 24u)) * d);
+      out0[at + ${rr} * u.stride + ${p} + 2] = h2(nib(w0, vec4<u32>(4u, 12u, 20u, 28u)) * d, nib(w1, vec4<u32>(4u, 12u, 20u, 28u)) * d);
+    }`).join("\n")}
+  }`).join("\n")}
+}`
+}
+
 type Ctx = { kqSlice: number }
-type Variant = { name: string; spec: (c: Ctx) => NativeSpec; buf?: boolean }
+type Variant = { name: string; spec: (c: Ctx) => NativeSpec; buf?: boolean; engine?: boolean }
 const VARIANTS: Variant[] = [
   { name: "d11", spec: () => direct({ tm: 1, tn: 1, wx: 8, wy: 8 }) },
   { name: "d11_cu2", spec: (c) => direct({ tm: 1, tn: 1, wx: 8, wy: 8, trips: c.kqSlice / 2, u: 2 }) },
@@ -352,7 +529,15 @@ const VARIANTS: Variant[] = [
   { name: "d11_bwc_ps", spec: (c) => direct({ tm: 1, tn: 1, wx: 8, wy: 8, buf: "w", ptr: true, swap: true, trips: c.kqSlice / 2 }) },
   { name: "d11_bwc_p4x16", spec: (c) => direct({ tm: 1, tn: 1, wx: 4, wy: 16, buf: "w", ptr: true, trips: c.kqSlice / 2 }) },
   { name: "d11_bwc_ps16x4", spec: (c) => direct({ tm: 1, tn: 1, wx: 16, wy: 4, buf: "w", ptr: true, swap: true, trips: c.kqSlice / 2 }) },
-  { name: "d11_bc_p", spec: (c) => direct({ tm: 1, tn: 1, wx: 8, wy: 8, buf: true, ptr: true, trips: c.kqSlice / 2 }) }
+  { name: "d11_bc_p", spec: (c) => direct({ tm: 1, tn: 1, wx: 8, wy: 8, buf: true, ptr: true, trips: c.kqSlice / 2 }) },
+  // The engine's own kernel (native.ts's promptMatmulBuffer), one and two row groups a thread.
+  { name: "eng1", spec: (c) => promptMatmulBuffer({ trips: c.kqSlice / 2, rowGroups: 1 }), engine: true },
+  { name: "eng2", spec: (c) => promptMatmulBuffer({ trips: c.kqSlice / 2, rowGroups: 2 }), engine: true },
+  // Straight from the 4-bit weights (no dequantization pass).
+  { name: "q1_16x4", spec: (c) => quant({ tm: 1, wx: 16, wy: 4, trips: c.kqSlice / 8 }) },
+  { name: "q1_8x8", spec: (c) => quant({ tm: 1, wx: 8, wy: 8, trips: c.kqSlice / 8 }) },
+  { name: "q2_8x8", spec: (c) => quant({ tm: 2, wx: 8, wy: 8, trips: c.kqSlice / 8 }) },
+  { name: "q1e_16x4", spec: (c) => quant({ tm: 1, wx: 16, wy: 4, trips: c.kqSlice / 8, late: false }) }
 ]
 
 // ------------------------------------------------------------ run
@@ -471,40 +656,67 @@ try {
     // The native dequant writing a storage buffer (rows SW texels) rather than the scratch texture: raw WebGPU, its own timestamps.
     const dev = gpu.device
     const dqBufCode = bufferDequant({ h2: true, toBuffer: true }).code
-    const dqPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: dqBufCode }), entryPoint: "main" } })
     const uniBuf = dev.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     const uniData = new Int32Array(16)
     uniData.set([0, 0, dqRect.width, dqRect.height, blocks, groups, rowTexels, rowTexels, kqW, 0, HD, N, 0, SW])
     dev.queue.writeBuffer(uniBuf, 0, uniData)
-    const outB = dev.createBuffer({ size: SW * HD * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
-    const dqGroup = dev.createBindGroup({ layout: dqPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: (scales.tex as GPUTexture).createView() },
-      { binding: 2, resource: { buffer: stored.tex as GPUBuffer } }, { binding: 3, resource: { buffer: outB } }] })
+    const outB = dev.createBuffer({ size: SW * HD * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
     const qs = dev.createQuerySet({ type: "timestamp", count: 2 })
-    const rawDq = async (n: number) => {
-      gpu.flush()
+    // (per: h2 texels a thread.)
+    const rawDequant = (code: string, per: number, rowsPer = 1) => {
+      const pipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" } })
+      const group = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: uniBuf } }, { binding: 1, resource: (scales.tex as GPUTexture).createView() },
+        { binding: 2, resource: { buffer: stored.tex as GPUBuffer } }, { binding: 3, resource: { buffer: outB } }] })
+      return async (n: number) => {
+        gpu.flush()
+        const enc = dev.createCommandEncoder()
+        const cp = enc.beginComputePass({ timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } })
+        cp.setPipeline(pipe); cp.setBindGroup(0, group)
+        for (let i = 0; i < n; i++) cp.dispatchWorkgroups(Math.ceil(dqRect.width / per / 64), Math.ceil(dqRect.height / rowsPer))
+        cp.end()
+        const res = dev.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC })
+        const rd = dev.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        enc.resolveQuerySet(qs, 0, 2, res, 0); enc.copyBufferToBuffer(res, 0, rd, 0, 16)
+        dev.queue.submit([enc.finish()])
+        await rd.mapAsync(GPUMapMode.READ)
+        const t = new BigUint64Array(rd.getMappedRange())
+        const ms = Number(t[1] - t[0]) / 1e6 / n
+        rd.unmap(); rd.destroy(); res.destroy()
+        return ms
+      }
+    }
+    const readOutB = async () => {
+      const rd = dev.createBuffer({ size: SW * HD * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
       const enc = dev.createCommandEncoder()
-      const cp = enc.beginComputePass({ timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } })
-      cp.setPipeline(dqPipe); cp.setBindGroup(0, dqGroup)
-      for (let i = 0; i < n; i++) cp.dispatchWorkgroups(Math.ceil(dqRect.width / 64), dqRect.height)
-      cp.end()
-      const res = dev.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC })
-      const rd = dev.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
-      enc.resolveQuerySet(qs, 0, 2, res, 0); enc.copyBufferToBuffer(res, 0, rd, 0, 16)
+      enc.copyBufferToBuffer(outB, 0, rd, 0, SW * HD * 16)
       dev.queue.submit([enc.finish()])
       await rd.mapAsync(GPUMapMode.READ)
-      const t = new BigUint64Array(rd.getMappedRange())
-      const ms = Number(t[1] - t[0]) / 1e6 / n
-      rd.unmap(); rd.destroy(); res.destroy()
-      return ms
+      const copy = new Uint32Array(rd.getMappedRange().slice(0))
+      rd.unmap(); rd.destroy()
+      return copy
     }
+    // The other dequants against bufferDequant's buffer, texel for texel (where it writes: each column's kq / 2 texels of a row).
+    const rawDq = rawDequant(dqBufCode, 4)
+    const rawDqT = rawDequant(dequantTexels(), 1), rawDq2 = rawDequant(dequantPairs(2), 2), rawDq44 = rawDequant(dequantPairs(4, 4), 4, 4)
+    await rawDq(1)
+    const wanted = await readOutB()
+    for (const [name, run] of [["dq_texels", rawDqT], ["dq_pairs2", rawDq2], ["dq_group4", rawDq44]] as const) {
+      dev.queue.writeBuffer(outB, 0, new Uint32Array(SW * HD * 4))
+      await run(1)
+      const got = await readOutB()
+      let bad = 0
+      for (let y = 0; y < dqRect.height; y++) for (let x = 0; x < dqRect.width * 4; x++) if (got[y * SW * 4 + x] !== wanted[y * SW * 4 + x]) bad++
+      log(`${shape.name}: ${name} vs bufferDequant's buffer: ${bad} words differ`)
+    }
+    await rawDq(1)
     await rawDq(1)
     const outBTex = { id: 1e9 + shapes.indexOf(shape), tex: outB, width: SW, height: HD, internal: -1, bytes: SW * HD * 16 } as unknown as Texture
     for (const v of variants) {
       let spec: NativeSpec
       try { spec = v.spec({ kqSlice }) } catch (e) { log(`${v.name}: ${(e as Error).message}`); continue }
       const program = gpu.nativeProgram({ ...spec, code: `// ${v.name} ${shape.name}\n${spec.code}` })
-      runs.push({ name: v.name, key: "", pass: { name: `${v.name}_${shape.name}`, program, inputs: { bW: outBTex, bA: aBuf, uW: scratch, uA: A }, uniforms: mmUniforms, output: outs, rect: mmRect } })
+      runs.push({ name: v.name, key: "", pass: { name: `${v.name}_${shape.name}`, program, inputs: { bW: outBTex, bA: aBuf, uW: (v as Variant).engine ? outBTex : scratch, uA: A, uS: scales, bQ: stored }, uniforms: { ...mmUniforms, uStride: { int: SW }, uKb: { int: blocks }, uH: { int: groups }, uRowTexels: { int: rowTexels }, uWidth: { int: rowTexels } }, output: outs, rect: mmRect } })
     }
     log(`${shape.name}: N ${N} K ${Kd} slices ${slices} × kqSlice ${kqSlice}, rect ${mmRect.width}x${mmRect.height}, dequant rect ${dqRect.width}x${dqRect.height}`)
     // Checks: the GLSL dequant against the native one, each variant against the baseline, the baseline against the CPU at sample points.
@@ -552,7 +764,7 @@ try {
     }
     if (gpu.errors.length > errors0) log(`${shape.name} GPU errors: ${gpu.errors.slice(errors0).join(" || ").slice(0, 1500)}`)
     // Timing: rounds, variants rotated, reps each, GPU timestamps.
-    const all: Array<{ name: string; pass?: Pass; raw?: (n: number) => Promise<number> }> = [{ name: "dq_native", pass: dqNative }, { name: "dq_glsl", pass: dqGl }, { name: "dq_tobuf", raw: rawDq }, ...runs.map((r) => ({ name: r.name, pass: r.pass }))]
+    const all: Array<{ name: string; pass?: Pass; raw?: (n: number) => Promise<number> }> = [{ name: "dq_native", pass: dqNative }, { name: "dq_glsl", pass: dqGl }, { name: "dq_tobuf", raw: rawDq }, { name: "dq_texels", raw: rawDqT }, { name: "dq_pairs2", raw: rawDq2 }, { name: "dq_group4", raw: rawDq44 }, ...runs.map((r) => ({ name: r.name, pass: r.pass }))]
     results[shape.name] = Object.fromEntries(all.map((r) => [r.name, [] as number[]]))
     for (const r of all) if (r.pass) gpu.run(r.pass)
     await gpu.finish()
