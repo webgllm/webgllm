@@ -130,7 +130,13 @@ export const TUNING = {
    * slower: tune() times it.
    */
   lanes: 0,
-  /** WebGPU: a token's add (y's RMS, the residual, its sums, the next input) in one native pass. */
+  /**
+   * WebGPU: a residual add (y's RMS, the residual, its sums, the next input)
+   * in one native pass, a token's and a prompt's alike. An M3 Ultra read
+   * LFM3 1.7B's prompts at 5,060 tokens/s with the prompt's fused where
+   * 4,920 (its sandwich norm made the add three passes), LFM2.5 350M's at
+   * 21,950 where 21,570, 1.2B's at 7,410 where 7,350, Qwen3.5 2B's the same.
+   */
   fusedAdd: 1,
   /** WebGPU: the Q6_K word head as a native pass, its activations in workgroup memory. */
   nativeHead: 1,
@@ -5149,31 +5155,38 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   ) {
     const { hiddenSize } = this.config
     const texels = hiddenSize / 4
-    // On WebGPU, a token's add in one native dispatch (see gpu/native.ts).
-    const key = `${texels} ${!!norm} ${!!next}`
-    if (split > 0 && TUNING.fusedAdd > 0 && "nativeProgram" in this.gpu && !this.fusedAdds.has(key)) {
+    // On WebGPU, the add in one native dispatch (see gpu/native.ts): a
+    // token's (y a split matmul's partials) or a prompt's (y a pair tensor).
+    const source = split > 0 ? "split" : this.quadOf(y) ? "quad" : "pair"
+    const slicing = this.slicing.get(y.id) ?? { split: 1, stride: 0 }
+    const slices = split > 0 ? 0 : Math.max(slicing.split, 1)
+    const fused = TUNING.fusedAdd > 0 && "nativeProgram" in this.gpu
+    const key = `${texels} ${!!norm} ${!!next} ${source} ${slices}`
+    if (fused && !this.fusedAdds.has(key)) {
       // (Null for a shape it doesn't fit: the passes below.)
       let spec: NativeSpec | null = null
       try {
-        spec = fusedAdd({ texels, normed: !!norm, next: !!next })
+        spec = fusedAdd({ texels, normed: !!norm, next: !!next, y: source, slices })
       } catch {
         spec = null
       }
       this.fusedAdds.set(key, spec)
     }
-    const spec = split > 0 && TUNING.fusedAdd > 0 ? this.fusedAdds.get(key) : null
+    const spec = fused ? this.fusedAdds.get(key) : null
     if (spec && "nativeProgram" in this.gpu) {
       const program = this.gpu.nativeProgram(spec)
       this.fusedAddPrograms.add(program)
+      const partner = this.quadOf(y)
       this.gpu.run({
         name: "add",
         program,
-        inputs: { uH: h, uY: y, ...(norm && { uNorm: norm }), ...(next && { uNext: next }) },
+        inputs: { uH: h, uY: y, ...(source === "quad" && partner && { uY_B: partner }), ...(norm && { uNorm: norm }), ...(next && { uNext: next }) },
         uniforms: {
           uSplitIn: { int: split },
           uParts: { int: this.parts },
           uEps: this.config.normEps,
-          uBase: { int: texels + K.RMS_PARTS }
+          uBase: { int: texels + K.RMS_PARTS },
+          uSliceStride: { int: slicing.stride }
         },
         output: next ? [out, this.scaledOf(out)] : out,
         rect: { x: 0, y: 0, width: texels, height: rows }
