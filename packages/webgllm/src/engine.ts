@@ -195,15 +195,6 @@ export const TUNING = {
   /** 1: WebGL's prompt matmuls are paced in bands of 32 columns, every token in each, as gemmColumnBands. */
   glColumnBands: 0,
   /**
-   * Experiment (off; set before the model loads): 1: WebGL's f16Pack 0
-   * prompt matmuls take 8 tokens a fragment, not 4, into four textures of
-   * their own (kernels.ts's matmulF16 with `oct`; the knob makes them, so
-   * it costs their memory). On a Pixel 10 Pro, LFM3 1.7B's prompts:
-   * Firefox 99 to 101 tokens/s where 85 to 90, Chrome 96 to 100 where 102
-   * (bench/README.md), so it can't replace the 4-token kernel as it is.
-   */
-  octMatmul: 0,
-  /**
    * WebGPU, f16Pack 0: prompts' f16 matmuls as the native pass, 8 rows × 4
    * tokens an invocation (gpu/native.ts's promptMatmul). The load's packing
    * probe times it against f16Pack 3's: a Pixel 10 Pro took it and read
@@ -917,8 +908,6 @@ export class Engine {
   private readonly scaleBatch: boolean
   /** A pair buffer's second texture, for 4-token matmuls (see matmulQuad). */
   private quads = new Map<number, Texture>()
-  /** A pair buffer's four textures for 8-token matmuls, half its height (TUNING.octMatmul). */
-  private octs = new Map<number, [Texture, Texture, Texture, Texture]>()
   private finalNorm!: Texture
   private ropeFull!: Texture
   private ropeSliding!: Texture
@@ -1134,11 +1123,8 @@ export class Engine {
       const b = this.buffers
       // (Not for a 1×1 stand-in: see allocate.)
       for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj])
-        if (t && t.width * t.height > 1) {
+        if (t && t.width * t.height > 1)
           this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
-          if (TUNING.octMatmul > 0 && this.gpu.canRender([GL.RGBA32UI, GL.RGBA32UI, GL.RGBA32UI, GL.RGBA32UI]))
-            this.octs.set(t.id, [0, 1, 2, 3].map(() => this.gpu.texture(GL.RGBA32UI, t.width, Math.ceil(t.height / 2))) as [Texture, Texture, Texture, Texture])
-        }
     }
     this.ropeFull = this.ropeTable(config.ropeThetaFull, config.ropeDimsFull)
     // (Only models with sliding-window layers read the second table.)
@@ -4270,7 +4256,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   /** How each pair tensor was last written: K-slices stacked, rows apart. */
   private slicing = new Map<
     number,
-    { split: number; stride: number; quad?: boolean; oct?: boolean }
+    { split: number; stride: number; quad?: boolean }
   >()
 
   /** Pair tensor t's second texture if a 4-token matmul wrote it last. */
@@ -4278,17 +4264,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return this.slicing.get(t.id)?.quad ? this.quads.get(t.id) : undefined
   }
 
-  /**
-   * The second texture of pair tensor t as input `name`_B, if it has one;
-   * an 8-token matmul's four textures as `name` and `name`_B, _C, _D.
-   */
+  /** The second texture of pair tensor t as input `name`_B, if it has one. */
   private quadInputs(name: string, t: Texture): Record<string, Texture> {
     const partner = this.quadOf(t)
-    if (!partner) return {}
-    const oct = this.slicing.get(t.id)?.oct ? this.octs.get(t.id) : undefined
-    return oct
-      ? { [name]: oct[0], [`${name}_B`]: oct[1], [`${name}_C`]: oct[2], [`${name}_D`]: oct[3] }
-      : { [`${name}_B`]: partner }
+    return partner ? { [`${name}_B`]: partner } : {}
   }
 
   /** `source` reading pair tensor input `name` (t) as it was written. */
@@ -4296,7 +4275,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!this.quadOf(t)) return source
     // The slice count as a constant: the reads unroll.
     const split = this.slicing.get(t.id)?.split ?? 1
-    return K.withPairSplit(K.fromQuad(source, [name], this.slicing.get(t.id)?.oct ? 8 : 4), split)
+    return K.withPairSplit(K.fromQuad(source, [name]), split)
   }
 
   /** The uniforms pf needs to read pair tensor t (its K-slices). */
@@ -4526,7 +4505,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if ((w.rgba4 || w.bits === 4) && partner && TUNING.quad > 0) {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
-      let quadRows = Math.ceil(rows / 4)
+      const quadRows = Math.ceil(rows / 4)
       // (This GPU's own choice for short batches, if tune made one.)
       const short = rows < TUNING.f16MinRows
       // The most slices the output holds at a full batch: the same for
@@ -4548,10 +4527,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const h2W = (pack & 2) !== 0
         const wOut = h2W ? f.wbuf ?? f.wh2 : f.w
         if (!wOut) throw new GpuError("The f16 matmul's scratch is missing.")
-        // (TUNING.octMatmul: eight tokens a fragment, into four textures.)
-        const oct = pack === 0 && TUNING.octMatmul > 0 && !("nativeProgram" in this.gpu) ? this.octs.get(out.id) : undefined
-        const tokens = oct ? 8 : 4
-        if (oct) quadRows = Math.ceil(rows / tokens)
         // The activations as RGBA16F, unless the matmul reads their h2.
         let fa = a
         if (!(pack & 1) && a.internal !== GL.RGBA16F) {
@@ -4567,7 +4542,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
               x: 0,
               y: 0,
               width: kq,
-              height: Math.min(quadRows * tokens, fa.height)
+              height: Math.min(quadRows * 4, fa.height)
             }
           })
         }
@@ -4595,8 +4570,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const multiply = this.gpu.program(
           K.matmulF16({
             half: TUNING.f16Half > 0 || this.precision === "mediump",
-            packed: pack,
-            oct: !!oct
+            packed: pack
           })
         )
         // WebGPU, RGBA16F weights and activations (f16Pack 0) in f32 math:
@@ -4664,23 +4638,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 uRow0: { int: r0 },
                 uStride: { int: wOut.width }
               },
-              output: oct ?? [out, partner],
+              output: [out, partner],
               rect: {
                 x: r0 / 4,
                 y: s0 * quadRows,
                 width: Math.ceil(n / 4),
                 height: quadRows * (s1 - s0)
               },
-              // (Per K texel: 4 rows' weights and 4 tokens' activations; twice that for 8 tokens,
-              // a fragment's time at most, so a band of them takes no longer.)
-              work: kqSlice * 2 * tokens,
+              // (Per K texel: 4 rows' weights and 4 tokens' activations.)
+              work: kqSlice * 8,
               ...(nativeMultiply ? TUNING.gemmColumnBands > 0 && { bandColumns: 16 } : this.glColumnBands())
             })
           }
         }
-        this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true, oct: !!oct })
-        // (A reader handed the first of the four reads its slicing too.)
-        if (oct) this.slicing.set(oct[0].id, { split: slices, stride: quadRows })
+        this.slicing.set(out.id, { split: slices, stride: quadRows, quad: true })
         return
       }
       if (w.rgba4) {

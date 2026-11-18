@@ -81,24 +81,6 @@ vec4 pf(highp sampler2D s, int x, int m) {
 `
 
 
-/** pf for an 8-token matmul's outputs, added to the kernels that read them (see fromQuad). */
-const PFO = `/*
- * The same from an 8-token matmul's four outputs (see matmulF16): tokens
- * 8q + 2i, 8q + 2i + 1 in texture i, row q (plus its K-slices).
- */
-vec4 pfo(highp usampler2D a, highp usampler2D b, highp usampler2D c, highp usampler2D d, int x, int m) {
-  vec4 acc = vec4(0.0);
-  int row = m >> 3;
-  int t = (m >> 1) & 3;
-  for (int k = 0; k < max(uPairSplit, 1); k++) {
-    ivec2 p = ivec2(x, row + k * uSliceStride);
-    uvec4 u = t == 0 ? texelFetch(a, p, 0) : t == 1 ? texelFetch(b, p, 0) : t == 2 ? texelFetch(c, p, 0) : texelFetch(d, p, 0);
-    acc += (m & 1) == 0 ? h2lo(u) : h2hi(u);
-  }
-  return acc;
-}
-`
-
 /**
  * The add's h2(x · next norm weights) is stored divided by this (and the
  * matmul that reads it multiplies back), so large residuals don't overflow
@@ -604,10 +586,9 @@ void main() {
  * 4, split by unpackHalf2x16: bit 1 the activations straight from the h2
  * tensor (no RGBA16F copy), bit 2 the weights in dequantOut's h2 layout.
  */
-function matmulF16Source(o: { half: boolean; packed?: number; oct?: boolean }) {
+function matmulF16Source(o: { half: boolean; packed?: number }) {
   const P = o.half ? "mediump " : ""
   if (o.packed) return matmulF16PackedSource(o.half, o.packed)
-  if (o.oct) return matmulF16OctSource(o.half)
   return `${HEADER}
 uniform ${P}sampler2D uW;
 uniform ${P}sampler2D uA;
@@ -652,64 +633,6 @@ void main() {
   }
   o0 = packH2(acc0, acc1);
   o1 = packH2(acc2, acc3);
-}`
-}
-
-/**
- * matmulF16 for 4 rows × 8 tokens a fragment, into four textures (tokens
- * 8q + 2i, 8q + 2i + 1 to output i, at row s · uSliceRows + q: pfo reads
- * them): the rows' four texels are fetched once for eight tokens, and
- * each token's sums are the texels' columns scaled by its activations and
- * added, two K texels a step.
- */
-function matmulF16OctSource(half: boolean) {
-  const P = half ? "mediump " : ""
-  const T = [0, 1, 2, 3, 4, 5, 6, 7]
-  const L: Array<string> = []
-  const line = (s: string) => L.push(`    ${s}`)
-  for (const u of [0, 1]) {
-    line(`{ int q = kq + ${u};`)
-    for (const r of [0, 1, 2, 3]) line(`  ${P}vec4 w${r} = texelFetch(uW, ivec2(wx + q, wy + ${r}), 0);`)
-    for (const t of T) {
-      line(`  { ${P}vec4 a = texelFetch(uA, ivec2(q, m0 + ${t}), 0);`)
-      line(`    acc${t} += ${["x", "y", "z", "w"].map((c) => `vec4(w0.${c}, w1.${c}, w2.${c}, w3.${c}) * a.${c}`).join(" + ")}; }`)
-    }
-    line(`}`)
-  }
-  return `${HEADER}
-uniform ${P}sampler2D uW;
-uniform ${P}sampler2D uA;
-uniform int uKq;
-uniform int uHd;
-uniform int uSliceRows;
-uniform int uKqSlice;
-uniform int uRow0;
-uniform int uKq0;
-uniform int uKqW;
-layout(location = 0) out uvec4 o0;
-layout(location = 1) out uvec4 o1;
-layout(location = 2) out uvec4 o2;
-layout(location = 3) out uvec4 o3;
-void main() {
-  int g = int(gl_FragCoord.x);
-  int y = int(gl_FragCoord.y);
-  int slice = y / uSliceRows;
-  int m0 = 8 * (y - slice * uSliceRows);
-  int row = 4 * g - uRow0;
-  int c = row / uHd;
-  int wx = c * uKqW - uKq0;
-  int wy = row - c * uHd;
-  // (Slices are whole blocks, 8 K texels each: every step has both texels.)
-  int kq0 = slice * uKqSlice;
-  int kq1 = min(uKq, kq0 + uKqSlice);
-${T.map((t) => `  vec4 acc${t} = vec4(0.0);`).join("\n")}
-  for (int kq = kq0; kq < kq1; kq += 2) {
-${L.join("\n")}
-  }
-  o0 = packH2(acc0, acc1);
-  o1 = packH2(acc2, acc3);
-  o2 = packH2(acc4, acc5);
-  o3 = packH2(acc6, acc7);
 }`
 }
 
@@ -3985,27 +3908,25 @@ const quadCache = new Map<string, Map<string, string>>()
  * A kernel that reads pair tensors `names` with pf, made to read a 4-token
  * matmul's two outputs instead: each name gets a second sampler, name_B.
  */
-export function fromQuad(source: string, names: Array<string>, tokens: 4 | 8 = 4) {
+export function fromQuad(source: string, names: Array<string>) {
   let bySource = quadCache.get(source)
   if (!bySource) {
     bySource = new Map()
     quadCache.set(source, bySource)
   }
-  const key = `${tokens}:${names.join(",")}`
+  const key = names.join(",")
   let out = bySource.get(key)
   if (out === undefined) {
     out = source
-    const more = tokens === 8 ? ["B", "C", "D"] : ["B"]
     for (const name of names) {
       out = out
         .replace(
           `uniform usampler2D ${name};`,
-          `uniform usampler2D ${name};\n${more.map((x) => `uniform usampler2D ${name}_${x};`).join("\n")}`
+          `uniform usampler2D ${name};\nuniform usampler2D ${name}_B;`
         )
         .split(`pf(${name},`)
-        .join(`${tokens === 8 ? "pfo" : "pfq"}(${name}, ${more.map((x) => `${name}_${x}`).join(", ")},`)
+        .join(`pfq(${name}, ${name}_B,`)
     }
-    if (tokens === 8 && !out.includes(PFO)) out = out.replace(HEADER, HEADER + PFO)
     bySource.set(key, out)
   }
   return out
