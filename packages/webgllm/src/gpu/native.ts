@@ -801,11 +801,8 @@ export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: n
     }`).join("\n")
     : [0, 1, 2, 3].map((r) => `    {
       let q = bW[base + kb * 4 + ${r}];
-      let L0 = vec4<f32>((vec4<u32>(q.x) >> SL) & vec4<u32>(15u)); let H0 = vec4<f32>((vec4<u32>(q.x) >> SH) & vec4<u32>(15u));
-      let L1 = vec4<f32>((vec4<u32>(q.y) >> SL) & vec4<u32>(15u)); let H1 = vec4<f32>((vec4<u32>(q.y) >> SH) & vec4<u32>(15u));
-      let L2 = vec4<f32>((vec4<u32>(q.z) >> SL) & vec4<u32>(15u)); let H2 = vec4<f32>((vec4<u32>(q.z) >> SH) & vec4<u32>(15u));
-      let L3 = vec4<f32>((vec4<u32>(q.w) >> SL) & vec4<u32>(15u)); let H3 = vec4<f32>((vec4<u32>(q.w) >> SH) & vec4<u32>(15u));
-      b.${"xyzw"[r]} = dot(L0, A0) + dot(L1, A1) + dot(L2, A2) + dot(L3, A3) + dot(H0, A4) + dot(H1, A5) + dot(H2, A6) + dot(H3, A7);
+      b.${"xyzw"[r]} = 255.0 * (dot(unpack4x8unorm(q.x & NB), A0) + dot(unpack4x8unorm(q.y & NB), A1) + dot(unpack4x8unorm(q.z & NB), A2) + dot(unpack4x8unorm(q.w & NB), A3)
+        + dot(unpack4x8unorm((q.x >> 4u) & NB), A4) + dot(unpack4x8unorm((q.y >> 4u) & NB), A5) + dot(unpack4x8unorm((q.z >> 4u) & NB), A6) + dot(unpack4x8unorm((q.w >> 4u) & NB), A7));
     }`).join("\n")
   const code = `
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
@@ -817,8 +814,7 @@ ${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
 @group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 1}) var<storage, read> bW: array<vec4<u32>>;
 @group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 2}) var out0: texture_storage_2d<${o.format}, write>;
 var<workgroup> red: array<vec4<f32>, ${o.wg}>;
-const SL = vec4<u32>(0u, 8u, 16u, 24u);
-const SH = vec4<u32>(4u, 12u, 20u, 28u);
+const NB = 0x0F0F0F0Fu;
 fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
 fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
 fn s8(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u)); }
@@ -841,10 +837,8 @@ ${rows}
   }
   red[l] = acc;
   workgroupBarrier();
-  for (var st = ${o.wg / 2}u; st > 0u; st >>= 1u) {
-    if (l < st) { red[l] += red[l + st]; }
-    workgroupBarrier();
-  }
+${Array.from({ length: Math.log2(o.wg) }, (_, i) => o.wg >> (i + 1)).map((st) => `  if (l < ${st}u) { red[l] += red[l + ${st}u]; }
+  workgroupBarrier();`).join("\n")}
   if (l == 0u) {
     var r = red[0];
 ${rms ? `    var s = vec4<f32>(0.0);

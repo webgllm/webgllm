@@ -155,8 +155,9 @@ export const TUNING = {
   /**
    * ...as bufferPairs (1: a slice a lane, its lanes over K about
    * bufferBlocks blocks each) or bufferMatvec (0: a workgroup a row group,
-   * bufferMatvecThreads lanes, one slice); -1: bufferMatvec where the
-   * workgroups' lanes share K loops (the tuned lanes), else bufferPairs. An
+   * bufferMatvecThreads lanes, one slice); -1: whichever tune timed faster
+   * where the workgroups' lanes share K loops (tuned.matvec), else
+   * bufferPairs. An
    * M3 Ultra (lanes) wrote LFM2.5 350M's tokens at 570/s with bufferMatvec,
    * 509 with bufferPairs; a Pixel 10 Pro (no lanes) at 62 with bufferPairs,
    * 13 with bufferMatvec.
@@ -571,6 +572,8 @@ export type Tuned = {
   flashDecodeFrom?: number
   /** WebGPU: threads a small pass's K loop is spread over (the GPU's coopThreads), or TUNING.lanes's. */
   lanes?: number | null
+  /** The buffer matvecs (see TUNING.bufferPairs): 1 bufferMatvec, else bufferPairs. */
+  matvec?: number | null
 }
 
 /**
@@ -1633,27 +1636,6 @@ export class Engine {
     stop: () => boolean = () => false,
     options: { keepCache?: boolean; alreadyBusy?: boolean } = {}
   ): Promise<Tuned | null> {
-    this.tuning = true
-    try {
-      // (Through the prototype: tests call tune on a stand-in engine.)
-      return await Engine.prototype.tuneChoices.call(this, stop, options)
-    } finally {
-      this.tuning = false
-    }
-  }
-
-  /**
-   * Whether tune is timing choices: the buffer matvecs stay bufferPairs
-   * meanwhile, so that a GPU whose lanes lose doesn't compile bufferMatvec
-   * for the lanes' trial alone (an iPhone 16 Pro Max's first load of LFM3
-   * spent seconds compiling native pipelines).
-   */
-  private tuning = false
-
-  private async tuneChoices(
-    stop: () => boolean,
-    options: { keepCache?: boolean; alreadyBusy?: boolean }
-  ): Promise<Tuned | null> {
     const before = { ...this.tuned }
     this.tuned = {
       shortSplit: null,
@@ -1661,6 +1643,7 @@ export class Engine {
       f16Pack: before.f16Pack ?? null,
       flashDecode: null,
       lanes: null,
+      matvec: null,
       streamMatvec: before.streamMatvec,
       submissionReads: before.submissionReads,
       submissionOverlap: before.submissionOverlap,
@@ -1710,7 +1693,7 @@ export class Engine {
     }
     class Stopped extends Error {}
     const choose = async (
-      key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode" | "lanes",
+      key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode" | "lanes" | "matvec",
       candidates: Array<number>,
       sample: () => unknown
     ): Promise<number | null> => {
@@ -1890,14 +1873,36 @@ export class Engine {
         : free
           ? await choose("lanes", [TUNING.lanes, TUNING.lanes > 0 ? 0 : 32768], async () => {
               this.gpu.coopThreads = Math.max(0, this.tuned.lanes ?? TUNING.lanes)
+              // (Shared K loops with bufferMatvec, else bufferPairs: an M3
+              // Ultra's lanes won only so; see matvec below.)
+              this.tuned.matvec = this.gpu.coopThreads > 0 && this.layers.some((l) => l.gateUp.stored) ? 1 : 0
               forwards = true
               this.reset()
               await this.forwardHidden([1000])
             })
           : (before.lanes ?? null)
       this.gpu.coopThreads = Math.max(0, lanes ?? TUNING.lanes)
+      // Where the lanes won, bufferMatvec against bufferPairs on the same
+      // forward, the lanes kept: a Pixel 10 Pro whose lanes won by noise
+      // wrote LFM3's tokens at 4.5/s with bufferMatvec where 21.6 with
+      // bufferPairs. Elsewhere bufferPairs.
+      const stores = this.layers.some((l) => l.gateUp.stored)
+      // (choose's null is its first candidate kept: bufferMatvec standing,
+      // as the lanes' winning arm ran it.)
+      const matvec = TUNING.bufferPairs >= 0 || !stores
+        ? null
+        : (lanes ?? TUNING.lanes) <= 0
+          ? 0
+          : free
+            ? (await choose("matvec", [1, 0], async () => {
+                forwards = true
+                this.reset()
+                await this.forwardHidden([1000])
+              })) ?? 1
+            : (before.matvec ?? 0)
       if (forwards) this.reset()
       picked = {
+        matvec,
         shortSplit,
         f16Matmul,
         f16Pack,
@@ -4753,7 +4758,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const normed = !norm ? false : norm === "prescaled" ? norm : "weights"
       // bufferPairs: lanes over K about TUNING.bufferBlocks blocks each (a
       // power of 2, at most maxSplit slices); else bufferMatvec, one slice.
-      const pairs = TUNING.bufferPairs < 0 ? this.tuning || (this.tuned.lanes ?? TUNING.lanes) <= 0 : TUNING.bufferPairs > 0
+      const pairs = TUNING.bufferPairs < 0 ? !((this.tuned.matvec ?? 0) > 0) : TUNING.bufferPairs > 0
       const lanes = pairs
         ? Math.max(2, Math.min(TUNING.maxSplit, 2 ** Math.floor(Math.log2(Math.max(1, w.blocks / TUNING.bufferBlocks)))))
         : 1
