@@ -617,8 +617,9 @@ export class WebGpu extends PacedGpu<Fence> {
   /**
    * A copy of `texture`'s bytes in a storage buffer, row after row, for
    * native passes that read it as an array (NativeSpec.buffers), after the
-   * passes issued so far; null where a row isn't a whole multiple of 256
-   * bytes (a texture-to-buffer copy's alignment).
+   * passes issued so far (all of them sent with the copy); null where a row
+   * isn't a whole multiple of 256 bytes (a texture-to-buffer copy's
+   * alignment).
    */
   toStorage(texture: Texture): Texture | null {
     const rowBytes = texture.width * formatOf(texture.internal).bytes
@@ -635,7 +636,10 @@ export class WebGpu extends PacedGpu<Fence> {
       { buffer, bytesPerRow: rowBytes },
       { width: texture.width, height: texture.height }
     )
-    this.touched.set(texture.id, this.generation)
+    // Sent at once, so that deleting the texture next frees it then, not
+    // once the commands built meanwhile are sent (a warm-up builds all of a
+    // model's: every texture would stay beside its copy until the end).
+    this.submit()
     this.bytes += bytes
     const stored: Texture = { id: this.nextId++, tex: buffer, width: texture.width, height: texture.height, internal: STORAGE_BUFFER, bytes }
     this.live.add(stored)

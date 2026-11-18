@@ -871,6 +871,104 @@ ${rms ? `    var s = vec4<f32>(0.0);
 }
 
 /**
+ * bufferMatvec's work as split partial sums, a slice a lane (TUNING.bufferPairs): a thread a row pair (rows p, p + 2)
+ * and block, `lanes` of them over K a row group, so that neighbouring threads
+ * read neighbouring 16-byte words; a workgroup of 64 threads holds 32 / lanes
+ * row groups (x) of one token (y). Neighbours on neighbouring words reads a
+ * Pixel 10 Pro's buffers at ~30 GB/s where its byte texels gave ~19, and an M3
+ * Ultra's past 800 where texels gave ~360; an iPhone's alike. Row r's block
+ * is 16 bytes: byte i of word w holds weight 4w + i in its low nibble and
+ * 16 + 4w + i in its high one (unpack4x8unorm splits them); zero points are
+ * 8. `normed`: "weights" reads the f32 residual times the norm weights
+ * (uNorm), "prescaled" the add's h2(x · weights / 32) at column uAOff of uA;
+ * either way each slice is times the row's 1 / RMS, from uR's partial sums of
+ * squares (kernels.ts's matmulSplitRgba4 alike).
+ */
+export function bufferPairs(o: { normed: false | "weights" | "prescaled"; lanes: number; format: "rgba16float" | "rgba32float" }): NativeSpec {
+  const weights = o.normed === "weights"
+  const rms = !!o.normed
+  const T = 2 * o.lanes
+  const G = 64 / T
+  const A = weights
+    ? Array.from({ length: 8 }, (_, j) => `      let A${j} = textureLoad(tA, vec2<i32>(kb * 8 + ${j}, m), 0) * textureLoad(tNorm, vec2<i32>(kb * 8 + ${j}, 0), 0);`).join("\n")
+    : [0, 1, 2, 3].map((j) => `      let a${j} = textureLoad(tA, vec2<i32>(u.aOff + kb * 4 + ${j}, m), 0);
+      let A${2 * j} = lo(a${j});
+      let A${2 * j + 1} = hi(a${j});`).join("\n")
+  const code = `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, groups: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<${weights ? "f32" : "u32"}>;
+@group(0) @binding(2) var tS: texture_2d<f32>;
+${weights ? "@group(0) @binding(3) var tNorm: texture_2d<f32>;" : ""}
+${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
+@group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 1}) var<storage, read> bW: array<vec4<u32>>;
+@group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 2}) var out0: texture_storage_2d<${o.format}, write>;
+var<workgroup> pairs: array<vec2<f32>, 64>;
+fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
+fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
+fn rd(q: vec4<u32>, A0: vec4<f32>, A1: vec4<f32>, A2: vec4<f32>, A3: vec4<f32>, A4: vec4<f32>, A5: vec4<f32>, A6: vec4<f32>, A7: vec4<f32>) -> f32 {
+  let n = 0x0F0F0F0Fu;
+  return 255.0 * (dot(unpack4x8unorm(q.x & n), A0) + dot(unpack4x8unorm(q.y & n), A1) + dot(unpack4x8unorm(q.z & n), A2) + dot(unpack4x8unorm(q.w & n), A3)
+    + dot(unpack4x8unorm((q.x >> 4u) & n), A4) + dot(unpack4x8unorm((q.y >> 4u) & n), A5) + dot(unpack4x8unorm((q.z >> 4u) & n), A6) + dot(unpack4x8unorm((q.w >> 4u) & n), A7));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let t = i32(l % ${T}u);
+  let lane = t / 2;
+  let p = t % 2;
+  let g = i32(w.x) * ${G} + i32(l / ${T}u);
+  let m = i32(w.y);
+  let live = g < u.groups;
+  let col = g / u.h;
+  let gr = g - col * u.h;
+  let base = (gr * u.width + col * u.rowTexels) / 4 + p;
+  let sx = col * u.kb;
+  var acc = vec2<f32>(0.0);
+  if (live) {
+    for (var kb = lane; kb < u.kb; kb += ${o.lanes}) {
+${A}
+      let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4<f32>(1.0));
+      let d4 = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+      let d = select(d4.xz, d4.yw, p == 1);
+      acc += d * (vec2<f32>(rd(bW[base + kb * 4], A0, A1, A2, A3, A4, A5, A6, A7), rd(bW[base + kb * 4 + 2], A0, A1, A2, A3, A4, A5, A6, A7)) - 8.0 * sa);
+    }
+  }
+${rms ? `  var s = vec4<f32>(0.0);
+  for (var q = 0; q < u.parts; q++) { s += textureLoad(tR, vec2<i32>(u.rOff + q, m), 0); }
+  acc *= inverseSqrt(dot(s, vec4<f32>(1.0)) / f32(u.texels * 4) + u.eps)${o.normed === "prescaled" ? " * 32.0" : ""};` : ""}
+  pairs[l] = acc;
+  workgroupBarrier();
+  if (live && p == 0) {
+    let b = pairs[l + 1u];
+    textureStore(out0, vec2<i32>(g + i32(u.rect.x), m * ${o.lanes} + lane), vec4<f32>(acc.x, b.x, acc.y, b.y));
+  }
+}`
+  return {
+    code,
+    inputs: [
+      { name: "uA", kind: weights ? "f" : "u" },
+      { name: "uS", kind: "f" },
+      ...(weights ? [{ name: "uNorm", kind: "f" as const }] : []),
+      ...(rms ? [{ name: "uR", kind: "f" as const }] : [])
+    ],
+    buffers: [{ name: "uW" }],
+    uniforms: [
+      { name: "uKb", type: "int" },
+      { name: "uH", type: "int" },
+      { name: "uRowTexels", type: "int" },
+      { name: "uWidth", type: "int" },
+      { name: "uG", type: "int" },
+      { name: "uAOff", type: "int" },
+      { name: "uROff", type: "int" },
+      { name: "uTexels", type: "int" },
+      { name: "uParts", type: "int" },
+      { name: "uEps", type: "float" }
+    ],
+    groups: (rect) => [Math.ceil(rect.width / G), rect.height]
+  }
+}
+
+/**
  * kernels.ts's dequantBytes (no zero points: 8) from weights in a storage
  * buffer (see bufferMatvec): output texel x of the f16 layout, or with `h2`
  * texels 2x' and 2x' + 1 of each column as one h2 texel x'.

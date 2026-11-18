@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -147,13 +147,26 @@ export const TUNING = {
   /** WebGPU: the pick's chunk maxima and argmax as native passes, a workgroup a chunk and a row (gpu/native.ts's chunkMax). */
   nativePick: 1,
   /**
-   * WebGPU, where the workgroups' lanes share K loops (the tuned lanes): a
-   * few tokens' 4-bit byte matvecs from a storage buffer copy of their
-   * weights (gpu/native.ts's bufferMatvec)...
+   * WebGPU, where the workgroups' lanes share K loops (the tuned lanes; 2:
+   * anywhere): a few tokens' 4-bit byte matvecs from a storage buffer copy
+   * of their weights (the textures go; prompts dequantize from the
+   * buffer)... An iPhone 16 Pro Max (no lanes) wrote LFM2.5's tokens 3-10%
+   * faster from buffers, but Safari killed the tab at its memory limit for
+   * LFM3 1.7B and Qwen3.5 2B (both load at ~1.3-1.5 GB from textures).
    */
   bufferMatvec: 1,
-  /** ...this many threads a row group. */
+  /**
+   * ...as bufferPairs (1: a slice a lane, its lanes over K about
+   * bufferBlocks blocks each) or bufferMatvec (0: a workgroup a row group,
+   * bufferMatvecThreads lanes, one slice); -1: bufferMatvec where the
+   * workgroups' lanes share K loops (the tuned lanes), else bufferPairs. An
+   * M3 Ultra (lanes) wrote LFM2.5 350M's tokens at 570/s with bufferMatvec,
+   * 509 with bufferPairs; a Pixel 10 Pro (no lanes) at 62 with bufferPairs,
+   * 13 with bufferMatvec.
+   */
+  bufferPairs: -1,
   bufferMatvecThreads: 64,
+  bufferBlocks: 8,
   /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
   nativeAttend: 1,
   /** ...in chunks of this many keys (a workgroup's threads). */
@@ -4655,9 +4668,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const gpu = this.gpu as unknown as { nativeProgram(spec: NativeSpec): unknown }
       const format = this.buffers.partial.internal === GL.RGBA16F ? "rgba16float" : "rgba32float"
       const normed = !norm ? false : norm === "prescaled" ? norm : "weights"
-      const key = `${normed} ${format} ${TUNING.bufferMatvecThreads}`
+      // bufferPairs: lanes over K about TUNING.bufferBlocks blocks each (a
+      // power of 2, at most maxSplit slices); else bufferMatvec, one slice.
+      const pairs = TUNING.bufferPairs < 0 ? (this.tuned.lanes ?? TUNING.lanes) <= 0 : TUNING.bufferPairs > 0
+      const lanes = pairs
+        ? Math.max(2, Math.min(TUNING.maxSplit, 2 ** Math.floor(Math.log2(Math.max(1, w.blocks / TUNING.bufferBlocks)))))
+        : 1
+      const key = `${normed} ${format} ${lanes}`
       let spec = this.bufferSpecs.get(key)
-      if (!spec) this.bufferSpecs.set(key, (spec = bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format })))
+      if (!spec)
+        this.bufferSpecs.set(key, (spec = lanes > 1
+          ? bufferPairs({ normed, lanes, format })
+          : bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format })))
       this.gpu.run({
         name: "matmul",
         program: gpu.nativeProgram(spec) as Program,
@@ -4671,6 +4693,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           uH: { int: w.rowsPerColumn },
           uRowTexels: { int: w.rowTexels },
           uWidth: { int: w.quants.width },
+          uG: { int: w.groups },
           uAOff: { int: norm === "prescaled" ? this.config.hiddenSize / 4 + K.RMS_PARTS : 0 },
           uROff: { int: this.config.hiddenSize / 4 },
           uTexels: { int: this.config.hiddenSize / 4 },
@@ -4680,7 +4703,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         output: this.buffers.partial,
         rect: { x: x0, y: 0, width: w.groups, height: rows }
       })
-      return 1
+      return lanes
     }
     {
       const split = Math.max(
@@ -4799,15 +4822,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private pickSpecs = new Map<string, NativeSpec>()
 
   /**
-   * w's quants in a storage buffer for bufferMatvec (copied on first use),
-   * or null: not on WebGL, nor without shared K loops, nor for weights other
-   * than 4-bit bytes with zero points of 8.
+   * w's quants in a storage buffer for the buffer matvecs (copied on first
+   * use, outside tune), or null: not on WebGL, nor for weights other than
+   * 4-bit bytes with zero points of 8.
    */
   private storedQuants(w: GpuMatrix): Texture | null {
     if (w.stored !== undefined) return w.stored
-    // (Not while tune times the lanes both ways: a GPU that keeps neither
-    // copy's work shouldn't hold the weights twice.)
-    if (TUNING.bufferMatvec <= 0 || this.tuning || !("toStorage" in this.gpu) || (this.tuned.lanes ?? TUNING.lanes) <= 0) return null
+    // (Not while tune times choices: its passes read the textures.)
+    if (TUNING.bufferMatvec <= 0 || this.tuning || !("toStorage" in this.gpu) || ((this.tuned.lanes ?? TUNING.lanes) <= 0 && TUNING.bufferMatvec < 2)) return null
     const fits = w.bits === 4 && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels
     w.stored = fits ? this.gpu.toStorage(w.quants) : null
     // The texture goes (after the copy: the GPU destroys it once the
