@@ -454,6 +454,132 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3
 }
 
 /**
+ * A prompt batch's attention inputs in one dispatch (kernels.ts's headPrep
+ * for the queries and for the keys, and its `values`: three passes, each
+ * texel summing its head's squares for itself): a workgroup a head of a
+ * token (the q heads, then the k, then the v), a thread a texel, the head's
+ * sum of squares through workgroup memory (summed as the GLSL pass sums,
+ * so the same bits: texels in order, then the 4 lanes). The q|k|v|gate projection is a pair
+ * tensor (`y` "pair") or a 4-token matmul's two textures ("quad"), in
+ * `slices` K-slices uSliceStride rows apart (kernels.ts's pf and pfq).
+ * Queries (normalized, rotated, times uScale) go to the first output, f32
+ * texel (head · T + t, m); keys (normalized, rotated) and values to the
+ * second, the KV cache, as h2 at token m's slot: uSlot0 + m, wrapped at
+ * uRing if there is one, in blocks of 2^uKvShift rows uKvWidth texels apart.
+ */
+export function promptPrep(o: { headDim: number; heads: number; kvHeads: number; y: "pair" | "quad"; slices: number; ropeLow: number }): NativeSpec {
+  const T = o.headDim / 4
+  if (T > 256 || T % 2) throw new Error(`No prompt prep for heads of ${o.headDim}.`)
+  const quad = o.y === "quad"
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uQKVG", kind: "u" },
+    ...(quad ? [{ name: "uQKVG_B", kind: "u" as const }] : []),
+    { name: "uQNorm", kind: "f" },
+    { name: "uKNorm", kind: "f" },
+    { name: "uRope", kind: "f" }
+  ]
+  const binding = (name: string) => inputs.findIndex((i) => i.name === name) + 1
+  const qT = o.heads * T, kvT = o.kvHeads * T
+  const code = `
+struct Uni { rect: vec4<u32>, pos0: i32, pairTexels: i32, stride: i32, ring: i32, kvShift: i32, kvWidth: i32, slot0: i32, eps: f32, scale: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(${binding("uQKVG")}) var tP: texture_2d<u32>;
+${quad ? `@group(0) @binding(${binding("uQKVG_B")}) var tPB: texture_2d<u32>;` : ""}
+@group(0) @binding(${binding("uQNorm")}) var tQN: texture_2d<f32>;
+@group(0) @binding(${binding("uKNorm")}) var tKN: texture_2d<f32>;
+@group(0) @binding(${binding("uRope")}) var tRope: texture_2d<f32>;
+@group(0) @binding(${inputs.length + 1}) var outQ: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(${inputs.length + 2}) var outKV: texture_storage_2d<rgba32uint, write>;
+var<workgroup> sq: array<vec4<f32>, ${T}>;
+var<workgroup> nv: array<vec4<f32>, ${T}>;
+fn lo(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.x), unpack2x16float(v.y)); }
+fn hi(v: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(v.z), unpack2x16float(v.w)); }
+/* Texel x of token m. */
+fn pf(x: i32, m: i32) -> vec4<f32> {
+  var acc = vec4<f32>(0.0);
+  for (var k = 0; k < ${Math.max(o.slices, 1)}; k++) {
+    let at = vec2<i32>(x, (m >> ${quad ? 2 : 1}u) + k * u.stride);
+${quad
+    ? `    var t: vec4<u32>;
+    if (((m >> 1u) & 1) == 1) { t = textureLoad(tPB, at, 0); } else { t = textureLoad(tP, at, 0); }`
+    : `    let t = textureLoad(tP, at, 0);`}
+    acc += select(lo(t), hi(t), (m & 1) == 1);
+  }
+  return acc;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${T})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let t = i32(li);
+  let unit = i32(w.x);
+  let m = i32(w.y + u.rect.y);
+  let isQ = unit < ${o.heads};
+  let isK = !isQ && unit < ${o.heads + o.kvHeads};
+  let head = select(select(unit - ${o.heads + o.kvHeads}, unit - ${o.heads}, isK), unit, isQ);
+  let base = select(select(${qT + kvT}, ${qT}, isK), 0, isQ) + head * ${T};
+  let v = pf(base + t, m);
+  sq[t] = v;
+  workgroupBarrier();
+  // (Summed as the GLSL pass sums: texels in order, each a fused multiply-add, as its \`s += v * v\` compiles; then the 4 lanes.)
+  var s4 = vec4<f32>(0.0);
+  for (var i = 0; i < ${T}; i++) { s4 = fma(sq[i], sq[i], s4); }
+  let inv = inverseSqrt(dot(s4, vec4<f32>(1.0)) / ${o.headDim}.0 + u.eps);
+  let n = v * inv * select(textureLoad(tKN, vec2<i32>(t, 0), 0), textureLoad(tQN, vec2<i32>(t, 0), 0), isQ);
+  nv[t] = n;
+  workgroupBarrier();
+  var r = n;
+  if (t < 2 * u.pairTexels) {
+    let first = t < u.pairTexels;
+    let tp = select(t - u.pairTexels, t + u.pairTexels, first);
+    let f = select(tp, t, first);
+    let p = nv[tp];
+    let pos = u.pos0 + m;
+    let pl = pos & ${o.ropeLow - 1};
+    let ph = ${o.ropeLow} + (pos >> ${Math.log2(o.ropeLow)}u);
+    let c1 = textureLoad(tRope, vec2<i32>(f, pl), 0);
+    let s1 = textureLoad(tRope, vec2<i32>(${T / 2} + f, pl), 0);
+    let c2 = textureLoad(tRope, vec2<i32>(f, ph), 0);
+    let s2 = textureLoad(tRope, vec2<i32>(${T / 2} + f, ph), 0);
+    let cs = c1 * c2 - s1 * s2;
+    let sn = s1 * c2 + c1 * s2;
+    r = select(n * cs + p * sn, n * cs - p * sn, first);
+  }
+  workgroupBarrier();
+  nv[t] = r;
+  workgroupBarrier();
+  if (isQ) {
+    textureStore(outQ, vec2<i32>(head * ${T} + t, m), r * u.scale);
+  } else if (t < ${T / 2}) {
+    // Token m's slot of the cache.
+    var slot = u.slot0 + m;
+    if (u.ring > 0) { slot = slot % u.ring; }
+    let kx = (slot >> u32(u.kvShift)) * u.kvWidth + head * ${T / 2} + t;
+    let ky = slot & ((1 << u32(u.kvShift)) - 1);
+    if (isK) {
+      textureStore(outKV, vec2<i32>(kx, ky), h2(nv[2 * t], nv[2 * t + 1]));
+    } else {
+      textureStore(outKV, vec2<i32>(kx + ${kvT / 2}, ky), h2(pf(base + 2 * t, m), pf(base + 2 * t + 1, m)));
+    }
+  }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uPos0", type: "int" }, { name: "uPairTexels", type: "int" }, { name: "uSliceStride", type: "int" }, { name: "uRing", type: "int" },
+      { name: "uKvShift", type: "int" }, { name: "uKvWidth", type: "int" }, { name: "uSlot0", type: "int" }, { name: "uEps", type: "float" }, { name: "uScale", type: "float" }
+    ],
+    // A workgroup a head of a token: the q heads, the k heads, the v heads; the rectangle's rows are the tokens.
+    groups: (rect) => [o.heads + 2 * o.kvHeads, rect.height]
+  }
+}
+
+/**
  * kernels.ts's CHUNK_MAX_AT as a workgroup per 256-token chunk and row, a
  * thread a texel of 4 logits, the 64 reduced in workgroup memory (the
  * GLSL pass is a thread a chunk: 500 threads for a 128,000-word

@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptMatmul, promptMatmulBuffer, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -225,6 +225,16 @@ export const TUNING = {
    * way...
    */
   nativeRecurrence: 1,
+  /**
+   * WebGPU: a prompt batch's queries, keys and values in one native pass
+   * (gpu/native.ts's promptPrep: a workgroup a head of a token, its sum of
+   * squares through workgroup memory), where three passes each summed
+   * the head's squares again for every texel (0). The same bits. An M3
+   * Ultra ran a layer's in 0.04 ms where 0.39, and read LFM3 1.7B's
+   * prompts at 5,300 tokens/s where 5,155, Qwen3.5 2B's at 4,880 where
+   * 4,765, LFM2.5 1.2B's at 7,680 where 7,610, 350M's the same.
+   */
+  promptPrep: 1,
   /**
    * WebGPU: a prompt batch's recurrence chunks one after another in one
    * native dispatch (gpu/native.ts's linChunkLoop: a workgroup a value
@@ -5086,6 +5096,23 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return spec
   }
 
+  /** The native prompt prep for a q|k|v|gate projection read as `y` in `slices` K-slices, or null where it doesn't fit. */
+  private promptPrepSpec(y: "pair" | "quad", slices: number) {
+    const c = this.config
+    const key = `batch ${y} ${slices}`
+    let spec = this.promptPreps.get(key)
+    if (spec === undefined) {
+      try {
+        spec = promptPrep({ headDim: c.headDim, heads: c.numHeads, kvHeads: c.numKvHeads, y, slices, ropeLow: K.ROPE_LOW })
+      } catch {
+        spec = null
+      }
+      this.promptPreps.set(key, spec)
+    }
+    return spec
+  }
+  private promptPreps = new Map<string, NativeSpec | null>()
+
   private nativeExpandedSpec(split: boolean, prescaled: boolean) {
     const wg = TUNING.nativeExpandedThreads
     const key = `expanded ${split} ${prescaled} ${wg}`
@@ -5501,7 +5528,33 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       c.headDim / 4 <= 64 && "nativeProgram" in this.gpu
       ? this.gpu.nativeProgram(this.attentionPrepSpec(split, kvWidth))
       : null
-    if (prep) {
+    // A prompt batch's (a pair tensor's rows, the queries in their own
+    // texture): the queries, keys and values of every token in one native
+    // pass (see gpu/native.ts's promptPrep).
+    // (Not a batch that wraps around its ring: its later tokens' keys must land last.)
+    const batchPrep = !prep && !split && !inCache && !mrope && (!layer.ring || rows <= layer.ring) && TUNING.promptPrep > 0 && "nativeProgram" in this.gpu
+      ? this.promptPrepSpec(this.quadOf(qkvgIn) ? "quad" : "pair", this.slicing.get(qkvgIn.id)?.split ?? 1)
+      : null
+    if (batchPrep && "nativeProgram" in this.gpu) {
+      this.gpu.run({
+        name: "heads",
+        program: this.gpu.nativeProgram(batchPrep),
+        inputs: { ...qkvgInputs, uQNorm: layer.qNorm, uKNorm: layer.kNorm, uRope: ropeTable },
+        uniforms: {
+          ...rope.uniforms,
+          uPairTexels: { int: pairTexels },
+          uSliceStride: { int: this.slicing.get(qkvgIn.id)?.stride ?? 0 },
+          uRing: { int: layer.ring },
+          uKvShift: { int: kvShift },
+          uKvWidth: { int: kvWidth },
+          uSlot0: { int: pos0 },
+          uEps: c.normEps,
+          uScale: 1 / Math.sqrt(c.headDim)
+        },
+        output: [b.q, layer.kv],
+        rect: { x: 0, y: 0, width: qDims / 4, height: rows }
+      })
+    } else if (prep) {
       this.gpu.run({
         name: "heads",
         program: prep,
