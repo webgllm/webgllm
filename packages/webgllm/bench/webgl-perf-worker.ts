@@ -8,6 +8,8 @@ import type { QuantMatrix, WeightPiece } from "../src/weights.js"
 import { Engine } from "../src/engine.js"
 let loadedEngine: Engine | null = null
 let peakGpuBytes = 0
+let pauseMs = 0
+let compileFirst = false
 let captureSample = false
 let nativeSample: QuantMatrix | undefined
 const uploadSamples: UploadSample[] = []
@@ -62,6 +64,8 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         }
       }
       if (name === "load") warmed = false
+      // (tune "pauseMs:<ms>": still before the weights and after each phase, so a memory trace shows each as a plateau.)
+      if (pauseMs > 0 && name === "load") await new Promise((r) => setTimeout(r, pauseMs))
       postMessage({ type: "bench-phase", name, gpuBytes: this.gpu.bytes })
       const value = await Reflect.apply(original, this, args)
       postMessage({ type: "bench-phase", name: `${name}:end`, gpuBytes: this.gpu.bytes })
@@ -80,11 +84,28 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         postMessage({ type: "bench-phase", name: `live ${live.size} ${top}`, gpuBytes: this.gpu.bytes })
       }
       if (name === "warmUp") warmed = true
+      if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs))
       return value
     }
   })
 }
 
+// (pauseMs: also still before the packing probe, inside load, so the uploads' end and the probe show apart.)
+for (const name of ["choosePromptPacking"] as const) {
+  const original = Reflect.get(Engine.prototype, name) as (...args: unknown[]) => Promise<unknown>
+  Object.assign(Engine.prototype, {
+    [name]: async function (this: Engine, ...args: unknown[]) {
+      if (pauseMs > 0) {
+        postMessage({ type: "bench-phase", name: "uploaded", gpuBytes: this.gpu.bytes })
+        await new Promise((r) => setTimeout(r, pauseMs))
+        // (tune "compileFirst:1": every pipeline compiled, nothing run — the deferred warm-up — before the probe, so
+        // a memory trace tells the pipelines' memory from the buffers' first writes. The warm-up wrapper pauses after it.)
+        if (compileFirst) await this.warmUp()
+      }
+      return Reflect.apply(original, this, args)
+    }
+  })
+}
 // (WebGPU's allocations too: its peak, for the load's stage events.)
 for (const name of ["texture", "storage", "toStorage"] as const) {
   const original = Reflect.get(WebGpu.prototype, name) as (...args: unknown[]) => unknown
@@ -401,6 +422,14 @@ const handle = async (event: MessageEvent) => {
           twiceWhileWriting.add(key.slice(6))
           delete event.data.values[key]
         }
+    if (event.data.type === "tune" && event.data.values?.compileFirst !== undefined) {
+      compileFirst = event.data.values.compileFirst > 0
+      delete event.data.values.compileFirst
+    }
+    if (event.data.type === "tune" && event.data.values?.pauseMs !== undefined) {
+      pauseMs = event.data.values.pauseMs
+      delete event.data.values.pauseMs
+    }
     if (event.data.type === "tune" && event.data.values?.burnUs !== undefined) {
       burnUs = event.data.values.burnUs
       delete event.data.values.burnUs
