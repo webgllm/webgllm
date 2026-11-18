@@ -132,12 +132,12 @@ export const TUNING = {
   lanes: 0,
   /**
    * WebGPU: a residual add (y's RMS, the residual, its sums, the next input)
-   * in one native pass, a token's and a prompt's alike. An M3 Ultra read
+   * in one native pass: 1 a token's, 2 a prompt's too. An M3 Ultra read
    * LFM3 1.7B's prompts at 5,060 tokens/s with the prompt's fused where
    * 4,920 (its sandwich norm made the add three passes), LFM2.5 350M's at
    * 21,950 where 21,570, 1.2B's at 7,410 where 7,350, Qwen3.5 2B's the same.
    */
-  fusedAdd: 1,
+  fusedAdd: 2,
   /** WebGPU: the Q6_K word head as a native pass, its activations in workgroup memory. */
   nativeHead: 1,
   /** ...in this many K-slices (its threads share their activations already). */
@@ -5263,11 +5263,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const { hiddenSize } = this.config
     const texels = hiddenSize / 4
     // On WebGPU, the add in one native dispatch (see gpu/native.ts): a
-    // token's (y a split matmul's partials) or a prompt's (y a pair tensor).
+    // token's (y a split matmul's partials) and, with fusedAdd 2, a
+    // prompt's (y a pair tensor).
     const source = split > 0 ? "split" : this.quadOf(y) ? "quad" : "pair"
     const slicing = this.slicing.get(y.id) ?? { split: 1, stride: 0 }
     const slices = split > 0 ? 0 : Math.max(slicing.split, 1)
-    const fused = TUNING.fusedAdd > 0 && "nativeProgram" in this.gpu
+    const fused = TUNING.fusedAdd > (split > 0 ? 0 : 1) && "nativeProgram" in this.gpu
     const key = `${texels} ${!!norm} ${!!next} ${source} ${slices}`
     if (fused && !this.fusedAdds.has(key)) {
       // (Null for a shape it doesn't fit: the passes below.)

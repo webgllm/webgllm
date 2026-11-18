@@ -143,7 +143,7 @@ What paid (medians of rounds 2 to 4, arms alternating load by load; tokens/s):
 
 | | LFM2.5 350M | LFM2.5 1.2B | LFM3 1.7B | Qwen3.5 2B |
 |---|---|---|---|---|
-| The residual add in one native pass (`fusedAdd`, where y's sums, the add and its sums were three) | 21,570 → 21,950 | 7,350 → 7,410 | 4,920 → 5,060 | 3,426 → 3,433 |
+| The residual add in one native pass (`fusedAdd` 2 against 1, where y's sums, the add and its sums were three) | 21,570 → 21,950 | 7,350 → 7,410 | 4,920 → 5,060 | 3,426 → 3,433 |
 | The buffer dequant a row's block a thread (4 words and the scale fetched once for 4 h2 texels) | 22,060 → 22,320 | 7,470 → 7,640 | 5,090 → 5,180 | 3,420 → 3,470 |
 | 8-bit matrices through the f16 scratch and the native matmul (`bufferGemm8`) | none | none | none | 3,504 → 4,285 |
 | …the 8-bit beta\|decay matmul too, into the block's output textures | | | | 4,450 → 4,530 |
