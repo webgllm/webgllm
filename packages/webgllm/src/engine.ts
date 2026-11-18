@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, promptMatmulBuffer, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptMatmul, promptMatmulBuffer, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -225,6 +225,16 @@ export const TUNING = {
    * way...
    */
   nativeRecurrence: 1,
+  /**
+   * WebGPU: a prompt batch's recurrence chunks one after another in one
+   * native dispatch (gpu/native.ts's linChunkLoop: a workgroup a value
+   * texel, its column of the state in workgroup memory from chunk to
+   * chunk), where each chunk is two dependent passes (0). The same sums in
+   * the same order. An M3 Ultra ran a layer's 17 chunks of a 531-token
+   * prompt in 0.38 ms this way where 0.75, and read Qwen3.5 2B's prompts at
+   * 4,590 tokens/s where 4,440, with the same replies.
+   */
+  chunkLoop: 1,
   /** ...a thread this many key rows of the state (4, 8 or 16). */
   recurrenceRows: 16,
   /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
@@ -5012,6 +5022,21 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!spec) this.recurrenceSpecs.set(key, (spec = linRecurrence({ ...shape, rows: TUNING.recurrenceRows })))
     return spec
   }
+  /** The native chunk loop for a Gated DeltaNet shape (see recurrenceChunks), or null where it doesn't fit. */
+  private chunkLoopSpec(shape: { keyHeadDim: number; valueHeadDim: number; chunk: number }) {
+    const key = `chunks ${shape.keyHeadDim} ${shape.valueHeadDim} ${shape.chunk}`
+    let spec = this.chunkLoops.get(key)
+    if (spec === undefined) {
+      try {
+        spec = linChunkLoop(shape)
+      } catch {
+        spec = null
+      }
+      this.chunkLoops.set(key, spec)
+    }
+    return spec
+  }
+  private chunkLoops = new Map<string, NativeSpec | null>()
   private bufferDequantSpec(h2: boolean, toBuffer = false, bits: 4 | 8 = 4) {
     const key = `dequant ${h2} ${toBuffer} ${bits}`
     let spec = this.bufferSpecs.get(key)
@@ -6407,8 +6432,40 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       run(K.linQO({ ...shape, out: "q" }), qo, c.qp, K4, {}, undefined, chunk)
     }
     const heads = { keyHeadDim: dk, valueHeadDim: dv }
-    for (let c0 = 0; c0 < rows; c0 += c0 === 0 ? first : chunk) {
-      const c1 = Math.min(c0 + (c0 === 0 ? first : chunk), rows)
+    const prefixAt = this.prefixSaving?.row
+    // WebGPU: the chunks one after another in one native dispatch (see
+    // gpu/native.ts's linChunkLoop), up to a row whose state is saved; a
+    // chunk a saved prefix ends inside takes the passes below (its state
+    // from the chunk's first rows).
+    const loop = TUNING.chunkLoop > 0 && both && "nativeProgram" in this.gpu ? this.chunkLoopSpec({ ...heads, chunk }) : null
+    const end = (c0: number) => Math.min(c0 + (c0 === 0 ? first : chunk), rows)
+    for (let c0 = 0; c0 < rows;) {
+      if (loop && "nativeProgram" in this.gpu) {
+        // Whole chunks from c0: to the batch's end, or the first row to save a state after.
+        let to = c0
+        while (to < rows && !(prefixAt !== undefined && to < prefixAt && prefixAt < end(to))) {
+          to = end(to)
+          if (to === saveAt || to === prefixAt) break
+        }
+        if (to > c0) {
+          this.gpu.run({
+            name: "recurrence",
+            program: this.gpu.nativeProgram(loop),
+            inputs: { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp, uQK: t.qk, uCum: c.cum },
+            uniforms: { uK4: { int: K4 }, uC0: { int: c0 }, uC1: { int: to }, uFirst: { int: first } },
+            output: [t.o, layer.state[1]],
+            rect: { x: 0, y: c0, width: V4, height: to - c0 },
+            work: dk
+          })
+          layer.state.reverse()
+          if (to === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+          if (to === prefixAt) this.prefixSaving!.state.linear.push(this.copyOf(layer.state[0]))
+          if (paced) await this.charge(3 * lin.V * dk * (to - c0))
+          c0 = to
+          continue
+        }
+      }
+      const c1 = end(c0)
       const outIn = { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp }
       const rect = { x: 0, y: c0, width: V4, height: c1 - c0 }
       if (both)
@@ -6441,6 +6498,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       if (c1 === prefixRow) this.prefixSaving!.state.linear.push(this.copyOf(layer.state[0]))
       // (Reading and writing the state: ~3 multiply-adds an element a token.)
       if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
+      c0 = c1
     }
   }
 

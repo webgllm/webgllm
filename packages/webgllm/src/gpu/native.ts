@@ -1293,6 +1293,105 @@ ${S.map((j) => `  textureStore(out1, vec2<i32>(x, r0 + ${j}), decay * s${j} + ${
 }
 
 /**
+ * A prompt batch's chunked recurrence (kernels.ts's linChunkOut and
+ * linChunkState, the same sums in the same order), chunk after chunk in
+ * one dispatch where those are two dependent passes a chunk: rows
+ * [uC0, uC1) of the batch, whole chunks (of `chunk` rows after a first one
+ * of uFirst, as chunkStart has them). A workgroup takes a value texel x and
+ * holds its column of the state (a thread a key row k) in workgroup memory
+ * from chunk to chunk:
+ * - a thread a token of the chunk: delta D = U - W S0 into workgroup
+ *   memory, and the output O = Oi + Q' S0 into the first output;
+ * - a thread a key row: S = exp(G_last) S0 + Σ_s exp(G_last - G_s) k̂_s D_s;
+ * and the last chunk's state goes to the second output (texel (x, k)).
+ */
+export function linChunkLoop(o: { keyHeadDim: number; valueHeadDim: number; chunk: number }): NativeSpec {
+  const dk = o.keyHeadDim
+  const DK4 = dk / 4
+  const DV4 = o.valueHeadDim / 4
+  if (dk > 256 || o.chunk > dk || dk % 4 || o.valueHeadDim % 4) throw new Error(`No chunk loop for ${dk} key dims and chunks of ${o.chunk}.`)
+  const code = `
+struct Uni { rect: vec4<u32>, k4: i32, c0: i32, c1: i32, first: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tU: texture_2d<f32>;
+@group(0) @binding(3) var tW: texture_2d<f32>;
+@group(0) @binding(4) var tOi: texture_2d<f32>;
+@group(0) @binding(5) var tQp: texture_2d<f32>;
+@group(0) @binding(6) var tQK: texture_2d<f32>;
+@group(0) @binding(7) var tCum: texture_2d<f32>;
+@group(0) @binding(8) var outO: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(9) var outS: texture_storage_2d<rgba32float, write>;
+var<workgroup> S: array<vec4<f32>, ${dk}>;
+var<workgroup> D: array<vec4<f32>, ${o.chunk}>;
+fn G(h: i32, r: i32) -> f32 { return textureLoad(tCum, vec2<i32>(h >> 2u, r), 0)[h & 3]; }
+@compute @workgroup_size(${dk})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let x = i32(w.x + u.rect.x);
+  let k = i32(l);
+  let h = x / ${DV4};
+  let kb = h * ${DK4};
+  let kc = h * ${dk} + k;
+  S[k] = textureLoad(tS, vec2<i32>(x, k), 0);
+  workgroupBarrier();
+  var c0 = u.c0;
+  while (c0 < u.c1) {
+    let c1 = min(c0 + select(${o.chunk}, u.first, c0 == 0), u.c1);
+    if (k < c1 - c0) {
+      let t = c0 + k;
+      var ws = vec4<f32>(0.0);
+      var qs = vec4<f32>(0.0);
+      for (var i = 0; i < ${DK4}; i++) {
+        let wv = textureLoad(tW, vec2<i32>(kb + i, t), 0);
+        let q = textureLoad(tQp, vec2<i32>(kb + i, t), 0);
+        let s0 = S[4 * i];
+        let s1 = S[4 * i + 1];
+        let s2 = S[4 * i + 2];
+        let s3 = S[4 * i + 3];
+        ws += s0 * wv.x + s1 * wv.y + s2 * wv.z + s3 * wv.w;
+        qs += s0 * q.x + s1 * q.y + s2 * q.z + s3 * q.w;
+      }
+      D[k] = textureLoad(tU, vec2<i32>(x, t), 0) - ws;
+      textureStore(outO, vec2<i32>(x, t), textureLoad(tOi, vec2<i32>(x, t), 0) + qs);
+    }
+    workgroupBarrier();
+    let last = G(h, c1 - 1);
+    var acc = exp(last) * S[k];
+    for (var s = c0; s < c1; s++) {
+      let kk = textureLoad(tQK, vec2<i32>(u.k4 + (kc >> 2u), s), 0)[kc & 3];
+      acc += exp(last - G(h, s)) * kk * D[s - c0];
+    }
+    // (Its own row: the others read theirs alone here, and all of them only after the barrier.)
+    S[k] = acc;
+    workgroupBarrier();
+    c0 = c1;
+  }
+  textureStore(outS, vec2<i32>(x, k), S[k]);
+}
+`
+  return {
+    code,
+    inputs: [
+      { name: "uS", kind: "f" },
+      { name: "uU", kind: "f" },
+      { name: "uW", kind: "f" },
+      { name: "uOi", kind: "f" },
+      { name: "uQp", kind: "f" },
+      { name: "uQK", kind: "f" },
+      { name: "uCum", kind: "f" }
+    ],
+    uniforms: [
+      { name: "uK4", type: "int" },
+      { name: "uC0", type: "int" },
+      { name: "uC1", type: "int" },
+      { name: "uFirst", type: "int" }
+    ],
+    // A workgroup a value texel of the rectangle's width.
+    groups: (rect) => [rect.width, 1]
+  }
+}
+
+/**
  * kernels.ts's 8-bit pair matmul (`matmul` with `pair`) from weights in a
  * storage buffer (see bufferMatvec's 8-bit layout): invocation (x, y) takes
  * row group x for tokens 2y and 2y + 1 (rows of h2 activations, 8 values a
