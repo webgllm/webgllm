@@ -870,8 +870,15 @@ export class Gpu extends PacedGpu<WebGLSync> {
         // Reading a prompt, sleep as soon as the wait isn't a short one:
         // its chunks are long, so a timer's delay costs little, and the
         // polling was a busy CPU core (see promptSpinMs).
+        // (Not where the polls wait inside the call, see timedPolls: each
+        // is already a wait of a millisecond or two, and a timer's delay on
+        // top of it is that much longer before the next chunk is issued.
+        // Firefox on a Pixel 10 Pro read LFM3's prompts at 93 to 98
+        // tokens/s without the timers where 84 to 98, Qwen3.5 2B's at 84
+        // to 87 where 73 to 85, LFM2.5 1.2B's and 350M's 2 to 3% faster,
+        // its page's process at 72% of a core where 47%.)
         const sleep =
-          this.phase === "prompt" && this.promptSpinMs >= 0
+          this.phase === "prompt" && this.promptSpinMs >= 0 && !(this.timedPolls && this.maxPollNs > 0)
             ? performance.now() - began >= this.promptSpinMs
             : this.phase !== "load" &&
               this.pollsBeforeSleep > 0 &&

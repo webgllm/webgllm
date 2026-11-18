@@ -409,7 +409,8 @@ export abstract class PacedGpu<F> {
    * one of two runs); cool, the same speed. The polling kept a CPU core
    * busy, heat the throttled GPU paid for.
    * Writing keeps polling: its chunks are a few ms, and timer sleeps cost
-   * it 4 ms a token there.
+   * it 4 ms a token there. Nor does a prompt's wait sleep where its polls
+   * wait inside the call (see timedPolls).
    */
   promptSpinMs = 0.25
   protected polls = 0
