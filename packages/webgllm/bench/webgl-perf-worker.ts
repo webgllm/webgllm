@@ -82,6 +82,8 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         }
         const top = [...byShape].sort((a, b) => b[1].mb - a[1].mb).slice(0, 24).map(([k, e]) => `${k}:${e.n}x=${Math.round(e.mb)}`).join(" ")
         postMessage({ type: "bench-phase", name: `live ${live.size} ${top}`, gpuBytes: this.gpu.bytes })
+        const groups = [...pipelineGroups].sort((a, b) => b[1] - a[1])
+        postMessage({ type: "bench-phase", name: `pipelines ${groups.reduce((n, g) => n + g[1], 0)} in ${groups.length} programs || ${groups.slice(0, 30).map(([k, n]) => `${n}x ${k.replace(/\s+/g, " ")}`).join(" || ")}`, gpuBytes: this.gpu.bytes })
       }
       if (name === "warmUp") warmed = true
       if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs))
@@ -103,6 +105,20 @@ for (const name of ["choosePromptPacking"] as const) {
         if (compileFirst) await this.warmUp()
       }
       return Reflect.apply(original, this, args)
+    }
+  })
+}
+// (Pipelines by program: how many variants each program compiled into, for the warm-up's stage events.)
+const pipelineGroups = new Map<string, number>()
+{
+  const original = Reflect.get(WebGpu.prototype, "count") as (source: string, ms: number) => void
+  Object.assign(WebGpu.prototype, {
+    count: function (this: WebGpu, source: string, ms: number) {
+      const native = source.startsWith("native ")
+      const body = native ? source : source.slice(source.indexOf("\n") + 1)
+      const tag = native ? source.slice(0, 48) : `${(body.split("\n").find((l) => l.startsWith("uniform")) ?? body.slice(0, 30)).slice(0, 36)}#${body.length}`
+      pipelineGroups.set(tag, (pipelineGroups.get(tag) ?? 0) + 1)
+      return Reflect.apply(original, this, [source, ms])
     }
   })
 }
