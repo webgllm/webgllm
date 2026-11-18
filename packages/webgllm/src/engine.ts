@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linRecurrence, promptMatmul, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -4652,6 +4652,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return
     }
     this.slicing.set(out.id, { split: 1, stride: 0 })
+    // 8-bit weights in a storage buffer (see storeQuants): the native pair matmul.
+    const stored8 = bits === 8 ? this.storedQuants(w) : null
+    if (stored8) {
+      await this.gpu.runAsync({
+        name: "matmul",
+        program: (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram((this.pairSpec8 ??= bufferPairMatmul())),
+        inputs: { uA: a, uS: w.scales, uW: stored8 },
+        uniforms: { ...shape, uWidth: { int: w.quants.width } },
+        output: out,
+        rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
+        work: w.blocks * 24
+      })
+      return
+    }
     await this.gpu.runAsync({
       name: "matmul",
       program: this.gpu.program(
@@ -4689,7 +4703,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   ) {
     // RGBA4 and 4-bit byte texels have the split kernel that folds norms;
     // the generic one folds the add's prescaled input (see foldEach).
-    const own = w.rgba4 || (w.bits === 4 && w.bytes)
+    const own = w.rgba4 || (w.bits === 4 && w.bytes) || !!w.stored
     if (norm && !own && norm !== "prescaled")
       throw new Error("Only 4-bit RGBA4 or byte matmuls fold the norm weights in.")
     const bits = w.bits
@@ -4718,12 +4732,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const lanes = pairs
         ? Math.max(2, Math.min(TUNING.maxSplit, 2 ** Math.floor(Math.log2(Math.max(1, w.blocks / TUNING.bufferBlocks)))))
         : 1
-      const key = `${normed} ${format} ${lanes}`
+      const bits = w.bits === 8 ? 8 : 4
+      const key = `${normed} ${format} ${lanes} ${bits}`
       let spec = this.bufferSpecs.get(key)
       if (!spec)
         this.bufferSpecs.set(key, (spec = lanes > 1
-          ? bufferPairs({ normed, lanes, format })
-          : bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format })))
+          ? bufferPairs({ normed, lanes, format, bits })
+          : bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format, bits })))
       this.gpu.run({
         name: "matmul",
         program: gpu.nativeProgram(spec) as Program,
@@ -4887,12 +4902,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   private storeQuants(w: GpuMatrix) {
     if (TUNING.bufferMatvec <= 0 || !("toStorage" in this.gpu)) return
-    if (!(w.bits === 4 && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels)) return
+    if (!((w.bits === 4 || w.bits === 8) && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels)) return
     w.stored = this.gpu.toStorage(w.quants)
     if (w.stored) this.gpu.delete(w.quants)
   }
   private bufferSpecs = new Map<string, NativeSpec>()
   private promptSpec: NativeSpec | undefined
+  private pairSpec8: NativeSpec | undefined
   private recurrenceSpecs = new Map<string, NativeSpec>()
   private recurrenceSpecOf(shape: { keyHeadDim: number; valueHeadDim: number }) {
     const key = `${shape.keyHeadDim} ${shape.valueHeadDim} ${TUNING.recurrenceRows}`
@@ -7231,7 +7247,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // layer's two norms folds where its own matmuls can.)
     const each = prescaled && TUNING.foldEach > 0
     const folds = (m?: GpuMatrix) =>
-      !!m && (m.rgba4 || (m.bits === 4 && m.bytes) || (each && m.bits === 8))
+      !!m && (m.rgba4 || (m.bits === 4 && m.bytes) || !!m.stored || (each && m.bits === 8))
     const canFold = rows <= SPLIT_ROWS && TUNING.foldNorm > 0 && !probe
     const opFolds = (l: GpuLayer) =>
       folds(l.conv?.inProj ?? l.attention?.qkvg ?? l.linear?.inProj) &&
