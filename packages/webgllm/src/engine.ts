@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -5430,7 +5430,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const U = c.headDim / 8
     if (
       rows === 1 && inCache && split > 0 && split <= 16 && TUNING.nativeAttend > 0 && "nativeProgram" in this.gpu &&
-      c.headDim % 8 === 0 && group * U <= TUNING.flashKeys && TUNING.flashKeys % (group * U) === 0
+      flashFits({ headDim: c.headDim, heads: c.numHeads, kvHeads: c.numKvHeads, keys: TUNING.flashKeys })
     ) {
       const j0 = sliding ? Math.max(0, pos0 - c.slidingWindow + 1) : 0
       const keys = pos0 + 1 - j0

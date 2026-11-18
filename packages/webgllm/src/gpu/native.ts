@@ -563,100 +563,140 @@ export const FLASH_KEYS = 128
  * rather than a texture. Texel h·(2U + 1) + 2u (+1) of row c: head h's
  * weighted values lo (hi) of its texel u; h·(2U + 1) + 2U: (max, sum).
  */
+/**
+ * Whether flashChunks has a kernel for this shape: whole groups of threads,
+ * and its workgroup memory within WebGPU's guaranteed 16 KiB.
+ */
+export function flashFits(o: { headDim: number; heads: number; kvHeads: number; keys?: number }): boolean {
+  const U = o.headDim / 8
+  const G = o.heads / o.kvHeads
+  const K = o.keys ?? FLASH_KEYS
+  const T = 2 * K
+  const groups = T / (G * U)
+  const bytes = 16 * G * 2 * U + 4 * G * T + 2 * 4 * G * K + 16 * T
+  return Number.isInteger(U) && U % 2 === 0 && Number.isInteger(G) && Number.isInteger(groups) && Number.isInteger(K / groups) && bytes <= 16384
+}
+
 export function flashChunks(o: { headDim: number; heads: number; kvHeads: number; kvWidth: number; keys?: number }): NativeSpec {
   const U = o.headDim / 8
   const G = o.heads / o.kvHeads
   const K = o.keys ?? FLASH_KEYS
+  // Two threads a key for its scores (half of the head's texels each), then
+  // every (member, texel) pair's weighted values over K / groups keys.
+  const T = 2 * K
+  const C = G * U
+  const groups = T / C
+  const per = K / groups
+  if (!flashFits(o)) throw new Error(`No native attention for ${G} heads of ${o.headDim} at ${K} keys.`)
   const W = 2 * U + 1
+  const Gs = Array.from({ length: G }, (_, g) => g)
   const code = `
 struct Uni { rect: vec4<u32>, qSlot0: i32, ring: i32, j0: i32, keys: i32, qpos: i32, window: i32, kvShift: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tKV: texture_2d<u32>;
 @group(0) @binding(2) var out0: texture_storage_2d<rgba32float, write>;
 var<workgroup> q: array<vec4<f32>, ${G * 2 * U}>;
+var<workgroup> part: array<f32, ${G * T}>;
 var<workgroup> s: array<f32, ${G * K}>;
-var<workgroup> red: array<f32, ${K}>;
-var<workgroup> acc: array<vec4<f32>, ${2 * K}>;
+var<workgroup> red: array<f32, ${G * K}>;
+var<workgroup> acc: array<vec4<f32>, ${T}>;
 fn kvAt(x: i32, slot: i32) -> vec2<i32> {
   return vec2<i32>(x + (slot >> u32(u.kvShift)) * ${o.kvWidth}, slot & ((1 << u32(u.kvShift)) - 1));
 }
 fn ringed(j: i32) -> i32 { return select(j, j - (j / u.ring) * u.ring, u.ring > 0); }
 fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
 fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
-fn reduceMax(v: f32, l: u32) -> f32 {
-  red[l] = v; workgroupBarrier();
-  for (var st = ${K / 2}u; st > 0u; st >>= 1u) { if (l < st) { red[l] = max(red[l], red[l + st]); } workgroupBarrier(); }
-  let r = red[0]; workgroupBarrier(); return r;
-}
-fn reduceSum(v: f32, l: u32) -> f32 {
-  red[l] = v; workgroupBarrier();
-  for (var st = ${K / 2}u; st > 0u; st >>= 1u) { if (l < st) { red[l] = red[l] + red[l + st]; } workgroupBarrier(); }
-  let r = red[0]; workgroupBarrier(); return r;
-}
-@compute @workgroup_size(${K})
+@compute @workgroup_size(${T})
 fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
   let kh = i32(w.x);
   let c = i32(w.y);
   let t = i32(l);
   // The group's queries (pre-scaled f32 bits in the cache's slots).
-  for (var i = t; i < ${G * 2 * U}; i += ${K}) {
-    let g = i / ${2 * U};
+  if (t < ${G * 2 * U}) {
+    let g = t / ${2 * U};
     let qt = (kh * ${G} + g) * ${2 * U};
     let slot = ringed(u.qSlot0 + qt / ${o.kvWidth});
     let p = kvAt(qt - (qt / ${o.kvWidth}) * ${o.kvWidth}, slot);
-    q[i] = bitcast<vec4<f32>>(textureLoad(tKV, vec2<i32>(p.x + (i - g * ${2 * U}), p.y), 0));
+    q[t] = bitcast<vec4<f32>>(textureLoad(tKV, vec2<i32>(p.x + (t - g * ${2 * U}), p.y), 0));
   }
   workgroupBarrier();
-  // This thread's key: its score against each member.
-  let j = u.j0 + c * ${K} + t;
-  let live = j - u.j0 < u.keys && j <= u.qpos && (u.window <= 0 || u.qpos - j < u.window);
-  let row = select(0, ringed(j), live);
-  let pk = kvAt(kh * ${U}, row);
-${Array.from({ length: G }, (_, g) => `  var a${g} = vec4<f32>(0.0);`).join("\n")}
-  for (var x = 0; x < ${U}; x++) {
+  // Half a key's scores: key t / 2, texels from (t % 2) · U / 2.
+  let kk = t / 2;
+  let h0 = (t % 2) * ${U / 2};
+  let jk = u.j0 + c * ${K} + kk;
+  let liveK = jk - u.j0 < u.keys && jk <= u.qpos && (u.window <= 0 || u.qpos - jk < u.window);
+  let pk = kvAt(kh * ${U}, select(0, ringed(jk), liveK));
+${Gs.map((g) => `  var a${g} = vec4<f32>(0.0);`).join("\n")}
+  for (var x = h0; x < h0 + ${U / 2}; x++) {
     let k = textureLoad(tKV, vec2<i32>(pk.x + x, pk.y), 0);
     let kl = lo(k);
-    let kh2 = hi(k);
-${Array.from({ length: G }, (_, g) => `    a${g} += q[${g * 2 * U} + 2 * x] * kl + q[${g * 2 * U} + 2 * x + 1] * kh2;`).join("\n")}
+    let kv = hi(k);
+${Gs.map((g) => `    a${g} += q[${g * 2 * U} + 2 * x] * kl + q[${g * 2 * U} + 2 * x + 1] * kv;`).join("\n")}
   }
-${Array.from({ length: G }, (_, g) => `  let m${g} = reduceMax(select(-1e30, dot(a${g}, vec4<f32>(1.0)), live), l);
-  let e${g} = select(0.0, exp(dot(a${g}, vec4<f32>(1.0)) - m${g}), live && m${g} > -1e29);
-  s[${g * K} + t] = e${g};
-  let l${g} = reduceSum(e${g}, l);`).join("\n")}
+${Gs.map((g) => `  part[${g * T} + t] = dot(a${g}, vec4<f32>(1.0));`).join("\n")}
   workgroupBarrier();
-  // Weighted values: thread t takes texel x = t % U of member g = (t / U) % G, keys of half t / (G·U).
-  let x = t % ${U};
-  let g = (t / ${U}) % ${G};
-  let half = t / ${G * U};
+  // Key t's scores (masked: -1e30), every member's max at once.
+  let live = t < ${K} && (u.j0 + c * ${K} + t) - u.j0 < u.keys && (u.j0 + c * ${K} + t) <= u.qpos && (u.window <= 0 || u.qpos - (u.j0 + c * ${K} + t) < u.window);
+  if (t < ${K}) {
+${Gs.map((g) => `    let sc${g} = select(-1e30, part[${g * T} + 2 * t] + part[${g * T} + 2 * t + 1], live);
+    s[${g * K} + t] = sc${g};
+    red[${g * K} + t] = sc${g};`).join("\n")}
+  }
+  workgroupBarrier();
+  for (var st = ${K / 2}; st > 0; st >>= 1u) {
+    if (t < st) {
+${Gs.map((g) => `      red[${g * K} + t] = max(red[${g * K} + t], red[${g * K} + t + st]);`).join("\n")}
+    }
+    workgroupBarrier();
+  }
+${Gs.map((g) => `  let m${g} = red[${g * K}];`).join("\n")}
+  workgroupBarrier();
+  if (t < ${K}) {
+${Gs.map((g) => `    let e${g} = select(0.0, exp(s[${g * K} + t] - m${g}), live && m${g} > -1e29);
+    s[${g * K} + t] = e${g};
+    red[${g * K} + t] = e${g};`).join("\n")}
+  }
+  workgroupBarrier();
+  for (var st = ${K / 2}; st > 0; st >>= 1u) {
+    if (t < st) {
+${Gs.map((g) => `      red[${g * K} + t] = red[${g * K} + t] + red[${g * K} + t + st];`).join("\n")}
+    }
+    workgroupBarrier();
+  }
+${Gs.map((g) => `  let l${g} = red[${g * K}];`).join("\n")}
+  // Weighted values: pair (member g, texel x) = t % ${C}, keys of group t / ${C}.
+  let pair = t % ${C};
+  let g = pair / ${U};
+  let x = pair % ${U};
+  let grp = t / ${C};
   var vlo = vec4<f32>(0.0);
   var vhi = vec4<f32>(0.0);
-  let per = ${K / ((K / (G * U)) || 1)};
-  for (var i = half * per; i < half * per + per; i++) {
+  for (var i = grp * ${per}; i < grp * ${per} + ${per}; i++) {
     let e = s[g * ${K} + i];
     if (e != 0.0) {
-      let jj = u.j0 + c * ${K} + i;
-      let v = textureLoad(tKV, kvAt(${o.kvHeads * U} + kh * ${U} + x, ringed(jj)), 0);
+      let v = textureLoad(tKV, kvAt(${o.kvHeads * U} + kh * ${U} + x, ringed(u.j0 + c * ${K} + i)), 0);
       vlo += e * lo(v);
       vhi += e * hi(v);
     }
   }
-  acc[(half * ${G * U} + g * ${U} + x) * 2] = vlo;
-  acc[(half * ${G * U} + g * ${U} + x) * 2 + 1] = vhi;
+  // The groups' sums, lo then hi through one buffer (16 KiB of workgroup memory is WebGPU's default limit).
+  acc[t] = vlo;
   workgroupBarrier();
-  if (t < ${G * U}) {
-    var sl = vec4<f32>(0.0);
+  var sl = vec4<f32>(0.0);
+  if (t < ${C}) { for (var r = 0; r < ${groups}; r++) { sl += acc[r * ${C} + t]; } }
+  workgroupBarrier();
+  acc[t] = vhi;
+  workgroupBarrier();
+  if (t < ${C}) {
     var sh = vec4<f32>(0.0);
-    for (var hf = 0; hf < ${Math.max(1, K / (G * U))}; hf++) {
-      sl += acc[(hf * ${G * U} + t) * 2];
-      sh += acc[(hf * ${G * U} + t) * 2 + 1];
-    }
+    for (var r = 0; r < ${groups}; r++) { sh += acc[r * ${C} + t]; }
     let h = kh * ${G} + g;
     textureStore(out0, vec2<i32>(h * ${W} + 2 * x, c), sl);
     textureStore(out0, vec2<i32>(h * ${W} + 2 * x + 1, c), sh);
   }
   if (t < ${G}) {
     let h = kh * ${G} + t;
-${Array.from({ length: G }, (_, g) => `    if (t == ${g}) { textureStore(out0, vec2<i32>(h * ${W} + ${2 * U}, c), select(vec4<f32>(m${g}, l${g}, 0.0, 0.0), vec4<f32>(-1e30, 0.0, 0.0, 0.0), m${g} <= -1e29)); }`).join("\n")}
+${Gs.map((gg) => `    if (t == ${gg}) { textureStore(out0, vec2<i32>(h * ${W} + ${2 * U}, c), select(vec4<f32>(m${gg}, l${gg}, 0.0, 0.0), vec4<f32>(-1e30, 0.0, 0.0, 0.0), m${gg} <= -1e29)); }`).join("\n")}
   }
 }
 `
