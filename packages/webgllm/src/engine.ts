@@ -180,6 +180,15 @@ export const TUNING = {
    */
   bufferGemm: 1,
   /**
+   * bufferGemm for the 8-bit matrices among 4-bit ones too (unsloth's
+   * Qwen3.5 2B has 21: Q5_K and Q4_1 tensors the loader keeps as 8-bit):
+   * dequantized into the same scratch, through the same matmul, where the
+   * native pair matmul ran them at a third of its speed. An M3 Ultra read
+   * Qwen3.5 2B's prompts at 4,285 tokens/s this way where 3,504, with the
+   * same replies.
+   */
+  bufferGemm8: 1,
+  /**
    * bufferGemm's matmul: row groups a thread (see gpu/native.ts's
    * promptMatmulBuffer); 0: one where tune's lanes won (threads sharing K
    * loops: a GPU that wants more threads), else two. Two read LFM3's
@@ -4328,6 +4337,16 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return w.bits === 4 && mode > 0 && (!w.rgba4 || mode > 1)
   }
 
+  /**
+   * Whether 8-bit matrix `w` (its quants in a storage buffer) goes through
+   * the f16 scratch buffer to the native prompt matmul, as the 4-bit ones
+   * beside it do (bufferGemm): through their scratch, which is at least
+   * as wide as the widest of their K, so only a matrix no wider.
+   */
+  private eightTakesF16(w: GpuMatrix, f: { kMax: number; wbuf?: Texture }) {
+    return TUNING.bufferGemm8 > 0 && w.bits === 8 && !!w.stored && !!f.wbuf && w.K <= f.kMax
+  }
+
   /** The layer matrices prompt matmuls read. */
   private layerMats() {
     return this.layers
@@ -4508,7 +4527,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       uG: { int: w.groups }
     }
     const partner = this.quads.get(out.id)
-    if ((w.rgba4 || w.bits === 4) && partner && TUNING.quad > 0) {
+    // (An 8-bit matrix among 4-bit ones that take the buffer scratch: through it too.)
+    const scratch8 = bits === 8 && !!w.stored && partner && TUNING.quad > 0 && this.usesF16() && (this.f16Pack() & 2) !== 0 ? this.f16Scratch() : false
+    const eight = !!scratch8 && this.eightTakesF16(w, scratch8)
+    if ((w.rgba4 || w.bits === 4 || eight) && partner && TUNING.quad > 0) {
       // Four tokens per fragment, into two textures; K in slices of about
       // quadSliceK values (twice that for wide matrices), stacked in rows.
       const quadRows = Math.ceil(rows / 4)
@@ -4523,8 +4545,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const { kbSlice, slices } = this.quadSlices(w, most)
       // (Byte texels have no matmulQuad: the f16 path at any size. RGBA4
       // takes it only with f16Matmul 2, and not for short batches.)
-      const f =
-        this.takesF16(w) && (!w.rgba4 || rows >= TUNING.f16MinRows)
+      const f = eight
+        ? scratch8
+        : this.takesF16(w) && (!w.rgba4 || rows >= TUNING.f16MinRows)
           ? this.f16Scratch()
           : false
       if (f) {
@@ -4557,9 +4580,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const toBuffer = !!f.wbuf && h2W
         if (toBuffer && !stored) throw new GpuError("The f16 matmul's buffer scratch needs the weights in a buffer.")
         const storedDequant = stored
-          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W, toBuffer))
+          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W, toBuffer, eight ? 8 : 4))
           : null
-        const dequant = this.gpu.program(
+        const dequant = stored ? null : this.gpu.program(
           w.rgba4
             ? this.scalesOf(
                 w,
@@ -4601,7 +4624,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             const n = Math.min(plan.rows, w.N - r0)
             await this.gpu.runAsync({
               name: "dequant",
-              program: stored ? storedDequant! : dequant,
+              program: (storedDequant ?? dequant)!,
               inputs: stored
                 ? { uW: stored, uS: w.scales }
                 : {

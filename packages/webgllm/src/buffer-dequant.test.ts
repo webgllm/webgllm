@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
+import { Engine } from "./engine.js"
 import { bufferDequant } from "./gpu/native.js"
 
 describe("the buffer dequant, a thread a row's block (gpu/native.ts's bufferDequant)", () => {
@@ -42,4 +43,17 @@ describe("the buffer dequant, a thread a row's block (gpu/native.ts's bufferDequ
     assert.match(spec.code, /let v5 = q\(w5\) \* d;/)
     assert.match(spec.code, /out0\[at \+ 2\] = h2\(v4, v5\);/)
   })
+})
+
+test("an 8-bit matrix takes the buffer scratch only where the 4-bit ones' holds its K", () => {
+  const takes = Reflect.get(Engine.prototype, "eightTakesF16") as (w: unknown, f: unknown) => boolean
+  const wbuf = {}
+  const stored = {}
+  assert.equal(takes({ bits: 8, stored, K: 2048 }, { kMax: 6144, wbuf }), true)
+  assert.equal(takes({ bits: 8, stored, K: 6144 }, { kMax: 6144, wbuf }), true)
+  // Wider than the scratch was sized for, weights not in a buffer, no buffer scratch, or 4-bit: as before.
+  assert.equal(takes({ bits: 8, stored, K: 8192 }, { kMax: 6144, wbuf }), false)
+  assert.equal(takes({ bits: 8, K: 2048 }, { kMax: 6144, wbuf }), false)
+  assert.equal(takes({ bits: 8, stored, K: 2048 }, { kMax: 6144 }), false)
+  assert.equal(takes({ bits: 4, stored, K: 2048 }, { kMax: 6144, wbuf }), false)
 })
