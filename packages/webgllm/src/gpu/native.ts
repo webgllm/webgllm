@@ -406,3 +406,147 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) w: vec3
     groups: () => [o.heads + 2 * o.kvHeads, 1]
   }
 }
+
+/**
+ * kernels.ts's CHUNK_MAX_AT as a workgroup per 256-token chunk and row, a
+ * thread a texel of 4 logits, the 64 reduced in workgroup memory (the
+ * GLSL pass is a thread a chunk: 500 threads for a 128,000-word
+ * vocabulary, each looping over 64 texels, at the end of every token).
+ * The same penalties (repetition, presence, the allowed-token mask) and
+ * the same answer: the chunk's largest logit and its position, ties to the
+ * lower position. Without CHUNK_MAX_AT's per-row seen overrides (uSeenRows:
+ * draft batches), which the GLSL pass keeps.
+ */
+export function chunkMax(): NativeSpec {
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uLogits", kind: "f" },
+    { name: "uMask", kind: "u" },
+    { name: "uAllowed", kind: "u" }
+  ]
+  const code = `
+struct Uni { rect: vec4<u32>, outW: i32, logitRows: i32, headSplit: i32, headStride: i32, penaltyRow0: i32, allowedEnabled: i32, allowedWidth: i32, allowedRows: i32, allowedStride: i32, penalty: f32, presence: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tLogits: texture_2d<f32>;
+@group(0) @binding(2) var tMask: texture_2d<u32>;
+@group(0) @binding(3) var tAllowed: texture_2d<u32>;
+@group(0) @binding(4) var out0: texture_storage_2d<rgba32float, write>;
+var<workgroup> bv: array<f32, 64>;
+var<workgroup> bi: array<i32, 64>;
+fn penalized(v0: f32, m: u32, id: i32, r: i32) -> f32 {
+  var v = v0;
+  if (u.allowedEnabled != 0) {
+    let word = id >> 5u;
+    let maskRow = select(r, 0, u.allowedRows == 1);
+    if (maskRow >= u.allowedRows) { return -1e30; }
+    let bits = textureLoad(tAllowed, vec2<i32>(word % u.allowedWidth, word / u.allowedWidth + maskRow * u.allowedStride), 0).x;
+    if ((bits & (1u << u32(id & 31))) == 0u) { return -1e30; }
+  }
+  if (m == 2u) { return -1e30; }
+  let seen = m == 1u || m == 3u;
+  if (seen) { v = select(v / u.penalty, v * u.penalty, v < 0.0); }
+  return select(v, v - u.presence, seen);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let c = i32(w.x);
+  let r = i32(w.y);
+  let t = i32(l);
+  let texel = c * 64 + t;
+  let p = vec2<i32>(texel % u.outW, texel / u.outW);
+  var v = vec4<f32>(0.0);
+  for (var s = 0; s < 4; s++) {
+    if (s >= u.headSplit) { break; }
+    v += textureLoad(tLogits, vec2<i32>(p.x, p.y + r * u.logitRows + s * u.headStride), 0);
+  }
+  let base = 4 * p.x;
+  let id = 4 * texel;
+  let pr = r + u.penaltyRow0;
+  let q = vec4<f32>(
+    penalized(v.x, textureLoad(tMask, vec2<i32>(base, p.y), 0).x, id, pr),
+    penalized(v.y, textureLoad(tMask, vec2<i32>(base + 1, p.y), 0).x, id + 1, pr),
+    penalized(v.z, textureLoad(tMask, vec2<i32>(base + 2, p.y), 0).x, id + 2, pr),
+    penalized(v.w, textureLoad(tMask, vec2<i32>(base + 3, p.y), 0).x, id + 3, pr));
+  // (As the GLSL scan: strictly larger replaces, so the first of equals stays.)
+  var mx = -3e38;
+  var at = 0;
+  if (q.x > mx) { mx = q.x; at = 4 * t; }
+  if (q.y > mx) { mx = q.y; at = 4 * t + 1; }
+  if (q.z > mx) { mx = q.z; at = 4 * t + 2; }
+  if (q.w > mx) { mx = q.w; at = 4 * t + 3; }
+  bv[l] = mx;
+  bi[l] = at;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s >>= 1u) {
+    if (l < s) {
+      let ov = bv[l + s];
+      let oi = bi[l + s];
+      if (ov > bv[l] || (ov == bv[l] && oi < bi[l])) { bv[l] = ov; bi[l] = oi; }
+    }
+    workgroupBarrier();
+  }
+  if (l == 0u) { textureStore(out0, vec2<i32>(c, r), vec4<f32>(bv[0], f32(bi[0]), 0.0, 0.0)); }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: [
+      { name: "uOutW", type: "int" }, { name: "uLogitRows", type: "int" }, { name: "uHeadSplit", type: "int" }, { name: "uHeadStride", type: "int" },
+      { name: "uPenaltyRow0", type: "int" }, { name: "uAllowedEnabled", type: "int" }, { name: "uAllowedWidth", type: "int" }, { name: "uAllowedRows", type: "int" },
+      { name: "uAllowedStride", type: "int" }, { name: "uPenalty", type: "float" }, { name: "uPresencePenalty", type: "float" }
+    ],
+    groups: (rect) => [rect.width, rect.height]
+  }
+}
+
+/**
+ * kernels.ts's CHUNK_ARGMAX_AT (`rows` false: row uRow's token id into an
+ * R32UI texel) or CHUNK_ARGMAX_ROWS (`rows`: each row's id and logit as
+ * floats), a 256-thread workgroup per row over `chunks` chunk maxima
+ * (the GLSL passes are one thread scanning them all): the first chunk
+ * with the largest maximum, then its position in it.
+ */
+export function chunkArgmax(o: { chunks: number; rows: boolean }): NativeSpec {
+  const code = `
+struct Uni { rect: vec4<u32>, row: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tMax: texture_2d<f32>;
+@group(0) @binding(2) var out0: texture_storage_2d<${o.rows ? "rgba32float" : "r32uint"}, write>;
+var<workgroup> bv: array<f32, 256>;
+var<workgroup> bi: array<i32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let row = ${o.rows ? "i32(u.rect.y + w.y)" : "u.row"};
+  var mx = -3e38;
+  var at = 0;
+  for (var i = i32(l); i < ${o.chunks}; i += 256) {
+    let v = textureLoad(tMax, vec2<i32>(i, row), 0).x;
+    if (v > mx) { mx = v; at = i; }
+  }
+  bv[l] = mx;
+  bi[l] = at;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (l < s) {
+      let ov = bv[l + s];
+      let oi = bi[l + s];
+      if (ov > bv[l] || (ov == bv[l] && oi < bi[l])) { bv[l] = ov; bi[l] = oi; }
+    }
+    workgroupBarrier();
+  }
+  if (l == 0u) {
+    let best = bi[0];
+    let pos = i32(textureLoad(tMax, vec2<i32>(best, row), 0).y);
+    ${o.rows
+      ? "textureStore(out0, vec2<i32>(0, row), vec4<f32>(f32(best * 256 + pos), bv[0], 0.0, 0.0));"
+      : "textureStore(out0, vec2<i32>(0, 0), vec4<u32>(u32(best * 256 + pos), 0u, 0u, 0u));"}
+  }
+}
+`
+  return {
+    code,
+    inputs: [{ name: "uMax", kind: "f" }],
+    uniforms: [{ name: "uRow", type: "int" }],
+    groups: (rect) => [1, o.rows ? rect.height : 1]
+  }
+}

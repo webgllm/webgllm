@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, chunkArgmax, chunkMax, expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -142,6 +142,8 @@ export const TUNING = {
   nativeExpandedThreads: 32,
   /** WebGPU: a token's queries, keys and values in one native pass (gpu/native.ts's attentionPrep). */
   nativePrep: 1,
+  /** WebGPU: the pick's chunk maxima and argmax as native passes, a workgroup a chunk and a row (gpu/native.ts's chunkMax). */
+  nativePick: 1,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -3797,10 +3799,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private async warmDraftBatches() {
     const rows = Math.min(SPLIT_ROWS, this.contextLength - 1)
     await this.forwardHidden(new Array<number>(rows).fill(0), { draft: true })
-    await this.pick(0, rows, 1, 1, [], true)
-    this.dropGuess()
-    await this.argmax(0, rows, 1, [], true)
-    this.dropGuess()
+    // With a row seeing a token otherwise than the mask too, as drafts'
+    // rows do: the pick's GLSL passes then (see nativePicks).
+    for (const seen of [[], [[0, 0, 0, rows]]] as Array<Array<SeenRow>>) {
+      await this.pick(0, rows, 1, 1, seen, true)
+      this.dropGuess()
+      await this.argmax(0, rows, 1, seen, true)
+      this.dropGuess()
+    }
     this.accept(1)
     if (TUNING.attendChunkTexels > 0) {
       const saved = [TUNING.attendChunkTexels, TUNING.attendChunkTexelsDecode, TUNING.flashPast]
@@ -4700,6 +4706,27 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
   private orderStage: Texture | null = null
+
+  /**
+   * The pick's native programs (see TUNING.nativePick), or null: not on
+   * WebGL, nor where rows see tokens otherwise than the mask (draft
+   * batches' seenRows), which the GLSL passes handle.
+   */
+  private nativePicks(seenRows: ReadonlyArray<SeenRow>, chunks: number) {
+    if (TUNING.nativePick <= 0 || seenRows.length > 0 || !("nativeProgram" in this.gpu)) return null
+    const gpu = this.gpu
+    const spec = (key: string, make: () => NativeSpec) => {
+      let s = this.pickSpecs.get(key)
+      if (!s) this.pickSpecs.set(key, (s = make()))
+      return gpu.nativeProgram(s)
+    }
+    return {
+      max: spec("max", chunkMax),
+      argmax: spec(`argmax ${chunks}`, () => chunkArgmax({ chunks, rows: false })),
+      rows: spec(`rows ${chunks}`, () => chunkArgmax({ chunks, rows: true }))
+    }
+  }
+  private pickSpecs = new Map<string, NativeSpec>()
 
   private attentionPreps = new Map<string, NativeSpec>()
   private attentionPrepSpec(split: number, kvWidth: number) {
@@ -6404,6 +6431,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const b = this.buffers
     const head = await this.head(row0, rows, false)
     const total = Math.ceil(c.vocabSize / CHUNK)
+    const native = this.nativePicks(seenRows, total)
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -6420,7 +6448,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(K.CHUNK_MAX_AT),
+      program: native?.max ?? this.gpu.program(K.CHUNK_MAX_AT),
       inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
@@ -6429,7 +6457,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (guess) {
       this.gpu.run({
         name: "pick",
-        program: this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_AT, total)),
+        program: native?.argmax ?? this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_AT, total)),
         inputs: { uMax: b.chunkMax },
         uniforms: { uRow: { int: rows - 1 } },
         output: b.ids,
@@ -6439,7 +6467,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.greedyOut ??= this.gpu.texture(GL.RGBA32F, 1, SPLIT_ROWS)
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_ROWS, total)),
+      program: native?.rows ?? this.gpu.program(K.withChunks(K.CHUNK_ARGMAX_ROWS, total)),
       inputs: { uMax: b.chunkMax },
       output: this.greedyOut,
       rect: { x: 0, y: 0, width: 1, height: rows }
@@ -6488,6 +6516,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const total = Math.ceil(c.vocabSize / CHUNK)
     const count = Math.min(chunks, MAX_CHUNKS, total)
     const fast = TUNING.fastPick > 0
+    const native = this.nativePicks(seenRows, total)
     const picking = {
       uOutW: { int: OUT_WIDTH },
       uPenalty: penalty,
@@ -6504,7 +6533,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     this.gpu.run({
       name: "pick",
-      program: this.gpu.program(fast ? K.CHUNK_MAX_AT : K.CHUNK_MAX),
+      program: native?.max ?? this.gpu.program(fast ? K.CHUNK_MAX_AT : K.CHUNK_MAX),
       inputs: { uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
       uniforms: picking,
       output: b.chunkMax,
@@ -6515,7 +6544,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // the chunk maxima: the forward waits on this, not on the gather.
       this.gpu.run({
         name: "pick",
-        program: this.gpu.program(
+        program: native?.argmax ?? this.gpu.program(
           fast ? K.withChunks(K.CHUNK_ARGMAX_AT, total) : K.CHUNK_ARGMAX
         ),
         inputs: { uMax: b.chunkMax, uLogits: head.logits, uMask: b.mask, uAllowed: this.allowedTokens ?? b.mask },
