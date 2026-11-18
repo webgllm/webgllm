@@ -550,3 +550,183 @@ fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<
     groups: (rect) => [1, o.rows ? rect.height : 1]
   }
 }
+
+/** Keys a native attention chunk takes (see flashChunks). */
+export const FLASH_KEYS = 128
+
+/**
+ * A token's attention over its cache, part 1 (kernels.ts's scores,
+ * attendPanel: the same math): a workgroup per KV head and FLASH_KEYS-key
+ * chunk scores each key against the G query heads sharing that KV head
+ * (queries from the cache's slots, as headPrep's "cache" left them), and
+ * sums the chunk's softmax-weighted values, the scores in workgroup memory
+ * rather than a texture. Texel h·(2U + 1) + 2u (+1) of row c: head h's
+ * weighted values lo (hi) of its texel u; h·(2U + 1) + 2U: (max, sum).
+ */
+export function flashChunks(o: { headDim: number; heads: number; kvHeads: number; kvWidth: number; keys?: number }): NativeSpec {
+  const U = o.headDim / 8
+  const G = o.heads / o.kvHeads
+  const K = o.keys ?? FLASH_KEYS
+  const W = 2 * U + 1
+  const code = `
+struct Uni { rect: vec4<u32>, qSlot0: i32, ring: i32, j0: i32, keys: i32, qpos: i32, window: i32, kvShift: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tKV: texture_2d<u32>;
+@group(0) @binding(2) var out0: texture_storage_2d<rgba32float, write>;
+var<workgroup> q: array<vec4<f32>, ${G * 2 * U}>;
+var<workgroup> s: array<f32, ${G * K}>;
+var<workgroup> red: array<f32, ${K}>;
+var<workgroup> acc: array<vec4<f32>, ${2 * K}>;
+fn kvAt(x: i32, slot: i32) -> vec2<i32> {
+  return vec2<i32>(x + (slot >> u32(u.kvShift)) * ${o.kvWidth}, slot & ((1 << u32(u.kvShift)) - 1));
+}
+fn ringed(j: i32) -> i32 { return select(j, j - (j / u.ring) * u.ring, u.ring > 0); }
+fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
+fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
+fn reduceMax(v: f32, l: u32) -> f32 {
+  red[l] = v; workgroupBarrier();
+  for (var st = ${K / 2}u; st > 0u; st >>= 1u) { if (l < st) { red[l] = max(red[l], red[l + st]); } workgroupBarrier(); }
+  let r = red[0]; workgroupBarrier(); return r;
+}
+fn reduceSum(v: f32, l: u32) -> f32 {
+  red[l] = v; workgroupBarrier();
+  for (var st = ${K / 2}u; st > 0u; st >>= 1u) { if (l < st) { red[l] = red[l] + red[l + st]; } workgroupBarrier(); }
+  let r = red[0]; workgroupBarrier(); return r;
+}
+@compute @workgroup_size(${K})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let kh = i32(w.x);
+  let c = i32(w.y);
+  let t = i32(l);
+  // The group's queries (pre-scaled f32 bits in the cache's slots).
+  for (var i = t; i < ${G * 2 * U}; i += ${K}) {
+    let g = i / ${2 * U};
+    let qt = (kh * ${G} + g) * ${2 * U};
+    let slot = ringed(u.qSlot0 + qt / ${o.kvWidth});
+    let p = kvAt(qt - (qt / ${o.kvWidth}) * ${o.kvWidth}, slot);
+    q[i] = bitcast<vec4<f32>>(textureLoad(tKV, vec2<i32>(p.x + (i - g * ${2 * U}), p.y), 0));
+  }
+  workgroupBarrier();
+  // This thread's key: its score against each member.
+  let j = u.j0 + c * ${K} + t;
+  let live = j - u.j0 < u.keys && j <= u.qpos && (u.window <= 0 || u.qpos - j < u.window);
+  let row = select(0, ringed(j), live);
+  let pk = kvAt(kh * ${U}, row);
+${Array.from({ length: G }, (_, g) => `  var a${g} = vec4<f32>(0.0);`).join("\n")}
+  for (var x = 0; x < ${U}; x++) {
+    let k = textureLoad(tKV, vec2<i32>(pk.x + x, pk.y), 0);
+    let kl = lo(k);
+    let kh2 = hi(k);
+${Array.from({ length: G }, (_, g) => `    a${g} += q[${g * 2 * U} + 2 * x] * kl + q[${g * 2 * U} + 2 * x + 1] * kh2;`).join("\n")}
+  }
+${Array.from({ length: G }, (_, g) => `  let m${g} = reduceMax(select(-1e30, dot(a${g}, vec4<f32>(1.0)), live), l);
+  let e${g} = select(0.0, exp(dot(a${g}, vec4<f32>(1.0)) - m${g}), live && m${g} > -1e29);
+  s[${g * K} + t] = e${g};
+  let l${g} = reduceSum(e${g}, l);`).join("\n")}
+  workgroupBarrier();
+  // Weighted values: thread t takes texel x = t % U of member g = (t / U) % G, keys of half t / (G·U).
+  let x = t % ${U};
+  let g = (t / ${U}) % ${G};
+  let half = t / ${G * U};
+  var vlo = vec4<f32>(0.0);
+  var vhi = vec4<f32>(0.0);
+  let per = ${K / ((K / (G * U)) || 1)};
+  for (var i = half * per; i < half * per + per; i++) {
+    let e = s[g * ${K} + i];
+    if (e != 0.0) {
+      let jj = u.j0 + c * ${K} + i;
+      let v = textureLoad(tKV, kvAt(${o.kvHeads * U} + kh * ${U} + x, ringed(jj)), 0);
+      vlo += e * lo(v);
+      vhi += e * hi(v);
+    }
+  }
+  acc[(half * ${G * U} + g * ${U} + x) * 2] = vlo;
+  acc[(half * ${G * U} + g * ${U} + x) * 2 + 1] = vhi;
+  workgroupBarrier();
+  if (t < ${G * U}) {
+    var sl = vec4<f32>(0.0);
+    var sh = vec4<f32>(0.0);
+    for (var hf = 0; hf < ${Math.max(1, K / (G * U))}; hf++) {
+      sl += acc[(hf * ${G * U} + t) * 2];
+      sh += acc[(hf * ${G * U} + t) * 2 + 1];
+    }
+    let h = kh * ${G} + g;
+    textureStore(out0, vec2<i32>(h * ${W} + 2 * x, c), sl);
+    textureStore(out0, vec2<i32>(h * ${W} + 2 * x + 1, c), sh);
+  }
+  if (t < ${G}) {
+    let h = kh * ${G} + t;
+${Array.from({ length: G }, (_, g) => `    if (t == ${g}) { textureStore(out0, vec2<i32>(h * ${W} + ${2 * U}, c), select(vec4<f32>(m${g}, l${g}, 0.0, 0.0), vec4<f32>(-1e30, 0.0, 0.0, 0.0), m${g} <= -1e29)); }`).join("\n")}
+  }
+}
+`
+  return {
+    code,
+    inputs: [{ name: "uKV", kind: "u" }],
+    uniforms: ["uQSlot0", "uRing", "uJ0", "uKeys", "uQPos", "uWindow", "uKvShift"].map((name): NativeSpec["uniforms"][number] => ({ name, type: "int" })),
+    groups: (rect) => [rect.width, rect.height]
+  }
+}
+
+/**
+ * A token's attention, part 2 (kernels.ts's attendPanelCombine): head h's
+ * chunks combined, the running max rescaling the sums, times its gate (one
+ * sigmoid a head, or one a dim: `gate`), into attnOut's texel h·U + u (h2).
+ */
+export function flashCombine(o: { headDim: number; heads: number; split: number; gate: false | true | "dim" }): NativeSpec {
+  const U = o.headDim / 8
+  const W = 2 * U + 1
+  const code = `
+struct Uni { rect: vec4<u32>, chunks: i32, gateTexel: i32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tP: texture_2d<f32>;
+@group(0) @binding(2) var tQKVG: texture_2d<f32>;
+@group(0) @binding(3) var out0: texture_storage_2d<rgba32uint, write>;
+fn pf(x: i32) -> vec4<f32> {
+  var a = vec4<f32>(0.0);
+  for (var k = 0; k < ${o.split}; k++) { a += textureLoad(tQKVG, vec2<i32>(x, k), 0); }
+  return a;
+}
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let c = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let d = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(c.xy), pack2x16float(c.zw), pack2x16float(d.xy), pack2x16float(d.zw));
+}
+@compute @workgroup_size(${U})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let h = i32(w.x);
+  let x = i32(l);
+  var mx = -1e30;
+  var sum = 0.0;
+  var vlo = vec4<f32>(0.0);
+  var vhi = vec4<f32>(0.0);
+  for (var c = 0; c < u.chunks; c++) {
+    let ml = textureLoad(tP, vec2<i32>(h * ${W} + ${2 * U}, c), 0).xy;
+    let mn = max(mx, ml.x);
+    let scale = exp(mx - mn);
+    let wgt = exp(ml.x - mn);
+    sum = sum * scale + ml.y * wgt;
+    vlo = vlo * scale + wgt * textureLoad(tP, vec2<i32>(h * ${W} + 2 * x, c), 0);
+    vhi = vhi * scale + wgt * textureLoad(tP, vec2<i32>(h * ${W} + 2 * x + 1, c), 0);
+    mx = mn;
+  }
+  let ox = h * ${U} + x;
+${o.gate === "dim"
+    ? `  let g0 = pf(u.gateTexel + 2 * ox);
+  let g1 = pf(u.gateTexel + 2 * ox + 1);
+  textureStore(out0, vec2<i32>(ox, 0), h2(vlo / (sum * (1.0 + exp(-g0))), vhi / (sum * (1.0 + exp(-g1)))));`
+    : o.gate
+      ? `  let gate = pf(u.gateTexel + h / 4)[h & 3];
+  let scale = 1.0 / (sum * (1.0 + exp(-gate)));
+  textureStore(out0, vec2<i32>(ox, 0), h2(vlo * scale, vhi * scale));`
+      : `  let scale = 1.0 / sum;
+  textureStore(out0, vec2<i32>(ox, 0), h2(vlo * scale, vhi * scale));`}
+}
+`
+  return {
+    code,
+    inputs: [{ name: "uP", kind: "f" }, { name: "uQKVG", kind: "f" }],
+    uniforms: [{ name: "uChunks", type: "int" }, { name: "uGateTexel", type: "int" }],
+    groups: (rect) => [rect.width, 1]
+  }
+}

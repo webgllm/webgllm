@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, chunkArgmax, chunkMax, expandedHead, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, chunkArgmax, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, fusedAdd, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -144,6 +144,10 @@ export const TUNING = {
   nativePrep: 1,
   /** WebGPU: the pick's chunk maxima and argmax as native passes, a workgroup a chunk and a row (gpu/native.ts's chunkMax). */
   nativePick: 1,
+  /** WebGPU: a token's attention as two native passes, its scores in workgroup memory (gpu/native.ts's flashChunks)... */
+  nativeAttend: 1,
+  /** ...in chunks of this many keys (a workgroup's threads). */
+  flashKeys: FLASH_KEYS,
   /** Prompt matmuls with at most this many row groups split K in two. */
   sliceGroups: 1024,
   /** Few-token matmuls split K until they have about this many fragments... */
@@ -4728,6 +4732,23 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
   private pickSpecs = new Map<string, NativeSpec>()
 
+  /** The native attention's partial sums (see flashChunks). */
+  private flashPartial: Texture | null = null
+  private flashSpecsMap = new Map<string, NativeSpec>()
+  private flashSpecs(kvWidth: number, split: number) {
+    const c = this.config
+    const gpu = this.gpu as WebGpu
+    const get = (key: string, make: () => NativeSpec) => {
+      let sp = this.flashSpecsMap.get(key)
+      if (!sp) this.flashSpecsMap.set(key, (sp = make()))
+      return gpu.nativeProgram(sp)
+    }
+    return {
+      chunks: get(`chunks ${kvWidth} ${TUNING.flashKeys}`, () => flashChunks({ headDim: c.headDim, heads: c.numHeads, kvHeads: c.numKvHeads, kvWidth, keys: TUNING.flashKeys })),
+      combine: get(`combine ${split}`, () => flashCombine({ headDim: c.headDim, heads: c.numHeads, split, gate: this.gate() }))
+    }
+  }
+
   private attentionPreps = new Map<string, NativeSpec>()
   private attentionPrepSpec(split: number, kvWidth: number) {
     const c = this.config
@@ -5404,6 +5425,49 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     let sIn = scoreInputs(scoreTex)
     const panelRows = growScores ? rowGroups * Math.min(this.capacity, this.scoreRows()) : scoreTex[0].height
     const scoreWidth = growScores ? Math.min(TUNING.scoreTexels, Math.ceil(this.contextLength / 4)) : scoreTex[0].width
+    // One token whose queries are in the cache's slots, from split partial
+    // sums: two native passes (see flashChunks), the scores never written out.
+    const U = c.headDim / 8
+    if (
+      rows === 1 && inCache && split > 0 && split <= 16 && TUNING.nativeAttend > 0 && "nativeProgram" in this.gpu &&
+      c.headDim % 8 === 0 && group * U <= TUNING.flashKeys && TUNING.flashKeys % (group * U) === 0
+    ) {
+      const j0 = sliding ? Math.max(0, pos0 - c.slidingWindow + 1) : 0
+      const keys = pos0 + 1 - j0
+      const chunks = Math.ceil(keys / TUNING.flashKeys)
+      const width = c.numHeads * (2 * U + 1)
+      const height = Math.ceil(this.contextLength / TUNING.flashKeys)
+      if (this.flashPartial?.width !== width || this.flashPartial.height < height) {
+        if (this.flashPartial) this.gpu.delete(this.flashPartial)
+        this.flashPartial = this.gpu.texture(GL.RGBA32F, width, height)
+      }
+      const fc = this.flashSpecs(kvWidth, split)
+      this.gpu.run({
+        name: "attend",
+        program: fc.chunks,
+        inputs: { uKV: layer.kv },
+        uniforms: {
+          uQSlot0: { int: qSlot0 },
+          uRing: { int: layer.ring },
+          uJ0: { int: j0 },
+          uKeys: { int: keys },
+          uQPos: { int: pos0 },
+          uWindow: { int: sliding ? c.slidingWindow : 0 },
+          uKvShift: { int: kvShift }
+        },
+        output: this.flashPartial,
+        rect: { x: 0, y: 0, width: c.numKvHeads, height: chunks }
+      })
+      this.gpu.run({
+        name: "attend",
+        program: fc.combine,
+        inputs: { uP: this.flashPartial, uQKVG: qkvgIn },
+        uniforms: { uChunks: { int: chunks }, uGateTexel: { int: (qDims + 2 * kvDims) / 4 } },
+        output: b.attnOut,
+        rect: { x: 0, y: 0, width: c.numHeads, height: 1 }
+      })
+      return
+    }
     for (let m0 = 0; m0 < rows;) {
       const j0 = sliding ? Math.max(0, pos0 + m0 - c.slidingWindow + 1) : 0
       const widest = Math.ceil((pos0 + rows - j0) / 4)
