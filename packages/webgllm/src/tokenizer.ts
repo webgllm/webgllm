@@ -186,6 +186,17 @@ const BYTE_LEVEL: ReadonlyMap<string, number> = (() => {
   return table
 })()
 
+/** tokenizer.json's parts the schema constraint reads (see constraintTokenizer). */
+function constraintJson(json: object): object {
+  const j = json as { decoder?: unknown; pre_tokenizer?: unknown; added_tokens?: unknown; model?: { type?: unknown; vocab?: unknown } }
+  return {
+    decoder: j.decoder,
+    pre_tokenizer: j.pre_tokenizer,
+    added_tokens: j.added_tokens,
+    model: { type: j.model?.type, vocab: j.model?.vocab }
+  }
+}
+
 export function loadTokenizer(files: TokenizerFiles): Tokenizer {
   const config = files.tokenizerConfig ?? {}
   const chatTemplate = chatTemplateOf(config, files.chatTemplate)
@@ -425,7 +436,10 @@ export function loadTokenizer(files: TokenizerFiles): Tokenizer {
     specialTokens,
     vocabSize,
     constraintTokenizer: {
-      tokenizerJSON: files.tokenizerJson,
+      // What the schema constraint reads (src/constraint: the decoder's
+      // kind, the vocabulary, the added tokens), not the merges: the whole
+      // JSON kept LFM3's tokenizer at 73 MiB of heap where 41.
+      tokenizerJSON: constraintJson(files.tokenizerJson),
       eos_token_id: specialTokens.eos,
       ...(specialTokens.bos !== null && { bos_token_id: specialTokens.bos }),
       special_token_ids: [...specialIds]

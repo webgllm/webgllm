@@ -2580,9 +2580,17 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         })
     this.work = null
     this.gpu.configurePacing(quota, TUNING.submissionMs)
+    // Only the option's own scratch held (its layout's weights, activation
+    // copies): both packs' at once took an iPhone 16 Pro Max's GPU memory
+    // 60 MB past LFM3's loaded 1,254 MB (48 past Qwen3.5 2B's 1,498).
+    const use = (index: number) => {
+      this.tuned.f16Pack = options[index].pack
+      this.f16Trim()
+      this.f16Scratch()
+    }
     const sample = async (index: number, rows = probeRows) => {
       signal?.throwIfAborted()
-      this.tuned.f16Pack = options[index].pack
+      use(index)
       if (native) this.tuned.f16Matmul = options[index].matmul
       this.gpu.resetPacing(true)
       this.gpu.primePresentation(trial && allowOverlap ? this.gpu.presentationAdvice.cap : TUNING.presentationFrames, trial ? overlap : quota, trial && allowOverlap)
@@ -2623,6 +2631,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const verification = options.map(() => NaN)
       const verificationRows = Math.min(probeRows, Math.max(64, TUNING.f16MinRows))
       const timed = async (i: number) => {
+        // (The scratch made before the clock starts.)
+        use(i)
         const start = performance.now(), beforeWork = this.gpu.submittedWork,
           beforeCompile = this.gpu.compiled?.count ?? 0
         await sample(i)

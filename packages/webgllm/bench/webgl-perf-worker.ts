@@ -65,12 +65,37 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
       postMessage({ type: "bench-phase", name, gpuBytes: this.gpu.bytes })
       const value = await Reflect.apply(original, this, args)
       postMessage({ type: "bench-phase", name: `${name}:end`, gpuBytes: this.gpu.bytes })
+      postMessage({ type: "bench-phase", name: `${name}:peak`, gpuBytes: peakGpuBytes })
+      // (The largest live allocations after the warm-up, by shape: where the GPU memory is.)
+      if (name === "warmUp") {
+        const live = (Reflect.get(this.gpu, "live") as Set<{ width: number; height: number; internal: number; bytes: number }> | undefined) ?? new Set()
+        const byShape = new Map<string, { n: number; mb: number }>()
+        for (const t of live) {
+          const k = `${t.width}x${t.height}/${t.internal}`
+          const e = byShape.get(k) ?? { n: 0, mb: 0 }
+          e.n++; e.mb += t.bytes / 1048576
+          byShape.set(k, e)
+        }
+        const top = [...byShape].sort((a, b) => b[1].mb - a[1].mb).slice(0, 24).map(([k, e]) => `${k}:${e.n}x=${Math.round(e.mb)}`).join(" ")
+        postMessage({ type: "bench-phase", name: `live ${live.size} ${top}`, gpuBytes: this.gpu.bytes })
+      }
       if (name === "warmUp") warmed = true
       return value
     }
   })
 }
 
+// (WebGPU's allocations too: its peak, for the load's stage events.)
+for (const name of ["texture", "storage", "toStorage"] as const) {
+  const original = Reflect.get(WebGpu.prototype, name) as (...args: unknown[]) => unknown
+  Object.assign(WebGpu.prototype, {
+    [name]: function (this: WebGpu, ...args: unknown[]) {
+      const value = Reflect.apply(original, this, args)
+      peakGpuBytes = Math.max(peakGpuBytes, this.bytes)
+      return value
+    }
+  })
+}
 for (const name of ["texture", "write"] as const) {
   const original = Gpu.prototype[name]
   Object.assign(Gpu.prototype, {
