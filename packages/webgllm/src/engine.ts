@@ -1084,7 +1084,7 @@ export class Engine {
             this.headChoice = { expanded: false, split: this.q6HeadSplit }
           else if (!this.headChoice) await this.chooseHead(value)
         }
-        if (row0 === 0) this.resizeScoreBuffers(value.bits)
+        if (row0 === 0) this.resizeScoreBuffers()
         if (row0 === 0) {
           // On WebGPU, word texels for the native head (TUNING.wordEmbedding).
           const words = value.bits === 4 && TUNING.wordEmbedding > 0 && this.nativeHeadOn
@@ -1493,7 +1493,7 @@ export class Engine {
     return rows * this.config.numHeads * width * 16
   }
 
-  private resizeScoreBuffers(embeddingBits: number) {
+  private resizeScoreBuffers() {
     const first = this.buffers.scores[0]
     // Recurrent models back their attention panels when first needed.
     if (!first) return
@@ -1502,9 +1502,13 @@ export class Engine {
     const expanded = TUNING.q6Expanded >= 0
       ? TUNING.q6Expanded > 0
       : this.headChoice?.expanded === true
-    // Keep the full attention tiles alongside a compact Q6 head. Only
-    // the stored scores are rounded. Softmax and its sums remain f32.
-    const format = embeddingBits === 6 && !expanded && this.mrt.chunks &&
+    // The full attention tiles (an expanded head halves them instead):
+    // only the stored scores are rounded; softmax and its sums remain
+    // f32. Whatever the embedding: kept f32 beside a 4-bit one (an ONNX
+    // model's), they held LFM2.5 1.2B ONNX 64 MB above its GGUF (1,067 MB
+    // against 970 on an iPhone 16 Pro Max and an M3 Ultra), at the same
+    // speed as halves.
+    const format = !expanded && this.mrt.chunks &&
       this.gpu.canRender(new Array(count).fill(GL.RGBA16F))
       ? GL.RGBA16F : GL.RGBA32F
     if (first.height === height && first.internal === format) return

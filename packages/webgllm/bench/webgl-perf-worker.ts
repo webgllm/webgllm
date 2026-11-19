@@ -160,6 +160,36 @@ for (const [name, key] of [["write", (a: unknown[]) => `write ${(a[0] as { inter
     })
   }
 }
+// (tune "bigAllocs:1": the stack of each texture or buffer of 32 MB or more, logged once a site.)
+{
+  const seen = new Set<string>()
+  for (const name of ["texture", "storage"] as const) {
+    const original = Reflect.get(WebGpu.prototype, name) as (...args: unknown[]) => { bytes?: number; width: number; height: number; internal: number }
+    Reflect.set(WebGpu.prototype, name, function (this: WebGpu, ...args: unknown[]) {
+      const t = original.apply(this, args)
+      if ((globalThis as { bigAllocs?: boolean }).bigAllocs && (t.bytes ?? 0) >= 32 << 20) {
+        const stack = new Error().stack?.split("\n").slice(2, 7).map((l) => l.trim().replace(/\(http[^)]*\)/, "")).join(" <- ") ?? ""
+        if (!seen.has(stack)) { seen.add(stack); void fetch("/log", { method: "POST", body: `BIGALLOC ${name} ${t.width}x${t.height}/${t.internal} ${Math.round((t.bytes ?? 0) / 2 ** 20)} MB ${stack}` }) }
+      }
+      return t
+    })
+  }
+}
+// (tune "zeroStats:1": per layer matrix with zero points, how many aren't 8, logged at the first layers.)
+{
+  const original = Reflect.get(Engine.prototype, "matrix") as (m: { N: number; K: number; bits: number; zeros?: Uint8Array | null }, ...rest: unknown[]) => unknown
+  let logged = 0
+  Reflect.set(Engine.prototype, "matrix", function (this: Engine, m: { N: number; K: number; bits: number; zeros?: Uint8Array | null }, ...rest: unknown[]) {
+    if ((globalThis as { zeroStats?: boolean }).zeroStats && m?.zeros && logged < 12) {
+      logged++
+      let off = 0
+      const hist = new Map<number, number>()
+      for (const z of m.zeros) { if (z !== 8) off++; hist.set(z, (hist.get(z) ?? 0) + 1) }
+      void fetch("/log", { method: "POST", body: `ZEROSTATS ${m.N}x${m.K} b${m.bits}: ${off} of ${m.zeros.length} not 8; ${[...hist].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([z, n]) => z + ":" + n).join(" ")}` })
+    }
+    return original.call(this, m, ...rest)
+  })
+}
 // (Pipelines by program: how many variants each program compiled into, for the warm-up's stage events.)
 const pipelineGroups = new Map<string, number>()
 {
@@ -482,7 +512,15 @@ const handle = async (event: MessageEvent) => {
     }
     if (event.data.type === "tune")
       for (const key of Object.keys(event.data.values ?? {}))
-        if (key.startsWith("skip_")) {
+        if (key === "zeroStats") {
+          ;(globalThis as { zeroStats?: boolean }).zeroStats = event.data.values[key] > 0
+          delete event.data.values[key]
+        }
+        else if (key === "bigAllocs") {
+          ;(globalThis as { bigAllocs?: boolean }).bigAllocs = event.data.values[key] > 0
+          delete event.data.values[key]
+        }
+        else if (key.startsWith("skip_")) {
           skipWhileWriting.add(key.slice(5))
           delete event.data.values[key]
         }
