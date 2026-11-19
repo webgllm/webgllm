@@ -17,7 +17,7 @@ import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
 import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
-import { matrixRow, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
+import { matrixRow, q4Repacker, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
   LayerType,
   LayerWeights,
@@ -323,8 +323,6 @@ export const TUNING = {
   packZeros: 1,
   /** 1: 4-bit byte weights in RGBA8 (normalized) textures (set before the model loads). */
   unormBytes: 1,
-  /** 1: raw MatMulNBits rows go into 4-bit byte texels through a GPU pass, not repacked on the CPU (see writeMatrix). */
-  rawUploadGpu: 1,
   /**
    * WebGPU: 4-bit embeddings (an ONNX model's) in word texels, the head a
    * native pass (gpu/native.ts's q4WordHead), not RGBA4 (which WebGPU holds
@@ -676,6 +674,7 @@ export function tuningToRetime(stored: Tuned): Tuned {
  * timings were kept (no submissionMs), whose pacing may be from the step
  * at two frames and whose packing from two pairs on a fast GPU.
  */
+
 /** The pick shaders' uSeenRows and uSeenRowCount (see K.PENALIZED). */
 function seenRowUniforms(rows: ReadonlyArray<SeenRow>) {
   if (rows.length > MAX_SEEN_ROWS) throw new RangeError(`A batch's penalty rows can't pass ${MAX_SEEN_ROWS}.`)
@@ -1124,9 +1123,10 @@ export class Engine {
     this.loadMs.scratch = performance.now() - started
     this.expandedUpload = new Uint8Array(0)
     this.repackUpload = new Uint32Array(0)
+    this.q4Repack = undefined
     // (The upload staging textures, done with.)
-    for (const stage of [this.rawStage, this.orderStage]) if (stage) this.gpu.delete(stage)
-    this.rawStage = this.orderStage = null
+    if (this.orderStage) this.gpu.delete(this.orderStage)
+    this.orderStage = null
     this.uploads = new Uint32Array(0)
     started = performance.now()
     await this.choosePromptPacking(signal)
@@ -2438,6 +2438,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   private finalNormValues: Float32Array | null = null
   /** Upload scratch for raw MatMulNBits rows repacked to the bytes layout (quantsFromRaw). */
   private repackUpload = new Uint32Array(0)
+  /** The load's WebAssembly repacker (see q4Repacker): null where it can't run, undefined before the first raw matrix. */
+  private q4Repack: ReturnType<typeof q4Repacker> | undefined = undefined
   /**
    * Upload scratch for texels converted on the CPU (rawRgba4's, packed
    * scales and zero points): one reused buffer, not one per matrix, whose
@@ -3061,21 +3063,26 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
   private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
     // Raw MatMulNBits rows go into RGBA4 as they are (16-byte runs moved
-    // into place; see rawRgba4), and into 4-bit byte texels through a GPU
-    // pass (K.rawQ4Bytes: an ONNX model's ~0.8 GB repacked on the CPU took
-    // LFM3 1.7B's load 300 ms on an M3 Ultra); other layouts get the rows
-    // repacked here.
-    const gpuRaw = !!m.raw && !gm.rgba4 && m.bits === 4 && !gm.quantPanels && TUNING.rawUploadGpu > 0
-    if (m.raw && !gm.rgba4 && !gpuRaw) {
-      const words = (m.N * m.K) / 8
-      if (this.repackUpload.length < words) this.repackUpload = new Uint32Array(words)
-      m = { ...m, quants: quantsFromRaw(m.raw, m.N, m.K, this.repackUpload), raw: undefined }
+    // into place; see rawRgba4); other layouts get the rows repacked here.
+    // (A GPU pass from a staging texture saved an M3 Ultra 300 ms of LFM3
+    // 1.7B's load, and cost an iPhone 16 Pro Max 0.1-1.2 s, a Pixel 10 Pro
+    // 0.3-0.8 s in Chrome and 0.9 s in Firefox.)
+    if (m.raw && !gm.rgba4) {
+      if (this.q4Repack === undefined) this.q4Repack = q4Repacker()
+      let quants: Uint32Array
+      if (this.q4Repack) quants = this.q4Repack(m.raw, m.N, m.K)
+      else {
+        const words = (m.N * m.K) / 8
+        if (this.repackUpload.length < words) this.repackUpload = new Uint32Array(words)
+        quants = quantsFromRaw(m.raw, m.N, m.K, this.repackUpload)
+      }
+      m = { ...m, quants, raw: undefined }
     }
     const { blocks, rowTexels, rowsPerColumn } = gm
     const g0 = row0 / 4
     const groups = m.N / 4
     // Words of one row group: its quant texels' bytes over 4.
-    const words = gpuRaw ? blocks * 16 : m.quants.length / groups
+    const words = m.quants.length / groups
     const stage = this.buffers?.act
     const gpuExpand =
       gm.q6Expanded &&
@@ -3104,41 +3111,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             : Infinity
       )
       const local = g - g0
-      const quants = gpuRaw ? new Uint32Array(0) : m.quants.subarray(local * words, (local + run) * words)
-      if (gpuRaw) {
-        // Through a staging texture of raw rows (a texel a row's block), a
-        // band at a time, rearranged into place on the GPU.
-        const raw = m.raw!
-        const rowBytes = m.K / 2
-        if (this.rawStage && this.rawStage.width !== blocks) {
-          this.gpu.delete(this.rawStage)
-          this.rawStage = null
-        }
-        const stage = (this.rawStage ??= this.gpu.texture(GL.RGBA32UI, blocks, Math.min(1024, this.gpu.limits.maxTextureSize & ~3)))
-        const band = stage.height / 4
-        for (let r0 = 0; r0 < run; r0 += band) {
-          const h = Math.min(band, run - r0)
-          const start = raw.byteOffset + (local + r0) * 4 * rowBytes
-          const bytes = h * 4 * rowBytes
-          const pixels = start & 3
-            ? new Uint32Array(raw.slice((local + r0) * 4 * rowBytes, (local + r0) * 4 * rowBytes + bytes).buffer)
-            : new Uint32Array(raw.buffer, start, bytes / 4)
-          this.gpu.write(
-            stage,
-            { x: 0, y: 0, width: blocks, height: 4 * h },
-            { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels }
-          )
-          const rect = { x: column * rowTexels, y: y + r0, width: rowTexels, height: h }
-          this.gpu.run({
-            name: "upload",
-            program: this.gpu.program(K.rawQ4Bytes(gm.unorm, !gm.bytes)),
-            inputs: { uRaw: stage },
-            uniforms: { uX0: { int: rect.x }, uY0: { int: rect.y } },
-            output: gm.quants,
-            rect
-          })
-        }
-      } else if (gpuExpand) {
+      const quants = m.quants.subarray(local * words, (local + run) * words)
+      if (gpuExpand) {
         this.gpu.write(
           stage,
           { x: 0, y: 0, width: blocks * 52, height: run },
@@ -5055,8 +5029,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
   private orderStage: Texture | null = null
-  /** Raw MatMulNBits rows on their way into byte texels (see writeMatrix). */
-  private rawStage: Texture | null = null
 
   /**
    * The pick's native programs (see TUNING.nativePick), or null: not on

@@ -133,6 +133,16 @@ for (const name of ["layer", "matrix", "allocateMatrix", "writeMatrix", "storeQu
     }
   })
 }
+// (WebGL texture writes' CPU time by internal format and pixel type, and the runs' (draws'), for the warm-up's stage events.)
+for (const [name, key] of [["write", (a: unknown[]) => `write ${(a[0] as { internal: number }).internal}/${(a[2] as { type: number }).type}`], ["run", () => "run"]] as const) {
+  const original = Reflect.get(Gpu.prototype, name) as (...args: unknown[]) => unknown
+  Object.assign(Gpu.prototype, {
+    [name]: function (this: Gpu, ...args: unknown[]) {
+      const t = performance.now()
+      try { return Reflect.apply(original, this, args) } finally { const x = (loadSteps[key(args)] ??= { n: 0, ms: 0 }); x.n++; x.ms += performance.now() - t }
+    }
+  })
+}
 // (Pipelines by program: how many variants each program compiled into, for the warm-up's stage events.)
 const pipelineGroups = new Map<string, number>()
 {

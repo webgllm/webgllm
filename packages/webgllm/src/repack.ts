@@ -163,6 +163,41 @@ export function quantsFromRaw(raw: Uint8Array, N: number, K: number, out?: Uint3
 }
 
 /**
+ * quantsFromRaw through WebAssembly SIMD, 247 bytes assembled by hand: a
+ * row's 16-byte block is split into its low and high nibbles (an and, a
+ * shift), the two interleaved into weights 0-15 and 16-31 (two
+ * shuffles) and joined a byte each (a shift, an or), stored at its place
+ * in the row group. 20 GB/s on an M3 Ultra where the JavaScript's 5 (an
+ * ONNX model's ~0.85 GB repack had cost LFM3 1.7B's load 300 ms there).
+ * The module: q4(src, dst, N, blocks) over its own memory, `mem`.
+ */
+const Q4_WASM = "AGFzbQEAAAABCAFgBH9/f38AAwIBAAUDAQABBwwCAnE0AAADbWVtAgAKywEByAECBX8DeyAAIQZBACEEAkADQCAEIAJJRQ0BIAEgBEECdiADbEECdCAEQQNxakEEdGohB0EAIQUCQANAIAUgA0lFDQEgBv0ABAAhCSAJ/QwPDw8PDw8PDw8PDw8PDw8P/U4hCiAJQQT9bSELIAcgCiAL/Q0AEAERAhIDEwQUBRUGFgcXIAogC/0NCBgJGQoaCxsMHA0dDh4PH0EE/Wv9UP0LBAAgBkEQaiEGIAdBwABqIQcgBUEBaiEFDAALCyAEQQFqIQQMAAsLCw=="
+
+/**
+ * A repacker for one load (its memory, twice the largest matrix's quants,
+ * goes with it), or null where WebAssembly SIMD isn't available (then
+ * quantsFromRaw). Its result is a view of that memory, good until its next
+ * call.
+ */
+export function q4Repacker(): ((raw: Uint8Array, N: number, K: number) => Uint32Array) | null {
+  let exports: { q4: (src: number, dst: number, N: number, blocks: number) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q4_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  return (raw, N, K) => {
+    const length = (N * K) / 2
+    if (exports.mem.buffer.byteLength < 2 * length)
+      exports.mem.grow(Math.ceil((2 * length - exports.mem.buffer.byteLength) / 65536))
+    new Uint8Array(exports.mem.buffer, 0, length).set(raw.subarray(0, length))
+    exports.q4(0, length, N, K / 32)
+    return new Uint32Array(exports.mem.buffer, length, length / 4)
+  }
+}
+
+/**
  * Rows [n0, n0 + rows) (multiples of 4) of MatMulNBits rows as RGBA4 texels
  * in the engine's layout (row group by row group: block, then row, then 8
  * texels of 4 weights, the first in the low nibble): each row's 16-byte
