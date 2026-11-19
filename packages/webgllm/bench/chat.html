@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>webgllm chat check</title>
+  <style>
+    body { background: #fff; color: #111; font: 13px/1.4 ui-monospace, monospace; margin: 12px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+    #status { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #ddd; padding: 4px 0; }
+  </style>
+  <div id="status">starting</div>
+  <pre id="out"></pre>
+  <script type="module">
+    // The public API on one model, as an app uses it: a load (its download
+    // first), then chats with streaming, with what each took.
+    //   ?model=<name or URL>&webgpu=0&ctx=8192&think=0&max=64&turns=2&len=0&q=<question>
+    // webgpu=0 keeps the model on WebGL 2; len pads the first message to about that many tokens.
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    const params = new URLSearchParams(location.search)
+    const out = document.getElementById("out")
+    const status = document.getElementById("status")
+    // ?tag=name: every line starts with [name], to tell several devices' lines apart in the server's output.
+    const tag = new URLSearchParams(location.search).get("tag")
+    const log = (...parts) => {
+      const line = (tag ? `[${tag}] ` : "") + parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ")
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const model = params.get("model") ?? "KRAFTON/Raon-1-nano-gguf"
+    const max = Number(params.get("max") ?? 64)
+    const turns = Number(params.get("turns") ?? 2)
+    const think = params.get("think") === "1"
+    const length = Number(params.get("len") ?? 0)
+    log(navigator.userAgent)
+    // ?log=info: the worker's and engine's messages (the console's) in the page's log too.
+    if (params.get("log"))
+      for (const level of ["info", "warn", "error"]) {
+        const original = console[level].bind(console)
+        console[level] = (...parts) => {
+          original(...parts)
+          log(`[${level}] ${parts.map((p) => (typeof p === "string" ? p : p?.message ?? JSON.stringify(p))).join(" ")}`.slice(0, 1500))
+        }
+      }
+    try {
+      let shown = -1
+      const llm = new WebGLLM({
+        ...(params.get("webgpu") === "0" && { webgpu: false }),
+        ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }),
+        logLevel: params.get("log") ?? "warn",
+        onProgress: (p) => {
+          const percent = Math.floor(p.progress * 100)
+          status.textContent = `${p.phase ?? "loading"} ${percent}%${p.cached ? " (stored)" : ""}`
+          if (percent !== shown && percent % 10 === 0) {
+            shown = percent
+            log(`progress ${p.phase ?? ""} ${percent}% ${p.cached ? "stored" : ""}`)
+          }
+        }
+      })
+      let t = performance.now()
+      await llm.loadModel(model)
+      log(`LOADED ${model} in ${((performance.now() - t) / 1000).toFixed(1)} s`)
+      const filler = "The harbour was quiet that morning, and the boats rocked gently at their moorings while gulls circled overhead. "
+      const questions = [
+        params.get("q") ?? "What is the capital of France? Answer in one short sentence.",
+        "And what river runs through it?",
+        "Name two famous museums there.",
+        "Write a haiku about that city."
+      ]
+      const messages = []
+      for (let turn = 0; turn < turns; turn++) {
+        const question = questions[turn % questions.length]
+        // (About 22 tokens a filler sentence.)
+        const pad = turn === 0 && length > 0 ? filler.repeat(Math.ceil(length / 22)) + "\n\n" : ""
+        messages.push({ role: "user", content: pad + question })
+        t = performance.now()
+        let first = 0
+        let text = ""
+        let usage
+        const stream = await llm.chat.completions.create({
+          model,
+          messages,
+          max_tokens: max,
+          temperature: 0,
+          stream: true,
+          stream_options: { include_usage: true },
+          reasoning_effort: think ? "high" : "none"
+        })
+        for await (const chunk of stream) {
+          const delta = chunk.choices[0]?.delta
+          const piece = (delta?.reasoning_content ?? "") + (delta?.content ?? "")
+          if (piece && !first) first = performance.now()
+          text += piece
+          if (piece) status.textContent = `turn ${turn + 1}: ${text.length} characters`
+          if (chunk.usage) usage = chunk.usage
+        }
+        const done = performance.now()
+        const written = usage?.completion_tokens ?? 0
+        log(`TURN ${turn + 1} prompt ${usage?.prompt_tokens} tokens, first token ${(first - t).toFixed(0)} ms, ${written} tokens at ${(((written - 1) * 1000) / Math.max(1, done - first)).toFixed(1)} tokens/s`)
+        log(`REPLY ${JSON.stringify(text)}`)
+        messages.push({ role: "assistant", content: text })
+      }
+      status.textContent = "done"
+      log("ALL DONE")
+    } catch (error) {
+      status.textContent = "failed"
+      // (Firefox's stack doesn't begin with the message.)
+      log(`ERROR: ${error?.code ?? ""} ${error?.message ?? error}\n${error?.stack ?? ""}`)
+    }
+  </script>
+</html>

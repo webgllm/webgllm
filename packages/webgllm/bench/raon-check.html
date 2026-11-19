@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raon-1 nano check</title>
+    <style>
+      body { font: 12px/1.4 ui-monospace, monospace; margin: 12px; background: #fff; color: #111; }
+      pre { white-space: pre-wrap; word-break: break-word; }
+    </style>
+  </head>
+  <body>
+    <pre id="out"></pre>
+    <script type="module">
+      // ?model=raon-1-nano-Q4_K_M.gguf&ref=reference-capital&webgpu=1&single=1&layers=1&tokens=8&batch=128&ctx=8192
+      const params = new URLSearchParams(location.search)
+      const out = document.getElementById("out")
+      const tag = params.get("tag")
+      const log = (text) => {
+        if (tag) text = `[${tag}] ${text}`
+        out.textContent += `${text}\n`
+        void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+      }
+      log(navigator.userAgent)
+      const worker = new Worker("/bundle/bench/raon-check-worker.js", { type: "module" })
+      worker.onmessage = ({ data }) => {
+        if (data.type === "log") log(data.text)
+        else if (data.type === "error") log(`ERROR: ${data.text}`)
+        else if (data.type === "done") log("ALL DONE")
+      }
+      worker.onerror = (event) => log(`ERROR: ${event.message}`)
+      worker.postMessage({
+        model: params.get("model") ?? "raon-1-nano-Q4_K_M.gguf",
+        ref: params.get("ref") ?? "reference-capital",
+        webgpu: params.get("webgpu") === "1",
+        batch: Number(params.get("batch") ?? 128),
+        ctx: Number(params.get("ctx") ?? 8192),
+        single: params.get("single") === "1",
+        tokens: Number(params.get("tokens") ?? 8),
+        layers: params.get("layers") !== "0",
+        selfCheck: params.get("selfcheck") === "1",
+        profile: params.get("profile") === "1",
+        tune: params.get("tune") ?? ""
+      })
+    </script>
+  </body>
+</html>
