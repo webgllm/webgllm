@@ -82,6 +82,19 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         }
         const top = [...byShape].sort((a, b) => b[1].mb - a[1].mb).slice(0, 24).map(([k, e]) => `${k}:${e.n}x=${Math.round(e.mb)}`).join(" ")
         postMessage({ type: "bench-phase", name: `live ${live.size} ${top}`, gpuBytes: this.gpu.bytes })
+        // (The first layers' matrices: their layout flags, and whether they're in storage buffers.)
+        const layers = (Reflect.get(this, "layers") as Array<Record<string, unknown>>) ?? []
+        const flags = (m: Record<string, unknown> | undefined) => m ? `b${m.bits}${m.bytes ? "B" : ""}${m.rgba4 ? "R4" : ""}${m.zeros ? "Z" : ""}${m.packed ? "P" : ""}${m.raw ? "W" : ""}${m.quantPanels ? "Q" : ""}${m.stored ? "S" : ""}` : "-"
+        const mats = layers.slice(0, 3).map((l, i) => {
+          const parts: Array<[string, Record<string, unknown> | undefined]> = [["gateUp", l.gateUp as Record<string, unknown>], ["down", l.down as Record<string, unknown>]]
+          for (const k of ["conv", "attention", "linear"]) {
+            const op = l[k] as Record<string, Record<string, unknown>> | undefined
+            if (op) for (const [n, m] of Object.entries(op)) if (m && typeof m === "object" && "bits" in m) parts.push([`${k}.${n}`, m])
+          }
+          return `L${i}: ${parts.map(([n, m]) => `${n}=${flags(m)}`).join(" ")}`
+        }).join(" || ")
+        postMessage({ type: "bench-phase", name: `mats ${mats}`, gpuBytes: this.gpu.bytes })
+        postMessage({ type: "bench-phase", name: `loadsteps ${Object.entries(loadSteps).map(([k, v]) => `${k} ${v.n}x ${Math.round(v.ms)}ms`).join(" | ")}`, gpuBytes: this.gpu.bytes })
         const groups = [...pipelineGroups].sort((a, b) => b[1] - a[1])
         postMessage({ type: "bench-phase", name: `pipelines ${groups.reduce((n, g) => n + g[1], 0)} in ${groups.length} programs || ${groups.slice(0, 30).map(([k, n]) => `${n}x ${k.replace(/\s+/g, " ")}`).join(" || ")}`, gpuBytes: this.gpu.bytes })
       }
@@ -105,6 +118,18 @@ for (const name of ["choosePromptPacking"] as const) {
         if (compileFirst) await this.warmUp()
       }
       return Reflect.apply(original, this, args)
+    }
+  })
+}
+// (The engine's load steps' CPU time, for the warm-up's stage events: where a load goes.)
+const loadSteps: Record<string, { n: number; ms: number }> = {}
+for (const name of ["layer", "matrix", "allocateMatrix", "writeMatrix", "storeQuants"]) {
+  const original = Reflect.get(Engine.prototype, name) as (...args: unknown[]) => unknown
+  if (typeof original !== "function") continue
+  Object.assign(Engine.prototype, {
+    [name]: function (this: Engine, ...args: unknown[]) {
+      const t = performance.now()
+      try { return Reflect.apply(original, this, args) } finally { const x = (loadSteps[name] ??= { n: 0, ms: 0 }); x.n++; x.ms += performance.now() - t }
     }
   })
 }

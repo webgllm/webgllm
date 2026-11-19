@@ -323,6 +323,8 @@ export const TUNING = {
   packZeros: 1,
   /** 1: 4-bit byte weights in RGBA8 (normalized) textures (set before the model loads). */
   unormBytes: 1,
+  /** 1: raw MatMulNBits rows go into 4-bit byte texels through a GPU pass, not repacked on the CPU (see writeMatrix). */
+  rawUploadGpu: 1,
   /**
    * 4-bit layer weights in RGBA4 textures (1) or byte textures (0); -1:
    * whichever this GPU writes faster (timed at load; see chooseLayout).
@@ -1107,6 +1109,9 @@ export class Engine {
     this.loadMs.scratch = performance.now() - started
     this.expandedUpload = new Uint8Array(0)
     this.repackUpload = new Uint32Array(0)
+    // (The upload staging textures, done with.)
+    for (const stage of [this.rawStage, this.orderStage]) if (stage) this.gpu.delete(stage)
+    this.rawStage = this.orderStage = null
     this.uploads = new Uint32Array(0)
     started = performance.now()
     await this.choosePromptPacking(signal)
@@ -3039,8 +3044,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
   private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
     // Raw MatMulNBits rows go into RGBA4 as they are (16-byte runs moved
-    // into place; see rawRgba4); other layouts get the rows repacked.
-    if (m.raw && !gm.rgba4) {
+    // into place; see rawRgba4), and into 4-bit byte texels through a GPU
+    // pass (K.rawQ4Bytes: an ONNX model's ~0.8 GB repacked on the CPU took
+    // LFM3 1.7B's load 300 ms on an M3 Ultra); other layouts get the rows
+    // repacked here.
+    const gpuRaw = !!m.raw && !gm.rgba4 && gm.bytes && m.bits === 4 && TUNING.rawUploadGpu > 0
+    if (m.raw && !gm.rgba4 && !gpuRaw) {
       const words = (m.N * m.K) / 8
       if (this.repackUpload.length < words) this.repackUpload = new Uint32Array(words)
       m = { ...m, quants: quantsFromRaw(m.raw, m.N, m.K, this.repackUpload), raw: undefined }
@@ -3049,7 +3058,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const g0 = row0 / 4
     const groups = m.N / 4
     // Words of one row group: its quant texels' bytes over 4.
-    const words = m.quants.length / groups
+    const words = gpuRaw ? blocks * 16 : m.quants.length / groups
     const stage = this.buffers?.act
     const gpuExpand =
       gm.q6Expanded &&
@@ -3078,8 +3087,41 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             : Infinity
       )
       const local = g - g0
-      const quants = m.quants.subarray(local * words, (local + run) * words)
-      if (gpuExpand) {
+      const quants = gpuRaw ? new Uint32Array(0) : m.quants.subarray(local * words, (local + run) * words)
+      if (gpuRaw) {
+        // Through a staging texture of raw rows (a texel a row's block), a
+        // band at a time, rearranged into place on the GPU.
+        const raw = m.raw!
+        const rowBytes = m.K / 2
+        if (this.rawStage && this.rawStage.width !== blocks) {
+          this.gpu.delete(this.rawStage)
+          this.rawStage = null
+        }
+        const stage = (this.rawStage ??= this.gpu.texture(GL.RGBA32UI, blocks, Math.min(1024, this.gpu.limits.maxTextureSize & ~3)))
+        const band = stage.height / 4
+        for (let r0 = 0; r0 < run; r0 += band) {
+          const h = Math.min(band, run - r0)
+          const start = raw.byteOffset + (local + r0) * 4 * rowBytes
+          const bytes = h * 4 * rowBytes
+          const pixels = start & 3
+            ? new Uint32Array(raw.slice((local + r0) * 4 * rowBytes, (local + r0) * 4 * rowBytes + bytes).buffer)
+            : new Uint32Array(raw.buffer, start, bytes / 4)
+          this.gpu.write(
+            stage,
+            { x: 0, y: 0, width: blocks, height: 4 * h },
+            { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels }
+          )
+          const rect = { x: column * rowTexels, y: y + r0, width: rowTexels, height: h }
+          this.gpu.run({
+            name: "upload",
+            program: this.gpu.program(K.rawQ4Bytes(gm.unorm)),
+            inputs: { uRaw: stage },
+            uniforms: { uX0: { int: rect.x }, uY0: { int: rect.y } },
+            output: gm.quants,
+            rect
+          })
+        }
+      } else if (gpuExpand) {
         this.gpu.write(
           stage,
           { x: 0, y: 0, width: blocks * 52, height: run },
@@ -3198,6 +3240,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         )
       if (gm.packed && m.zeros) {
         // Each texel: 4 scales then 4 zero points, as halves.
+        const packStart = performance.now()
         const n = run * blocks * 4
         const at = local * blocks * 4
         const texels = this.uploadScratch(n)
@@ -3209,6 +3252,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           texels[t + 2] = HALF_INT[zeros[a]] | (HALF_INT[zeros[a + 1]] << 16)
           texels[t + 3] = HALF_INT[zeros[a + 2]] | (HALF_INT[zeros[a + 3]] << 16)
         }
+        this.loadMs.convert += performance.now() - packStart
         this.gpu.write(
           gm.scales,
           { x: column * blocks, y, width: blocks, height: run },
@@ -4630,7 +4674,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const toBuffer = !!f.wbuf && h2W
         if (toBuffer && !stored) throw new GpuError("The f16 matmul's buffer scratch needs the weights in a buffer.")
         const storedDequant = stored
-          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W, toBuffer, eight ? 8 : 4))
+          ? (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram(this.bufferDequantSpec(h2W, toBuffer, eight ? 8 : 4, w.packed))
           : null
         const dequant = stored ? null : this.gpu.program(
           w.rgba4
@@ -4868,12 +4912,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         ? Math.max(2, Math.min(TUNING.maxSplit, 2 ** Math.floor(Math.log2(Math.max(1, w.blocks / TUNING.bufferBlocks)))))
         : 1
       const bits = w.bits === 8 ? 8 : 4
-      const key = `${normed} ${format} ${lanes} ${bits}`
+      const zeros = w.packed
+      const key = `${normed} ${format} ${lanes} ${bits} ${zeros}`
       let spec = this.bufferSpecs.get(key)
       if (!spec)
         this.bufferSpecs.set(key, (spec = lanes > 1
-          ? bufferPairs({ normed, lanes, format, bits })
-          : bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format, bits })))
+          ? bufferPairs({ normed, lanes, format, bits, zeros })
+          : bufferMatvec({ normed, wg: TUNING.bufferMatvecThreads, format, bits, zeros })))
       this.gpu.run({
         name: "matmul",
         program: gpu.nativeProgram(spec) as Program,
@@ -4993,6 +5038,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** The staging texture ordered Q6_K uploads go through (see writeMatrix). */
   private orderStage: Texture | null = null
+  /** Raw MatMulNBits rows on their way into byte texels (see writeMatrix). */
+  private rawStage: Texture | null = null
 
   /**
    * The pick's native programs (see TUNING.nativePick), or null: not on
@@ -5037,7 +5084,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   private storeQuants(w: GpuMatrix) {
     if (TUNING.bufferMatvec <= 0 || !("toStorage" in this.gpu)) return
-    if (!((w.bits === 4 || w.bits === 8) && w.bytes && !w.rgba4 && !w.zeros && !w.packed && !w.quantPanels)) return
+    // (Zero points packed with the scales are read by the buffer kernels too: an ONNX model's asymmetric matrices.)
+    if (!((w.bits === 4 || w.bits === 8) && w.bytes && !w.rgba4 && !w.zeros && !(w.packed && w.bits !== 4) && !w.quantPanels)) return
     w.stored = this.gpu.toStorage(w.quants)
     if (w.stored) this.gpu.delete(w.quants)
   }
@@ -5084,10 +5132,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     return spec
   }
   private chunkLoops = new Map<string, NativeSpec | null>()
-  private bufferDequantSpec(h2: boolean, toBuffer = false, bits: 4 | 8 = 4) {
-    const key = `dequant ${h2} ${toBuffer} ${bits}`
+  private bufferDequantSpec(h2: boolean, toBuffer = false, bits: 4 | 8 = 4, zeros = false) {
+    const key = `dequant ${h2} ${toBuffer} ${bits} ${zeros}`
     let spec = this.bufferSpecs.get(key)
-    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2, toBuffer, bits })))
+    if (!spec) this.bufferSpecs.set(key, (spec = bufferDequant({ h2, toBuffer, bits, zeros })))
     return spec
   }
   private promptBufferSpec(trips: number) {

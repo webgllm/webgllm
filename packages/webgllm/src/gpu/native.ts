@@ -1093,7 +1093,7 @@ ${o.gate === "dim"
  * uAOff of uA; either way the sums are times the row's 1 / RMS, from uR's
  * partial sums of squares (kernels.ts's matmulSplitRgba4 alike).
  */
-export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8 }): NativeSpec {
+export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8; zeros?: boolean }): NativeSpec {
   const weights = o.normed === "weights"
   const rms = !!o.normed
   const A = weights
@@ -1116,7 +1116,7 @@ export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: n
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tA: texture_2d<${weights ? "f32" : "u32"}>;
-@group(0) @binding(2) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tS: texture_2d<${o.zeros ? "u32" : "f32"}>;
 ${weights ? "@group(0) @binding(3) var tNorm: texture_2d<f32>;" : ""}
 ${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
 @group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 1}) var<storage, read> bW: array<vec4<u32>>;
@@ -1136,12 +1136,17 @@ fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<
   let sx = col * u.kb;
   var acc = vec4<f32>(0.0);
   for (var kb = i32(l); kb < u.kb; kb += ${o.wg}) {
-    let d = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+${o.zeros
+    ? `    // (Packed: the block's 4 scales, then its 4 zero points, as halves; see GpuMatrix.packed.)
+    let sz = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+    let d = vec4<f32>(unpack2x16float(sz.x), unpack2x16float(sz.y));
+    let z = vec4<f32>(unpack2x16float(sz.z), unpack2x16float(sz.w));`
+    : "    let d = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);"}
 ${A}
     let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4<f32>(1.0));
     var b = vec4<f32>(0.0);
 ${rows}
-    acc += ${o.bits === 8 ? "d * b" : "d * (b - 8.0 * sa)"};
+    acc += ${o.bits === 8 ? "d * b" : o.zeros ? "d * (b - z * sa)" : "d * (b - 8.0 * sa)"};
   }
   red[l] = acc;
   workgroupBarrier();
@@ -1159,7 +1164,7 @@ ${rms ? `    var s = vec4<f32>(0.0);
     code,
     inputs: [
       { name: "uA", kind: weights ? "f" : "u" },
-      { name: "uS", kind: "f" },
+      { name: "uS", kind: o.zeros ? "u" : "f" },
       ...(weights ? [{ name: "uNorm", kind: "f" as const }] : []),
       ...(rms ? [{ name: "uR", kind: "f" as const }] : [])
     ],
@@ -1193,7 +1198,7 @@ ${rms ? `    var s = vec4<f32>(0.0);
  * either way each slice is times the row's 1 / RMS, from uR's partial sums of
  * squares (kernels.ts's matmulSplitRgba4 alike).
  */
-export function bufferPairs(o: { normed: false | "weights" | "prescaled"; lanes: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8 }): NativeSpec {
+export function bufferPairs(o: { normed: false | "weights" | "prescaled"; lanes: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8; zeros?: boolean }): NativeSpec {
   const weights = o.normed === "weights"
   const rms = !!o.normed
   const T = 2 * o.lanes
@@ -1207,7 +1212,7 @@ export function bufferPairs(o: { normed: false | "weights" | "prescaled"; lanes:
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, groups: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
 @group(0) @binding(0) var<uniform> u: Uni;
 @group(0) @binding(1) var tA: texture_2d<${weights ? "f32" : "u32"}>;
-@group(0) @binding(2) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tS: texture_2d<${o.zeros ? "u32" : "f32"}>;
 ${weights ? "@group(0) @binding(3) var tNorm: texture_2d<f32>;" : ""}
 ${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
 @group(0) @binding(${2 + (weights ? 1 : 0) + (rms ? 1 : 0) + 1}) var<storage, read> bW: array<vec4<u32>>;
@@ -1241,13 +1246,18 @@ fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<
     for (var kb = lane; kb < u.kb; kb += ${o.lanes}) {
 ${A}
       let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4<f32>(1.0));
-      let d4 = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+${o.zeros
+    ? `      let sz = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+      let d4 = vec4<f32>(unpack2x16float(sz.x), unpack2x16float(sz.y));
+      let z4 = vec4<f32>(unpack2x16float(sz.z), unpack2x16float(sz.w));
+      let z = select(z4.xz, z4.yw, p == 1);`
+    : "      let d4 = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);"}
       let d = select(d4.xz, d4.yw, p == 1);
 ${o.bits === 8
     ? `      let r0 = base + kb * 8 + 2 * p;
       let r2 = r0 + 4;
       acc += d * vec2<f32>(rd8(bW[r0], bW[r0 + 1], A0, A1, A2, A3, A4, A5, A6, A7), rd8(bW[r2], bW[r2 + 1], A0, A1, A2, A3, A4, A5, A6, A7));`
-    : `      acc += d * (vec2<f32>(rd(bW[base + kb * 4], A0, A1, A2, A3, A4, A5, A6, A7), rd(bW[base + kb * 4 + 2], A0, A1, A2, A3, A4, A5, A6, A7)) - 8.0 * sa);`}
+    : `      acc += d * (vec2<f32>(rd(bW[base + kb * 4], A0, A1, A2, A3, A4, A5, A6, A7), rd(bW[base + kb * 4 + 2], A0, A1, A2, A3, A4, A5, A6, A7)) - ${o.zeros ? "z" : "8.0"} * sa);`}
     }
   }
 ${rms ? `  var s = vec4<f32>(0.0);
@@ -1264,7 +1274,7 @@ ${rms ? `  var s = vec4<f32>(0.0);
     code,
     inputs: [
       { name: "uA", kind: weights ? "f" : "u" },
-      { name: "uS", kind: "f" },
+      { name: "uS", kind: o.zeros ? "u" : "f" },
       ...(weights ? [{ name: "uNorm", kind: "f" as const }] : []),
       ...(rms ? [{ name: "uR", kind: "f" as const }] : [])
     ],
@@ -1298,7 +1308,7 @@ ${rms ? `  var s = vec4<f32>(0.0);
  * (bench/gemm-exact.html). `bits` 8: bufferMatvec's 8-bit layout (a word a
  * texel).
  */
-export function bufferDequant(o: { h2: boolean; toBuffer?: boolean; bits?: 4 | 8 }): NativeSpec {
+export function bufferDequant(o: { h2: boolean; toBuffer?: boolean; bits?: 4 | 8; zeros?: boolean }): NativeSpec {
   if (o.toBuffer && !o.h2) throw new Error("A dequant into a buffer writes h2 texels.")
   const bits = o.bits ?? 4
   // Texels a block: 8 of the f16 layout, 4 of h2.
@@ -1311,12 +1321,12 @@ export function bufferDequant(o: { h2: boolean; toBuffer?: boolean; bits?: 4 | 8
   const code = `
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, kq: i32, kq0: i32, hd: i32, n: i32, row0: i32, stride: i32 }
 @group(0) @binding(0) var<uniform> u: Uni;
-@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(1) var tS: texture_2d<${o.zeros ? "u32" : "f32"}>;
 @group(0) @binding(2) var<storage, read> bW: array<u32>;
 ${o.toBuffer ? "@group(0) @binding(3) var<storage, read_write> out0: array<vec4<u32>>;" : `@group(0) @binding(3) var out0: texture_storage_2d<${o.h2 ? "rgba32uint" : "rgba16float"}, write>;`}
 ${bits === 8
     ? "fn q(w: u32) -> vec4<f32> { return vec4<f32>(bitcast<vec4<i32>>(vec4<u32>(w) << vec4<u32>(24u, 16u, 8u, 0u)) >> vec4<u32>(24u)); }"
-    : "fn q(w: u32, s: vec4<u32>) -> vec4<f32> { return vec4<f32>((vec4<u32>(w) >> s) & vec4<u32>(15u)) - 8.0; }"}
+    : `fn q(w: u32, s: vec4<u32>, z: f32) -> vec4<f32> { return vec4<f32>((vec4<u32>(w) >> s) & vec4<u32>(15u)) - z; }`}
 ${o.h2 ? `fn h2(a0: vec4<f32>, b0: vec4<f32>) -> vec4<u32> {
   let a = clamp(a0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
   let b = clamp(b0, vec4<f32>(-65504.0), vec4<f32>(65504.0));
@@ -1343,15 +1353,20 @@ ${stores(() => "vec4<f32>(0.0)")}
   let col = g / u.h;
   let gr = g - col * u.h;
   let kb = (u.kq0 >> 3u) + kbl;
-  let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];
+${o.zeros
+    ? `  // (Packed: the block's 4 scales, then its 4 zero points, as halves; see GpuMatrix.packed.)
+  let sz = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0);
+  let d = vec4<f32>(unpack2x16float(sz.x), unpack2x16float(sz.y))[r];
+  let z = vec4<f32>(unpack2x16float(sz.z), unpack2x16float(sz.w))[r];`
+    : `  let d = textureLoad(tS, vec2<i32>(col * u.kb + kb, gr), 0)[r];${bits === 8 ? "" : "\n  let z = 8.0;"}`}
   let wb = gr * u.width + col * u.rowTexels + kb * ${4 * words.length} + r * ${words.length};
 ${words.map((j) => `  let w${j} = bW[wb + ${j}];`).join("\n")}
-${J.map((j) => `  let v${j} = ${bits === 8 ? `q(w${j})` : `q(w${j & 3}, vec4<u32>(${j < 4 ? "0u, 8u, 16u, 24u" : "4u, 12u, 20u, 28u"}))`} * d;`).join("\n")}
+${J.map((j) => `  let v${j} = ${bits === 8 ? `q(w${j})` : `q(w${j & 3}, vec4<u32>(${j < 4 ? "0u, 8u, 16u, 24u" : "4u, 12u, 20u, 28u"}), z)`} * d;`).join("\n")}
 ${stores((j) => `v${j}`)}
 }`
   return {
     code,
-    inputs: [{ name: "uS", kind: "f" }],
+    inputs: [{ name: "uS", kind: o.zeros ? "u" : "f" }],
     buffers: [{ name: "uW" }],
     uniforms: [
       { name: "uKb", type: "int" },

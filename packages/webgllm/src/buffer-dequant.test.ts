@@ -16,8 +16,8 @@ describe("the buffer dequant, a thread a row's block (gpu/native.ts's bufferDequ
     assert.equal(spec.code.split("textureLoad(tS").length, 2)
     assert.match(spec.code, /let wb = gr \* u\.width \+ col \* u\.rowTexels \+ kb \* 16 \+ r \* 4;/)
     // Texels 4j..4j+3 of the block (f16 layout): the low nibbles of word j, then the high nibbles of word j - 4.
-    assert.match(spec.code, /let v1 = q\(w1, vec4<u32>\(0u, 8u, 16u, 24u\)\) \* d;/)
-    assert.match(spec.code, /let v6 = q\(w2, vec4<u32>\(4u, 12u, 20u, 28u\)\) \* d;/)
+    assert.match(spec.code, /let v1 = q\(w1, vec4<u32>\(0u, 8u, 16u, 24u\), z\) \* d;/)
+    assert.match(spec.code, /let v6 = q\(w2, vec4<u32>\(4u, 12u, 20u, 28u\), z\) \* d;/)
     assert.match(spec.code, /out0\[at \+ 0\] = h2\(v0, v1\);/)
     assert.match(spec.code, /out0\[at \+ 3\] = h2\(v6, v7\);/)
     // Rows past the matrix's: zeros.
