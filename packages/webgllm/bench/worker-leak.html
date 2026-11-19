@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Worker leak probe</title>
+  <h1>A worker doing one thing webgllm's worker does, for what its page leaves behind when replaced</h1>
+  <p>
+    <code>?do=</code> <code>device</code> (a WebGPU device and 64 MB), <code>bulk</code> (300 buffers of 4 MB, written),
+    <code>textures</code> (300 textures of 2 MB, written), <code>readback</code> (300 mapped reads),
+    <code>bindgroups</code> (3,000 bind groups), <code>bigshaders</code> (60 pipelines of about 16 KB of WGSL each),
+    <code>pipelines</code> (200 small pipelines), <code>webgl</code> (a WebGL 2 context on an OffscreenCanvas, lost after),
+    <code>wasm</code> (a WebAssembly memory of 16 MB), <code>opfs</code> (a stored file read through a sync access
+    handle), <code>module</code> (webgllm's worker script, idle). Logs <code>WORKER-LEAK &lt;what&gt; ready</code>.
+  </p>
+  <script type="module">
+    const what = new URLSearchParams(location.search).get("do")
+    const log = (text) => fetch("/log", { method: "POST", body: `WORKER-LEAK ${what} ${text}` })
+    // The probes, as a function whose source the worker runs.
+    async function probe(what) {
+      const gpu = async () => (await navigator.gpu.requestAdapter()).requestDevice()
+      const keep = []
+      if (what === "device") {
+        const device = await gpu()
+        const buffer = device.createBuffer({ size: 32 << 20, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+        device.queue.writeBuffer(buffer, 0, new Uint8Array(32 << 20))
+        keep.push(device, buffer, device.createTexture({ size: { width: 2048, height: 1024 }, format: "rgba32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }))
+      } else if (what === "bulk") {
+        const device = await gpu()
+        for (let i = 0; i < 300; i++) {
+          const b = device.createBuffer({ size: 4 << 20, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+          device.queue.writeBuffer(b, 0, new Uint8Array(4 << 20))
+          keep.push(b)
+          if (i % 32 === 31) await device.queue.onSubmittedWorkDone()
+        }
+        keep.push(device)
+      } else if (what === "textures") {
+        const device = await gpu()
+        const data = new Uint8Array(1024 * 1024 * 2)
+        for (let i = 0; i < 300; i++) {
+          const t = device.createTexture({ size: { width: 1024, height: 1024 }, format: i % 2 ? "r16uint" : "rgba16float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+          device.queue.writeTexture({ texture: t }, data, { bytesPerRow: 2048 }, { width: 1024, height: 1024 })
+          keep.push(t)
+          if (i % 32 === 31) await device.queue.onSubmittedWorkDone()
+        }
+        keep.push(device)
+      } else if (what === "readback") {
+        const device = await gpu()
+        const src = device.createBuffer({ size: 1 << 20, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.STORAGE })
+        for (let i = 0; i < 300; i++) {
+          const dst = device.createBuffer({ size: 1 << 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
+          const e = device.createCommandEncoder()
+          e.copyBufferToBuffer(src, 0, dst, 0, 1 << 16)
+          device.queue.submit([e.finish()])
+          await dst.mapAsync(GPUMapMode.READ)
+          new Uint8Array(dst.getMappedRange()).slice(0, 16)
+          dst.unmap()
+        }
+        keep.push(device, src)
+      } else if (what === "bindgroups") {
+        const device = await gpu()
+        const module = device.createShaderModule({ code: "@group(0) @binding(0) var<storage, read_write> a: array<f32>; @group(0) @binding(1) var<storage, read_write> b: array<f32>; @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3u) { a[g.x] = b[g.x]; }" })
+        const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } })
+        const buffers = Array.from({ length: 64 }, () => device.createBuffer({ size: 1 << 16, usage: GPUBufferUsage.STORAGE }))
+        for (let i = 0; i < 3000; i++)
+          keep.push(device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buffers[i % 64] } }, { binding: 1, resource: { buffer: buffers[(i * 7 + 1) % 64] } }] }))
+        keep.push(device)
+      } else if (what === "bigshaders" || what === "pipelines") {
+        const device = await gpu()
+        const big = what === "bigshaders"
+        for (let i = 0; i < (big ? 60 : 200); i++) {
+          let body = ""
+          for (let j = 0; j < (big ? 400 : 1); j++) body += "  v = v * " + (i + j + 1) + ".0 + sin(v + " + j + ".0);" + String.fromCharCode(10)
+          const code = "@group(0) @binding(0) var<storage, read_write> b: array<f32>; @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3u) { var v = b[g.x]; " + body + " b[g.x] = v; }"
+          keep.push(await device.createComputePipelineAsync({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } }))
+        }
+        keep.push(device)
+      } else if (what === "dispatch") {
+        // 5,000 submissions, each a uniform write and a compute pass's dispatch, as a load and a reply issue them.
+        const device = await gpu()
+        const module = device.createShaderModule({ code: "struct U { k: f32 }; @group(0) @binding(0) var<uniform> u: U; @group(0) @binding(1) var<storage, read_write> b: array<f32>; @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3u) { b[g.x] = b[g.x] * u.k + 1.0; }" })
+        const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } })
+        const uniform = device.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+        const storage = device.createBuffer({ size: 1 << 20, usage: GPUBufferUsage.STORAGE })
+        const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uniform } }, { binding: 1, resource: { buffer: storage } }] })
+        for (let i = 0; i < 5000; i++) {
+          device.queue.writeBuffer(uniform, 0, new Float32Array([0.999]))
+          const e = device.createCommandEncoder()
+          const pass = e.beginComputePass()
+          pass.setPipeline(pipeline)
+          pass.setBindGroup(0, group)
+          pass.dispatchWorkgroups(64)
+          pass.end()
+          device.queue.submit([e.finish()])
+          if (i % 50 === 49) await device.queue.onSubmittedWorkDone()
+        }
+        keep.push(device)
+      } else if (what === "errorscopes") {
+        // An out-of-memory error scope around each of 100 allocations, as the WebGPU backend makes them.
+        const device = await gpu()
+        for (let i = 0; i < 100; i++) {
+          device.pushErrorScope("out-of-memory")
+          keep.push(device.createBuffer({ size: 1 << 16, usage: GPUBufferUsage.STORAGE }))
+          void device.popErrorScope()
+        }
+        await device.queue.onSubmittedWorkDone()
+        keep.push(device)
+      } else if (what === "copytexture") {
+        // rgba8unorm textures (storage usage) written, copied to storage buffers, and destroyed: a layer's matrices.
+        const device = await gpu()
+        const data = new Uint8Array(1024 * 512 * 4)
+        const e = device.createCommandEncoder()
+        for (let i = 0; i < 8; i++) {
+          const t = device.createTexture({ size: { width: 1024, height: 512 }, format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING })
+          device.queue.writeTexture({ texture: t }, data, { bytesPerRow: 4096 }, { width: 1024, height: 512 })
+          const b = device.createBuffer({ size: data.length, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+          e.copyTextureToBuffer({ texture: t }, { buffer: b, bytesPerRow: 4096 }, { width: 1024, height: 512 })
+          keep.push(b, t)
+        }
+        device.queue.submit([e.finish()])
+        await device.queue.onSubmittedWorkDone()
+        for (const t of keep.filter((x) => x instanceof GPUTexture)) t.destroy()
+        keep.push(device)
+      } else if (what === "webgl") {
+        const gl = new OffscreenCanvas(1, 1).getContext("webgl2")
+        const debug = gl.getExtension("WEBGL_debug_renderer_info")
+        keep.push(String(gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER)))
+        gl.getExtension("WEBGL_lose_context")?.loseContext()
+      } else if (what === "wasm") {
+        const memory = new WebAssembly.Memory({ initial: 256 })
+        new Uint8Array(memory.buffer).fill(1)
+        const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 2, 10, 1, 1, 109, 3, 109, 101, 109, 2, 0, 1])
+        keep.push(memory, await WebAssembly.instantiate(bytes, { m: { mem: memory } }))
+      } else if (what === "opfs" || what === "opfsopen") {
+        const files = []
+        const walk = async (dir, depth) => {
+          for await (const [, h] of dir.entries()) {
+            if (h.kind === "file") files.push(h)
+            else if (depth < 4) await walk(h, depth + 1)
+          }
+        }
+        await walk(await navigator.storage.getDirectory(), 0)
+        let biggest = null, size = 0
+        for (const f of files) {
+          const s = (await f.getFile()).size
+          if (s > size) [size, biggest] = [s, f]
+        }
+        if (biggest) {
+          const handle = await biggest.createSyncAccessHandle()
+          const buf = new Uint8Array(16 << 20)
+          for (let at = 0; at < Math.min(size, 256 << 20); at += buf.length) handle.read(buf, { at })
+          // (do=opfsopen: left open, as a load's handles are when its worker is ended mid-load.)
+          if (what === "opfsopen") keep.push(handle)
+          else handle.close()
+        }
+      }
+      self.keep = keep
+    }
+    const worker =
+      what === "module"
+        ? new Worker("/bundle/src/worker.js", { type: "module" })
+        : what === "repackers"
+          // webgllm's WebAssembly SIMD converters (repack.ts), each made and run on 16 MB, in a module worker.
+          ? new Worker(URL.createObjectURL(new Blob([`import { q4Repacker, q8Converter, q6Splitter } from "${location.origin}/bundle/src/repack.js"
+              const q4 = q4Repacker()
+              self.out = q4 && q4(new Uint8Array(4096 * 4096), 4096, 8192)
+              self.q8 = q8Converter()
+              self.q6 = q6Splitter()
+              postMessage(q4 ? "ready" : "error no q4 repacker")`], { type: "text/javascript" })), { type: "module" })
+        : what === "tokenizer"
+          // webgllm's tokenizer (tokenizer.ts) built from the bench server's tokenizer files (/hf/), in a module worker.
+          ? new Worker(URL.createObjectURL(new Blob([`import { loadTokenizer } from "${location.origin}/bundle/src/tokenizer.js"
+              const json = (name) => fetch("${location.origin}/hf/" + name).then((r) => r.json())
+              const tokenizerJson = await json("tokenizer.json"), tokenizerConfig = await json("tokenizer_config.json")
+              const chatTemplate = await fetch("${location.origin}/hf/chat_template.jinja").then((r) => (r.ok ? r.text() : undefined))
+              self.tokenizer = loadTokenizer({ tokenizerJson, tokenizerConfig, ...(chatTemplate && { chatTemplate }) })
+              self.ids = self.tokenizer.encode("A river at dawn, in two sentences.")
+              postMessage("ready")`], { type: "text/javascript" })), { type: "module" })
+        : what === "enginedevice" || what === "enginedevicemodule"
+          // The engine's own device (WebGpu.create: its features and limits), in a classic or a module worker.
+          ? new Worker(URL.createObjectURL(new Blob([`(async () => {
+              const gpu = navigator.gpu, adapter = await gpu.requestAdapter({ powerPreference: "high-performance" })
+              const want = (name) => adapter.limits[name]
+              self.device = await adapter.requestDevice({
+                requiredFeatures: ["timestamp-query", "subgroups"].filter((f) => adapter.features.has(f)),
+                requiredLimits: { maxTextureDimension2D: want("maxTextureDimension2D"), maxStorageTexturesPerShaderStage: want("maxStorageTexturesPerShaderStage"), maxSampledTexturesPerShaderStage: want("maxSampledTexturesPerShaderStage"), maxBufferSize: want("maxBufferSize") }
+              })
+              self.device.createBuffer({ size: 64 << 20, usage: GPUBufferUsage.STORAGE })
+              postMessage("ready")
+            })().catch((e) => postMessage("error " + e))`], { type: "text/javascript" })), what === "enginedevicemodule" ? { type: "module" } : {})
+          : new Worker(URL.createObjectURL(new Blob([`(${probe})(${JSON.stringify(what)}).then(() => postMessage("ready"), (e) => postMessage("error " + e))`], { type: "text/javascript" })))
+    worker.onerror = (e) => log(`error ${e.message ?? e}`)
+    worker.onmessage = ({ data }) => log(data)
+    if (what === "module") setTimeout(() => log("ready"), 1500)
+  </script>

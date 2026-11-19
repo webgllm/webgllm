@@ -10,15 +10,16 @@
   <h1>Load, reply, unload, again: what a page keeps</h1>
   <p>
     Through the public API, as an app does: <code>loadModel</code>, one short reply, <code>unloadModel</code>,
-    <code>?n=</code> times (6), with <code>?rest=</code> ms (3000) after each unload for a memory reading.
+    <code>?n=</code> times (6; <code>?reply=0</code>: no reply; <code>?alt=</code>: every other load this model), with <code>?rest=</code> ms (3000) after each unload for a memory reading.
     <code>?own=1</code>: one worker of the page's, kept for every load (what's left is the engine's); otherwise
-    webgllm's own worker per model, ended at each unload. <code>&amp;trace=1</code> with it: the bench worker, every GPU allocation traced (MEMTRACE). <code>?model=</code> (Qwen3.5 2B GGUF). Logs
+    webgllm's own workers. <code>&amp;trace=1</code> with it: the bench worker, every GPU allocation traced (MEMTRACE). <code>?model=</code> (Qwen3.5 2B GGUF). Logs
     <code>RELOAD-LOOP ...</code>.
   </p>
   <pre id="out"></pre>
   <script type="module">
     const params = new URLSearchParams(location.search)
-    const model = params.get("model") ?? "unsloth/Qwen3.5-2B-GGUF"
+    const first = params.get("model") ?? "unsloth/Qwen3.5-2B-GGUF"
+    const alt = params.get("alt")
     const n = Number(params.get("n") ?? 6)
     const rest = Number(params.get("rest") ?? 3000)
     const own = params.get("own") === "1"
@@ -33,20 +34,26 @@
     const worker = own ? new Worker(trace ? "/bundle/bench/webgl-perf-worker.js" : "/bundle/src/worker.js", { type: "module" }) : undefined
     if (trace) worker.postMessage({ type: "tune", values: { memTrace: 1 }, webgllm: true })
     const llm = new WebGLLM({ ...(worker && { worker }) })
-    log(`${own ? "own worker" : "a worker per model"}, ${model}, ${n} loads`)
+    log(`${own ? "own worker" : "webgllm's workers"}, ${first}${alt ? ` and ${alt}, alternating` : ""}, ${n} loads`)
     try {
       for (let i = 1; i <= n; i++) {
         const started = performance.now()
+        const model = alt && i % 2 === 0 ? alt : first
         await llm.loadModel(model, { contextLength: 8192 })
         const loaded = performance.now() - started
-        const reply = await llm.chat.completions.create({
+        const reply = params.get("reply") === "0" ? { choices: [{ message: { content: "(no reply asked)" } }] } : await llm.chat.completions.create({
           model,
           messages: [{ role: "user", content: "Describe a river at dawn in two sentences." }],
           max_tokens: 24,
           temperature: 0
         })
+        // (?hold=<ms>: loaded and idle that long before the unload, for a heap snapshot of a loaded worker.)
+        if (params.get("hold")) {
+          log(`holding ${i} at ${Date.now()}`)
+          await new Promise((r) => setTimeout(r, Number(params.get("hold"))))
+        }
         await llm.unloadModel(model)
-        log(`load ${i}: ${Math.round(loaded)} ms, reply ${JSON.stringify(reply.choices[0].message.content?.slice(0, 30))}; unloaded at ${Date.now()}`)
+        log(`load ${i} (${model}): ${Math.round(loaded)} ms, reply ${JSON.stringify(reply.choices[0].message.content?.slice(0, 30))}; unloaded at ${Date.now()}`)
         await new Promise((r) => setTimeout(r, rest))
       }
     } catch (error) {

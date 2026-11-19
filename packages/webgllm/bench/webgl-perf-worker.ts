@@ -9,6 +9,7 @@ import { Engine } from "../src/engine.js"
 let loadedEngine: Engine | null = null
 let peakGpuBytes = 0
 let pauseMs = 0
+let stopAt = 0
 let compileFirst = false
 let captureSample = false
 let nativeSample: QuantMatrix | undefined
@@ -67,7 +68,11 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
       // (tune "pauseMs:<ms>": still before the weights and after each phase, so a memory trace shows each as a plateau.)
       if (pauseMs > 0 && name === "load") await new Promise((r) => setTimeout(r, pauseMs))
       postMessage({ type: "bench-phase", name, gpuBytes: this.gpu.bytes })
+      // (tune "stopAt:<n>": the load ends with an error at 1, before the weights; 2, once they're
+      // uploaded; 3, after the warm-up; 4–6, see below. For what each stage leaves once its page is gone.)
+      if (stopAt === 1 && name === "load") throw new Error("stopAt 1")
       const value = await Reflect.apply(original, this, args)
+      if ((stopAt === 2 && name === "load") || (stopAt === 3 && name === "warmUp")) throw new Error(`stopAt ${stopAt}`)
       postMessage({ type: "bench-phase", name: `${name}:end`, gpuBytes: this.gpu.bytes })
       postMessage({ type: "bench-phase", name: `${name}:peak`, gpuBytes: peakGpuBytes })
       // (The largest live allocations after the warm-up, by shape: where the GPU memory is.)
@@ -120,6 +125,50 @@ for (const name of ["choosePromptPacking"] as const) {
       return Reflect.apply(original, this, args)
     }
   })
+}
+// (tune "stopAt:4|5|6": the load ends with an error as it starts its layout probe (the first layer
+// read), its head probe (every layer uploaded) or its packing probe (the embedding too).)
+for (const [name, at] of [["chooseLayout", 4], ["chooseHead", 5], ["choosePromptPacking", 6]] as const) {
+  const original = Reflect.get(Engine.prototype, name) as (...args: unknown[]) => unknown
+  Object.assign(Engine.prototype, {
+    [name]: function (this: Engine, ...args: unknown[]) {
+      if (stopAt === at) throw new Error(`stopAt ${at}`)
+      return Reflect.apply(original, this, args)
+    }
+  })
+}
+// (tune "stopLayers:<n>": the load ends with an error as it starts its nth layer.)
+let stopLayers = 0, layersSeen = 0
+{
+  const original = Reflect.get(Engine.prototype, "layer") as (...args: unknown[]) => unknown
+  Object.assign(Engine.prototype, {
+    layer: function (this: Engine, ...args: unknown[]) {
+      if (stopLayers > 0 && ++layersSeen >= stopLayers) {
+        if (countingApi) void fetch("/log", { method: "POST", body: `API-COUNTS ${JSON.stringify(apiCounts)}` })
+        throw new Error(`stopLayers ${stopLayers}`)
+      }
+      return Reflect.apply(original, this, args)
+    }
+  })
+}
+// (tune "apiCounts:1": every WebGPU call by name, logged as API-COUNTS when the load stops (stopLayers) or ends.)
+const apiCounts: Record<string, number> = {}
+let countingApi = false
+const countApi = () => {
+  if (countingApi || typeof GPUDevice === "undefined") return
+  countingApi = true
+  for (const [proto, prefix] of [[GPUDevice.prototype, "device"], [GPUQueue.prototype, "queue"], [GPUCommandEncoder.prototype, "encoder"], [GPUComputePassEncoder.prototype, "pass"], [GPUBuffer.prototype, "buffer"], [GPUTexture.prototype, "texture"]] as const) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      const d = Object.getOwnPropertyDescriptor(proto, name)
+      if (!d || typeof d.value !== "function" || name === "constructor") continue
+      const f = d.value as (...a: Array<unknown>) => unknown
+      Object.defineProperty(proto, name, { ...d, value: function (this: unknown, ...a: Array<unknown>) {
+        const key = `${prefix}.${name}${name === "createTexture" ? `(${(a[0] as { format: string }).format}${(a[0] as { usage: number }).usage & 8 ? ",storage" : ""})` : ""}`
+        apiCounts[key] = (apiCounts[key] ?? 0) + 1
+        return f.apply(this, a)
+      } })
+    }
+  }
 }
 // (The engine's load steps' CPU time, for the warm-up's stage events: where a load goes.)
 const loadSteps: Record<string, { n: number; ms: number }> = {}
@@ -568,6 +617,18 @@ const handle = async (event: MessageEvent) => {
       for (const key of Object.keys(event.data.values ?? {}))
         if (key === "zeroStats") {
           ;(globalThis as { zeroStats?: boolean }).zeroStats = event.data.values[key] > 0
+          delete event.data.values[key]
+        }
+        else if (key === "apiCounts") {
+          if (event.data.values[key] > 0) countApi()
+          delete event.data.values[key]
+        }
+        else if (key === "stopLayers") {
+          stopLayers = event.data.values[key]
+          delete event.data.values[key]
+        }
+        else if (key === "stopAt") {
+          stopAt = event.data.values[key]
           delete event.data.values[key]
         }
         else if (key === "memTrace") {
