@@ -2633,7 +2633,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const alternate = TUNING.f16Matmul === 2 ? 1 : 2
       options.push({ pack: options[0].pack, matmul: alternate })
     }
-    if (options.length === 1 && !retained) return
+    // (One way where stored 8-bit matrices take only pack 3: still timed, for
+    // the submissions' pacing the probe measures; returning skipped it, and
+    // Qwen3.5 2B GGUF's prompts ran 25% slower on an M3 Ultra.)
+    if (options.length === 1 && !retained && !this.h2Weights) return
     const all = this.layers,
       previous = this.tuned.f16Pack,
       previousMatmul = this.tuned.f16Matmul,
