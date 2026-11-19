@@ -457,6 +457,15 @@ async function load(
     timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
     const weightSources = stored.sources
     let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
+    // Per-layer embeddings (Raon) stay in the file, a token's row read when
+    // the token is: from the stored file itself, which outlives the load's
+    // access handles. They take no GPU memory, so not the estimate's either.
+    const perLayerTable = ggufHeader?.tensors.get("per_layer_token_embd.weight")
+    if (perLayerTable) {
+      engine.perLayerSource = blobSource(weightFiles[0])
+      await claimMemory(model, (weightBytes - perLayerTable.byteLength) * TEXTURES_PER_FILE_BYTE, signal)
+      if (signal.aborted) throw new Superseded()
+    }
     const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
@@ -660,11 +669,15 @@ async function load(
     void closeStored()
     // A failed or superseded load frees its textures now.
     release(engine)
-    if (reusedTuning && !signal.aborted && error instanceof GpuError)
+    if (reusedTuning && !signal.aborted && error instanceof GpuError) {
+      post({ type: "log", text: `${model} didn't load with another load's GPU tuning (${error.message}); tuning afresh.` })
       return load(model, signal, contextLength, plain, false, webgl)
+    }
     // Whatever WebGPU couldn't do, WebGL 2 may.
-    if (webgpu && !signal.aborted && !(error instanceof Superseded))
+    if (webgpu && !signal.aborted && !(error instanceof Superseded)) {
+      post({ type: "log", text: `${model} didn't load on WebGPU (${error instanceof Error ? error.message : String(error)}); loading it on WebGL 2.` })
       return load(model, signal, contextLength, plain, reuseTuning, true)
+    }
     throw error
   }
 }

@@ -168,3 +168,153 @@ export function deltaChunked(
   }
   return { o, state: S }
 }
+
+/*
+ * Raon Delta Attention's recurrence: the gated delta rule with a decay per
+ * key dim (the state's row k decays by a_t[k] = exp(g_t[k])) and a write
+ * gate apart from the erase gate (v_t scaled by ratio_t before the rule):
+ *   d_t = beta_t (ratio_t v_t - (a_t ∘ S)ᵀk̂_t), S_t = a_t ∘ S_{t-1} + k̂_t d_tᵀ, o_t = S_tᵀq̂_t.
+ * In a chunk, with G_t the per-key sum of g from the chunk's start to t:
+ *   A[t][s] = beta_t Σ_i k̂_t[i] k̂_s[i] exp(G_t[i] - G_s[i]) (s < t), T = (I + A)⁻¹,
+ *   U = T diag(beta · ratio) V, W = T diag(beta) (exp(G) ∘ K), D = U - W S0;
+ *   P[t][s] = Σ_i q̂_t[i] k̂_s[i] exp(G_t[i] - G_s[i]) (s ≤ t),
+ *   O = P U + (exp(G) ∘ Q - P W) S0;
+ *   S = exp(G_last) ∘ S0 + Σ_s (exp(G_last - G_s) ∘ k̂_s) d_sᵀ.
+ * As above, every exponent is a difference ≤ 0 or a sum from the chunk's
+ * start (≤ 0). The engine's passes (gpu/raon-kernels.ts's rda*) follow
+ * these step for step.
+ */
+
+/** One head's inputs, as DeltaInputs with a log-decay per key and a write ratio. */
+export type KeyedDeltaInputs = Omit<DeltaInputs, "g"> & {
+  /** tokens × dk: each key's log-decay (≤ 0). */
+  g: Float64Array
+  /** tokens: the write gate over the erase gate. */
+  ratio: Float64Array
+}
+
+/** Token by token, as rdaDelta and rdaState do it. */
+export function deltaSequentialKeys(x: KeyedDeltaInputs, state: Float64Array) {
+  const { dk, dv, tokens } = x
+  const S = Float64Array.from(state)
+  const o = new Float64Array(tokens * dv)
+  const d = new Float64Array(dv)
+  for (let t = 0; t < tokens; t++) {
+    let qk = 0
+    for (let i = 0; i < dk; i++) qk += x.q[t * dk + i] * x.k[t * dk + i]
+    for (let j = 0; j < dv; j++) {
+      let kv = 0
+      let qs = 0
+      for (let i = 0; i < dk; i++) {
+        const s = Math.exp(x.g[t * dk + i]) * S[i * dv + j]
+        kv += s * x.k[t * dk + i]
+        qs += s * x.q[t * dk + i]
+      }
+      d[j] = x.beta[t] * (x.ratio[t] * x.v[t * dv + j] - kv)
+      o[t * dv + j] = qs + qk * d[j]
+    }
+    for (let i = 0; i < dk; i++) {
+      const a = Math.exp(x.g[t * dk + i])
+      for (let j = 0; j < dv; j++) S[i * dv + j] = a * S[i * dv + j] + x.k[t * dk + i] * d[j]
+    }
+  }
+  return { o, state: S }
+}
+
+/** In chunks, as deltaChunked: the state-free steps over every chunk, then two steps a chunk. */
+export function deltaChunkedKeys(
+  x: KeyedDeltaInputs,
+  state: Float64Array,
+  chunk: number,
+  first = chunk,
+  onState?: (end: number, state: Float64Array) => void
+) {
+  const { dk, dv, tokens: R } = x
+  const C = chunk
+  const start = (t: number) => (t < first ? 0 : first + Math.floor((t - first) / C) * C)
+  // rdaCum: G, each key's running sum of g within the chunk.
+  const G = new Float64Array(R * dk)
+  for (let t = 0; t < R; t++)
+    for (let i = 0; i < dk; i++) G[t * dk + i] = (t === start(t) ? 0 : G[(t - 1) * dk + i]) + x.g[t * dk + i]
+  // rdaGram.
+  const A = new Float64Array(R * C)
+  const P = new Float64Array(R * C)
+  for (let t = 0; t < R; t++) {
+    const c0 = start(t)
+    for (let s = c0; s <= t; s++) {
+      let kk = 0
+      let qk = 0
+      for (let i = 0; i < dk; i++) {
+        const ks = x.k[s * dk + i] * Math.exp(Math.min(G[t * dk + i] - G[s * dk + i], 0))
+        kk += x.k[t * dk + i] * ks
+        qk += x.q[t * dk + i] * ks
+      }
+      if (s < t) A[t * C + s - c0] = x.beta[t] * kk
+      P[t * C + s - c0] = qk
+    }
+  }
+  // linSolve.
+  const T = new Float64Array(R * C)
+  for (let t = 0; t < R; t++) {
+    const c0 = start(t)
+    const r = t - c0
+    for (let j = 0; j <= r; j++) {
+      let acc = j === r ? 1 : 0
+      for (let s = j; s < r; s++) acc -= A[t * C + s] * T[(c0 + s) * C + j]
+      T[t * C + j] = acc
+    }
+  }
+  // rdaUW, then rdaQO.
+  const U = new Float64Array(R * dv)
+  const W = new Float64Array(R * dk)
+  for (let t = 0; t < R; t++) {
+    const c0 = start(t)
+    for (let s = c0; s <= t; s++) {
+      const tau = T[t * C + s - c0] * x.beta[s]
+      for (let j = 0; j < dv; j++) U[t * dv + j] += tau * x.ratio[s] * x.v[s * dv + j]
+      for (let i = 0; i < dk; i++) W[t * dk + i] += tau * Math.exp(G[s * dk + i]) * x.k[s * dk + i]
+    }
+  }
+  const Oi = new Float64Array(R * dv)
+  const Qp = new Float64Array(R * dk)
+  for (let t = 0; t < R; t++) {
+    const c0 = start(t)
+    for (let i = 0; i < dk; i++) Qp[t * dk + i] = Math.exp(G[t * dk + i]) * x.q[t * dk + i]
+    for (let s = c0; s <= t; s++) {
+      const p = P[t * C + s - c0]
+      for (let j = 0; j < dv; j++) Oi[t * dv + j] += p * U[s * dv + j]
+      for (let i = 0; i < dk; i++) Qp[t * dk + i] -= p * W[s * dk + i]
+    }
+  }
+  // The chain: linChunkOut, then rdaChunkState.
+  let S = Float64Array.from(state)
+  const D = new Float64Array(R * dv)
+  const o = new Float64Array(R * dv)
+  for (let c0 = 0; c0 < R; c0 += c0 === 0 ? first : C) {
+    const c1 = Math.min(c0 + (c0 === 0 ? first : C), R)
+    for (let t = c0; t < c1; t++) {
+      for (let j = 0; j < dv; j++) {
+        let ws = 0
+        let qs = 0
+        for (let i = 0; i < dk; i++) {
+          ws += W[t * dk + i] * S[i * dv + j]
+          qs += Qp[t * dk + i] * S[i * dv + j]
+        }
+        D[t * dv + j] = U[t * dv + j] - ws
+        o[t * dv + j] = Oi[t * dv + j] + qs
+      }
+    }
+    const next = new Float64Array(dk * dv)
+    for (let i = 0; i < dk; i++) {
+      const last = G[(c1 - 1) * dk + i]
+      for (let j = 0; j < dv; j++) {
+        let acc = Math.exp(last) * S[i * dv + j]
+        for (let s = c0; s < c1; s++) acc += Math.exp(last - G[s * dk + i]) * x.k[s * dk + i] * D[s * dv + j]
+        next[i * dv + j] = acc
+      }
+    }
+    S = next
+    onState?.(c1, S)
+  }
+  return { o, state: S }
+}

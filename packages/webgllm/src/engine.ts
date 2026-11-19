@@ -17,11 +17,14 @@ import { PacedGpu } from "./gpu/paced.js"
 import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, q4WordHead, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
+import * as R from "./gpu/raon-kernels.js"
 import { panelLayout } from "./panels.js"
 import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
+import { rowsToFloats } from "./load-gguf.js"
 import { matrixRow, q4Repacker, q6SplitRows, q6Splitter, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
+  ByteSource,
   LayerType,
   LayerWeights,
   ModelConfig,
@@ -115,10 +118,27 @@ type GpuLayer = {
     a: Texture
     dtBias: Texture
     norm: Texture
+    /** Raon Delta Attention: the decay's rank to every key's logit (see LinearAttentionWeights.decay). */
+    decay?: GpuMatrix
   }
+  /** Raon's gated MLA beside `attention` (whose qkvg is its first projection): q_b and the per-head matrices. */
+  latent?: {
+    qB: GpuMatrix
+    /** Texel (h · (keyDim - shared) / 4 + i, j): head h's row j, weights 4i..4i+3 (RGBA16F). */
+    kB: Texture
+    /** Texel (h · rank / 4 + i, v): head h's row v, weights 4i..4i+3 (RGBA16F). */
+    vB: Texture
+  }
+  /** Raon's mHC sites (see StreamMixWeights). */
+  mix?: { operator: GpuMix; ffn: GpuMix }
+  /** Raon's per-layer embedding, this layer's part. */
+  perLayer?: { gate: GpuMatrix; proj: GpuMatrix; norm: Texture }
   gateUp: GpuMatrix
   down: GpuMatrix
 }
+
+/** An mHC site on the GPU: the selector, its biases (a row), and the chart (rows 0..15 K's, 16 r, 17 c0). */
+type GpuMix = { fn: GpuMatrix; base: Texture; chart: Texture }
 
 /**
  * Knobs for A/B timing on the bench page (bench/check.html?ab=...); the
@@ -513,6 +533,13 @@ export const TUNING = {
    */
   fuseLinear: 1,
   /**
+   * 1: a few rows' stream-mixing sites (Raon's mHC) in four passes, not
+   * seven: the selector reads the streams as they are, and the passes after
+   * it take the streams' RMS and the branch input's themselves (see
+   * Engine.streamSite). 0: the batch's passes.
+   */
+  streamInline: 1,
+  /**
    * Prompt batches run at most paceAhead chunks ahead of the GPU, each
    * about this many full-batch layers of matmul work (attention counted
    * by paceAttention; 0: unpaced), so the browser's GPU process never
@@ -901,6 +928,10 @@ const HALF_INT = Uint16Array.from({ length: 256 }, (_, n) => {
 
 /** Batches this small split their matmuls along K (see TUNING). */
 const SPLIT_ROWS = 8
+/** A few rows' selector reads the streams divided by this (halves' range), as the add's prescaled input is. */
+const STREAM_PRESCALE = 32
+/** Per-layer table rows kept after they're read (24 KB each for Raon-1 nano). */
+const PER_LAYER_ROWS_KEPT = 1024
 
 /**
  * The fewest tokens a cache may hold: the load's self-check reads a prompt
@@ -1123,6 +1154,9 @@ export class Engine {
         this.finalNorm = this.vector(piece.value)
         this.finalNormValues = piece.value.slice()
       }
+      else if (piece.kind === "perLayer") {
+        this.perLayer = { proj: this.matrix(piece.proj), norm: this.vector(piece.norm), table: piece.table }
+      }
       else {
         // The weight layout this GPU writes fastest, once, before the
         // first layer's textures (see chooseLayout).
@@ -1225,7 +1259,7 @@ export class Engine {
     if (this.quadMatmuls) {
       const b = this.buffers
       // (Not for a 1×1 stand-in: see allocate.)
-      for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj])
+      for (const t of [b.opOut, b.bcx, b.qkvg, b.gateUp, b.ffnOut, b.lin?.inProj, b.streams?.gate])
         if (t && t.width * t.height > 1)
           this.quads.set(t.id, this.gpu.texture(GL.RGBA32UI, t.width, t.height))
     }
@@ -1282,6 +1316,8 @@ export class Engine {
   /** Rows of the q|k|v|gate projection (see AttentionWeights). */
   private qkvgDims() {
     const c = this.config
+    // (Latent attention's first projection: q_a, kv_a and the output gate.)
+    if (c.latent) return c.latent.queryRank + c.latent.rank + c.latent.shared + c.latent.heads * c.latent.valueDim
     return (
       (c.numHeads + 2 * c.numKvHeads) * c.headDim +
       (c.gatePerDim ? c.numHeads * c.headDim : c.numHeads)
@@ -1311,7 +1347,8 @@ export class Engine {
     for (const tex of Object.values(this.linChunks?.textures ?? {})) this.gpu.delete(tex)
     const M = this.capacity
     const textures = {
-      cum: this.f32(lin.H, M),
+      // (Per key where the decay is: Raon Delta Attention.)
+      cum: this.f32(lin.l.keyDecay ? lin.K : lin.H, M),
       a: this.f32(lin.H * chunk, M),
       t: this.f32(lin.H * chunk, M),
       p: this.f32(lin.H * chunk, M),
@@ -1442,8 +1479,10 @@ export class Engine {
       /** Gated DeltaNet's tensors (see kernels.ts). */
       lin: lin && {
         inProj: this.pair(lin.C + lin.V, 2 * M),
-        ba: this.pair(2 * lin.H, 2 * M),
-        gates: this.f32(2 * lin.H, M),
+        // (Raon Delta Attention: the decay's rank before b and b + write; the keys' log-decays after the gates.)
+        ba: this.pair(2 * lin.H + (lin.l.keyDecay?.rank ?? 0), 2 * M),
+        gates: this.f32(2 * lin.H + (lin.l.keyDecay ? lin.K : 0), M),
+        rank: lin.l.keyDecay ? this.h2(lin.l.keyDecay.rank, M) : null,
         qkv: this.f32(lin.C, M),
         qk: this.f32(2 * lin.K, M),
         delta: this.f32(lin.V, M),
@@ -1461,7 +1500,37 @@ export class Engine {
           k: this.f32(lin.V, lin.l.convKernel - 1),
           decay: this.f32(lin.V, lin.l.convKernel - 1)
         }
-      }
+      },
+      /** Raon's tensors: the residual streams, their mixing, the per-layer inputs and the latent attention's. */
+      streams: c.streams && this.streamBuffers(M)
+    }
+  }
+
+  private streamBuffers(M: number) {
+    const c = this.config
+    const D = c.hiddenSize
+    const S = c.streams!.count
+    const ple = c.perLayer ? c.perLayer.dim * c.numLayers : 0
+    const l = c.latent
+    return {
+      /** The streams one after another, f32; the other is written by each mix. */
+      s: [0, 1].map(() => this.f32(S * D, M)) as [Texture, Texture],
+      /** The streams over their RMS, h2: the selectors' input; or (a few rows) as they are, their dot products' partial sums after them (see STREAM_H2). */
+      flat: this.gpu.texture(GL.RGBA32UI, (S * D) / 8 + 3 * R.STREAM_PARTS, M),
+      /** All ones: the selector's norm has no weights. */
+      ones: this.vector(new Float32Array(S * D).fill(1)),
+      /** A selector's outputs. */
+      mixes: this.pair(20, 2 * M),
+      /** A site's coefficients: pre, post, the mixing matrix (6 texels), then a few rows' streams' dot products (3). */
+      coef: this.f32(36, M),
+      /** The per-layer inputs, made from the tokens' table rows. */
+      inputs: this.f32(Math.max(ple, 4), M),
+      gate: this.pair(c.perLayer?.dim ?? 4, 2 * M),
+      gated: this.h2(c.perLayer?.dim ?? 8, M),
+      /** The latent attention's query latent, gate and output. */
+      queryLatent: l ? this.h2(l.queryRank, M) : null,
+      latentGate: l ? this.h2(l.heads * l.valueDim, M) : null,
+      latentOut: l ? this.h2(l.heads * l.valueDim, M) : null
     }
   }
 
@@ -2120,7 +2189,7 @@ export class Engine {
     }
     const started = performance.now()
     const made = [true, false].map((rgba4) => {
-      const gm = this.allocateMatrix(m.N, m.K, 4, !!m.zeros, rgba4, true)
+      const gm = this.allocateMatrix(m.N, m.K, 4, !!m.zeros || !!m.zeroHalves, rgba4, true, false, !!m.zeroHalves)
       this.writeMatrix(gm, m, 0)
       return gm
     })
@@ -2254,9 +2323,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
       m.N,
       m.K,
       m.bits,
-      !!m.zeros,
+      !!m.zeros || !!m.zeroHalves,
       m.bits === 4 && this.rgba4Layers,
-      true
+      true,
+      false,
+      !!m.zeroHalves
     )
     this.writeMatrix(gm, m, 0)
     this.storeQuants(gm)
@@ -2282,11 +2353,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     /** A layer matrix: scales and zero points may be packed (see GpuMatrix.packed). */
     layer = false,
     /** 4- or 8-bit weights in RGBA32UI word texels, not byte texels. */
-    words = false
+    words = false,
+    /** The zero points are fractions (QuantMatrix.zeroHalves): only the packed texel holds them. */
+    halfZeros = false
   ): GpuMatrix {
     const max = this.gpu.limits.maxTextureSize
+    if (halfZeros && !(layer && bits === 4 && (rgba4 || (this.bytes && !words))))
+      throw new GpuError("Fractional zero points are for 4-bit layer matrices in RGBA4 or byte texels.")
     if (rgba4) {
-      const packed = layer && withZeros && TUNING.packZeros > 0
+      const packed = layer && withZeros && (TUNING.packZeros > 0 || halfZeros)
       const blocks = K / 32
       const groups = N / 4
       const rowTexels = blocks * 32
@@ -2356,7 +2431,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     // (Layer matrices only: the head's and embedding's kernels read integer texels.)
     const unorm = layer && bytes && bits === 4 && TUNING.unormBytes > 0
     const packed =
-      layer && bytes && bits === 4 && withZeros && TUNING.packZeros > 0
+      layer && bytes && bits === 4 && withZeros && (TUNING.packZeros > 0 || halfZeros)
+    if (halfZeros && !packed)
+      throw new GpuError(`A ${N}×${K} matrix with fractional zero points doesn't fit this GPU's byte texels.`)
     const quantFormat = expanded
       ? expandedWords ? GL.RGBA32UI : GL.RGBA8
       : !bytes
@@ -3410,7 +3487,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                   )
           }
         )
-      if (gm.packed && m.zeros) {
+      if (gm.packed && (m.zeros || m.zeroHalves)) {
         // Each texel: 4 scales then 4 zero points, as halves.
         const packStart = performance.now()
         const n = run * blocks * 4
@@ -3418,6 +3495,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const texels = this.uploadScratch(n)
         const scales = m.scales
         const zeros = m.zeros
+        const halves = m.zeroHalves
+        if (halves)
+          for (let t = 0, a = at; t < n; t += 4, a += 4) {
+            texels[t] = scales[a] | (scales[a + 1] << 16)
+            texels[t + 1] = scales[a + 2] | (scales[a + 3] << 16)
+            texels[t + 2] = halves[a] | (halves[a + 1] << 16)
+            texels[t + 3] = halves[a + 2] | (halves[a + 3] << 16)
+          }
+        else if (zeros)
         for (let t = 0, a = at; t < n; t += 4, a += 4) {
           texels[t] = scales[a] | (scales[a + 1] << 16)
           texels[t + 1] = scales[a + 2] | (scales[a + 3] << 16)
@@ -3513,8 +3599,57 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         ) as [Texture, Texture],
         a: this.vector(w.linear.a),
         dtBias: this.vector(w.linear.dtBias),
-        norm: this.vector(w.linear.norm)
+        norm: this.vector(w.linear.norm),
+        ...(w.linear.decay && { decay: this.matrix(w.linear.decay) })
       }
+    }
+    if (w.latent) {
+      const l = c.latent
+      if (!l) throw new Error("The model's config has no latent attention shapes.")
+      const nope = l.keyDim - l.shared
+      const halves = (values: Uint16Array, width: number, height: number) =>
+        this.gpu.texture(GL.RGBA16F, width, height, { format: GL.RGBA, type: GL.HALF_FLOAT, pixels: values })
+      // Head-major, row-major halves → one head's rows beside the next's.
+      const beside = (values: Uint16Array, rows: number, K: number) => {
+        const out = new Uint16Array(values.length)
+        for (let h = 0; h < l.heads; h++)
+          for (let r = 0; r < rows; r++)
+            out.set(values.subarray((h * rows + r) * K, (h * rows + r + 1) * K), (r * l.heads + h) * K)
+        return out
+      }
+      layer.attention = {
+        qkvg: this.matrix(w.latent.inProj),
+        o: this.matrix(w.latent.o),
+        qNorm: this.vector(w.latent.qNorm),
+        kNorm: this.vector(w.latent.kvNorm),
+        kv: this.kvTexture(this.kvPositions),
+        ring: 0
+      }
+      layer.latent = {
+        qB: this.matrix(w.latent.qB),
+        kB: halves(beside(w.latent.kB, l.rank, nope), (l.heads * nope) / 4, l.rank),
+        vB: halves(beside(w.latent.vB, l.valueDim, l.rank), (l.heads * l.rank) / 4, l.valueDim)
+      }
+    }
+    if (w.mix) {
+      const s = c.streams
+      if (!s || s.count !== 4) throw new Error("The engine mixes four residual streams.")
+      const site = (m: NonNullable<LayerWeights["mix"]>["operator"]): GpuMix => {
+        const n = m.base.length
+        if (m.fn.N !== 20 || n !== 17) throw new Error("The engine's stream selector has 17 outputs.")
+        const base = new Float32Array(m.fn.N)
+        base.set(m.base)
+        // K's rows (n values each) padded to the selector's rows, then r and c0.
+        const chart = new Float32Array(18 * m.fn.N)
+        for (let j = 0; j < 16; j++) chart.set(m.chart.subarray(j * n, (j + 1) * n), j * m.fn.N)
+        chart.set(m.chart.subarray(16 * n, 16 * n + 16), 16 * m.fn.N)
+        chart.set(m.chart.subarray(16 * n + 16, 16 * n + 32), 17 * m.fn.N)
+        return { fn: this.matrix(m.fn), base: this.vector(base), chart: this.vector(chart, 18) }
+      }
+      layer.mix = { operator: site(w.mix.operator), ffn: site(w.mix.ffn) }
+    }
+    if (w.perLayer) {
+      layer.perLayer = { gate: this.matrix(w.perLayer.gate), proj: this.matrix(w.perLayer.proj), norm: this.vector(w.perLayer.norm) }
     }
     if (w.attention) {
       const kvDims = c.numKvHeads * c.headDim
@@ -4013,7 +4148,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const c = this.config
     const qkvg = this.qkvgDims()
     this.debug ??= this.f32(
-      Math.max(2 * c.intermediateSize, qkvg),
+      // (Latent attention's queries are wider than its projection.)
+      Math.max(2 * c.intermediateSize, qkvg, c.numHeads * c.headDim),
       this.capacity
     )
     return this.debug
@@ -5009,7 +5145,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return
     }
     // (The passes below read the weights' texture, deleted once they're in a storage buffer.)
-    if (w.stored) throw new GpuError("A matrix in a storage buffer reached a texture matmul.")
+    if (w.stored) throw new GpuError(`A ${w.N}×${w.K} matrix in a storage buffer reached a texture matmul (${rows} rows).`)
     if (w.rgba4) {
       // Narrow matrices split K in two, stacked in the output, so there are
       // enough fragments to fill the GPU (consumers add the slices).
@@ -5425,8 +5561,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   /** Native fused adds by shape (see addNormed). */
   private fusedAdds = new Map<string, NativeSpec | null>()
 
-  private rms(x: Texture, row0: number, rows: number, split = -1) {
-    const texels = this.config.hiddenSize / 4
+  private rms(x: Texture, row0: number, rows: number, split = -1, texels = this.config.hiddenSize / 4) {
     this.gpu.run({
       name: "rms",
       program: this.gpu.program(
@@ -5459,23 +5594,25 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     out: Texture,
     rows: number,
     rowIn = -1,
-    ownSums = true
+    ownSums = true,
+    /** x's texels a row and the epsilon, where they aren't the hidden state's (Raon's streams). */
+    texels = this.config.hiddenSize / 4,
+    eps = this.config.normEps
   ) {
-    const { hiddenSize } = this.config
-    if (!ownSums) this.rms(x, Math.max(rowIn, 0), rows)
+    if (!ownSums) this.rms(x, Math.max(rowIn, 0), rows, -1, texels)
     this.gpu.run({
       name: "norm",
       program: this.gpu.program(K.withRms(K.NORM_TO_H2, this.parts)),
       inputs: { uX: x, uR: ownSums ? x : this.buffers.rms, uNorm: norm },
       uniforms: {
         uRowIn: { int: rowIn },
-        uROff: { int: ownSums ? hiddenSize / 4 : 0 },
+        uROff: { int: ownSums ? texels : 0 },
         uParts: { int: this.parts },
-        uTexels: { int: hiddenSize / 4 },
-        uEps: this.config.normEps
+        uTexels: { int: texels },
+        uEps: eps
       },
       output: out,
-      rect: { x: 0, y: 0, width: hiddenSize / 8, height: rows }
+      rect: { x: 0, y: 0, width: texels / 2, height: rows }
     })
   }
 
@@ -5993,75 +6130,93 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     }
     await this.attention(layer, type, rows, pos0, split, qkvgIn, paced, inCache)
-    if (this.panelErrors || this.chunkErrors) {
-      // panelError: this layer's output again by the one-pass kernel,
-      // from the same queries and cache (that output goes on).
-      const qDims = c.numHeads * c.headDim
-      const read = async () => {
-        this.gpu.run({
-          program: this.gpu.program(K.H2_TO_F32),
-          inputs: { uX: b.attnOut },
-          output: this.debugTexture(),
-          rect: { x: 0, y: 0, width: qDims / 4, height: rows }
-        })
-        return this.gpu.read(this.debugTexture(), {
-          x: 0,
-          y: 0,
-          width: qDims / 4,
-          height: rows
-        })
-      }
-      const got = await read()
-      const saved = TUNING.attendChunkTexels,
-        savedDecode = TUNING.attendChunkTexelsDecode
-      TUNING.attendChunkTexels = this.chunkErrors ? 1 : 0
-      if (this.chunkErrors) TUNING.attendChunkTexelsDecode = 1
-      try {
-        await this.attention(
-          layer,
-          type,
-          rows,
-          pos0,
-          split,
-          qkvgIn,
-          false,
-          inCache
-        )
-      } finally {
-        TUNING.attendChunkTexels = saved
-        TUNING.attendChunkTexelsDecode = savedDecode
-      }
-      const want = await read()
-      let worst = 0
-      for (let row = 0; row < rows; row++) {
-        let err = 0,
-          ref = 0,
-          finite = true
-        for (let i = row * qDims; i < (row + 1) * qDims; i++) {
-          finite &&= Number.isFinite(got[i]) && Number.isFinite(want[i])
-          err += (got[i] - want[i]) ** 2
-          ref += want[i] ** 2
-        }
-        worst = Math.max(
-          worst,
-          finite ? Math.sqrt(err / Math.max(ref, 1e-30)) : Infinity
-        )
-      }
-      ;(this.panelErrors ?? this.chunkErrors)?.push(worst)
-      // The normal attention output continues through the reference model.
-      if (this.chunkErrors)
-        await this.attention(
-          layer,
-          type,
-          rows,
-          pos0,
-          split,
-          qkvgIn,
-          false,
-          inCache
-        )
-    }
+    await this.attentionRecheck(layer, type, rows, pos0, split, qkvgIn, inCache)
     return this.project(b.attnOut, layer.o, b.opOut, rows)
+  }
+
+  /**
+   * While the self-check's panel or chunk comparison runs: this layer's
+   * attention output again another way from the same queries and cache
+   * (see panelError), their relative error recorded.
+   */
+  private async attentionRecheck(
+    layer: NonNullable<GpuLayer["attention"]>,
+    type: LayerType,
+    rows: number,
+    pos0: number,
+    split: number,
+    qkvgIn: Texture,
+    inCache: boolean
+  ) {
+    if (!this.panelErrors && !this.chunkErrors) return
+    const c = this.config
+    const b = this.buffers
+    // panelError: this layer's output again by the one-pass kernel,
+    // from the same queries and cache (that output goes on).
+    const qDims = c.numHeads * c.headDim
+    const read = async () => {
+      this.gpu.run({
+        program: this.gpu.program(K.H2_TO_F32),
+        inputs: { uX: b.attnOut },
+        output: this.debugTexture(),
+        rect: { x: 0, y: 0, width: qDims / 4, height: rows }
+      })
+      return this.gpu.read(this.debugTexture(), {
+        x: 0,
+        y: 0,
+        width: qDims / 4,
+        height: rows
+      })
+    }
+    const got = await read()
+    const saved = TUNING.attendChunkTexels,
+      savedDecode = TUNING.attendChunkTexelsDecode
+    TUNING.attendChunkTexels = this.chunkErrors ? 1 : 0
+    if (this.chunkErrors) TUNING.attendChunkTexelsDecode = 1
+    try {
+      await this.attention(
+        layer,
+        type,
+        rows,
+        pos0,
+        split,
+        qkvgIn,
+        false,
+        inCache
+      )
+    } finally {
+      TUNING.attendChunkTexels = saved
+      TUNING.attendChunkTexelsDecode = savedDecode
+    }
+    const want = await read()
+    let worst = 0
+    for (let row = 0; row < rows; row++) {
+      let err = 0,
+        ref = 0,
+        finite = true
+      for (let i = row * qDims; i < (row + 1) * qDims; i++) {
+        finite &&= Number.isFinite(got[i]) && Number.isFinite(want[i])
+        err += (got[i] - want[i]) ** 2
+        ref += want[i] ** 2
+      }
+      worst = Math.max(
+        worst,
+        finite ? Math.sqrt(err / Math.max(ref, 1e-30)) : Infinity
+      )
+    }
+    ;(this.panelErrors ?? this.chunkErrors)?.push(worst)
+    // The normal attention output continues through the reference model.
+    if (this.chunkErrors)
+      await this.attention(
+        layer,
+        type,
+        rows,
+        pos0,
+        split,
+        qkvgIn,
+        false,
+        inCache
+      )
   }
 
   /**
@@ -6869,6 +7024,797 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
   }
 
+  // ----------------------------------------------------------------- Raon
+
+  /** Raon's per-layer embeddings, the model's part (see WeightPiece's perLayer). */
+  private perLayer: {
+    proj: GpuMatrix
+    norm: Texture
+    table: { offset: number; rowBytes: number; type: number; rows: number }
+  } | null = null
+  /** The model's file, where a token's per-layer table row is read from when the token is. */
+  perLayerSource: ByteSource | null = null
+  /** Rows read lately, by token (a chat's template tokens come back every turn). */
+  private perLayerRead = new Map<number, Float32Array>()
+
+  /** The per-layer table's rows for `tokens`, dequantized, one after another. */
+  private async perLayerRows(tokens: ArrayLike<number>): Promise<Float32Array> {
+    const p = this.perLayer
+    const source = this.perLayerSource
+    const c = this.config
+    if (!p || !c.perLayer) throw new Error("The model's weights have no per-layer embeddings.")
+    if (!source) throw new Error("The model's per-layer embeddings have no file to be read from (Engine.perLayerSource).")
+    const width = c.perLayer.dim * c.numLayers
+    const info = { name: "per_layer_token_embd.weight", dims: [width, 1], type: p.table.type, offset: 0, byteLength: p.table.rowBytes }
+    const missing = new Set<number>()
+    for (let i = 0; i < tokens.length; i++) {
+      const token = Math.min(Math.max(tokens[i], 0), p.table.rows - 1)
+      if (!this.perLayerRead.has(token)) missing.add(token)
+    }
+    const read = new Map<number, Float32Array>()
+    await Promise.all(
+      [...missing].map(async (token) => {
+        const bytes = await source.read(p.table.offset + token * p.table.rowBytes, p.table.rowBytes)
+        const row = new Float32Array(width)
+        rowsToFloats(info, bytes, 1, row)
+        read.set(token, row)
+      })
+    )
+    const out = new Float32Array(tokens.length * width)
+    for (let i = 0; i < tokens.length; i++) {
+      const token = Math.min(Math.max(tokens[i], 0), p.table.rows - 1)
+      const row = read.get(token) ?? this.perLayerRead.get(token)
+      if (!row) throw new Error("A per-layer row wasn't read.")
+      out.set(row, i * width)
+    }
+    for (const [token, row] of read) this.perLayerRead.set(token, row)
+    // (The oldest go first: a Map keeps insertion order.)
+    for (const token of this.perLayerRead.keys()) {
+      if (this.perLayerRead.size <= PER_LAYER_ROWS_KEPT) break
+      this.perLayerRead.delete(token)
+    }
+    return out
+  }
+
+  /** How a kernel reads a matmul's output `name`: the pair tensor `tex`, or a split matmul's `split` partial sums. */
+  private reading(name: string, tex: Texture, split: number) {
+    const input = split ? this.partials() : tex
+    return {
+      program: (source: string) =>
+        this.gpu.program(split ? this.fromSplit(source, [name], split) : this.readPair(source, name, input)),
+      inputs: { [name]: input, ...(!split && this.quadInputs(name, input)) } as Record<string, Texture>,
+      uniforms: { uSplitIn: { int: split }, ...this.pairIn(input) }
+    }
+  }
+
+  /**
+   * An mHC site (Raon): the selector reads the streams over their RMS; its
+   * outputs give how the branch reads them (the weighted sum, normed, into
+   * buffers.normed: returned) and, in the coefficients buffer, how the
+   * branch's output goes back (see streamMix).
+   */
+  private async streamSite(mix: GpuMix, norm: Texture, rows: number) {
+    const c = this.config
+    const b = this.buffers
+    const sb = b.streams
+    if (!sb || !c.streams) throw new Error("The model's config has no residual streams.")
+    const T = c.hiddenSize / 4
+    const texels = c.streams.count * T
+    // A few rows: the selector reads the streams as they are (scaled down
+    // into halves' range), the coefficients' pass applies their 1 / RMS and
+    // sums the streams' dot products, and the branch's input is normed as
+    // it's summed: four passes where a batch's way takes seven.
+    const few = rows <= SPLIT_ROWS && TUNING.streamInline > 0
+    if (few)
+      this.gpu.run({
+        name: "streams",
+        program: this.gpu.program(R.streamH2(Math.ceil(T / R.STREAM_PARTS))),
+        inputs: { uS: sb.s[0] },
+        uniforms: { uScale: 1 / STREAM_PRESCALE, uT: { int: T } },
+        output: sb.flat,
+        rect: { x: 0, y: 0, width: texels / 2 + 3 * R.STREAM_PARTS, height: rows }
+      })
+    else this.normToH2(sb.s[0], sb.ones, sb.flat, rows, -1, false, texels, c.streams.eps)
+    const split = await this.project(sb.flat, mix.fn, sb.mixes, rows)
+    const r = this.reading("uMix", sb.mixes, split)
+    this.gpu.run({
+      name: "streams",
+      program: r.program(R.streamCoefficients(few)),
+      inputs: { ...r.inputs, uBase: mix.base, uChart: mix.chart, ...(few && { uFlat: sb.flat }) },
+      uniforms: { ...r.uniforms, ...(few && { uT: { int: T }, uEps: c.streams.eps, uPrescale: 1 / STREAM_PRESCALE }) },
+      output: sb.coef,
+      rect: { x: 0, y: 0, width: few ? 9 : 6, height: rows }
+    })
+    if (few) {
+      this.gpu.run({
+        name: "streams",
+        program: this.gpu.program(R.STREAM_INPUT),
+        inputs: { uS: sb.s[0], uCoef: sb.coef, uNorm: norm },
+        uniforms: { uT: { int: T }, uEps: c.normEps },
+        output: b.normed,
+        rect: { x: 0, y: 0, width: T / 2, height: rows }
+      })
+      return b.normed
+    }
+    this.gpu.run({
+      name: "streams",
+      program: this.gpu.program(R.STREAM_AGGREGATE),
+      inputs: { uS: sb.s[0], uCoef: sb.coef },
+      uniforms: { uT: { int: T } },
+      output: b.residual[1],
+      rect: { x: 0, y: 0, width: T, height: rows }
+    })
+    this.normToH2(b.residual[1], norm, b.normed, rows, -1, false)
+    return b.normed
+  }
+
+  /** The streams after a branch: mixed, plus the branch's output `y` (a pair tensor, or `split` partial sums). */
+  private streamMix(y: Texture, split: number, rows: number) {
+    const c = this.config
+    const sb = this.buffers.streams
+    if (!sb || !c.streams) throw new Error("The model's config has no residual streams.")
+    const T = c.hiddenSize / 4
+    const r = this.reading("uY", y, split)
+    this.gpu.run({
+      name: "streams",
+      program: r.program(R.STREAM_MIX),
+      inputs: { ...r.inputs, uS: sb.s[0], uCoef: sb.coef },
+      uniforms: { ...r.uniforms, uT: { int: T } },
+      output: sb.s[1],
+      rect: { x: 0, y: 0, width: c.streams.count * T, height: rows }
+    })
+    sb.s.reverse()
+  }
+
+  /**
+   * Raon's layers, after the embedding is in the residual: the per-layer
+   * inputs (the tokens' table rows from the file), the streams, then each
+   * layer's two sites (the operator and the MLP, each read from and mixed
+   * back into the streams) and its per-layer input. Leaves the streams'
+   * mean, with its sums of squares, where the head reads the hidden state.
+   */
+  private async forwardStreams(
+    batch: Array<number>,
+    pos0: number,
+    probe: LayerProbe | undefined,
+    paced: boolean,
+    decodeLayers: number,
+    saveAt?: number
+  ) {
+    const c = this.config
+    const b = this.buffers
+    const sb = b.streams
+    const pl = this.perLayer
+    if (!sb || !c.streams || !pl || !c.perLayer) throw new Error("The model's weights have no residual streams or per-layer embeddings.")
+    const rows = batch.length
+    const D = c.hiddenSize
+    const T = D / 4
+    const S = c.streams.count
+    const P = c.perLayer.dim
+    const inputs4 = (P * c.numLayers) / 4
+    const look = async (layer: number, name: string, tex: Texture, dims: number, h2 = false) => {
+      if (!probe) return
+      await probe(layer, name, async () => {
+        let src = tex
+        if (h2) {
+          this.gpu.run({
+            program: this.gpu.program(K.H2_TO_F32),
+            inputs: { uX: tex },
+            output: this.debugTexture(),
+            rect: { x: 0, y: 0, width: dims / 4, height: rows }
+          })
+          src = this.debugTexture()
+        }
+        return { data: await this.gpu.read(src, { x: 0, y: 0, width: dims / 4, height: rows }), rows, dims, offset: pos0 }
+      })
+    }
+    // The tokens' table rows (into the streams' other texture, free until
+    // the first mix), then the per-layer inputs.
+    const table = sb.s[1]
+    this.gpu.write(
+      table,
+      { x: 0, y: 0, width: inputs4, height: rows },
+      { format: GL.RGBA, type: GL.FLOAT, pixels: await this.perLayerRows(batch) }
+    )
+    this.gpu.run({
+      name: "streams",
+      program: this.gpu.program(R.F32_TO_H2),
+      inputs: { uX: b.residual[0] },
+      output: b.normed,
+      rect: { x: 0, y: 0, width: D / 8, height: rows }
+    })
+    const projSplit = await this.project(b.normed, pl.proj, b.gateUp, rows)
+    const pr = this.reading("uProj", b.gateUp, projSplit)
+    this.gpu.run({
+      name: "streams",
+      program: pr.program(R.perLayerInputs(P)),
+      inputs: { ...pr.inputs, uTable: table, uNorm: pl.norm },
+      uniforms: { ...pr.uniforms, uEps: c.normEps },
+      output: sb.inputs,
+      rect: { x: 0, y: 0, width: inputs4, height: rows },
+      work: P / 4
+    })
+    await look(-1, "per_layer_inputs", sb.inputs, P * c.numLayers)
+    this.gpu.run({
+      name: "streams",
+      program: this.gpu.program(R.STREAMS_REPEAT),
+      inputs: { uX: b.residual[0] },
+      uniforms: { uT: { int: T } },
+      output: sb.s[0],
+      rect: { x: 0, y: 0, width: S * T, height: rows }
+    })
+    for (let i = 0; i < this.layers.length; i++) {
+      const layer = this.layers[i]
+      if (!layer.mix || !layer.perLayer) throw new Error("A layer has no stream mixing or per-layer embedding.")
+      const groupEnd = i > 0 && decodeLayers > 0 && this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
+      if (paced) await this.charge(0)
+      else {
+        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
+          TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
+          this.gpu.flush()
+      }
+      // The operator.
+      const opIn = await this.streamSite(layer.mix.operator, layer.operatorNorm, rows)
+      await look(i, "attn_in", b.normed, D, true)
+      let opSplit = 0
+      if (layer.linear) opSplit = await this.deltaAttend(layer.linear, rows, opIn, paced, saveAt, rows <= SPLIT_ROWS && !probe)
+      else if (layer.attention && layer.latent) opSplit = await this.latentAttend(layer.attention, layer.latent, rows, pos0, opIn, paced, probe && ((name, read) => probe(i, name, read)))
+      else throw new Error("A layer has neither Raon Delta Attention nor latent attention.")
+      this.streamMix(opSplit ? this.partials() : b.opOut, opSplit, rows)
+      await look(i, "after_attn", sb.s[0], S * D)
+      // The MLP.
+      const ffnIn = await this.streamSite(layer.mix.ffn, layer.ffnNorm, rows)
+      if (rows <= SPLIT_ROWS) {
+        const slices = this.splitPartials(ffnIn, layer.gateUp, rows)
+        this.gpu.run({
+          name: "swiglu",
+          program: this.gpu.program(K.withSplit(K.REDUCE_SWIGLU, slices)),
+          inputs: { uP: this.partials() },
+          uniforms: { uSplitIn: { int: slices }, uHalf: { int: c.intermediateSize / 4 } },
+          output: b.act,
+          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+        })
+      } else {
+        await this.matmul(ffnIn, layer.gateUp, b.gateUp, rows)
+        this.gpu.run({
+          name: "swiglu",
+          program: this.gpu.program(this.readPair(K.SWIGLU, "uGU", b.gateUp)),
+          inputs: { uGU: b.gateUp, ...this.quadInputs("uGU", b.gateUp) },
+          uniforms: { uHalf: { int: c.intermediateSize / 4 }, ...this.pairIn(b.gateUp) },
+          output: b.act,
+          rect: { x: 0, y: 0, width: c.intermediateSize / 8, height: rows }
+        })
+      }
+      const downSplit = await this.project(b.act, layer.down, b.ffnOut, rows)
+      this.streamMix(downSplit ? this.partials() : b.ffnOut, downSplit, rows)
+      await look(i, "after_ffn", sb.s[0], S * D)
+      // The layer's per-layer input, into every stream.
+      this.gpu.run({
+        name: "streams",
+        program: this.gpu.program(R.STREAM_SUM_H2),
+        inputs: { uS: sb.s[0] },
+        uniforms: { uT: { int: T } },
+        output: b.normed,
+        rect: { x: 0, y: 0, width: D / 8, height: rows }
+      })
+      const gateSplit = await this.project(b.normed, layer.perLayer.gate, sb.gate, rows)
+      const rg = this.reading("uG", sb.gate, gateSplit)
+      this.gpu.run({
+        name: "streams",
+        program: rg.program(R.PER_LAYER_GATE),
+        inputs: { ...rg.inputs, uInputs: sb.inputs },
+        uniforms: { ...rg.uniforms, uOff: { int: (i * P) / 4 } },
+        output: sb.gated,
+        rect: { x: 0, y: 0, width: P / 8, height: rows }
+      })
+      const projected = await this.project(sb.gated, layer.perLayer.proj, b.ffnOut, rows)
+      const y = projected ? this.partials() : b.ffnOut
+      this.rms(y, 0, rows, projected)
+      const ry = this.reading("uY", y, projected)
+      this.gpu.run({
+        name: "streams",
+        program: this.gpu.program(K.withRms(projected ? this.fromSplit(R.PER_LAYER_ADD, ["uY"], projected) : this.readPair(R.PER_LAYER_ADD, "uY", y), this.parts)),
+        inputs: { ...ry.inputs, uS: sb.s[0], uR: b.rms, uNorm: layer.perLayer.norm },
+        uniforms: { ...ry.uniforms, uT: { int: T }, uROff: { int: 0 }, uTexels: { int: T }, uParts: { int: this.parts }, uEps: c.normEps },
+        output: sb.s[1],
+        rect: { x: 0, y: 0, width: S * T, height: rows }
+      })
+      sb.s.reverse()
+      await look(i, "streams_out", sb.s[0], S * D)
+      if (paced) this.unpaced += rows * this.layerWork(i)
+    }
+    // The hidden state the head reads: the streams' mean, and its sums of squares beside it.
+    const mean = { uT: { int: T }, uScale: 1 / S }
+    this.gpu.run({
+      name: "streams",
+      program: this.gpu.program(R.STREAM_SUM),
+      inputs: { uS: sb.s[0] },
+      uniforms: mean,
+      output: b.residual[0],
+      rect: { x: 0, y: 0, width: T, height: rows }
+    })
+    this.gpu.run({
+      name: "streams",
+      program: this.gpu.program(R.STREAM_SUM_SQUARES),
+      inputs: { uS: sb.s[0] },
+      uniforms: { ...mean, uTexels: { int: T }, uChunk: { int: Math.ceil(T / this.parts) }, uBase: { int: T } },
+      output: b.residual[0],
+      rect: { x: T, y: 0, width: this.parts, height: rows }
+    })
+    // (As the other models' last layer's output: what headError reads the head's input from.)
+    await look(this.layers.length - 1, "l_out", b.residual[0], D)
+    this.headScaled = false
+    this.position += rows
+    return rows - 1
+  }
+
+  /**
+   * A Raon Delta Attention block: linearAttend's passes with a decay per key
+   * (from the low-rank projection, through its second matrix) and a write
+   * gate, and sigmoid on the output gate. Returns the out projection's split.
+   */
+  private async deltaAttend(
+    layer: NonNullable<GpuLayer["linear"]>,
+    rows: number,
+    input: Texture,
+    paced: boolean,
+    saveAt?: number,
+    /** Whether writing's fused block may run (see deltaFused; not while probing). */
+    fusable = false
+  ) {
+    const lin = this.linDims()
+    const b = this.buffers
+    const t = b.lin
+    const kd = lin?.l.keyDecay
+    if (!lin || !t || !kd || !t.rank || !layer.decay) throw new Error("The model's config has no Raon Delta Attention shapes.")
+    if (fusable && saveAt === undefined && !this.prefixSaving && this.fusesDelta(layer, rows))
+      return this.deltaFused(layer, rows, input)
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const width = lin.l.convKernel
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const C4 = lin.C / 4
+    const chunk = TUNING.linChunk
+    const chunked =
+      this.chunkedRecurrence && chunk > 0 && chunk % 4 === 0 && rows >= Math.max(2, TUNING.linChunkMin) &&
+      lin.l.numKeyHeads === lin.l.numValueHeads
+    // The decay's rank, b and b + write: beta and the write ratio, then every key's log-decay.
+    const baSplit = await this.project(input, layer.ba, t.ba, rows)
+    const ba = this.reading("uBA", t.ba, baSplit)
+    this.gpu.run({
+      name: "linear",
+      program: ba.program(R.rdaGates(H4, kd.rank / 4)),
+      inputs: ba.inputs,
+      uniforms: { ...ba.uniforms, uBAx: { int: 0 } },
+      output: t.gates,
+      rect: { x: 0, y: 0, width: 2 * H4, height: rows }
+    })
+    this.gpu.run({
+      name: "linear",
+      program: ba.program(R.RDA_RANK),
+      inputs: ba.inputs,
+      uniforms: { ...ba.uniforms, uBAx: { int: 0 } },
+      output: t.rank,
+      rect: { x: 0, y: 0, width: kd.rank / 8, height: rows }
+    })
+    const fbSplit = await this.project(t.rank, layer.decay, t.inProj, rows)
+    const fb = this.reading("uFB", t.inProj, fbSplit)
+    this.gpu.run({
+      name: "linear",
+      program: fb.program(R.rdaDecay(false)),
+      inputs: { ...fb.inputs, uDt: layer.dtBias },
+      uniforms: { ...fb.uniforms, uX0: { int: 2 * H4 }, uFBx: { int: 0 }, uLower: kd.lowerBound },
+      output: t.gates,
+      rect: { x: 2 * H4, y: 0, width: K4, height: rows }
+    })
+    // q|k|v|gate, then silu(conv(q|k|v)) and the conv state after the batch.
+    const split = await this.project(input, layer.inProj, t.inProj, rows)
+    const rd = this.reading("uIn", t.inProj, split)
+    if (this.prefixSaving) {
+      const copy = this.f32(lin.C, width - 1)
+      this.prefixSaving.state.linear.push(copy)
+      this.gpu.run({
+        name: "linear",
+        program: rd.program(K.linConvState(width)),
+        inputs: { ...rd.inputs, uState: layer.convState[0] },
+        uniforms: { ...rd.uniforms, uM: { int: this.prefixSaving.row } },
+        output: copy,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 }
+      })
+    }
+    this.gpu.run({
+      name: "linear",
+      program: rd.program(K.linConv(width)),
+      inputs: { ...rd.inputs, uState: layer.convState[0], uConv: layer.kernel },
+      uniforms: rd.uniforms,
+      output: t.qkv,
+      rect: { x: 0, y: 0, width: C4, height: rows }
+    })
+    for (const m of [rows, ...(saveAt !== undefined ? [saveAt] : [])]) {
+      const out = m === saveAt ? this.f32(lin.C, width - 1) : layer.convState[1]
+      if (m === saveAt) this.saving?.push(out)
+      this.gpu.run({
+        name: "linear",
+        program: rd.program(K.linConvState(width)),
+        inputs: { ...rd.inputs, uState: layer.convState[0] },
+        uniforms: { ...rd.uniforms, uM: { int: m } },
+        output: out,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 }
+      })
+    }
+    layer.convState.reverse()
+    this.gpu.run({
+      name: "linear",
+      program: this.gpu.program(K.linPrep(dk)),
+      inputs: { uQKV: t.qkv },
+      uniforms: { uK4: { int: K4 } },
+      output: t.qk,
+      rect: { x: 0, y: 0, width: 2 * K4, height: rows }
+    })
+    const shape = { keyHeadDim: dk, valueHeadDim: dv }
+    const common = { uK4: { int: K4 }, uH4: { int: H4 } }
+    if (chunked) await this.deltaChunks(layer, rows, chunk, paced, saveAt)
+    else for (let r = 0; r < rows; r++) {
+      const deltaIn = { uS: layer.state[0], uQK: t.qk, uQKV: t.qkv, uG: t.gates }
+      const rect = { x: 0, y: r, width: V4, height: 1 }
+      if (this.mrt.lin) {
+        this.gpu.run({
+          name: "recurrence",
+          program: this.gpu.program(R.rdaDelta({ ...shape, out: "both" })),
+          inputs: deltaIn,
+          uniforms: common,
+          output: [t.delta, t.o],
+          rect
+        })
+      } else {
+        for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const) {
+          this.gpu.run({
+            name: "recurrence",
+            program: this.gpu.program(R.rdaDelta({ ...shape, out })),
+            inputs: deltaIn,
+            uniforms: common,
+            output: tex,
+            rect
+          })
+        }
+      }
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.program(R.rdaState(shape)),
+        inputs: { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uG: t.gates },
+        uniforms: { ...common, uRow: { int: r } },
+        output: layer.state[1],
+        rect: { x: 0, y: 0, width: V4, height: dk }
+      })
+      layer.state.reverse()
+      if (r + 1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (r + 1 === this.prefixSaving?.row) this.prefixSaving.state.linear.push(this.copyOf(layer.state[0]))
+      if (paced) await this.charge(4 * lin.V * dk)
+    }
+    this.gpu.run({
+      name: "linear",
+      program: rd.program(R.rdaNorm(dv)),
+      inputs: { ...rd.inputs, uO: t.o, uNorm: layer.norm },
+      uniforms: { ...rd.uniforms, uZ: { int: C4 }, uEps: this.config.normEps },
+      output: t.out,
+      rect: { x: 0, y: 0, width: V4 / 2, height: rows }
+    })
+    return this.project(t.out, layer.outProj, b.opOut, rows)
+  }
+
+  /** Whether a `rows`-row batch runs writing's fused Raon Delta Attention block (see deltaFused). */
+  private fusesDelta(layer: NonNullable<GpuLayer["linear"]>, rows: number) {
+    const lin = this.linDims()
+    if (!lin || !layer.decay || TUNING.fuseLinear <= 0 || !this.mrt.linFused) return false
+    const l = lin.l
+    return (
+      rows === 1 &&
+      l.keyHeadDim === l.valueHeadDim &&
+      l.numKeyHeads === l.numValueHeads &&
+      // The decay's projections' slices beside in_proj's in the partial buffer.
+      layer.inProj.groups + layer.ba.groups + layer.decay.groups <= this.buffers.partial.width
+    )
+  }
+
+  /**
+   * Writing's Raon Delta Attention block (see TUNING.fuseLinear): deltaAttend's
+   * math in 9 render passes, not 13. The decay's projection and in_proj into
+   * one target; its rank; the keys' logits beside them; their decays; the
+   * convolution with its state; delta, the output and k̂ with the gates and
+   * norms computed in the pass (rdaDeltaFused); the state; the gated norm;
+   * the out projection.
+   */
+  private async deltaFused(layer: NonNullable<GpuLayer["linear"]>, rows: number, input: Texture) {
+    const lin = this.linDims()
+    const b = this.buffers
+    const t = b.lin
+    const kd = lin?.l.keyDecay
+    if (!lin || !t || !kd || !t.rank || !layer.decay) throw new Error("The model's config has no Raon Delta Attention shapes.")
+    const small = t.small
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const width = lin.l.convKernel
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const C4 = lin.C / 4
+    const partial = this.partials()
+    const baX = layer.inProj.groups
+    const fbX = baX + layer.ba.groups
+    const baSplit = this.splitPartials(input, layer.ba, rows, undefined, baX)
+    const split = this.splitPartials(input, layer.inProj, rows)
+    const ba = this.reading("uBA", partial, baSplit)
+    this.gpu.run({
+      name: "linear",
+      program: ba.program(R.RDA_RANK),
+      inputs: ba.inputs,
+      uniforms: { ...ba.uniforms, uBAx: { int: baX } },
+      output: t.rank,
+      rect: { x: 0, y: 0, width: kd.rank / 8, height: rows }
+    })
+    const fbSplit = this.splitPartials(t.rank, layer.decay, rows, undefined, fbX)
+    const fb = this.reading("uFB", partial, fbSplit)
+    this.gpu.run({
+      name: "linear",
+      program: fb.program(R.rdaDecay(true)),
+      inputs: { ...fb.inputs, uDt: layer.dtBias },
+      uniforms: { ...fb.uniforms, uX0: { int: 0 }, uFBx: { int: fbX }, uLower: kd.lowerBound },
+      output: small.decay,
+      rect: { x: 0, y: 0, width: K4, height: rows }
+    })
+    const rd = this.reading("uIn", partial, split)
+    this.gpu.run({
+      name: "linear",
+      program: rd.program(K.linConvFused(width)),
+      inputs: { ...rd.inputs, uState: layer.convState[0], uConv: layer.kernel },
+      uniforms: { ...rd.uniforms, uM: { int: rows } },
+      output: [small.qkv, layer.convState[1]],
+      rect: { x: 0, y: 0, width: C4, height: width - 1 }
+    })
+    layer.convState.reverse()
+    const shape = { keyHeadDim: dk, valueHeadDim: dv }
+    this.gpu.run({
+      name: "recurrence",
+      program: this.gpu.program(R.rdaDeltaFused(shape)),
+      inputs: { uS: layer.state[0], uQKV: small.qkv, uBA: partial, uDecay: small.decay },
+      uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, uBAx: { int: baX + kd.rank / 4 }, uSplitIn: { int: baSplit } },
+      output: [small.delta, small.o, small.k],
+      rect: { x: 0, y: 0, width: V4, height: rows }
+    })
+    this.gpu.run({
+      name: "recurrence",
+      program: this.gpu.program(R.rdaStateFused(shape)),
+      inputs: { uS: layer.state[0], uK: small.k, uDelta: small.delta, uDecay: small.decay },
+      uniforms: { uRow: { int: 0 } },
+      output: layer.state[1],
+      rect: { x: 0, y: 0, width: V4, height: dk }
+    })
+    layer.state.reverse()
+    this.gpu.run({
+      name: "linear",
+      program: rd.program(R.rdaNorm(dv)),
+      inputs: { ...rd.inputs, uO: small.o, uNorm: layer.norm },
+      uniforms: { ...rd.uniforms, uZ: { int: C4 }, uEps: this.config.normEps },
+      output: t.out,
+      rect: { x: 0, y: 0, width: V4 / 2, height: rows }
+    })
+    return this.project(t.out, layer.outProj, b.opOut, rows)
+  }
+
+  /** recurrenceChunks for Raon Delta Attention (see gpu/raon-kernels.ts's chunked passes). */
+  private async deltaChunks(
+    layer: NonNullable<GpuLayer["linear"]>,
+    rows: number,
+    chunk: number,
+    paced: boolean,
+    saveAt?: number
+  ) {
+    const lin = this.linDims()
+    const t = this.buffers.lin
+    if (!lin || !t) throw new Error("The model's config has no Raon Delta Attention shapes.")
+    const c = this.linChunkBuffers(chunk)
+    const dk = lin.l.keyHeadDim
+    const dv = lin.l.valueHeadDim
+    const H4 = lin.H / 4
+    const K4 = lin.K / 4
+    const V4 = lin.V / 4
+    const both = this.mrt.lin
+    const wide = (lin.H * chunk) / 4
+    const first = saveAt ? saveAt % chunk || chunk : chunk
+    const run = (
+      program: string,
+      inputs: Record<string, Texture>,
+      output: Texture | Array<Texture>,
+      width: number,
+      uniforms: Record<string, { int: number }> = {},
+      rect?: { x: number; y: number; width: number; height: number },
+      work = 1
+    ) =>
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.program(program),
+        inputs,
+        uniforms: { uK4: { int: K4 }, uH4: { int: H4 }, uFirst: { int: first }, ...uniforms },
+        output,
+        rect: rect ?? { x: 0, y: 0, width, height: rows },
+        work
+      })
+    run(R.rdaCum(chunk), { uG: t.gates }, c.cum, K4, {}, undefined, chunk)
+    const gram = { uQK: t.qk, uG: t.gates, uCum: c.cum }
+    if (both) run(R.rdaGram({ keyHeadDim: dk, chunk, out: "both" }), gram, [c.a, c.p], wide, {}, undefined, dk)
+    else
+      for (const [out, tex] of [["a", c.a], ["p", c.p]] as const)
+        run(R.rdaGram({ keyHeadDim: dk, chunk, out }), gram, tex, wide, {}, undefined, dk)
+    run(K.linSolve(chunk), { uA: c.a }, c.t, wide, {}, undefined, chunk)
+    const shape = { keyHeadDim: dk, valueHeadDim: dv, chunk }
+    const uw = { uT: c.t, uQK: t.qk, uQKV: t.qkv, uG: t.gates, uCum: c.cum }
+    const qo = { uP: c.p, uU: c.u, uW: c.w, uQK: t.qk, uCum: c.cum }
+    if (both && dk === dv) {
+      run(R.rdaUW({ ...shape, out: "both" }), uw, [c.u, c.w], V4, {}, undefined, chunk)
+      run(R.rdaQO({ ...shape, out: "both" }), qo, [c.oi, c.qp], V4, {}, undefined, chunk)
+    } else {
+      run(R.rdaUW({ ...shape, out: "u" }), uw, c.u, V4, {}, undefined, chunk)
+      run(R.rdaUW({ ...shape, out: "w" }), uw, c.w, K4, {}, undefined, chunk)
+      run(R.rdaQO({ ...shape, out: "oi" }), qo, c.oi, V4, {}, undefined, chunk)
+      run(R.rdaQO({ ...shape, out: "q" }), qo, c.qp, K4, {}, undefined, chunk)
+    }
+    const heads = { keyHeadDim: dk, valueHeadDim: dv }
+    const end = (c0: number) => Math.min(c0 + (c0 === 0 ? first : chunk), rows)
+    for (let c0 = 0; c0 < rows;) {
+      const c1 = end(c0)
+      const outIn = { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp }
+      const rect = { x: 0, y: c0, width: V4, height: c1 - c0 }
+      if (both)
+        run(K.linChunkOut({ ...heads, out: "both" }), outIn, [t.delta, t.o], V4, {}, rect, dk)
+      else
+        for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const)
+          run(K.linChunkOut({ ...heads, out }), outIn, tex, V4, {}, rect, dk)
+      const stateIn = { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum }
+      const stateRect = { x: 0, y: 0, width: V4, height: dk }
+      const prefixRow = this.prefixSaving?.row
+      if (prefixRow !== undefined && c0 < prefixRow && prefixRow < c1) {
+        const copy = this.f32(lin.V, dk)
+        this.prefixSaving!.state.linear.push(copy)
+        run(R.rdaChunkState(heads), stateIn, copy, V4, { uC0: { int: c0 }, uC1: { int: prefixRow } }, stateRect, prefixRow - c0)
+      }
+      run(R.rdaChunkState(heads), stateIn, layer.state[1], V4, { uC0: { int: c0 }, uC1: { int: c1 } }, stateRect, c1 - c0)
+      layer.state.reverse()
+      if (c1 === saveAt) this.saving?.push(this.copyOf(layer.state[0]))
+      if (c1 === prefixRow) this.prefixSaving!.state.linear.push(this.copyOf(layer.state[0]))
+      if (paced) await this.charge(3 * lin.V * dk * (c1 - c0))
+      c0 = c1
+    }
+  }
+
+  /**
+   * Raon's gated MLA, absorbed (see LatentConfig): the first projection's
+   * q_a through its norm and q_b, each head's query into the latent (its
+   * own matrix) for the queries the attention reads; kv_a's normed latent
+   * and shared dims as the token's cache row (key and value alike); the
+   * attention as any other, over latent rows; then each head's attended
+   * latent through its own matrix, times the gate, and the out projection
+   * (whose split is returned).
+   */
+  private async latentAttend(
+    layer: NonNullable<GpuLayer["attention"]>,
+    latent: NonNullable<GpuLayer["latent"]>,
+    rows: number,
+    pos0: number,
+    input: Texture,
+    paced: boolean,
+    /** Sees the attention's queries, output and cache (for the self-check: see attentionError). */
+    probe?: (name: string, read: () => Promise<{ data: Float32Array; rows: number; dims: number; offset: number }>) => void | Promise<void>
+  ) {
+    const c = this.config
+    const b = this.buffers
+    const sb = b.streams
+    const l = c.latent
+    if (!l || !sb?.queryLatent || !sb.latentGate || !sb.latentOut) throw new Error("The model's config has no latent attention shapes.")
+    const qDims = c.numHeads * c.headDim
+    const out8 = (l.heads * l.valueDim) / 8
+    const split = await this.project(input, layer.qkvg, b.qkvg, rows)
+    const rd = this.reading("uIn", b.qkvg, split)
+    this.gpu.run({
+      name: "heads",
+      program: rd.program(R.latentNorm(l.queryRank)),
+      inputs: { ...rd.inputs, uNorm: layer.qNorm },
+      uniforms: { ...rd.uniforms, uEps: l.eps },
+      output: sb.queryLatent,
+      rect: { x: 0, y: 0, width: l.queryRank / 8, height: rows }
+    })
+    // A few rows: q_b's slices go beside the first projection's in the
+    // partial buffer, so the gate's rows are still there for the last pass
+    // (no pass of its own).
+    const gateAt = (l.queryRank + l.rank + l.shared) / 4
+    const few = split > 0 && TUNING.fuseLinear > 0 && layer.qkvg.groups + latent.qB.groups <= b.partial.width
+    if (!few)
+      this.gpu.run({
+        name: "heads",
+        program: rd.program(R.LATENT_GATE),
+        inputs: rd.inputs,
+        uniforms: { ...rd.uniforms, uBase: { int: gateAt } },
+        output: sb.latentGate,
+        rect: { x: 0, y: 0, width: out8, height: rows }
+      })
+    // The tokens' cache rows at positions pos0..., in runs split where a block of rows ends.
+    const kvWidth = this.kvWidth()
+    const blockRows = 2 ** this.kvShift
+    for (let m0 = 0; m0 < rows;) {
+      const slot = pos0 + m0
+      const row0 = slot % blockRows
+      const x0 = Math.floor(slot / blockRows) * kvWidth
+      const run = Math.min(rows - m0, blockRows - row0)
+      this.gpu.run({
+        name: "heads",
+        program: rd.program(R.latentKeys({ rank: l.rank, shared: l.shared })),
+        inputs: { ...rd.inputs, uNorm: layer.kNorm },
+        uniforms: { ...rd.uniforms, uBase: { int: l.queryRank / 4 }, uRowOffset: { int: row0 - m0 }, uXOff: { int: x0 }, uEps: l.eps },
+        output: layer.kv,
+        rect: { x: x0, y: row0, width: kvWidth, height: run }
+      })
+      m0 += run
+    }
+    const qX = few ? layer.qkvg.groups : 0
+    const qSplit = few
+      ? this.splitPartials(sb.queryLatent, latent.qB, rows, undefined, qX)
+      : await this.project(sb.queryLatent, latent.qB, b.gateUp, rows)
+    const rq = this.reading("uQ", b.gateUp, qSplit)
+    this.gpu.run({
+      name: "heads",
+      program: rq.program(R.latentQuery({ rank: l.rank, shared: l.shared, keyDim: l.keyDim })),
+      inputs: { ...rq.inputs, uKB: latent.kB },
+      uniforms: { ...rq.uniforms, uScale: c.attentionScale ?? 1 / Math.sqrt(l.keyDim), uQx: { int: qX } },
+      output: b.q,
+      rect: { x: 0, y: 0, width: qDims / 4, height: rows },
+      work: (l.keyDim - l.shared) / 4
+    })
+    await this.attention(layer, "full_attention", rows, pos0, 0, b.qkvg, paced, false)
+    await this.attentionRecheck(layer, "full_attention", rows, pos0, 0, b.qkvg, false)
+    if (probe) {
+      // What attentionError recomputes the attention from: the queries, its output, then the cache.
+      await probe("q", async () => ({ data: await this.gpu.read(b.q, { x: 0, y: 0, width: qDims / 4, height: rows }), rows, dims: qDims, offset: pos0 }))
+      await probe("attn_out", async () => {
+        this.gpu.run({
+          program: this.gpu.program(K.H2_TO_F32),
+          inputs: { uX: b.attnOut },
+          output: this.debugTexture(),
+          rect: { x: 0, y: 0, width: qDims / 4, height: rows }
+        })
+        return { data: await this.gpu.read(this.debugTexture(), { x: 0, y: 0, width: qDims / 4, height: rows }), rows, dims: qDims, offset: pos0 }
+      })
+      const keys = pos0 + rows
+      if (keys <= blockRows)
+        await probe("kv", async () => {
+          const width = (2 * c.headDim) / 4
+          if (this.kvDebug?.width !== width || this.kvDebug.height < keys) {
+            if (this.kvDebug) this.gpu.delete(this.kvDebug)
+            this.kvDebug = this.f32(2 * c.headDim, Math.max(keys, this.capacity))
+          }
+          this.gpu.run({
+            program: this.gpu.program(K.H2_TO_F32),
+            inputs: { uX: layer.kv },
+            output: this.kvDebug,
+            rect: { x: 0, y: 0, width, height: keys }
+          })
+          return { data: await this.gpu.read(this.kvDebug, { x: 0, y: 0, width, height: keys }), rows: keys, dims: 2 * c.headDim, offset: 0 }
+        })
+    }
+    const valueShape = { rank: l.rank, shared: l.shared, valueDim: l.valueDim }
+    this.gpu.run({
+      name: "heads",
+      program: few ? rd.program(R.latentValue({ ...valueShape, gate: "projection" })) : this.gpu.program(R.latentValue({ ...valueShape, gate: "h2" })),
+      inputs: few ? { ...rd.inputs, uA: b.attnOut, uVB: latent.vB } : { uA: b.attnOut, uVB: latent.vB, uGate: sb.latentGate },
+      ...(few && { uniforms: { ...rd.uniforms, uBase: { int: gateAt } } }),
+      output: sb.latentOut,
+      rect: { x: 0, y: 0, width: out8, height: rows },
+      work: l.rank / 8
+    })
+    return this.project(sb.latentOut, layer.o, b.opOut, rows)
+  }
+
   /**
    * Reads the model's tokens into the cache, from `this.position` on, and
    * returns the logits after the last one. `probe` sees each layer's
@@ -7087,6 +8033,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
    */
   private async forwardGuess() {
     if (this.position + 1 > this.contextLength) return
+    // A token's per-layer table row is read from the file, by its id: nothing to read ahead of the pick.
+    if (this.config.perLayer) return
     const at = this.position
     await this.forwardBatch([0], undefined, true)
     this.guessAt = at
@@ -7911,7 +8859,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const each = prescaled && TUNING.foldEach > 0
     const folds = (m?: GpuMatrix) =>
       !!m && (m.rgba4 || (m.bits === 4 && m.bytes) || !!m.stored || (each && m.bits === 8))
-    const canFold = rows <= SPLIT_ROWS && TUNING.foldNorm > 0 && !probe
+    // (Raon's streams go through their own passes: see forwardStreams.)
+    const canFold = rows <= SPLIT_ROWS && TUNING.foldNorm > 0 && !probe && !c.streams
     const opFolds = (l: GpuLayer) =>
       folds(l.conv?.inProj ?? l.attention?.qkvg ?? l.linear?.inProj) &&
       (!l.linear || folds(l.linear.ba))
@@ -8070,6 +9019,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     await look(-1, "embedding", b.residual[0], c.hiddenSize)
 
     const paced = rows > SPLIT_ROWS
+    if (c.streams) {
+      this.lastRowOnly = false
+      return this.forwardStreams(batch, pos0, probe, paced, decodeLayers, saveAt)
+    }
     // Only the last row's logits are asked for (see lastRowOnly).
     const lastRowOnly = TUNING.lastRowOnly > 0 && rows > SPLIT_ROWS && !probe && !fullRows
     this.lastRowOnly = lastRowOnly
