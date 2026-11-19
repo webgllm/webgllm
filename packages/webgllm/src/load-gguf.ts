@@ -525,14 +525,23 @@ export function packRows(
     }
     return
   }
-  const values = new Float32Array(rows * m.K)
-  rowsToFloats(info, bytes, rows, values)
-  if (perm) {
-    const src = values.slice()
-    for (let i = 0; i < rows; i++)
-      values.set(src.subarray(perm[i] * m.K, (perm[i] + 1) * m.K), i * m.K)
+  // Each row from where the tensor has it: perm may pick among more rows
+  // than the part takes (Qwen3.5's queries and gates are halves of one
+  // tensor), so the rows are found in the tensor's bytes, not among the
+  // first `rows` of them.
+  const rowBytes = tensorByteLength(info.type, [m.K, 1])
+  if (floatScratch.length < FLOAT_ROWS * m.K) floatScratch = new Float32Array(FLOAT_ROWS * m.K)
+  for (let r = 0; r < rows; r += FLOAT_ROWS) {
+    const count = Math.min(FLOAT_ROWS, rows - r)
+    const values = floatScratch.subarray(0, count * m.K)
+    for (let i = 0; i < count; i++) {
+      const from = perm[r + i]
+      if (from < 0 || (from + 1) * rowBytes > bytes.length)
+        throw new Error(`GGUF: ${info.name} has no row ${from}`)
+      rowsToFloats(info, bytes.subarray(from * rowBytes, (from + 1) * rowBytes), 1, values.subarray(i * m.K, (i + 1) * m.K))
+    }
+    quantizeQ8(m, row0 + r, values, count)
   }
-  quantizeQ8(m, row0, values, rows)
 }
 
 /** F32, F16, Q4_1, Q4_K, Q5_K, Q6_K or Q8_0 rows as floats. */

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { loadGguf } from "./load-gguf.js"
+import { loadGguf, packRows, rowsToFloats } from "./load-gguf.js"
 import { GgmlType } from "./gguf.js"
 import type { GgufHeader, GgufTensorInfo, GgufValue } from "./gguf.js"
 import { modelMeta, WEBGL_TEXT_MODELS } from "./model-meta.js"
 import type { WeightPiece } from "./weights.js"
+import { toHalf } from "./half.js"
+import { matrixRow, newQuantMatrix } from "./repack.js"
 
 function fixture(arch = "lfm2", sliding = 0) {
   const tensors = new Map<string,GgufTensorInfo>(), chunks:Uint8Array[]=[]
@@ -124,4 +126,73 @@ test("only the layers whose q/k rows the loader reorders say so: LFM's full atte
   const cfg = qwen.find((p) => p.kind === "config"); assert.ok(cfg?.kind === "config"); assert.deepEqual(cfg.config.layerTypes, ["linear_attention", "full_attention"])
   assert.ok(cfg.config.ropeDimsFull < cfg.config.headDim, "partial RoPE, where a reorder would change the rows")
   assert.deepEqual(flags(qwen), [["linear", false], ["attention", false]], "Qwen's q/k keep their layout")
+})
+
+test("a Qwen3.5 attention matrix of mixed tensor types takes every head's query and gate rows from where the tensor has them", async () => {
+  // attn_q as F32, a value a row (per head: its query rows, then its gate rows), beside Q4_0 k and v: the parts go through floats.
+  const f = qwenFixture()
+  const q = f.header.tensors.get("blk.1.attn_q.weight")
+  assert.ok(q)
+  const K = 32, tensorRows = 64, headDim = 16
+  const rowValue = (r: number) => 0.015625 * (r + 1)
+  const floats = new Float32Array(K * tensorRows)
+  for (let r = 0; r < tensorRows; r++) floats.fill(rowValue(r), r * K, (r + 1) * K)
+  const eight = (name: string, rows: number, value: number) => new Float32Array(K * rows).fill(value)
+  const extra = [
+    { name: "blk.1.attn_q.weight", data: floats, rows: tensorRows },
+    { name: "blk.1.attn_k.weight", data: eight("k", 16, 0.25), rows: 16 },
+    { name: "blk.1.attn_v.weight", data: eight("v", 16, 0.5), rows: 16 }
+  ]
+  const old = new Uint8Array(await f.source.read(0, f.source.size))
+  let size = old.length
+  const chunks = [old]
+  for (const e of extra) {
+    const bytes = new Uint8Array(e.data.buffer)
+    f.header.tensors.set(e.name, { name: e.name, dims: [K, e.rows], type: GgmlType.F32, offset: size, byteLength: bytes.length })
+    chunks.push(bytes)
+    size += bytes.length
+  }
+  const all = new Uint8Array(size)
+  let at = 0
+  for (const c of chunks) { all.set(c, at); at += c.length }
+  const pieces: WeightPiece[] = []
+  for await (const p of loadGguf({ size, async read(offset: number, length: number) { return all.slice(offset, offset + length) } }, { header: f.header, embeddingChunkRows: 4 })) pieces.push(p)
+  const layer = pieces.find((p) => p.kind === "layer" && p.value.attention)
+  assert.ok(layer?.kind === "layer" && layer.value.attention)
+  const m = layer.value.attention.qkvg
+  assert.equal(m.bits, 8)
+  const near = (got: number, want: number, what: string) => assert.ok(Math.abs(got - want) <= want / 100, `${what}: ${got}, not ${want}`)
+  for (let r = 0; r < 32; r++) {
+    const head = Math.floor(r / headDim), d = r % headDim
+    const query = matrixRow(m, r), gate = matrixRow(m, 32 + 16 + 16 + r)
+    assert.ok(query && gate)
+    near(query[0], rowValue(head * 2 * headDim + d), `head ${head}'s query row ${d}`)
+    near(gate[K - 1], rowValue(head * 2 * headDim + headDim + d), `head ${head}'s gate row ${d}`)
+  }
+})
+
+test("rows picked from beyond a part's own count are the tensor's rows, for a type packed through floats", () => {
+  // Q4_1: 32 weights a block (a half scale, a half minimum, 16 bytes of nibbles), so a row of 32 is a block.
+  const K = 32, tensorRows = 8, rows = 4
+  const bytes = new Uint8Array(tensorRows * 20)
+  const view = new DataView(bytes.buffer)
+  for (let r = 0; r < tensorRows; r++) {
+    view.setUint16(r * 20, toHalf(0.01 * (r + 1)), true)
+    view.setUint16(r * 20 + 2, toHalf(-0.05 * (r + 1)), true)
+    for (let i = 0; i < 16; i++) bytes[r * 20 + 4 + i] = ((r * 7 + i * 3) & 15) | (((r + i * 5) & 15) << 4)
+  }
+  const info = { name: "w", dims: [K, tensorRows], type: GgmlType.Q4_1, offset: 0, byteLength: bytes.length }
+  const want = new Float32Array(tensorRows * K)
+  rowsToFloats(info, bytes, tensorRows, want)
+  const perm = Int32Array.of(4, 5, 6, 7)
+  const m = newQuantMatrix(rows, K, 8, false)
+  packRows(m, 0, info, bytes, rows, perm)
+  for (let i = 0; i < rows; i++) {
+    const got = matrixRow(m, i)
+    assert.ok(got)
+    let peak = 0
+    for (let k = 0; k < K; k++) peak = Math.max(peak, Math.abs(want[perm[i] * K + k]))
+    for (let k = 0; k < K; k++) assert.ok(Math.abs(got[k] - want[perm[i] * K + k]) <= peak / 100, `row ${i}, weight ${k}`)
+  }
+  assert.throws(() => packRows(m, 0, info, bytes, rows, Int32Array.of(0, 1, 2, 8)), /no row 8/)
 })
