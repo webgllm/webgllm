@@ -115,10 +115,13 @@ export class ModelWorker {
     readonly model: string,
     private readonly worker: Worker,
     private readonly owned: boolean,
-    private readonly events: WorkerEvents
+    private readonly events: WorkerEvents,
+    /** WebGLLMOptions.webgpu: false is sent before anything else (and so before any load); "auto" is the worker's default. */
+    webgpu: "auto" | false = "auto"
   ) {
     worker.addEventListener("message", this.onMessage)
     worker.addEventListener("error", this.onError)
+    if (webgpu === false) this.post({ type: "configure", webgpu })
   }
 
   get loading(): boolean {

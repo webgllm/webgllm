@@ -25,6 +25,8 @@ export type PoolOptions = {
   worker?: Worker
   /** Bytes all loaded models may take together. */
   memoryBudget: () => number
+  /** WebGLLMOptions.webgpu: false loads on WebGL 2 even where there's WebGPU. */
+  webgpu?: "auto" | false
   storage: ModelStorage
   /** Every load's and download's progress (the instance's listeners). */
   onProgress: (progress: LoadProgress) => void
@@ -526,7 +528,7 @@ export class ModelPool {
   /** `model`'s side of a worker: the caller's, else one started for it. */
   private modelWorker(model: string, events: WorkerEvents): ModelWorker {
     const given = this.options.worker
-    return new ModelWorker(model, given ?? this.options.createWorker(), !given, events)
+    return new ModelWorker(model, given ?? this.options.createWorker(), !given, events, this.options.webgpu ?? "auto")
   }
 
   /**

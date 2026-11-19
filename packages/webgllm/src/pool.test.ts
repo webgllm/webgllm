@@ -14,7 +14,7 @@ const C = "LiquidAI/LFM3-1.7B-GGUF"
 
 const fields = { chat: [{ role: "user" as const, content: "hi" }], tools: [], sampling: { temperature: 0, top_k: 1, repetition_penalty: 1 } }
 
-function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>; onMemoryClaim?: PoolOptions["onMemoryClaim"]; worker?: Worker } = {}) {
+function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>; onMemoryClaim?: PoolOptions["onMemoryClaim"]; worker?: Worker; webgpu?: "auto" | false } = {}) {
   const workers = fakeWorkers({ bytes: () => 60, ...options })
   const progress: Array<LoadProgress> = []
   const logs: Array<string> = []
@@ -28,6 +28,7 @@ function pool(options: FakeOptions & { budget?: number; downloaded?: Set<string>
     onModelEvent: (event) => events.push(event),
     ...(options.onMemoryClaim && { onMemoryClaim: options.onMemoryClaim }),
     ...(options.worker && { worker: options.worker }),
+    ...(options.webgpu !== undefined && { webgpu: options.webgpu }),
     log: (_, text) => logs.push(text)
   })
   return { pool: p, workers, progress, logs, storage, events }
@@ -795,4 +796,13 @@ test("a worker of the caller's: completions take turns, so a second model's does
   await Promise.all([a, b])
   assert.deepEqual(worker.generations().map((g) => g.model), [A, B])
   assert.deepEqual(worker.sent.filter((m) => m.type === "load").map((m) => m.model), [A, B])
+})
+
+test("webgpu false is sent to each worker before its load; auto sends nothing", async () => {
+  const off = pool({ webgpu: false })
+  await off.pool.load(A)
+  assert.deepEqual(off.workers.workers[0]?.sent.slice(0, 2).map(({ type, webgpu }: { type: string; webgpu?: unknown }) => ({ type, webgpu })), [{ type: "configure", webgpu: false }, { type: "load", webgpu: undefined }])
+  const auto = pool({ webgpu: "auto" })
+  await auto.pool.load(A)
+  assert.ok(!auto.workers.workers[0]?.sent.some(({ type }: { type: string }) => type === "configure"))
 })

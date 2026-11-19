@@ -444,6 +444,8 @@ export async function probeSpeed(
     onEngine?: (engine: Engine | null) => void
     /** false: the prompt alone (writing and the head untimed: decodeLayers NaN, the head's times 0). */
     decode?: boolean
+    /** false: on WebGL 2 even where there's WebGPU (WebGLLMOptions.webgpu). */
+    webgpu?: boolean
   } = {}
 ): Promise<Omit<ProbeReport, "shapeMs">> {
   const { signal, onEngine, decode = true } = options
@@ -451,7 +453,7 @@ export async function probeSpeed(
   // As the worker makes its engine (handler.ts load): on WebGPU where the
   // browser has it (WebGL 2 elsewhere, or on a canvas handed in), the same
   // batch, the model's own context length (the cache starts small and grows).
-  const webgpu = !options.canvas && TUNING.webgpu > 0 ? await WebGpu.create().catch(() => null) : null
+  const webgpu = !options.canvas && TUNING.webgpu > 0 && options.webgpu !== false ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(options.canvas ?? new OffscreenCanvas(1, 1), {
     ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH

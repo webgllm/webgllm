@@ -95,6 +95,12 @@ export type TokenLogprob = {
 
 export type WorkerRequest =
   | {
+      /** Settings for every load in this worker from now on (WebGLLMOptions'). */
+      type: "configure"
+      /** false: WebGL 2 even where the browser has WebGPU. */
+      webgpu: "auto" | false
+    }
+  | {
       type: "load"
       model: string
       /**

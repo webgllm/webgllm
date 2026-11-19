@@ -116,8 +116,11 @@ export interface LogitProcessor {
 let logitProcessors: Map<string, LogitProcessor> | undefined
 
 const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
-  "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune"
+  "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune", "configure"
 ])
+
+/** Whether loads may run on WebGPU (WebGLLMOptions.webgpu: "configure" with false says not). */
+let webgpuAllowed = true
 
 /**
  * Whether a message is one of the page's requests: marked as webgllm's
@@ -134,6 +137,7 @@ function isRequest(data: unknown): data is WorkerRequest {
   }
   if (type === "generate" || type === "forward" || type === "reset" || type === "stop" || type === "download") return typeof id === "string"
   if (type === "claimed" || type === "unload") return typeof id === "number"
+  if (type === "configure") return (data as { webgpu?: unknown }).webgpu === "auto" || (data as { webgpu?: unknown }).webgpu === false
   return true
 }
 
@@ -387,7 +391,7 @@ async function load(
     timings[name] = Math.round(now - mark)
     mark = now
   }
-  const webgpu = TUNING.webgpu > 0 && !webgl ? await WebGpu.create().catch(() => null) : null
+  const webgpu = TUNING.webgpu > 0 && webgpuAllowed && !webgl ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(new OffscreenCanvas(1, 1), {
     ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
@@ -1890,6 +1894,8 @@ function receive(data: WorkerRequest) {
     claims.get(data.id)?.resolve()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
+  } else if (data.type === "configure") {
+    webgpuAllowed = data.webgpu !== false
   } else if (data.type === "load") {
     // After the generations asked for before it: another context length
     // frees the engine they run on. Each answer names its load.

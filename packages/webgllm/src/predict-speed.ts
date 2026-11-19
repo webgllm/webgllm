@@ -37,6 +37,8 @@ export type PredictSpeedOptions = {
    * about 1.6 s this way, where 2.1 s with writing.
    */
   decode?: boolean
+  /** As WebGLLMOptions.webgpu: false measures on WebGL 2 even where there's WebGPU. */
+  webgpu?: "auto" | false
   signal?: AbortSignal
 }
 
@@ -64,13 +66,16 @@ export type PredictSpeedOptions = {
 export async function predictSpeed(model: WebGlModelId, options: PredictSpeedOptions = {}): Promise<SpeedPrediction> {
   throwIfAborted(options.signal)
   if (typeof model !== "string" || !model) throw new TypeError("model is required.")
-  const remembered = !options.force && inPage.get(model)
+  if (options.webgpu !== undefined && options.webgpu !== "auto" && options.webgpu !== false)
+    throw new TypeError(`webgpu must be "auto" or false.`)
+  const pageKey = `${model}|${options.webgpu === false ? "webgl" : "auto"}`
+  const remembered = !options.force && inPage.get(pageKey)
   if (remembered && (options.decode === false || remembered.decode !== undefined)) return remembered
   const run = typeof document !== "undefined" && typeof Worker !== "undefined"
     ? inWorker(model, options).then((r) => r.prediction)
     : predictHere(model, options).then((r) => r.prediction)
   const prediction = await run
-  inPage.set(model, prediction)
+  inPage.set(pageKey, prediction)
   return prediction
 }
 
@@ -79,7 +84,7 @@ const inPage = new Map<string, SpeedPrediction>()
 
 /** What a worker of predictSpeed's own is sent, and answers. */
 export type SpeedWorkerRequest =
-  | { type: "predict-speed"; model: string; force: boolean; decode?: boolean }
+  | { type: "predict-speed"; model: string; force: boolean; decode?: boolean; webgpu?: "auto" | false }
   | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
 export type SpeedWorkerReply =
   | { type: "speed"; prediction: SpeedPrediction; report: SpeedReport }
@@ -120,7 +125,7 @@ export function inWorker(
       done()
       reject(new Error(event.message || "predictSpeed's worker failed to start."))
     }
-    post({ type: "predict-speed", model, force: !!options.force, decode: options.decode !== false })
+    post({ type: "predict-speed", model, force: !!options.force, decode: options.decode !== false, ...(options.webgpu === false && { webgpu: false as const }) })
   })
 }
 
@@ -138,12 +143,12 @@ export type SpeedStore = {
 
 /** What predictHere runs on: the real ones, or a test's. */
 export type SpeedDeps = {
-  /** This GPU's renderer string (as GPU notes key it). */
-  renderer: () => string
+  /** This GPU's renderer string (as GPU notes key it), and the backend a model runs on (`webgpu` false: WebGL 2). */
+  renderer: (webgpu?: boolean) => string
   userAgent: string
   store: SpeedStore
   /** Shapes, then timings: the GPU's part (`decode` false: the prompt's alone). */
-  measure: (model: string, signal?: AbortSignal, decode?: boolean) => Promise<{ shape: SpeedShape; report: ProbeReport }>
+  measure: (model: string, signal?: AbortSignal, decode?: boolean, webgpu?: boolean) => Promise<{ shape: SpeedShape; report: ProbeReport }>
 }
 
 /** FNV-1a of a string, as hex (as the worker's note keys). */
@@ -282,8 +287,8 @@ async function writeShape(key: string, shape: SpeedShape) {
  * model's worker runs on here (WebGPU where the browser has it: see
  * TUNING.webgpu), so a prediction made on one isn't kept for the other.
  */
-function rendererHere() {
-  const backend = TUNING.webgpu > 0 && typeof navigator !== "undefined" && "gpu" in navigator ? "webgpu" : "webgl"
+function rendererHere(webgpu = true) {
+  const backend = webgpu && TUNING.webgpu > 0 && typeof navigator !== "undefined" && "gpu" in navigator ? "webgpu" : "webgl"
   return `${webglRenderer()}|${backend}`
 }
 
@@ -305,7 +310,7 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
   renderer: rendererHere,
   userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
   store: opfsSpeedStore,
-  measure: async (model, signal, decode = true) => {
+  measure: async (model, signal, decode = true, webgpu = true) => {
     const started = performance.now()
     const meta = await resolveModel(model, signal)
     // (The shapes remembered from an earlier measurement of the same files:
@@ -316,7 +321,7 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
     void writeShape(shapeKey, shape)
     const shapeMs = performance.now() - started
     throwIfAborted(signal)
-    const report = await probeSpeed(shape, { signal, onEngine, decode })
+    const report = await probeSpeed(shape, { signal, onEngine, decode, webgpu })
     return { shape, report: { ...report, shapeMs } }
   }
 })
@@ -333,7 +338,8 @@ export function predictHere(
   options: PredictSpeedOptions = {},
   deps: SpeedDeps = realSpeedDeps()
 ): Promise<{ prediction: SpeedPrediction; report: SpeedReport }> {
-  const key = speedKey(deps.renderer(), deps.userAgent, model)
+  const webgpu = options.webgpu !== false
+  const key = speedKey(deps.renderer(webgpu), deps.userAgent, model)
   const decode = options.decode !== false
   // (A prompt-only measurement doesn't answer a call that wants writing too.)
   const running = pending.get(`${key}|${decode}`) ?? (decode ? undefined : pending.get(`${key}|true`))
@@ -344,7 +350,7 @@ export function predictHere(
       if (note && (!decode || note.decode !== undefined))
         return { prediction: { prompt: note.prompt, ...(note.decode !== undefined && { decode: note.decode }) }, report: { cached: true as const } }
     }
-    const { shape, report } = await deps.measure(model, options.signal, decode)
+    const { shape, report } = await deps.measure(model, options.signal, decode, webgpu)
     const prediction = speedFromTimes(report.times, shape.config.layerTypes, shape.config.vocabSize)
     await deps.store.write(key, { ...prediction, at: Date.now() })
     return { prediction, report: { ...report, cached: false as const } }
