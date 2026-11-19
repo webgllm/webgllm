@@ -26,6 +26,7 @@ import { halfTable, bytesToFloats, halvesToFloats } from "./half.js"
 import {
   GgmlType,
   readGgufHeader,
+  tensorByteLength,
   type GgufHeader,
   type GgufTensorInfo,
   type GgufValue
@@ -469,6 +470,10 @@ export function bitsOf(info: GgufTensorInfo): 4 | 8 {
   }
 }
 
+/** Rows converted through floats at a time, and their buffer (see packRows). */
+const FLOAT_ROWS = 32
+let floatScratch = new Float32Array(0)
+
 function packRows(
   m: QuantMatrix,
   row0: number,
@@ -479,6 +484,20 @@ function packRows(
 ): void {
   if (info.type === GgmlType.Q4_0) return packQ4_0(m, row0, bytes, rows, perm)
   if (info.type === GgmlType.Q8_0) return packQ8_0(m, row0, bytes, rows, perm)
+  if (!perm) {
+    // A few rows at a time through one small reused buffer: a float copy of
+    // the whole tensor (16 MB for each of Qwen3.5 2B's Q5_K ssm_out) was
+    // fresh memory touched for every tensor, most of the conversion's time.
+    const rowBytes = tensorByteLength(info.type, [m.K, 1])
+    if (floatScratch.length < FLOAT_ROWS * m.K) floatScratch = new Float32Array(FLOAT_ROWS * m.K)
+    for (let r = 0; r < rows; r += FLOAT_ROWS) {
+      const count = Math.min(FLOAT_ROWS, rows - r)
+      const values = floatScratch.subarray(0, count * m.K)
+      rowsToFloats(info, bytes.subarray(r * rowBytes, (r + count) * rowBytes), count, values)
+      quantizeQ8(m, row0 + r, values, count)
+    }
+    return
+  }
   const values = new Float32Array(rows * m.K)
   rowsToFloats(info, bytes, rows, values)
   if (perm) {

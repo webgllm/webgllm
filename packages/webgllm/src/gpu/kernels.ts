@@ -481,7 +481,38 @@ function dequantBytesSource(o: {
   packed?: boolean
   /** h2 output texels (see dequantOut). */
   h2?: boolean
+  /** 8-bit byte texels (RGBA8I: a row's block, 8 texels of 4 signed weights), times the block's scale. */
+  eight?: boolean
 }) {
+  if (o.eight) return dequantOut(o.h2, `${HEADER}
+uniform isampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq + uKq0;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  o = vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0)) * d;
+}`)
   return dequantOut(o.h2, `${HEADER}
 uniform ${o.unorm ? "sampler2D" : "usampler2D"} uW;
 uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;

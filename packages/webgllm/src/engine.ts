@@ -333,6 +333,8 @@ export const TUNING = {
    * the M3 Ultra and the same on the iPhone; word texels slower on all.
    */
   wordEmbedding: 1,
+  /** WebGL: 8-bit layer matrices' prompts through the f16 scratch (K.dequantBytes's eight), not a pair matmul (set before the model loads). */
+  glScratch8: 1,
   /**
    * 4-bit layer weights in RGBA4 textures (1) or byte textures (0); -1:
    * whichever this GPU writes faster (timed at load; see chooseLayout).
@@ -437,12 +439,14 @@ export const TUNING = {
    * With foldNorm 2: each norm folds on its own (the feed-forward's even
    * where the operator's matmuls can't), and 8-bit split matmuls fold the
    * prescaled input too (Qwen3.5 GGUF's Q8_0 beta|alpha): no norm passes.
-   * 0: a layer folds both norms or neither, 4-bit matmuls only. Off: on
-   * an iPhone 16 Pro Max (Qwen3.5 GGUF, sweep alternated in one page) it
-   * wrote 1.6% slower (32.5 against 32.0 GPU ms a token) and read prompts
-   * slower, though an M3 wrote 5% faster.
+   * 0: a layer folds both norms or neither, 4-bit matmuls only. Only a
+   * model with 8-bit matrices on WebGL is affected (stored ones fold
+   * anyway): Qwen3.5 2B GGUF wrote 3-5% faster with it in Firefox on a
+   * Pixel 10 Pro (5.5-6.0 tokens/s against 5.3-5.8), 2-3% on an M3 Ultra's
+   * WebGL, the same on an iPhone 16 Pro Max's (an earlier sweep there had
+   * it 1.6% slower).
    */
-  foldEach: 0,
+  foldEach: 1,
   /** 1: writing sizes its attention chunks by the key count (see attend). */
   attendDecodeChunking: 1,
   /**
@@ -4430,7 +4434,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** The f16 scratch 8-bit matrix `w` goes through into `out` (a 4-token matmul's output: it has a second texture), or false. */
   private eightScratch(w: GpuMatrix, out: Texture) {
-    if (w.bits !== 8 || !w.stored || !this.quads.has(out.id) || TUNING.quad <= 0 || !this.usesF16() || !(this.f16Pack() & 2)) return false
+    if (w.bits !== 8 || !this.quads.has(out.id) || TUNING.quad <= 0 || !this.usesF16()) return false
+    if (!w.stored) {
+      // WebGL: 8-bit byte texels dequantized into the f16 scratch too
+      // (K.dequantBytes's eight), not a pair matmul (TUNING.glScratch8).
+      if (!w.bytes || TUNING.glScratch8 <= 0) return false
+      const f = this.f16Scratch()
+      return f && w.K <= f.kMax ? f : false
+    }
+    if (!(this.f16Pack() & 2)) return false
     const f = this.f16Scratch()
     return f && this.eightTakesF16(w, f) ? f : false
   }
@@ -4693,7 +4705,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
                 words: !w.bytes,
                 unorm: w.unorm,
                 packed: w.packed,
-                h2: h2W
+                h2: h2W,
+                eight
               })
         )
         const multiply = this.gpu.program(

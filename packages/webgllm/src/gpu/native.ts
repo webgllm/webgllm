@@ -173,6 +173,12 @@ export function wordHead(o: { split: boolean; prescaled: boolean; kbSlice: numbe
   ]
   const C = "xyzw"
   const texels = 32 * o.kbSlice
+  // A word's 4 six-bit weights as unpack4x8unorm's n / 255 (one
+  // instruction where two half unpacks and masks were: a Pixel 10 Pro wrote
+  // Qwen3.5 2B GGUF at 14.1-15.1 tokens/s where 12.0-12.7, an M3 Ultra and
+  // an iPhone 16 Pro Max the same); the 255 and the -32 come out once per
+  // group, the -32 through the activations' sum (sA), shared by the 4 rows.
+  const V = "unpack4x8unorm"
   const rowBlock = (r: number) => `      {
 ${o.ordered ? `        let t = wx + sb * 52 + 4 + q * 12 + ${r * 3};
         let QA = textureLoad(tW, vec2<i32>(t, gr), 0);
@@ -183,7 +189,8 @@ ${o.ordered ? `        let t = wx + sb * 52 + 4 + q * 12 + ${r * 3};
         let QH = textureLoad(tW, vec2<i32>(t + qh, gr), 0);`}
         let SS = select(S${r}.zw, S${r}.xy, n == 0);
         var p = vec4<f32>(0.0);
-${[0, 1, 2, 3].map((wi) => `        p += vec4<f32>(dot(q6v(q6g0(QA.${C[wi]}, QH.${C[wi]})), A${wi}0), dot(q6v(q6g1(QB.${C[wi]}, QH.${C[wi]})), A${wi}1), dot(q6v(q6g2(QA.${C[wi]}, QH.${C[wi]})), A${wi}2), dot(q6v(q6g3(QB.${C[wi]}, QH.${C[wi]})), A${wi}3));`).join("\n")}
+${[0, 1, 2, 3].map((wi) => `        p += vec4<f32>(dot(${V}(q6g0(QA.${C[wi]}, QH.${C[wi]})), A${wi}0), dot(${V}(q6g1(QB.${C[wi]}, QH.${C[wi]})), A${wi}1), dot(${V}(q6g2(QA.${C[wi]}, QH.${C[wi]})), A${wi}2), dot(${V}(q6g3(QB.${C[wi]}, QH.${C[wi]})), A${wi}3));`).join("\n")}
+        p = 255.0 * p - 32.0 * sA;
         P.${C[r]} += dot(p, vec4<f32>(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));
       }`
   const code = `
@@ -195,11 +202,6 @@ struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, g: i32, outW: i32
 ${o.prescaled ? "@group(0) @binding(4) var tR: texture_2d<f32>;" : ""}
 @group(0) @binding(${inputs.length + 1}) var out0: texture_storage_2d<rgba32float, write>;
 var<workgroup> act: array<vec4<u32>, ${texels}>;
-fn q6v(q: u32) -> vec4<f32> {
-  let e = unpack2x16float((q & 0x00FF00FFu) | 0x64006400u);
-  let f = unpack2x16float(((q >> 8u) & 0x00FF00FFu) | 0x64006400u);
-  return vec4<f32>(e.x, f.x, e.y, f.y) - 1056.0;
-}
 fn q6g0(a: u32, h: u32) -> u32 { return (a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4u); }
 fn q6g1(b: u32, h: u32) -> u32 { return (b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2u); }
 fn q6g2(a: u32, h: u32) -> u32 { return ((a >> 4u) & 0x0F0F0F0Fu) | (h & 0x30303030u); }
@@ -247,6 +249,8 @@ ${[0, 1].flatMap((wp) => [0, 1, 2, 3].map((gg) => `        let u${wp}${gg} = act
         let qh = 8 + 2 * n + hw;
         let b0 = u32(hw);
         let b2 = u32(hw + 2);
+        let one = vec4<f32>(1.0);
+        let sA = vec4<f32>(${[0, 1, 2, 3].map((g) => `dot(A0${g} + A1${g} + A2${g} + A3${g}, one)`).join(", ")});
 ${[0, 1, 2, 3].map(rowBlock).join("\n")}
       }
       acc += d * P;
@@ -280,7 +284,7 @@ ${o.prescaled ? `    var s = vec4<f32>(0.0);
  * unpack4x8unorm splits a word's 4 nibbles at once, as expandedHead's
  * bytes (the 255 it divides by comes out once a block). Threads splitting
  * K within the workgroup (2 to 8 a texel) didn't speed it up on an M3
- * Ultra; the half-float split of q6v was no faster anywhere.
+ * Ultra; a half-float split of the nibbles was no faster anywhere.
  */
 export function q4WordHead(o: { split: boolean; prescaled: boolean; kbSlice: number; zeros: boolean }): NativeSpec {
   const inputs: NativeSpec["inputs"] = [
