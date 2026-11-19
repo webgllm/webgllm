@@ -3,7 +3,7 @@ import test from "node:test"
 import { GgmlType } from "./gguf.js"
 import type { GgufHeader, GgufTensorInfo, GgufValue } from "./gguf.js"
 import { loadGguf } from "./load-gguf.js"
-import type { WeightPiece } from "./weights.js"
+import type { QuantMatrix, WeightPiece } from "./weights.js"
 
 /**
  * A two-layer raon1nano file in float32, shaped as KRAFTON's converter
@@ -150,4 +150,46 @@ test("an _MTP file's extra block is left out", async () => {
   assert.ok(config?.kind === "config")
   assert.equal(config.config.numLayers, 2)
   assert.equal(pieces.filter((p) => p.kind === "layer").length, 2)
+})
+
+test("predictSpeed's shape of a Raon-1 nano GGUF, and the probe model made from it, are the loader's: every matrix's size and storage, every vector's length", async () => {
+  const { ggufHeaderSpeedShape, probePieces, probePerLayerSource, probeConfig } = await import("./speed-probe.js")
+  const { raonMatrixStorage } = await import("./load-raon.js")
+  const f = fixture()
+  const shape = ggufHeaderSpeedShape(f.header)
+  assert.deepEqual(shape.kinds.map((k) => k.type), ["linear_attention", "full_attention"])
+  assert.deepEqual(Object.keys(shape.kinds[0].matrices).sort(), ["ba", "decay", "down", "gateUp", "inProj", "mixFfn", "mixOperator", "outProj", "perLayerGate", "perLayerProj"])
+  assert.deepEqual(Object.keys(shape.kinds[1].matrices).sort(), ["down", "gateUp", "latentIn", "mixFfn", "mixOperator", "o", "perLayerGate", "perLayerProj", "qB"])
+  assert.ok(shape.perLayer)
+
+  // What a piece is made of: each matrix as [rows, columns, bits, half zero points], each other array's length.
+  const describe = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") return value
+    if (ArrayBuffer.isView(value)) return (value as unknown as { length: number }).length
+    const m = value as Partial<QuantMatrix>
+    if (m.quants && m.scales) return [m.N, m.K, m.bits, !!m.zeroHalves]
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, describe(v)]))
+  }
+  const real = await collect(f)
+  const probe: Array<WeightPiece> = []
+  for await (const piece of probePieces(shape)) probe.push(piece)
+  const layersOf = (pieces: Array<WeightPiece>) => pieces.flatMap((p) => (p.kind === "layer" ? [describe(p.value)] : []))
+  assert.deepEqual(layersOf(probe), layersOf(real))
+  const tableOf = (pieces: Array<WeightPiece>) => pieces.flatMap((p) => (p.kind === "perLayer" ? [{ proj: describe(p.proj), norm: p.norm.length, rowBytes: p.table.rowBytes, type: p.table.type }] : []))
+  assert.deepEqual(tableOf(probe), tableOf(real))
+  const head = (pieces: Array<WeightPiece>) => pieces.flatMap((p) => (p.kind === "embedding" ? [[p.value.K, p.value.bits]] : []))[0]
+  assert.deepEqual(head(probe), head(real))
+  // A token's row for the probe's engine: as many bytes as the table's rows have.
+  const table = probe.find((p) => p.kind === "perLayer")
+  assert.ok(table?.kind === "perLayer")
+  const source = probePerLayerSource(shape)
+  assert.ok(source)
+  assert.equal((await source.read(3 * table.table.rowBytes, table.table.rowBytes)).length, table.table.rowBytes)
+  assert.equal(probeConfig(shape).perLayer?.layers, 2)
+
+  // Q4_K parts alone keep 4 bits (rows of whole super-blocks); anything else is 8-bit here.
+  const t = (type: number) => ({ name: "t", dims: [256, 4], type, offset: 0, byteLength: 0 })
+  assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K)], 256), { bits: 4, halves: true })
+  assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K), t(GgmlType.Q6_K)], 256), { bits: 8, halves: false })
+  assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K)], 96), { bits: 8, halves: false })
 })

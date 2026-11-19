@@ -1521,7 +1521,7 @@ export class Engine {
     const c = this.config
     const D = c.hiddenSize
     const S = c.streams!.count
-    const ple = c.perLayer ? c.perLayer.dim * c.numLayers : 0
+    const ple = c.perLayer ? c.perLayer.dim * (c.perLayer.layers ?? c.numLayers) : 0
     const l = c.latent
     return {
       /** The streams one after another, f32; the other is written by each mix. */
@@ -7080,7 +7080,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const c = this.config
     if (!p || !c.perLayer) throw new Error("The model's weights have no per-layer embeddings.")
     if (!source) throw new Error("The model's per-layer embeddings have no file to be read from (Engine.perLayerSource).")
-    const width = c.perLayer.dim * c.numLayers
+    const width = c.perLayer.dim * (c.perLayer.layers ?? c.numLayers)
     const info = { name: "per_layer_token_embd.weight", dims: [width, 1], type: p.table.type, offset: 0, byteLength: p.table.rowBytes }
     const missing = new Set<number>()
     for (let i = 0; i < tokens.length; i++) {
@@ -7268,7 +7268,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const T = D / 4
     const S = c.streams.count
     const P = c.perLayer.dim
-    const inputs4 = (P * c.numLayers) / 4
+    const inputs4 = (P * (c.perLayer.layers ?? c.numLayers)) / 4
     const look = async (layer: number, name: string, tex: Texture, dims: number, h2 = false) => {
       if (!probe) return
       await probe(layer, name, async () => {
@@ -7311,7 +7311,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       rect: { x: 0, y: 0, width: inputs4, height: rows },
       work: P / 4
     })
-    await look(-1, "per_layer_inputs", sb.inputs, P * c.numLayers)
+    await look(-1, "per_layer_inputs", sb.inputs, 4 * inputs4)
     this.gpu.run({
       name: "streams",
       program: this.gpu.program(R.STREAMS_REPEAT),

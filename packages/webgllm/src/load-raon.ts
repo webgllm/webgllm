@@ -129,6 +129,49 @@ export function raonConfig(header: GgufHeader): ModelConfig {
   }
 }
 
+/** How loadRaon stores a matrix made of these tensors' rows (K weights each): Q4_K ones alone as 4-bit with half zero points, any others as 8-bit. */
+export function raonMatrixStorage(infos: ReadonlyArray<GgufTensorInfo>, K: number): { bits: 4 | 8; halves: boolean } {
+  const halves = infos.every((info) => info.type === GgmlType.Q4_K) && K % 256 === 0
+  return { bits: halves ? 4 : 8, halves }
+}
+
+/**
+ * A layer's matrices by role: the tensors each is made of (their names
+ * after `blk.N.`) and the rows' width. What loadRaon reads them by, and
+ * what predictSpeed's probe sizes and stores its random ones by.
+ */
+export function raonLayerMatrices(config: ModelConfig, type: LayerType): Record<string, { K: number; N: number; tensors: Array<string> }> {
+  const { hiddenSize: D, intermediateSize: F } = config
+  const lin = config.linear
+  const latent = config.latent
+  const streams = config.streams
+  const perLayer = config.perLayer
+  if (!lin?.keyDecay || !latent || !streams || !perLayer) throw new Error("The model's config isn't a Raon-1 nano's.")
+  const inner = lin.numKeyHeads * lin.keyHeadDim
+  const mixRows = 2 * streams.count + (streams.count - 1) ** 2
+  const mix = (site: string) => ({ K: streams.count * D, N: Math.ceil(mixRows / 4) * 4, tensors: [`hc_${site}_fn`] })
+  return {
+    mixOperator: mix("attn"),
+    mixFfn: mix("ffn"),
+    ...(type === "linear_attention"
+      ? {
+          inProj: { K: D, N: 4 * inner, tensors: ["attn_qkv"] },
+          ba: { K: D, N: lin.keyDecay.rank + 2 * lin.numKeyHeads, tensors: ["ssm_f_a"] },
+          decay: { K: lin.keyDecay.rank, N: inner, tensors: ["ssm_f_b"] },
+          outProj: { K: inner, N: D, tensors: ["attn_output"] }
+        }
+      : {
+          latentIn: { K: D, N: latent.queryRank + latent.rank + latent.shared + latent.heads * latent.valueDim, tensors: ["attn_q_a", "attn_kv_a_mqa", "attn_gate"] },
+          qB: { K: latent.queryRank, N: latent.heads * latent.keyDim, tensors: ["attn_q_b"] },
+          o: { K: latent.heads * latent.valueDim, N: D, tensors: ["attn_output"] }
+        }),
+    perLayerGate: { K: D, N: perLayer.dim, tensors: ["inp_gate"] },
+    perLayerProj: { K: perLayer.dim, N: D, tensors: ["proj"] },
+    gateUp: { K: D, N: 2 * F, tensors: ["ffn_up"] },
+    down: { K: F, N: D, tensors: ["ffn_down"] }
+  }
+}
+
 export async function* loadRaon(
   source: ByteSource,
   header: GgufHeader,
@@ -215,7 +258,7 @@ export async function* loadRaon(
    * and zero points (no weight requantized), any others as 8-bit.
    */
   const matrix = async (K: number, parts: Array<{ name: string; rows: number }>, N = parts.reduce((n, p) => n + p.rows, 0)): Promise<QuantMatrix> => {
-    const q4k = parts.every((p) => tensor(p.name).type === GgmlType.Q4_K) && K % 256 === 0
+    const q4k = raonMatrixStorage(parts.map((p) => tensor(p.name)), K).halves
     const m = q4k ? newQuantMatrix(N, K, 4, "halves") : newQuantMatrix(N, K, 8, false)
     let row0 = 0
     for (const { name, rows } of parts) {

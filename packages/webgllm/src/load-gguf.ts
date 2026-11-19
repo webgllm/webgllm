@@ -253,15 +253,7 @@ export async function* loadGguf(
     }>
   ): Promise<QuantMatrix> => {
     const infos = parts.map((p) => tensor(p.name))
-    // Q4_K parts alone keep their 4 bits, each sub-block a block with its own scale and zero point (see packQ4_K).
-    const q4k = infos.every((info) => info.type === GgmlType.Q4_K) && K % 256 === 0
-    const bits = q4k ? 4 : bitsOf(infos[0])
-    for (const info of infos) {
-      if (!q4k && bitsOf(info) !== bits)
-        throw new Error(
-          `GGUF: ${info.name} can't be combined with ${infos[0].name}`
-        )
-    }
+    const { bits, halves: q4k } = matrixStorage(infos, K)
     const N = parts.reduce((n, p) => n + p.rows, 0)
     const m = pooled(`${parts.map((p) => p.name.replace(/^blk\.\d+\./, "")).join("+")}:${N}x${K}:${bits}${q4k ? "k" : ""}`, N, K, bits, q4k)
     let row0 = 0
@@ -471,6 +463,23 @@ export function defaultEmbeddingRows(
   // bytes and packed matrix. Never enlarge a piece past 4 MiB.
   const budget = Math.min(4 << 20, largestTensorBytes / 3)
   return Math.max(512, Math.min(2048, Math.floor(budget / rowBytes) & ~3))
+}
+
+/**
+ * How a matrix made of these tensors' rows (K weights each) is stored: Q4_K
+ * parts alone keep their 4 bits, each sub-block a block with its own scale
+ * and a zero point as a half (`halves`: see packQ4_K); any others take
+ * their type's bits (bitsOf), which must agree. predictSpeed's probe gives
+ * its random matrices the same storage (speed-probe.ts).
+ */
+export function matrixStorage(infos: ReadonlyArray<GgufTensorInfo>, K: number): { bits: 4 | 8; halves: boolean } {
+  const halves = infos.every((info) => info.type === GgmlType.Q4_K) && K % 256 === 0
+  const bits = halves ? 4 : bitsOf(infos[0])
+  for (const info of infos) {
+    if (!halves && bitsOf(info) !== bits)
+      throw new Error(`GGUF: ${info.name} can't be combined with ${infos[0].name}`)
+  }
+  return { bits, halves }
 }
 
 /** The bits a tensor gets in a QuantMatrix. */

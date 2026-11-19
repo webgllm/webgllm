@@ -146,6 +146,8 @@ export type LatentConfig = {
 /** Raon's per-layer embeddings: `dim` values a layer for every token. */
 export type PerLayerConfig = {
   dim: number
+  /** Layers the per-layer table and its projection hold inputs for, where not the model's own count (predictSpeed's probe: a layer of each kind standing in for all of them). */
+  layers?: number
 }
 
 export type QuantMatrix = {

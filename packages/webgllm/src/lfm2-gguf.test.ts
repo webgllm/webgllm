@@ -196,3 +196,33 @@ test("rows picked from beyond a part's own count are the tensor's rows, for a ty
   }
   assert.throws(() => packRows(m, 0, info, bytes, rows, Int32Array.of(0, 1, 2, 8)), /no row 8/)
 })
+
+test("predictSpeed's shape of a GGUF makes each matrix of the tensors the loader does: the same bits, and the same tensors that must agree", async () => {
+  const { ggufHeaderSpeedShape } = await import("./speed-probe.js")
+  for (const make of [() => fixture("lfm2"), () => fixture("lfm3"), qwenFixture]) {
+    const f = make()
+    const shape = ggufHeaderSpeedShape(f.header)
+    const layers = (await collect(f)).flatMap((p) => (p.kind === "layer" ? [p.value] : []))
+    for (const kind of shape.kinds) {
+      const layer = layers.find((l) => l.type === kind.type)
+      assert.ok(layer)
+      const loaded: Record<string, { bits: number } | undefined> = {
+        gateUp: layer.gateUp, down: layer.down,
+        inProj: layer.conv?.inProj ?? layer.linear?.inProj, outProj: layer.conv?.outProj ?? layer.linear?.outProj, ba: layer.linear?.ba,
+        qkvg: layer.attention?.qkvg, o: layer.attention?.o
+      }
+      for (const [role, storage] of Object.entries(kind.matrices)) assert.equal(storage.bits, loaded[role]?.bits, `${kind.type}'s ${role}`)
+      assert.deepEqual(Object.keys(kind.matrices).sort(), Object.keys(loaded).filter((role) => loaded[role]).sort())
+    }
+    // A tensor of another type in a matrix of several: the loader refuses to combine them, and so must the shape.
+    const refused = (run: () => unknown) => { try { run(); return false } catch (error) { return /can't be combined/.test((error as Error).message) } }
+    for (const name of [...f.header.tensors.keys()].filter((n) => n.startsWith("blk.") && f.header.tensors.get(n)?.type === GgmlType.Q4_0)) {
+      const g = make()
+      const info = g.header.tensors.get(name)
+      assert.ok(info)
+      g.header.tensors.set(name, { ...info, type: GgmlType.Q8_0 })
+      const loader = await collect(g).then(() => false, (error: Error) => /can't be combined/.test(error.message))
+      assert.equal(refused(() => ggufHeaderSpeedShape(g.header)), loader, name)
+    }
+  }
+})

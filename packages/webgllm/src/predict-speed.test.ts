@@ -333,8 +333,11 @@ test("a GGUF's shape from its header alone: each kind's tensor types, the embedd
   const { GgmlType } = await import("./gguf.js")
   const layer = (i: number) => [
     { name: `blk.${i}.attn_q.weight`, dims: [64, 64], type: GgmlType.Q4_0 },
+    { name: `blk.${i}.attn_k.weight`, dims: [64, 32], type: GgmlType.Q4_0 },
+    { name: `blk.${i}.attn_v.weight`, dims: [64, 32], type: GgmlType.Q4_0 },
     { name: `blk.${i}.attn_output.weight`, dims: [64, 64], type: GgmlType.Q8_0 },
     { name: `blk.${i}.ffn_gate.weight`, dims: [64, 128], type: GgmlType.Q4_0 },
+    { name: `blk.${i}.ffn_up.weight`, dims: [64, 128], type: GgmlType.Q4_0 },
     { name: `blk.${i}.ffn_down.weight`, dims: [128, 64], type: GgmlType.Q4_0 }
   ]
   const bytes = ggufHeaderBytes(
@@ -379,4 +382,48 @@ test("a GGUF's shape from its header alone: each kind's tensor types, the embedd
   assert.deepEqual(shape.embedding, { bits: 8, zeros: false, raw: false })
   // The header's bytes only, never a weight's.
   assert.ok(read <= bytes.length + (2 << 20))
+})
+
+test("a GGUF's Q4_K matrices are predicted as the loader stores them: 4-bit with half zero points where every part is Q4_K, 8-bit where one isn't", async () => {
+  const { ggufSpeedShape } = await import("./speed-probe.js")
+  const { GgmlType } = await import("./gguf.js")
+  const { matrixStorage } = await import("./load-gguf.js")
+  const K = GgmlType.Q4_K
+  const layer = (i: number) => [
+    { name: `blk.${i}.attn_q.weight`, dims: [256, 256], type: K },
+    // (One part of another type: the whole matrix goes through 8 bits.)
+    { name: `blk.${i}.attn_k.weight`, dims: [256, 128], type: GgmlType.Q6_K },
+    { name: `blk.${i}.attn_v.weight`, dims: [256, 128], type: K },
+    { name: `blk.${i}.attn_output.weight`, dims: [256, 256], type: GgmlType.Q8_0 },
+    { name: `blk.${i}.ffn_gate.weight`, dims: [256, 512], type: K },
+    { name: `blk.${i}.ffn_up.weight`, dims: [256, 512], type: K },
+    { name: `blk.${i}.ffn_down.weight`, dims: [512, 256], type: K }
+  ]
+  const bytes = ggufHeaderBytes(
+    {
+      "general.architecture": "lfm2",
+      "lfm2.block_count": 2,
+      "lfm2.embedding_length": 256,
+      "lfm2.attention.head_count": 8,
+      "lfm2.attention.head_count_kv": 4,
+      "lfm2.attention.key_length": 32,
+      "lfm2.rope.freq_base": 1000000,
+      "lfm2.attention.layer_norm_rms_epsilon": 0.00001,
+      "lfm2.shortconv.l_cache": 3,
+      "lfm2.feed_forward_length": 512,
+      "lfm2.context_length": 1024
+    },
+    [{ name: "token_embd.weight", dims: [256, 64], type: GgmlType.Q6_K }, ...layer(0), ...layer(1)]
+  )
+  const shape = await ggufSpeedShape({ size: bytes.length + (1 << 20), read: async (offset, length) => { const out = new Uint8Array(length); out.set(bytes.subarray(offset, offset + length)); return out } })
+  const native = { bits: 4, zeros: false, raw: false, halves: true }
+  const eight = { bits: 8, zeros: false, raw: false }
+  assert.deepEqual(shape.kinds, [{ type: "full_attention", matrices: { gateUp: native, down: native, qkvg: eight, o: eight } }])
+  assert.deepEqual(shape.embedding, { bits: 6, zeros: false, raw: false })
+  // The rule itself, the loader's: rows too narrow for Q4_K's 256-weight super-blocks aren't kept as 4 bits.
+  const t = (type: number) => ({ name: "t", dims: [256, 4], type, offset: 0, byteLength: 0 })
+  assert.deepEqual(matrixStorage([t(K), t(K)], 256), { bits: 4, halves: true })
+  assert.deepEqual(matrixStorage([t(K)], 96), { bits: 8, halves: false })
+  assert.deepEqual(matrixStorage([t(K), t(GgmlType.Q5_K)], 256), { bits: 8, halves: false })
+  assert.throws(() => matrixStorage([t(K), t(GgmlType.Q4_0)], 256), /can't be combined/)
 })
