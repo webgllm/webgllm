@@ -1806,6 +1806,7 @@ export class Engine {
               : String(v)
     return (
       Object.entries(K).map(([name, v]) => name + code(v)).join("\n") +
+      Object.entries(R).map(([name, v]) => name + code(v)).join("\n") +
       Engine.toString() +
       Gpu.toString() +
       weightPanelSource.toString() +

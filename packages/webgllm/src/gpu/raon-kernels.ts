@@ -940,3 +940,6 @@ void main() {
 }`
 }
 export const latentValue = memo(latentValueSource)
+
+/** What the kernels above are built from that isn't exported: in the engine's fingerprint with them (see Engine.fingerprintText). */
+export const RAON_CODE: Array<unknown> = [RMS_SCALE, SIGMOID, chunkStart]
