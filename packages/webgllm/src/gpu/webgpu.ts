@@ -553,7 +553,9 @@ export class WebGpu extends PacedGpu<Fence> {
   ) {
     // The queue's write lands before the commands not yet submitted: fine
     // unless one of them uses the texture (it would see the new contents).
-    // Otherwise staged behind them, which ends the compute pass.
+    // Otherwise staged behind them, which ends the compute pass. (A queued
+    // pass that uses it is dispatched first, so the write goes behind it.)
+    this.flushQueueUsing(target)
     this.upload(target, rect, data, !this.encoder || this.touched.get(target.id) !== this.generation)
   }
 
@@ -611,7 +613,9 @@ export class WebGpu extends PacedGpu<Fence> {
     this.touched.delete(texture.id)
     this.writers.delete(texture.id)
     this.groupsByTexture.delete(texture.id)
-    // (Passes issued and not yet submitted may read it: destroyed after they're sent.)
+    // (Passes issued and not yet submitted may read it: destroyed after
+    // they're sent. A queued pass that uses it is dispatched first.)
+    this.flushQueueUsing(texture)
     if (this.encoder) this.doomed.push(texture.tex as GPUTexture | GPUBuffer)
     else (texture.tex as GPUTexture | GPUBuffer).destroy()
     if (this.live.delete(texture)) this.bytes -= texture.bytes
@@ -853,6 +857,11 @@ export class WebGpu extends PacedGpu<Fence> {
       if (!same || reads || overlaps || g.length >= 8 || textures > this.limits.maxTextureUnits) this.flushQueue()
     }
     this.queued.push(q)
+  }
+
+  /** Dispatches the queued passes if one of them reads or writes `texture`. */
+  private flushQueueUsing(texture: Texture) {
+    if (this.queued.some((q) => q.inputs.includes(texture) || q.outputs.includes(texture))) this.flushQueue()
   }
 
   /** Dispatches the queued passes. */
@@ -1115,7 +1124,9 @@ export class WebGpu extends PacedGpu<Fence> {
   }
 
   /** (WebGPU can't block: a throttled page's waits stay on the fences.) */
-  protected readBack() {}
+  protected readBack() {
+    return false
+  }
 
   // ------------------------------------------------------------ reads
 
@@ -1239,3 +1250,6 @@ export class WebGpu extends PacedGpu<Fence> {
     }
   }
 }
+
+/** This module's code, for Engine.fingerprint: list every new top-level declaration here. */
+export const WEBGPU_CODE: Array<unknown> = [FORMATS, formatOf, BUFFER, TEXTURE, STORAGE_BUFFER, COMPUTE, MAP_READ, align, toHalves, WebGpu]

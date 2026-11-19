@@ -1910,3 +1910,6 @@ ${I.map((i) => `  if (ok${i}) {
     groups: (rect) => [Math.ceil(rect.height / wx), Math.ceil(rect.width / (wy * tm))]
   }
 }
+
+/** This module's code besides its exports, for Engine.fingerprint: list every new top-level declaration here. */
+export const NATIVE_CODE: Array<unknown> = [PRESCALE]

@@ -10,7 +10,10 @@ import { attentionError } from "./attention-check.js"
 import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
-import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
+import { WEBGPU_CODE, type NativeSpec, type WebGpu } from "./gpu/webgpu.js"
+import * as NATIVE from "./gpu/native.js"
+import { WGSL_CODE } from "./gpu/wgsl.js"
+import { PacedGpu } from "./gpu/paced.js"
 import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, q4WordHead, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
@@ -1696,25 +1699,42 @@ export class Engine {
     })
   }
 
-  /** A quantized matrix as textures, filled with `m`. */
   /**
-   * A hash of the engine's GPU code (every kernel and the engine itself):
-   * what the worker keys a GPU's remembered self-check and weight layout
-   * by, so any change to the code checks again.
+   * The text Engine.fingerprint hashes: the engine's GPU code, both
+   * backends' (WebGL's, and WebGPU's with its native kernels and GLSL
+   * translator), and what pacing and the weight layouts are decided by.
    */
-  static readonly fingerprint: string = (() => {
-    const text =
-      Object.entries(K)
-        .map(([name, v]) =>
-          name +
-          (typeof v === "function"
-            ? ((v as { source?: string }).source ?? v.toString())
-            : String(v))
-        )
-        .join("\n") + Engine.toString() +
+  static fingerprintText(): string {
+    const code = (v: unknown): string =>
+      typeof v === "function"
+        ? ((v as { source?: string }).source ?? v.toString())
+        : v instanceof Set
+          ? [...v].join(",")
+          : Array.isArray(v)
+            ? v.map(code).join("\n")
+            : v && typeof v === "object"
+              ? JSON.stringify(v)
+              : String(v)
+    return (
+      Object.entries(K).map(([name, v]) => name + code(v)).join("\n") +
+      Engine.toString() +
       Gpu.toString() +
       weightPanelSource.toString() +
-      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + pipelineSpeed.toString() + `${PACKING_PROBE_MS},${PACKING_PROBE_PAIRS}` + SubmissionBudget.toString() + q4WordsToRgba4.toString()
+      weightHeadRegions.toString() + expandQ6.toString() + fitsExpandedHead.toString() + headScratchBytes.toString() + fundedF16Scratch.toString() + calibratedReadQuota.toString() + calibratedWindow.toString() + pipelineSpeed.toString() + `${PACKING_PROBE_MS},${PACKING_PROBE_PAIRS}` + SubmissionBudget.toString() + q4WordsToRgba4.toString() +
+      PacedGpu.toString() +
+      Object.entries(NATIVE).map(([name, v]) => name + code(v)).join("\n") +
+      code(WGSL_CODE) +
+      code(WEBGPU_CODE)
+    )
+  }
+
+  /**
+   * A hash of fingerprintText: what the worker keys a GPU's remembered
+   * self-check, tuning, prefixes and speed predictions by, so any change
+   * to the code they depend on checks again.
+   */
+  static readonly fingerprint: string = (() => {
+    const text = Engine.fingerprintText()
     // FNV-1a.
     let h = 0x811c9dc5
     for (let i = 0; i < text.length; i++) {
@@ -4972,6 +4992,22 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         return
       }
     }
+    // 8-bit weights in a storage buffer (see storeQuants): the native pair matmul.
+    const stored8 = bits === 8 ? this.storedQuants(w) : null
+    if (stored8) {
+      this.slicing.set(out.id, { split: 1, stride: 0 })
+      await this.gpu.runAsync({
+        name: "matmul",
+        program: (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram((this.pairSpec8 ??= bufferPairMatmul())),
+        inputs: { uA: a, uS: w.scales, uW: stored8 },
+        uniforms: { ...shape, uWidth: { int: w.quants.width } },
+        output: out,
+        rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
+        work: w.blocks * 24,
+        ...this.glColumnBands()
+      })
+      return
+    }
     // (The passes below read the weights' texture, deleted once they're in a storage buffer.)
     if (w.stored) throw new GpuError("A matrix in a storage buffer reached a texture matmul.")
     if (w.rgba4) {
@@ -5004,21 +5040,6 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       return
     }
     this.slicing.set(out.id, { split: 1, stride: 0 })
-    // 8-bit weights in a storage buffer (see storeQuants): the native pair matmul.
-    const stored8 = bits === 8 ? this.storedQuants(w) : null
-    if (stored8) {
-      await this.gpu.runAsync({
-        name: "matmul",
-        program: (this.gpu as unknown as { nativeProgram(spec: NativeSpec): Program }).nativeProgram((this.pairSpec8 ??= bufferPairMatmul())),
-        inputs: { uA: a, uS: w.scales, uW: stored8 },
-        uniforms: { ...shape, uWidth: { int: w.quants.width } },
-        output: out,
-        rect: { x: 0, y: 0, width: w.groups, height: Math.ceil(rows / 2) },
-        work: w.blocks * 24,
-        ...this.glColumnBands()
-      })
-      return
-    }
     await this.gpu.runAsync({
       name: "matmul",
       program: this.gpu.program(

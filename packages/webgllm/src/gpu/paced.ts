@@ -18,8 +18,8 @@ export abstract class PacedGpu<F> {
   protected abstract deleteFence(fence: F): void
   /** Resolves once the GPU passes a fence. */
   protected abstract wait(fence: F | null, budget?: SubmissionBudget, at?: number): Promise<void>
-  /** Blocks until the GPU is done, where timers are throttled (see pace). */
-  protected abstract readBack(): void
+  /** Blocks until the GPU has done the queue: false where it can't block (see pace). */
+  protected abstract readBack(): boolean
   /** The fewest rows of a `width`-texel pass runAsync issues at once (a band's floor). */
   protected minBandRows(width: number) {
     void width
@@ -368,9 +368,13 @@ export abstract class PacedGpu<F> {
       // A page the browser counts as hidden has its timers throttled (a
       // 1 ms wait can take a second, or a minute): then wait by reading a
       // pixel of the last pass's output instead, which blocks until the
-      // GPU has done the queue. The queue stays bounded either way.
+      // GPU has done the queue. The queue stays bounded either way. (Where
+      // a read can't block, WebGPU's, on the fence itself.)
       if (performance.now() < this.throttledUntil) {
-        this.readBack()
+        if (!this.readBack()) {
+          await this.wait(oldest.sync, oldest.budget, oldest.at)
+          continue
+        }
         for (const f of this.paced) this.deleteFence(f.sync)
         this.paced = []
         break

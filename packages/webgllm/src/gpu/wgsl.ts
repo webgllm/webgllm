@@ -920,6 +920,9 @@ class Emitter {
     const lo = this.coerce(v.init!, "int", c)
     const hi = this.coerce(cond.b, "int", c)
     const acc = this.lookup(this.coop!.acc)
+    // The lanes sum only their iterations' terms: the value the accumulator
+    // held before the loop (a recurrent state, say) is added back once.
+    out.push(`${i}let init_ = ${acc.out};`, `${i}${acc.out} = ${wgslType(acc.type)}();`)
     if (this.variant.subgroups) {
       // Lane l takes iterations l, l + L, …; the L lanes of a texel are
       // neighbours in a subgroup, so a butterfly of shuffles sums them.
@@ -934,7 +937,7 @@ class Emitter {
       this.scopes.pop()
       out.push(`${i}}`)
       for (let k = L >> 1; k > 0; k >>= 1) out.push(`${i}${acc.out} += subgroupShuffleXor(${acc.out}, ${k}u);`)
-      out.push(`${indent}}`)
+      out.push(`${i}${acc.out} = init_ + ${acc.out};`, `${indent}}`)
       return
     }
     out.push(
@@ -959,7 +962,7 @@ class Emitter {
       `${i}  if (lane < s_) { coopAcc[li] += coopAcc[li + s_]; }`,
       `${i}  workgroupBarrier();`,
       `${i}}`,
-      `${i}${acc.out} = coopAcc[li - lane];`,
+      `${i}${acc.out} = init_ + coopAcc[li - lane];`,
       `${indent}}`
     )
   }
@@ -1321,3 +1324,9 @@ export function toWgsl(shader: Shader, variant: Variant): Translation {
 }
 
 export type { Shader }
+
+/** This module's code, for Engine.fingerprint: list every new top-level declaration here. */
+export const WGSL_CODE: Array<unknown> = [
+  SCALARS, PREFIX, SAMPLERS, shape, make, isType, WGSL_BASE, wgslType, OPS, lex, QUALIFIERS, Parser,
+  BUILTIN_SAME, RENAME, COMPARE, BITCAST, Emitter, coopLoop, assigns, parseGlsl, toWgsl
+]

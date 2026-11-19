@@ -214,3 +214,35 @@ test("writing earns its queue back on frames that are slow on average but have n
   }
   assert.equal(budget.ahead, 1)
 })
+
+test("a throttled WebGPU page still waits on its fences, so the queue stays bounded", async (t) => {
+  const { WebGpu } = await import("./gpu/webgpu.js")
+  let done!: () => void
+  const fence = { done: false, promise: new Promise<void>((resolve) => (done = resolve)) }
+  void fence.promise.then(() => (fence.done = true))
+  // Timers throttled: every 1 ms sleep takes 60.
+  let now = 0
+  t.mock.method(performance, "now", () => now)
+  t.mock.method(globalThis, "setTimeout", (resolve: () => void) => {
+    now += 60
+    resolve()
+  })
+  const gpu = Object.create(WebGpu.prototype)
+  Object.assign(gpu, {
+    deferPipelines: false,
+    lost: false,
+    paced: [],
+    throttledUntil: 0,
+    presentationFrames: 0,
+    submissionBudget: new SubmissionBudget(),
+    fence: () => fence
+  })
+  let returned = false
+  const paced = gpu.pace(0).then(() => (returned = true))
+  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(returned, false, "pace returned before the GPU passed its fence")
+  assert.equal(gpu.paced.length, 1)
+  done()
+  await paced
+  assert.equal(gpu.paced.length, 0)
+})

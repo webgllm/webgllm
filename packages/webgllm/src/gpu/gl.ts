@@ -684,11 +684,11 @@ export class Gpu extends PacedGpu<WebGLSync> {
   /** Reads a pixel of the last pass's output: returns once the GPU has done it. */
   protected readBack() {
     const t = this.lastOutput
-    if (this.isLost) return
+    if (this.isLost) return true
     const gl = this.gl
     if (!t) {
       gl.finish()
-      return
+      return true
     }
     const float = t.internal === gl.RGBA32F || t.internal === gl.RGBA16F
     const fb = this.framebuffer(t)
@@ -698,6 +698,7 @@ export class Gpu extends PacedGpu<WebGLSync> {
     else if (t.internal === gl.RGBA32UI)
       gl.readPixels(0, 0, 1, 1, gl.RGBA_INTEGER, gl.UNSIGNED_INT, new Uint32Array(4))
     else gl.finish()
+    return true
   }
 
   /**
