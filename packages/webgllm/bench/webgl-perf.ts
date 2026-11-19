@@ -50,7 +50,7 @@ let measuring = true
 let gaps: number[] = [],
   taps = 0
 const gpuEvents: unknown[] = []
-let stageEvents: Array<{ name: string; at: number }> = []
+let stageEvents: Array<{ name: string; at: number; gpuMB?: number }> = []
 const frameTimes: Array<{ at: number; gap: number }> = []
 const tap = document.querySelector<HTMLButtonElement>("#tap")!
 tap.onclick = (event) => {
@@ -378,7 +378,7 @@ async function run() {
       | { type: "bench-profile-done" }
       | { type: "bench-profile-error"; message: string }
       | WorkerResponse
-      | { type: "bench-phase"; name: string }
+      | { type: "bench-phase"; name: string; gpuBytes?: number }
       | {
           type: "bench-gpu"
           name: string
@@ -402,7 +402,7 @@ async function run() {
       return
     }
     if (data.type === "bench-pacing") {
-      void result({ phase: "pacing", when: data.when, states: data.states })
+      void result({ phase: "pacing", when: data.when, states: data.states, paces: (data as { paces?: object }).paces, runCpu: (data as { runCpu?: object }).runCpu })
       return
     }
     if (data.type === "bench-profile-data") {
@@ -423,7 +423,7 @@ async function run() {
       return
     }
     if (data.type === "bench-phase") {
-      stageEvents.push({ name: data.name, at: performance.now() })
+      stageEvents.push({ name: data.name, at: performance.now(), ...(data.gpuBytes !== undefined && { gpuMB: Math.round(data.gpuBytes / 1048576) }) })
       return
     }
     if (data.type === "claim") {
@@ -433,6 +433,10 @@ async function run() {
       void end({ timings: data.timings, gpuBytes }).then(() => ready())
     } else if (data.type === "token") {
       reply += data.text
+      for (const lp of data.logprobs ?? []) {
+        const alt = lp.top_logprobs?.find((t) => t.token !== lp.token)
+        log(`lp ${JSON.stringify(lp.token)} ${lp.logprob.toFixed(6)} margin ${alt ? (lp.logprob - alt.logprob).toFixed(6) : "-"}${alt ? ` vs ${JSON.stringify(alt.token)} ${alt.logprob.toFixed(6)}` : ""}`)
+      }
       if (first) {
         // The first token ends prefill: switch phases synchronously, so the
         // decode measurement never waits on the prefill result's upload.
@@ -481,7 +485,8 @@ async function run() {
   await new Promise<void>((r, j) => {
     ready = r
     reject = j
-    send({ type: "load", model, loadId: 1 })
+    // `?ctx=`: the context length to load for (the app's 8,192 on iOS; the model's whole window when left out).
+    send({ type: "load", model, loadId: 1, ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }) })
   })
   if (baseline && params.get("waitTune") === "1") {
     begin("calibration")
@@ -504,6 +509,12 @@ async function run() {
     length = Number(params.get("len") ?? 512)
   const filler =
     "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+  const settle = Number(params.get("afterLoadMs") ?? 0)
+  if (settle > 0) {
+    begin("settle")
+    await new Promise((resolve) => setTimeout(resolve, settle))
+    await end()
+  }
   for (let i = 0; i < rounds; i++) {
     const rest = Number(params.get("restMs") ?? 0)
     if (i && rest > 0) {
@@ -519,12 +530,17 @@ async function run() {
       reject = j
       send({
         type: "generate",
+        // (The load's context length: another one would load the model again.)
+        ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }),
         id: `run${i}`,
         model,
         chat: [
           {
             role: "user",
-            content: `Trial ${i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
+            // TEMP: ?ask=copy has the reply repeat a passage from the prompt (a quoting / summarizing style reply).
+            content: params.get("ask") === "copy"
+              ? `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nHere is a note from the miller:\n"${COPY_PASSAGE}"\nRepeat the miller's note exactly, word for word.`
+              : `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
           }
         ],
         tools: [],
@@ -532,11 +548,12 @@ async function run() {
         sampling: {
           temperature: Number(params.get("temperature") ?? 0),
           top_k: Number(params.get("topk") ?? 1),
-          repetition_penalty: 1.1
+          repetition_penalty: params.get("rp") ? Number(params.get("rp")) : params.get("ask") === "copy" ? 1 : 1.1
         },
         maxTokens: Number(params.get("tokens") ?? 64),
         pipeline: params.get("pipeline") !== "0",
-        speculative: params.get("speculative") !== "0"
+        speculative: params.get("speculative") !== "0",
+        ...(params.get("logprobs") === "1" && { logprobs: true, topLogprobs: 2 })
       })
     })
     await end({
@@ -598,7 +615,7 @@ renderer.addEventListener("submit", (event) => {
 })
 void run().catch(async (e) => {
   document.documentElement.dataset.phase = "error"
-  log(`ERROR ${e.stack}`)
+  log(`ERROR ${e.message} | ${e.stack}`)
   try {
     await (
       globalThis as { __benchShutdown?: () => Promise<boolean> }

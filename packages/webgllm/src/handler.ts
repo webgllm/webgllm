@@ -8,23 +8,24 @@ import type { GpuNote } from "./storage.js"
  * behind a worker's messages (the package's worker.ts, or a caller's).
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
-import { blobSource } from "./byte-source.js"
+import { blobSource, storedSources } from "./byte-source.js"
 import { ggufShape, readGgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
+import { WebGpu } from "./gpu/webgpu.js"
 import { loadGguf } from "./load-gguf.js"
 import { loadOnnx } from "./load-onnx.js"
 import { modelMeta, onnxDataSources, rememberModel } from "./model-meta.js"
 import { resolveModel } from "./resolve-model.js"
 import { anchorFor, readPrompt, systemPrefixFor, templateFramingFor } from "./prompt.js"
 import { repackTime } from "./repack.js"
-import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
+import type { ModelFile } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { DraftPolicy, lookupDraft } from "./draft.js"
+import { DraftPolicy, draftTimes, lookupDraft, type DraftTimes } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
-import { download, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
+import { download, incumbentGpuTuning, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
 import type { Tokenizer } from "./tokenizer.js"
 import { createThinkingSplitter, THINK_OPEN } from "./reply.js"
@@ -115,8 +116,11 @@ export interface LogitProcessor {
 let logitProcessors: Map<string, LogitProcessor> | undefined
 
 const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
-  "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune"
+  "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune", "configure"
 ])
+
+/** Whether loads may run on WebGPU (WebGLLMOptions.webgpu: "configure" with false says not). */
+let webgpuAllowed = true
 
 /**
  * Whether a message is one of the page's requests: marked as webgllm's
@@ -133,6 +137,7 @@ function isRequest(data: unknown): data is WorkerRequest {
   }
   if (type === "generate" || type === "forward" || type === "reset" || type === "stop" || type === "download") return typeof id === "string"
   if (type === "claimed" || type === "unload") return typeof id === "number"
+  if (type === "configure") return (data as { webgpu?: unknown }).webgpu === "auto" || (data as { webgpu?: unknown }).webgpu === false
   return true
 }
 
@@ -230,6 +235,12 @@ const DRAFTS = 7
  */
 const GUESS_MIN_HITS = 0.6
 const GUESS_WINDOW = 16
+/**
+ * What tokens and draft batches have cost on each loaded engine, kept from
+ * reply to reply (see DraftPolicy). On a Pixel 10 Pro a batch of a token
+ * and 4 drafts took 5.6× a token alone; each reply paid one to find out.
+ */
+const draftCosts = new WeakMap<object, DraftTimes>()
 
 
 /** FNV-1a of a string, as hex (for note keys). */
@@ -255,7 +266,7 @@ const release = (engine: Engine) => {
  * slower on an M3, and nothing the GPU reports tells where the room is
  * short (an M3 and an iPhone report the same limits).
  */
-const PROMPT_BATCH = 512
+export const PROMPT_BATCH = 512
 
 class Superseded extends Error {
   constructor() {
@@ -362,7 +373,9 @@ async function load(
   contextLength: number | undefined,
   /** Without multiple render targets or the chunked recurrence: after a failed self-check. */
   plain = false,
-  reuseTuning = true
+  reuseTuning = true,
+  /** On WebGL 2 even where there's WebGPU: after WebGPU failed this model. */
+  webgl = false
 ): Promise<Loaded> {
   const meta = await resolveModel(model)
   // The GPU first: a browser or GPU that can't run the model says so before
@@ -378,7 +391,9 @@ async function load(
     timings[name] = Math.round(now - mark)
     mark = now
   }
+  const webgpu = TUNING.webgpu > 0 && webgpuAllowed && !webgl ? await WebGpu.create().catch(() => null) : null
   const engine = new Engine(new OffscreenCanvas(1, 1), {
+    ...(webgpu && { gpu: webgpu }),
     batchSize: TUNING.promptBatch > 0 ? TUNING.promptBatch : PROMPT_BATCH,
     ...(contextLength !== undefined && { contextLength }),
     ...(plain && {
@@ -389,6 +404,8 @@ async function load(
   pacingEngine = engine
   lap("context")
   let reusedTuning = false
+  // Closes the weights' synchronous access handles, which lock their files (see storedSources).
+  let closeStored = async () => {}
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -434,7 +451,12 @@ async function load(
     // The weights' shape, from their header: a model of the same shape as
     // one already tuned here starts from its tuning.
     // (The header is read once: the load below takes it too.)
-    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(blobSource(weightFiles[0])) : undefined
+    // The weights read through synchronous access handles where they can be (see storedSources).
+    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: async () => undefined }
+    closeStored = stored.close
+    timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
+    const weightSources = stored.sources
+    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
     const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
@@ -458,22 +480,34 @@ async function load(
       engine.preferLayout = note.layout
       engine.headChoice = note.head ?? null
       if (note.tuned) engine.tuned = retime ? tuningToRetime(note.tuned) : { ...note.tuned }
+    } else if (reuseTuning) {
+      // Tuned afresh (another browser version, engine code or settings):
+      // this GPU's last choices for the model stand unless another way is
+      // clearly faster (see Engine.incumbent).
+      const incumbent = incumbentGpuTuning(notes, engine.gpu.limits.renderer, model, passes, SELF_CHECK_MAX)
+      if (incumbent) engine.incumbent = { ...(incumbent.tuned && { tuned: incumbent.tuned }), ...(incumbent.head && { head: incumbent.head }) }
+      timings.incumbent = incumbent ? 1 : 0
     }
     const pieces =
       meta.files.kind === "gguf"
-        ? uploadedGgufWeights(loadGguf(blobSource(weightFiles[0]), {
+        ? uploadedGgufWeights(loadGguf(weightSources[0], {
             header: ggufHeader,
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
             readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
-            releaseReadBuffers: canReleaseStaging
+            releaseReadBuffers: canReleaseStaging,
+            // (The engine uploads each piece before it asks for the next.)
+            reusePieces: true
           }))
         : loadOnnx({
             config: JSON.parse(await weightFiles[0].text()) as Record<
               string,
               unknown
             >,
-            graph: blobSource(weightFiles[1]),
-            data: onnxData(meta.files, weightFiles.slice(2))
+            ...(stored.reader && { readAhead: { reads: TUNING.readerAhead, bytes: TUNING.readerAheadMiB << 20 } }),
+            releaseReadBuffers: canReleaseStaging && TUNING.releaseOnnxReads > 0,
+            reusePieces: true,
+            graph: weightSources[1],
+            data: onnxDataSources(meta.files, weightSources.slice(2))
           })
     ggufHeader = undefined
     let layers = 0
@@ -495,12 +529,12 @@ async function load(
           cached
         })
       }
-    }, signal)
+    }, signal).finally(stored.close)
     if (signal.aborted) throw new Superseded()
     if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0
-    timings.headSplit = engine.headChoice?.split ?? TUNING.q6HeadSplit
+    timings.headSplit = engine.headChoice?.split ?? engine.q6HeadSplit
     timings.promptPacking = engine.tuned.f16Pack ?? TUNING.f16Pack & 3
     post({
       type: "log",
@@ -508,6 +542,7 @@ async function load(
     })
     timings.weightsReading = Math.round(engine.loadMs.reading)
     timings.weightsUploading = Math.round(engine.loadMs.uploading)
+    timings.weightsPacing = Math.round(engine.loadMs.pacing)
     timings.f16Init = Math.round(engine.loadMs.scratch)
     timings.packingProbe = Math.round(engine.loadMs.packing)
     timings.matvecProbe = Math.round(engine.loadMs.matvec)
@@ -566,20 +601,23 @@ async function load(
             pacing: note?.pacing,
             head: engine.headChoice ?? undefined,
             tuned: { ...engine.tuned },
-            ...(shape && { shape })
+            ...(shape && { shape }),
+            // (A note written again unchanged keeps its time: see incumbentGpuTuning.)
+            at: checkedNote && JSON.stringify(checkedNote.tuned) === JSON.stringify(engine.tuned) ? (checkedNote.at ?? Date.now()) : Date.now()
           }
         : null
     timings.total = Math.round(performance.now() - t0)
     if (signal.aborted) throw new Superseded()
     if (!(error <= SELF_CHECK_MAX)) {
       if (reusedTuning) throw new GpuError("Previous GPU tuning failed validation.")
+      if (webgpu) throw new GpuError(`WebGPU computes the model wrong (relative error ${error.toExponential(1)}).`)
       if (plain) {
         throw new GpuError(
-          `This GPU computes attention wrong (relative error ${error.toExponential(1)}).`
+          `This GPU computes the model wrong: its startup check against the CPU found a relative error of ${error.toExponential(1)}.`
         )
       }
       release(engine)
-      return await load(model, signal, contextLength, true)
+      return await load(model, signal, contextLength, true, true, webgl)
     }
     engine.gpu.resetPacing(true)
     engine.gpu.setPhase("load")
@@ -619,12 +657,29 @@ async function load(
       timings
     }
   } catch (error) {
+    void closeStored()
     // A failed or superseded load frees its textures now.
     release(engine)
     if (reusedTuning && !signal.aborted && error instanceof GpuError)
-      return load(model, signal, contextLength, plain, false)
+      return load(model, signal, contextLength, plain, false, webgl)
+    // Whatever WebGPU couldn't do, WebGL 2 may.
+    if (webgpu && !signal.aborted && !(error instanceof Superseded))
+      return load(model, signal, contextLength, plain, reuseTuning, true)
     throw error
   }
+}
+
+/**
+ * The context length a request runs at: its own, or (left out) the one its
+ * model is loaded or loading at. A request that left it out used to load the
+ * model again at its whole window: a second copy of LFM3 1.7B beside one
+ * loaded at 8,192 tokens took an iPhone's tab past its 2 GB.
+ */
+function requestedContext(request: { model: string; contextLength?: number }) {
+  if (request.contextLength !== undefined) return request.contextLength
+  if (loading?.model === request.model) return loading.contextLength
+  if (current?.model === request.model) return current.contextLength
+  return undefined
 }
 
 /**
@@ -758,9 +813,6 @@ const errorMessage = (error: unknown) =>
     : error instanceof Error
       ? error.message
       : String(error)
-
-/** An ONNX model's external data, as loadOnnx takes it (see onnxDataSources). */
-const onnxData = (files: Extract<WebGlModelMeta["files"], { kind: "onnx" }>, blobs: Array<Blob>) => onnxDataSources(files, blobs.map(blobSource))
 
 /** One of a model's files: stored, or downloaded now. */
 async function modelFile(file: ModelFile, signal?: AbortSignal): Promise<File> {
@@ -956,7 +1008,7 @@ async function generate(request: GenerateRequest) {
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   // The model this request is for: loaded again if its GPU context was
   // lost, or loaded if another was asked for since.
-  const model = await startLoad(request.model, request.contextLength)
+  const model = await startLoad(request.model, requestedContext(request))
   if (stopped.has(id)) return post({ type: "done", id, stats: empty, finishReason: "stop" })
   const calibration = model.engine.gpu.calibratePromptPacing()
   if (calibration) {
@@ -1345,7 +1397,9 @@ async function generate(request: GenerateRequest) {
   }
   // How many drafts to check with each token, by what they've cost and
   // earned (see DraftPolicy).
-  const policy = new DraftPolicy(DRAFTS)
+  let costs = draftCosts.get(engine)
+  if (!costs) draftCosts.set(engine, (costs = draftTimes(DRAFTS)))
+  const policy = new DraftPolicy(DRAFTS, undefined, undefined, undefined, undefined, costs)
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
   const draftsFor = (max: number) => {
@@ -1780,7 +1834,7 @@ async function generate(request: GenerateRequest) {
  * the caller passes it in next.
  */
 async function forwardTokens(request: Extract<WorkerRequest, { type: "forward" }>) {
-  const model = await startLoad(request.model, request.contextLength)
+  const model = await startLoad(request.model, requestedContext(request))
   const { engine } = model
   const ids = request.inputIds
   if (!ids.length) throw new Error("forwardTokensAndSample needs at least one token.")
@@ -1830,31 +1884,6 @@ function resetChat(request: Extract<WorkerRequest, { type: "reset" }>) {
  * so one must finish (or stop) before the next reads its prompt.
  */
 let queue: Promise<void> = Promise.resolve()
-/** Generations, token forwards and resets waiting or running (see warmConstraint). */
-let pending = 0
-
-/**
- * The constraint compiler's one-time work for a model's tokenizer:
- * llguidance converting its vocabulary on the first structured answer
- * (0.36 s for LFM3's in Node on an M-series Mac, seconds in a browser
- * worker), which that answer used to wait for. Done once the worker is idle
- * after a load instead; skipped when a request is already waiting, which
- * does the work itself if it needs it. The conversion is kept with the
- * tokenizer, so every later constraint reuses it.
- */
-function warmConstraint(model: Loaded) {
-  if (pending > 0 || current !== model) return
-  // (Only ever a head start: a failure here is the first structured answer's to report.)
-  try {
-    void createConstraint({ schema: { type: "string" }, tokenizer: model.tokenizer.constraintTokenizer }).then(
-      (constraint) => constraint.dispose(),
-      () => undefined
-    )
-  } catch {
-    // Nothing to warm.
-  }
-}
-
 function receive(data: WorkerRequest) {
   if (data.type === "frames") {
     pacingEngine?.gpu.observeFrames(
@@ -1868,6 +1897,8 @@ function receive(data: WorkerRequest) {
     claims.get(data.id)?.resolve()
   } else if (data.type === "tune") {
     Object.assign(TUNING, data.values)
+  } else if (data.type === "configure") {
+    webgpuAllowed = data.webgpu !== false
   } else if (data.type === "load") {
     // After the generations asked for before it: another context length
     // frees the engine they run on. Each answer names its load.
@@ -1884,8 +1915,6 @@ function receive(data: WorkerRequest) {
             contextLength: loaded.engine.contextLength,
             ...(loaded !== before && { timings: loaded.timings })
           })
-          // (After the messages already sent: a request among them goes first.)
-          if (loaded !== before) setTimeout(() => warmConstraint(loaded), 0)
         },
         (error: unknown) => {
           if (!(error instanceof Superseded))
@@ -1902,18 +1931,14 @@ function receive(data: WorkerRequest) {
     if (data.meta) rememberModel(data.meta)
     void downloadModel(data.model, data.id)
   } else if (data.type === "reset") {
-    pending++
     queue = queue.then(() => {
       try {
         resetChat(data)
       } catch (error) {
         post({ type: "error", id: data.id, message: errorMessage(error), code: errorCode(error) })
-      } finally {
-        pending--
       }
     })
   } else if (data.type === "generate" || data.type === "forward") {
-    pending++
     queue = queue
       .then(() => (data.type === "generate" ? generate(data) : forwardTokens(data)))
       .catch((error: unknown) => {
@@ -1933,7 +1958,6 @@ function receive(data: WorkerRequest) {
         post({ type: "error", id: data.id, message: errorMessage(error), code: lost ? "gpu-context-lost" : errorCode(error) })
       })
       .finally(() => {
-        pending--
         stopped.delete(data.id)
         aborts.delete(data.id)
       })

@@ -481,7 +481,38 @@ function dequantBytesSource(o: {
   packed?: boolean
   /** h2 output texels (see dequantOut). */
   h2?: boolean
+  /** 8-bit byte texels (RGBA8I: a row's block, 8 texels of 4 signed weights), times the block's scale. */
+  eight?: boolean
 }) {
+  if (o.eight) return dequantOut(o.h2, `${HEADER}
+uniform isampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+uniform int uKq;
+uniform int uHd;
+uniform int uN;
+uniform int uRow0;
+uniform int uKq0;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int c = x / uKq;
+  int kq = x - c * uKq + uKq0;
+  int row = c * uHd + y;
+  if (row >= uN) { o = vec4(0.0); return; }
+  row += uRow0;
+  int g = row / 4;
+  int r = row - g * 4;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int kb = kq / 8;
+  int j = kq - kb * 8;
+  float d = comp(texelFetch(uS, ivec2(col * uKb + kb, gr), 0), r);
+  o = vec4(texelFetch(uW, ivec2(col * uRowTexels + kb * 32 + r * 8 + j, gr), 0)) * d;
+}`)
   return dequantOut(o.h2, `${HEADER}
 uniform ${o.unorm ? "sampler2D" : "usampler2D"} uW;
 uniform ${o.packed ? "usampler2D" : "sampler2D"} uS;
@@ -3352,38 +3383,62 @@ void main() {
  * qh texel 32 + 8n + w. The bits come apart with float math (exact on
  * integers up to 255), which mobile GPUs run faster than integer shifts.
  */
-/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
-export const EXPAND_Q6_BYTES = `${HEADER}
+/** The expanded head's 4 bytes at weights j .. j + 3 of row `row`'s super-block `block` (see EXPAND_Q6_BYTES). */
+const EXPAND_Q6_AT = `
 uniform usampler2D uNative;
 uniform int uX0;
 uniform int uY0;
-out vec4 o;
 uint nativeWord(int base, int y, int word) {
   return comp(texelFetch(uNative, ivec2(base + (word >> 2), y), 0), word & 3);
 }
-void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
-  int block = p.x >> 8;
-  int row = (p.x >> 6) & 3;
-  int j = (p.x & 63) * 4;
+uvec4 expandQ6(int block, int row, int j, int y) {
   int base = (block * 4 + row) * 13;
   int n = j >> 7;
   int part = (j >> 5) & 3;
   int lane = j & 31;
-  uint ql = nativeWord(base, p.y, (n * 64 + lane + (part & 1) * 32) >> 2);
-  uint qh = nativeWord(base, p.y, (128 + n * 32 + lane) >> 2);
+  uint ql = nativeWord(base, y, (n * 64 + lane + (part & 1) * 32) >> 2);
+  uint qh = nativeWord(base, y, (128 + n * 32 + lane) >> 2);
   uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
   uvec4 lo = (uvec4(ql) >> shifts) & 255u;
   uvec4 hi = (uvec4(qh) >> shifts) & 255u;
   uvec4 q = ((lo >> uint((part >> 1) * 4)) & 15u) | (((hi >> uint(part * 2)) & 3u) << 4u);
   if ((j & 15) == 0) {
     int at = 192 + (j >> 4);
-    uint scale = (nativeWord(base, p.y, at >> 2) >> uint((at & 3) * 8)) & 255u;
+    uint scale = (nativeWord(base, y, at >> 2) >> uint((at & 3) * 8)) & 255u;
     q |= ((uvec4(scale) >> uvec4(0u, 2u, 4u, 6u)) & 3u) << 6u;
   }
-  o = vec4(q) / 255.0;
-}
-`
+  return q;
+}`
+
+/** Losslessly repack native Q6_K bytes into the expanded byte head at upload. */
+export const EXPAND_Q6_BYTES = `${HEADER}${EXPAND_Q6_AT}
+out vec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  o = vec4(expandQ6(p.x >> 8, (p.x >> 6) & 3, (p.x & 63) * 4, p.y)) / 255.0;
+}`
+
+/**
+ * The expanded head's bytes as RGBA32UI, 16 (a 16-weight run) a texel, in
+ * the order the native expanded head reads them (gpu/native.ts's
+ * expandedHead): a super-block's 64 texels are, per 32-block q and half h,
+ * its 4 rows' runs, texel q · 8 + h · 4 + row.
+ */
+export const EXPAND_Q6_WORDS = `${HEADER}${EXPAND_Q6_AT}
+uint dot4(uvec4 v) { return v.x | v.y | v.z | v.w; }
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int block = p.x >> 6;
+  int k = p.x & 63;
+  int j0 = (k >> 3) * 32 + ((k >> 2) & 1) * 16;
+  uvec4 b0 = expandQ6(block, k & 3, j0, p.y);
+  uvec4 b1 = expandQ6(block, k & 3, j0 + 4, p.y);
+  uvec4 b2 = expandQ6(block, k & 3, j0 + 8, p.y);
+  uvec4 b3 = expandQ6(block, k & 3, j0 + 12, p.y);
+  uvec4 shifts = uvec4(0u, 8u, 16u, 24u);
+  o = uvec4(dot4(b0 << shifts), dot4(b1 << shifts), dot4(b2 << shifts), dot4(b3 << shifts));
+}`
 
 const Q6_K_UNPACK = `
 // Low nibbles (lo) and high nibbles (hi) of 4 bytes.
@@ -3532,9 +3587,11 @@ float sc8w(uint u, uint b) { return float(int(u << (24u - 8u * b)) >> 24); }`
 
 /**
  * The output head from a Q6_K embedding in word texels (see Q6_K_WORDS):
- * one quarter of a super-block (half n, word positions 4hw..4hw+3) per
- * loop iteration, its activations decoded once for the fragment's 4 rows,
- * then each row's ql, ql + 32 and qh words and its scales word. A loop,
+ * a super-block per outer iteration (its scale and each row's scales word
+ * read once: 18% faster on an iPad Pro M4, 4% on an M3 Ultra), then one
+ * quarter of it (half n, word positions 4hw..4hw+3) per inner iteration,
+ * its activations decoded once for the fragment's 4 rows, then each row's
+ * ql, ql + 32 and qh words. A loop,
  * not unrolled: the same work unrolled a super-block at a time (as
  * MATMUL_Q6_K_HEAD) took 1.3 ms a head on an M3 Ultra against 0.6, its
  * registers the limit. With `split`, a
@@ -3546,10 +3603,8 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
   const C = "xyzw"
   const body: Array<string> = []
   const line = (s: string) => body.push(`    ${s}`)
-  line(`int sb = q >> 2;`)
   line(`int n = (q >> 1) & 1;`)
   line(`int hw = q & 1;`)
-  line(`vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);`)
   // Activations k = 256 sb + 128 n + 32 g + 4 w + i: h2 texel k / 8, the
   // pair of word positions 2wp, 2wp + 1 in its two halves.
   line(
@@ -3571,8 +3626,7 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
     line(`  uvec4 QA = texelFetch(uW, ivec2(t + qa, gr), 0);`)
     line(`  uvec4 QB = texelFetch(uW, ivec2(t + qa + 2, gr), 0);`)
     line(`  uvec4 QH = texelFetch(uW, ivec2(t + qh, gr), 0);`)
-    line(`  uvec4 S = texelFetch(uW, ivec2(t + 12, gr), 0);`)
-    line(`  uvec2 SS = n == 0 ? S.xy : S.zw;`)
+    line(`  uvec2 SS = n == 0 ? S${r}.xy : S${r}.zw;`)
     line(`  vec4 p = vec4(0.0);`)
     for (let wi = 0; wi < 4; wi++) {
       const c = C[wi]
@@ -3581,7 +3635,7 @@ function matmulQ6KHeadWordsSource(o: { split: boolean; prescaled: boolean }) {
       )
     }
     line(
-      `  acc.${C[r]} += d.${C[r]} * dot(p, vec4(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));`
+      `  P.${C[r]} += dot(p, vec4(sc8w(SS.x, b0), sc8w(SS.x, b2), sc8w(SS.y, b0), sc8w(SS.y, b2)));`
     )
     line(`}`)
   }
@@ -3611,8 +3665,17 @@ ${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
   int wx = col * uRowTexels;
   int sx = col * uKb;
   vec4 acc = vec4(0.0);
-  for (int q = sb0 * 4; q < sb1 * 4; q++) {
+  for (int sb = sb0; sb < sb1; sb++) {
+    vec4 d = texelFetch(uS, ivec2(sx + sb, gr), 0);
+    uvec4 S0 = texelFetch(uW, ivec2(wx + (sb * 4) * 13 + 12, gr), 0);
+    uvec4 S1 = texelFetch(uW, ivec2(wx + (sb * 4 + 1) * 13 + 12, gr), 0);
+    uvec4 S2 = texelFetch(uW, ivec2(wx + (sb * 4 + 2) * 13 + 12, gr), 0);
+    uvec4 S3 = texelFetch(uW, ivec2(wx + (sb * 4 + 3) * 13 + 12, gr), 0);
+    vec4 P = vec4(0.0);
+    for (int q = 0; q < 4; q++) {
 ${body.join("\n")}
+    }
+    acc += d * P;
   }
   o = ${o.prescaled ? `acc * (rmsScale(uRowA0 + m) * ${PRESCALE}.0)` : "acc"};
 }`
@@ -3626,6 +3689,147 @@ export function matmulQ6KHeadWords(o: { split: boolean; prescaled: boolean }) {
   if (!source) q6Words.set(key, (source = matmulQ6KHeadWordsSource(o)))
   return source
 }
+
+/**
+ * A Q6_K embedding split for WebGL (see Engine's q6Split): each weight's
+ * low 4 bits in an RGBA4 texture laid out as a 4-bit RGBA4 matrix's (a row
+ * group's texels: 32-weight block, row, 8 texels of 4, read .wzyx), which
+ * the texture unit unpacks, as the ONNX models' 4-bit head reads; its top
+ * 2 bits in a second RGBA4 texture, half as wide (block, row, 4 texels:
+ * nibble k of texel t holds weight 4t + k's in its low 2 bits and weight
+ * 16 + 4t + k's above them); d a super-block a texel for the group's 4
+ * rows (RGBA16F) and each row's 16 int8 sub-block scales in one RGBA32UI
+ * texel. A large embedding takes several textures of each (parts: whole
+ * columns each, so a contiguous run of row groups); uCol0 is a part's
+ * first column. w = d · scale · (low + 16 · high - 32).
+ */
+const Q6_SPLIT = `
+// Weight 4t + k's top 2 bits (lo) and 16 + 4t + k's (hi) from a high texel.
+void q6High(vec4 t, out vec4 lo, out vec4 hi) {
+  vec4 v = floor(t.wzyx * 15.0 + 0.5);
+  hi = floor(v * 0.25);
+  lo = v - 4.0 * hi;
+}
+float sc8w(uint u, uint b) { return float(int(u << (24u - 8u * b)) >> 24); }`
+
+function headQ6SplitSource(o: { split: boolean }) {
+  const C = "xyzw"
+  const rows: Array<string> = []
+  for (const r of [0, 1, 2, 3]) {
+    const L = (t: number) => `texelFetch(uW, ivec2(wx + k * 32 + ${r * 8 + t}, gr), 0).wzyx`
+    rows.push(`      {
+        float lo0 = dot(${L(0)}, A0) + dot(${L(1)}, A1) + dot(${L(2)}, A2) + dot(${L(3)}, A3);
+        float lo1 = dot(${L(4)}, A4) + dot(${L(5)}, A5) + dot(${L(6)}, A6) + dot(${L(7)}, A7);
+        vec4 a, b, c, d2, e, f, g2, h;
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4}, gr), 0), a, b);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 1}, gr), 0), c, d2);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 2}, gr), 0), e, f);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 3}, gr), 0), g2, h);
+        float hi0 = dot(a, A0) + dot(c, A1) + dot(e, A2) + dot(g2, A3);
+        float hi1 = dot(b, A4) + dot(d2, A5) + dot(f, A6) + dot(h, A7);
+        uint w = comp(SC${r}, kb >> 1);
+        P.${C[r]} += sc8w(w, b0) * (15.0 * lo0 + 16.0 * hi0 - 32.0 * sa0) + sc8w(w, b0 + 1u) * (15.0 * lo1 + 16.0 * hi1 - 32.0 * sa1);
+      }`)
+  }
+  return `${HEADER}${Q6_SPLIT}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uHigh;
+uniform sampler2D uS;
+uniform usampler2D uSub;
+uniform int uKb;
+uniform int uH;
+uniform int uG;
+uniform int uOutW;
+uniform int uLogitRows;
+uniform int uCol0;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int m = y / uLogitRows;
+  y -= m * uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+  int g = y * uOutW + x;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int col = g / uH;
+  int gr = g - col * uH;
+  int lc = col - uCol0;
+  int wx = lc * uKb * 256;
+  int hx = lc * uKb * 128;
+  int sx = lc * uKb;
+  vec4 acc = vec4(0.0);
+  for (int sb = sb0; sb < sb1; sb++) {
+    vec4 dd = texelFetch(uS, ivec2(sx + sb, gr), 0);
+    uvec4 SC0 = texelFetch(uSub, ivec2((sx + sb) * 4, gr), 0);
+    uvec4 SC1 = texelFetch(uSub, ivec2((sx + sb) * 4 + 1, gr), 0);
+    uvec4 SC2 = texelFetch(uSub, ivec2((sx + sb) * 4 + 2, gr), 0);
+    uvec4 SC3 = texelFetch(uSub, ivec2((sx + sb) * 4 + 3, gr), 0);
+    vec4 P = vec4(0.0);
+    for (int kb = 0; kb < 8; kb++) {
+      int k = sb * 8 + kb;
+      uvec4 u0 = texelFetch(uA, ivec2(k * 4, m), 0);
+      uvec4 u1 = texelFetch(uA, ivec2(k * 4 + 1, m), 0);
+      uvec4 u2 = texelFetch(uA, ivec2(k * 4 + 2, m), 0);
+      uvec4 u3 = texelFetch(uA, ivec2(k * 4 + 3, m), 0);
+      vec4 A0 = h2lo(u0); vec4 A1 = h2hi(u0); vec4 A2 = h2lo(u1); vec4 A3 = h2hi(u1);
+      vec4 A4 = h2lo(u2); vec4 A5 = h2hi(u2); vec4 A6 = h2lo(u3); vec4 A7 = h2hi(u3);
+      float sa0 = dot(A0 + A1 + A2 + A3, vec4(1.0));
+      float sa1 = dot(A4 + A5 + A6 + A7, vec4(1.0));
+      uint b0 = uint(2 * (kb & 1));
+${rows.join("\n")}
+    }
+    acc += dd * P;
+  }
+  o = acc;
+}`
+}
+
+const q6Splits = new Map<string, string>()
+/** The output head through a split Q6_K embedding (see Q6_SPLIT): one part's columns. */
+export function headQ6Split(o: { split: boolean }) {
+  const key = `${o.split}`
+  let source = q6Splits.get(key)
+  if (!source) q6Splits.set(key, (source = headQ6SplitSource(o)))
+  return source
+}
+
+/** Embedding rows from a split Q6_K embedding (see Q6_SPLIT): rows of other parts are left (discarded). */
+export const EMBED_Q6_SPLIT = `${HEADER}${Q6_SPLIT}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uHigh;
+uniform sampler2D uS;
+uniform usampler2D uSub;
+uniform int uKb;
+uniform int uH;
+uniform int uCol0;
+uniform int uCols;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int lc = col - uCol0;
+  if (lc < 0 || lc >= uCols) discard;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int k = c >> 5;
+  int t = (c & 31) >> 2;
+  int sb = c >> 8;
+  vec4 lo = floor(texelFetch(uW, ivec2(lc * uKb * 256 + k * 32 + r * 8 + t, gr), 0).wzyx * 15.0 + 0.5);
+  vec4 h0, h1;
+  q6High(texelFetch(uHigh, ivec2(lc * uKb * 128 + k * 16 + r * 4 + (t & 3), gr), 0), h0, h1);
+  vec4 q = lo + 16.0 * (t < 4 ? h0 : h1);
+  int i = c >> 4;
+  float sc = sc8w(comp(texelFetch(uSub, ivec2((lc * uKb + sb) * 4 + r, gr), 0), (i & 15) >> 2), uint(i & 3));
+  float d = comp(texelFetch(uS, ivec2(lc * uKb + sb, gr), 0), r);
+  o = (d * sc) * (q - 32.0);
+}`
 
 /** EMBED_Q6_K for word texels (see Q6_K_WORDS). */
 export const EMBED_Q6_K_WORDS = `${HEADER}${Q6_K_WORDS}
@@ -3661,6 +3865,77 @@ void main() {
   float sc = sc8w(comp(texelFetch(uW, ivec2(t0 + 12, gr), 0), k >> 2), uint(k & 3));
   float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
   o = (d * sc) * (vec4(lo | (hb << 4u)) - 32.0);
+}`
+
+/**
+ * Q6_K word texels in the order the native head reads them (see
+ * ORDER_Q6_WORDS): a super-block's 52 texels are its 4 rows' scale texels,
+ * then per q-step (n, hw) = (q >> 1, q & 1) each row's ql texels 4n + hw
+ * and 4n + hw + 2 and qh texel 8 + 2n + hw. q6Pos: where row r's texel j
+ * (of the 13 in kernels' usual order) went.
+ */
+export const EMBED_Q6_K_WORDS_ORDERED = `${HEADER}${Q6_K_WORDS}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb;
+uniform int uH;
+uniform int uRowTexels;
+out vec4 o;
+int q6Pos(int r, int j) {
+  if (j == 12) return r;
+  int slot = j >= 8 ? 2 : (j >> 1) & 1;
+  int n = j >= 8 ? (j - 8) >> 1 : j >> 2;
+  return 4 + (2 * n + (j & 1)) * 12 + r * 3 + slot;
+}
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int sb = c >> 8;
+  int n = (c >> 7) & 1;
+  int grp = (c >> 5) & 3;
+  int w = (c & 31) >> 2;
+  int t0 = col * uRowTexels + sb * 52;
+  // ql uint 16n + w (groups 0, 2) or 16n + 8 + w (1, 3); qh uint 32 + 8n + w.
+  int qi = 16 * n + 8 * (grp & 1) + w;
+  uint q = comp(texelFetch(uW, ivec2(t0 + q6Pos(r, qi >> 2), gr), 0), qi & 3);
+  int hi = 32 + 8 * n + w;
+  uint h = comp(texelFetch(uW, ivec2(t0 + q6Pos(r, hi >> 2), gr), 0), hi & 3);
+  uvec4 lo = ((uvec4(q) >> BYTE_SHIFT) >> uint(4 * (grp >> 1))) & 15u;
+  uvec4 hb = ((uvec4(h) >> BYTE_SHIFT) >> uint(2 * grp)) & 3u;
+  int k = 8 * n + (w >> 2) + 2 * grp;
+  float sc = sc8w(comp(texelFetch(uW, ivec2(t0 + r, gr), 0), k >> 2), uint(k & 3));
+  float d = comp(texelFetch(uS, ivec2(col * uKb + sb, gr), 0), r);
+  o = (d * sc) * (vec4(lo | (hb << 4u)) - 32.0);
+}`
+
+/** Native Q6_K word texels (13 a super-block row) rearranged into the native head's order (EMBED_Q6_K_WORDS_ORDERED's). */
+export const ORDER_Q6_WORDS = `${HEADER}
+uniform usampler2D uNative;
+uniform int uX0;
+uniform int uY0;
+out uvec4 o;
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+  int sb = p.x / 52;
+  int pos = p.x - sb * 52;
+  int src = pos * 13 + 12;
+  if (pos >= 4) {
+    int k = pos - 4;
+    int q = k / 12;
+    int r = (k - q * 12) / 3;
+    int slot = k - q * 12 - r * 3;
+    int n = q >> 1;
+    int hw = q & 1;
+    src = r * 13 + (slot == 2 ? 8 + 2 * n + hw : 4 * n + hw + 2 * slot);
+  }
+  o = texelFetch(uNative, ivec2(sb * 52 + src, p.y), 0);
 }`
 
 /** Embedding rows for token ids from a Q6_K embedding: `embed`, for 6-bit weights. */
@@ -3903,6 +4178,24 @@ vec4 acc=vec4(0);for(int q=sb0*8;q<sb1*8;q++){
 ${body.join("\n")}
 }o=${o.prescaled ? `acc*(rmsScale(uRowA0+m)*${PRESCALE}.0)` : "acc"};}`
 }
+
+/** EMBED_Q6_EXPANDED for the RGBA32UI layout (EXPAND_Q6_WORDS's). */
+export const EMBED_Q6_EXPANDED_WORDS = `${HEADER}
+uniform usampler2D uIds;
+uniform usampler2D uW;
+uniform sampler2D uS;
+uniform int uKb,uH,uRowTexels;
+out vec4 o;
+void main(){int x=int(gl_FragCoord.x),y=int(gl_FragCoord.y),id=int(texelFetch(uIds,ivec2(0,y),0).x);
+int g=id>>2,r=id&3,col=g/uH,gr=g-col*uH,sb=x>>6,q=x&63;
+uvec4 t=texelFetch(uW,ivec2(col*uRowTexels+sb*64+(q>>3)*8+((q>>2)&1)*4+r,gr),0);
+uvec4 shifts=uvec4(0u,8u,16u,24u);
+uvec4 b=(uvec4(comp(t,q&3))>>shifts)&255u;
+uvec4 s=((uvec4(t.x)>>shifts)>>6u)&3u;
+float sc=float(s.x+4u*s.y+16u*s.z+64u*s.w);
+sc=sc>=128.0?sc-256.0:sc;
+vec4 quant=vec4((q&3)==0?b&63u:b)-32.0;
+float d=comp(texelFetch(uS,ivec2(col*uKb+sb,gr),0),r);o=(d*sc)*quant;}`
 
 export const EMBED_Q6_EXPANDED = `${HEADER}${Q6_EXPANDED}
 uniform usampler2D uIds;

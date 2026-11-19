@@ -1,0 +1,390 @@
+/**
+ * predictSpeed: how fast a model would read prompts and write on this
+ * device, before its weights download, for an app deciding whether to run
+ * it here (say, only at 1,000 prompt tokens/s or more).
+ *
+ * Measured, not guessed: the model's shapes come from its GGUF header or
+ * its ONNX graph and config (see speed-probe.ts), one layer of each kind it
+ * has is built with random weights in the storage the real load gives
+ * them, and the engine's own prompt and writing passes are timed on it.
+ * The timings scale to the whole model by its layer counts and vocabulary
+ * (speedFromTimes). The result is remembered per GPU, browser, model and
+ * engine code, so later calls answer at once.
+ */
+import { Engine, TUNING } from "./engine.js"
+import { monitorFrames } from "./frame-pacing.js"
+import { abortable, abortError, throwIfAborted } from "./errors.js"
+import type { WebGlModelId } from "./model-meta.js"
+import { resolveModel } from "./resolve-model.js"
+import { probeSpeed, speedShape, type ProbeReport, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
+import type { LayerType } from "./weights.js"
+
+/** Tokens per second on this device. */
+export type SpeedPrediction = {
+  /** Prompt tokens read per second, for a prompt of about 512 tokens. */
+  prompt: number
+  /** Tokens written per second, one at a time (no speculative drafts); absent when measured with `decode: false`. */
+  decode?: number
+}
+
+export type PredictSpeedOptions = {
+  /** Measure again, even if this device's result for the model is remembered. */
+  force?: boolean
+  /**
+   * false: the prompt speed alone, faster (the writing and the head aren't
+   * timed): enough to decide whether a model reads prompts fast enough here
+   * to download it. Firefox on a Pixel 10 Pro answers for LFM3 1.7B in
+   * about 1.6 s this way, where 2.1 s with writing.
+   */
+  decode?: boolean
+  /** As WebGLLMOptions.webgpu: false measures on WebGL 2 even where there's WebGPU. */
+  webgpu?: "auto" | false
+  signal?: AbortSignal
+}
+
+/**
+ * The prompt and writing speed of `model` on this device, in tokens per
+ * second, without downloading its weights: it reads the model's shapes (a
+ * GGUF's header, or an ONNX model's graph and config), times one layer of
+ * each kind it has with random weights on this GPU (about a second on an
+ * M3 Ultra, longer on a slower GPU; a few hundred MB of GPU memory, freed
+ * after), and scales that to the whole model. Remembered per GPU, browser, model and engine version: a
+ * later call answers at once (`force` measures again).
+ *
+ * In a page it runs in a worker of its own. It shares the GPU with
+ * anything else running: call it while no model is loading or answering,
+ * or both are slowed and the prediction is low.
+ *
+ * @example
+ * ```ts
+ * const { prompt, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF")
+ * const local = prompt >= 200 && decode! >= 10
+ * // Only whether prompts are fast enough, sooner:
+ * const fast = (await predictSpeed("LiquidAI/LFM3-1.7B-GGUF", { decode: false })).prompt >= 300
+ * ```
+ */
+export async function predictSpeed(model: WebGlModelId, options: PredictSpeedOptions = {}): Promise<SpeedPrediction> {
+  throwIfAborted(options.signal)
+  if (typeof model !== "string" || !model) throw new TypeError("model is required.")
+  if (options.webgpu !== undefined && options.webgpu !== "auto" && options.webgpu !== false)
+    throw new TypeError(`webgpu must be "auto" or false.`)
+  const pageKey = `${model}|${options.webgpu === false ? "webgl" : "auto"}`
+  const remembered = !options.force && inPage.get(pageKey)
+  if (remembered && (options.decode === false || remembered.decode !== undefined)) return remembered
+  const run = typeof document !== "undefined" && typeof Worker !== "undefined"
+    ? inWorker(model, options).then((r) => r.prediction)
+    : predictHere(model, options).then((r) => r.prediction)
+  const prediction = await run
+  inPage.set(pageKey, prediction)
+  return prediction
+}
+
+/** This page's answers (the GPU, browser and engine code can't change under it). */
+const inPage = new Map<string, SpeedPrediction>()
+
+/** What a worker of predictSpeed's own is sent, and answers. */
+export type SpeedWorkerRequest =
+  | { type: "predict-speed"; model: string; force: boolean; decode?: boolean; webgpu?: "auto" | false }
+  | { type: "frames"; intervalMs: number; expectedMs: number; frames: number; startedAt?: number; meanMs?: number }
+export type SpeedWorkerReply =
+  | { type: "speed"; prediction: SpeedPrediction; report: SpeedReport }
+  | { type: "speed-error"; name: string; message: string }
+
+/**
+ * predictSpeed in a worker of its own (predict-speed-worker.ts), as a
+ * model runs: its GPU waits aren't the page's, and the page's frames are
+ * reported to it as webgllm's own workers get them (the GPU's pacing
+ * depends on them).
+ */
+export function inWorker(
+  model: string,
+  options: PredictSpeedOptions = {},
+  worker: Worker = new Worker(new URL("./predict-speed-worker.js", import.meta.url), { type: "module", name: "webgllm-speed" })
+): Promise<{ prediction: SpeedPrediction; report: SpeedReport }> {
+  return new Promise((resolve, reject) => {
+    const post = (message: SpeedWorkerRequest) => worker.postMessage(message)
+    const stopFrames = monitorFrames((intervalMs, expectedMs, frames, startedAt, meanMs) =>
+      post({ type: "frames", intervalMs, expectedMs, frames, startedAt, meanMs })
+    )
+    const done = () => {
+      stopFrames()
+      options.signal?.removeEventListener("abort", abort)
+      worker.terminate()
+    }
+    const abort = () => {
+      done()
+      reject(options.signal?.reason ?? new DOMException("Aborted", "AbortError"))
+    }
+    options.signal?.addEventListener("abort", abort, { once: true })
+    worker.onmessage = ({ data }: MessageEvent<SpeedWorkerReply>) => {
+      done()
+      if (data.type === "speed") resolve({ prediction: data.prediction, report: data.report })
+      else reject(Object.assign(new Error(data.message), { name: data.name }))
+    }
+    worker.onerror = (event) => {
+      done()
+      reject(new Error(event.message || "predictSpeed's worker failed to start."))
+    }
+    post({ type: "predict-speed", model, force: !!options.force, decode: options.decode !== false, ...(options.webgpu === false && { webgpu: false as const }) })
+  })
+}
+
+/** How a prediction was made: the shapes, the timings, how long it took (absent when remembered). */
+export type SpeedReport = ProbeReport & { cached: false } | { cached: true }
+
+/** A remembered prediction. */
+export type SpeedNote = SpeedPrediction & { at: number }
+
+/** Where predictions are remembered (OPFS by default; see opfsSpeedStore). */
+export type SpeedStore = {
+  read: (key: string) => Promise<SpeedNote | undefined>
+  write: (key: string, note: SpeedNote) => Promise<void>
+}
+
+/** What predictHere runs on: the real ones, or a test's. */
+export type SpeedDeps = {
+  /** This GPU's renderer string (as GPU notes key it), and the backend a model runs on (`webgpu` false: WebGL 2). */
+  renderer: (webgpu?: boolean) => string
+  userAgent: string
+  store: SpeedStore
+  /** Shapes, then timings: the GPU's part (`decode` false: the prompt's alone). */
+  measure: (model: string, signal?: AbortSignal, decode?: boolean, webgpu?: boolean) => Promise<{ shape: SpeedShape; report: ProbeReport }>
+}
+
+/** FNV-1a of a string, as hex (as the worker's note keys). */
+function hash(text: string) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193)
+  return (h >>> 0).toString(16)
+}
+
+/**
+ * The key a prediction is remembered by: GPU, browser, model, and the
+ * engine's code and settings (Engine.fingerprint and TUNING, as GPU notes
+ * are keyed), so a new engine or browser measures again.
+ */
+export function speedKey(renderer: string, userAgent: string, model: string, code = `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}`) {
+  return `${renderer}|${userAgent}|${model}|${code}`
+}
+
+/**
+ * Tokens per second from the probe's timings. The head over the model's
+ * vocabulary: the probe's, plus its rows past the probe's at the measured
+ * cost per row. A prompt: through the first and last layers, plus what
+ * the probe's stack of middle layers added, scaled to the model's middle
+ * layers, then the head for its last token. A writing step: every layer,
+ * then the head.
+ */
+export function speedFromTimes(times: ProbeTimes, layerTypes: ReadonlyArray<LayerType>, vocabSize: number): SpeedPrediction {
+  const headExtra = Math.max(0, vocabSize - times.vocab) * times.headPerRow
+  const head = times.headAt + headExtra
+  const middle = Math.max(0, layerTypes.length - 2)
+  const middleMs = times.stackLayers > 0 ? (Math.max(0, times.promptStack - times.promptBase) * middle) / times.stackLayers : 0
+  // (The prompt's last token goes through the head too.)
+  const promptMs = times.promptBase + middleMs + head
+  const prompt = (1000 * times.promptTokens) / promptMs
+  // (Writing untimed: a prompt-only measurement, see PredictSpeedOptions.decode.)
+  return Number.isFinite(times.decodeLayers) ? { prompt, decode: 1000 / (times.decodeLayers + head) } : { prompt }
+}
+
+const SPEED_NOTES = "speed-notes.json"
+
+/**
+ * Predictions in the origin's storage (webgl-models/speed-notes.json),
+ * best effort: no storage means measuring each time. Written through a
+ * synchronous access handle in a worker, else createWritable.
+ */
+export const opfsSpeedStore: SpeedStore = {
+  async read(key) {
+    try {
+      const notes = JSON.parse(await (await (await speedFile()).getFile()).text()) as Record<string, SpeedNote>
+      const note = notes[key]
+      return note && note.prompt > 0 && (note.decode === undefined || note.decode > 0) ? note : undefined
+    } catch {
+      return undefined
+    }
+  },
+  async write(key, note) {
+    try {
+      const file = await speedFile()
+      let notes: Record<string, SpeedNote> = {}
+      try {
+        notes = JSON.parse(await (await file.getFile()).text()) as Record<string, SpeedNote>
+      } catch {
+        // None yet, or unreadable: written over.
+      }
+      // This GPU, browser and model's notes from other engine code are stale.
+      const prefix = key.slice(0, key.lastIndexOf("|") + 1)
+      for (const k of Object.keys(notes)) if (k.startsWith(prefix)) delete notes[k]
+      notes[key] = note
+      await writeText(file, JSON.stringify(notes))
+    } catch {
+      // Remembering is optional.
+    }
+  }
+}
+
+/** A file's whole text: through a synchronous access handle in a worker, else createWritable. */
+async function writeText(file: FileSystemFileHandle, text: string) {
+  const bytes = new TextEncoder().encode(text)
+  const handle = file as FileSystemFileHandle & {
+    createSyncAccessHandle?: () => Promise<{ truncate: (n: number) => void; write: (b: Uint8Array, o: { at: number }) => number; flush: () => void; close: () => void }>
+  }
+  if (typeof document === "undefined" && handle.createSyncAccessHandle) {
+    const access = await handle.createSyncAccessHandle()
+    try {
+      access.truncate(0)
+      access.write(bytes, { at: 0 })
+      access.flush()
+    } finally {
+      access.close()
+    }
+  } else {
+    const writable = await file.createWritable()
+    await writable.write(bytes)
+    await writable.close()
+  }
+}
+
+async function speedFile(name = SPEED_NOTES) {
+  const root = await navigator.storage.getDirectory()
+  const dir = await root.getDirectoryHandle("webgl-models", { create: true })
+  return dir.getFileHandle(name, { create: true })
+}
+
+const SPEED_SHAPES = "speed-shapes.json"
+
+/** A model's shapes as predictSpeed last read them (webgl-models/speed-shapes.json), best effort. */
+async function readShape(key: string): Promise<SpeedShape | undefined> {
+  try {
+    const shapes = JSON.parse(await (await (await speedFile(SPEED_SHAPES)).getFile()).text()) as Record<string, SpeedShape>
+    const shape = shapes[key]
+    return shape?.config && Array.isArray(shape.kinds) && shape.embedding ? shape : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function writeShape(key: string, shape: SpeedShape) {
+  try {
+    const handle = await speedFile(SPEED_SHAPES)
+    let shapes: Record<string, SpeedShape> = {}
+    try {
+      shapes = JSON.parse(await (await handle.getFile()).text()) as Record<string, SpeedShape>
+    } catch {
+      // Unreadable or empty: written over.
+    }
+    if (JSON.stringify(shapes[key]) === JSON.stringify(shape)) return
+    shapes[key] = shape
+    await writeText(handle, JSON.stringify(shapes))
+  } catch {
+    // No storage: read again next time.
+  }
+}
+
+/**
+ * The GPU's renderer string, from a context of its own, and the backend a
+ * model's worker runs on here (WebGPU where the browser has it: see
+ * TUNING.webgpu), so a prediction made on one isn't kept for the other.
+ */
+function rendererHere(webgpu = true) {
+  const backend = webgpu && TUNING.webgpu > 0 && typeof navigator !== "undefined" && "gpu" in navigator ? "webgpu" : "webgl"
+  return `${webglRenderer()}|${backend}`
+}
+
+/** The GPU's WebGL renderer string, from a context of its own. */
+function webglRenderer() {
+  const gl = new OffscreenCanvas(1, 1).getContext("webgl2")
+  if (!gl) throw new Error("This browser has no WebGL 2.")
+  const debug = gl.getExtension("WEBGL_debug_renderer_info")
+  const renderer = String(gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER))
+  gl.getExtension("WEBGL_lose_context")?.loseContext()
+  return renderer
+}
+
+/**
+ * The real dependencies; `onEngine` is told of the probe's engine while it
+ * measures (and of null after), for the page's frame reports.
+ */
+export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): SpeedDeps => ({
+  renderer: rendererHere,
+  userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+  store: opfsSpeedStore,
+  measure: async (model, signal, decode = true, webgpu = true) => {
+    const started = performance.now()
+    const meta = await resolveModel(model, signal)
+    // (The shapes remembered from an earlier measurement of the same files:
+    // a GGUF's shapes follow its whole vocabulary, a second's download on
+    // an iPhone before the model is stored.)
+    const shapeKey = `${model}|${JSON.stringify(meta.files)}`
+    const shape = (await readShape(shapeKey)) ?? (await speedShape(meta))
+    void writeShape(shapeKey, shape)
+    const shapeMs = performance.now() - started
+    throwIfAborted(signal)
+    const report = await probeSpeed(shape, { signal, onEngine, decode, webgpu })
+    return { shape, report: { ...report, shapeMs } }
+  }
+})
+
+/**
+ * Measures at most once at a time per model in this context: one run, the
+ * calls waiting on it, and what calls it off once every one of them has
+ * aborted.
+ */
+const pending = new Map<
+  string,
+  { run: Promise<{ prediction: SpeedPrediction; report: SpeedReport }>; waiters: number; stop: AbortController }
+>()
+
+/**
+ * predictSpeed in this context (a worker's, or a test's with `deps`):
+ * the remembered prediction unless `force`, else measured and remembered.
+ * Each call's `signal` ends its own wait; a measurement calls share stops
+ * only once every call waiting on it has aborted.
+ */
+export function predictHere(
+  model: string,
+  options: PredictSpeedOptions = {},
+  deps: SpeedDeps = realSpeedDeps()
+): Promise<{ prediction: SpeedPrediction; report: SpeedReport }> {
+  const { signal } = options
+  if (signal?.aborted) return Promise.reject(abortError(signal))
+  const webgpu = options.webgpu !== false
+  const key = speedKey(deps.renderer(webgpu), deps.userAgent, model)
+  const decode = options.decode !== false
+  // (A prompt-only measurement doesn't answer a call that wants writing too.)
+  let shared = pending.get(`${key}|${decode}`) ?? (decode ? undefined : pending.get(`${key}|true`))
+  if (!shared) {
+    const stop = new AbortController()
+    const run = (async () => {
+      if (!options.force) {
+        const note = await deps.store.read(key)
+        if (note && (!decode || note.decode !== undefined))
+          return { prediction: { prompt: note.prompt, ...(note.decode !== undefined && { decode: note.decode }) }, report: { cached: true as const } }
+      }
+      throwIfAborted(stop.signal)
+      const { shape, report } = await deps.measure(model, stop.signal, decode, webgpu)
+      const prediction = speedFromTimes(report.times, shape.config.layerTypes, shape.config.vocabSize)
+      await deps.store.write(key, { ...prediction, at: Date.now() })
+      return { prediction, report: { ...report, cached: false as const } }
+    })()
+    const entry = { run, waiters: 0, stop }
+    const name = `${key}|${decode}`
+    pending.set(name, entry)
+    const clear = () => {
+      if (pending.get(name) === entry) pending.delete(name)
+    }
+    run.then(clear, clear)
+    shared = entry
+  }
+  const entry = shared
+  entry.waiters++
+  return abortable(entry.run, signal).finally(() => {
+    entry.waiters--
+    // The last call waiting gave up: the measurement is called off, and the next call starts afresh.
+    if (entry.waiters === 0 && signal?.aborted) {
+      entry.stop.abort(abortError(signal))
+      for (const [name, e] of pending) if (e === entry) pending.delete(name)
+    }
+  })
+}

@@ -65,3 +65,26 @@ test("inline tensor bytes remain caller-owned even with retirement enabled", asy
   assert.equal(data.byteLength, 16)
   assert.equal(data[0], 7)
 })
+
+test("a retired read goes back to a source that recycles, not freed, and only once every slice is done", async () => {
+  const data = Uint8Array.from({ length: 128 }, (_, i) => i)
+  const recycled: Array<ArrayBuffer> = []
+  const source = {
+    size: 128,
+    read: async (offset: number, length: number) => data.slice(offset, offset + length),
+    recycle: (buffer: ArrayBuffer) => void recycled.push(buffer)
+  }
+  const plan = new ReadPlan(3, 64, true)
+  plan.add({ key: "a", source, offset: 16, length: 16 })
+  plan.add({ key: "b", source, offset: 32, length: 16 })
+  // (A larger read planned: a and b are read together, into one buffer.)
+  plan.add({ key: "c", source, offset: 64, length: 64 })
+  const a = await plan.take("a")
+  plan.release(a)
+  assert.equal(recycled.length, 0, "b still borrows the shared read")
+  const b = await plan.take("b")
+  plan.release(b)
+  assert.equal(recycled.length, 1)
+  assert.equal(recycled[0], a.buffer)
+  assert.equal(recycled[0].byteLength, 32, "handed back whole, not detached")
+})

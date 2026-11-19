@@ -20,6 +20,10 @@ function fake(linear = false) {
     chunkErrors: null as number[] | null,
     debug: null,
     kvDebug: null,
+    // (No embedding rows sampled: headError checks nothing.)
+    embeddingSamples: new Map(),
+    finalNormValues: null,
+    headError: Reflect.get(Engine.prototype, "headError") as () => Promise<number>,
     reset() {
       this.position = 0
     },
@@ -164,6 +168,7 @@ test("the warm-up fits a small requested context", async () => {
       contextLength,
       get position() { return position },
       capacity: 576,
+      batchSize: 128,
       canDraft: true,
       quadMatmuls: false,
       layers: [{ type: "full_attention", attention: {} }],
@@ -190,8 +195,8 @@ test("the warm-up fits a small requested context", async () => {
     }
     await Engine.prototype.warmUp.call(state as unknown as Engine)
     assert.equal(position, 0)
-    // A big enough context reads every batch shape the warm-up has.
-    if (contextLength === 8192) assert.deepEqual(sizes, [9, 64, 2, 1, 12, 1])
+    // A big enough context reads every batch shape the warm-up has (a full prompt batch among them).
+    if (contextLength === 8192) assert.deepEqual(sizes, [9, 128, 2, 1, 12, 1])
   }
 })
 

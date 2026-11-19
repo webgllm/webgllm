@@ -6,6 +6,7 @@
  * request has images to read.
  */
 import { GL, type Gpu, type Pass, type Texture } from "./gpu/gl.js"
+import type { WebGpu } from "./gpu/webgpu.js"
 import * as V from "./gpu/vision-kernels.js"
 import { patchPlace, type ImagePatches } from "./image.js"
 import {
@@ -267,7 +268,7 @@ export class VisionEncoder {
   private merger!: GpuMerger
   private weights: Array<Texture> = []
 
-  constructor(readonly gpu: Gpu) {}
+  constructor(readonly gpu: Gpu | WebGpu) {}
 
   /** The most patches one view may have here: a texture's height. */
   get maxPatches() {

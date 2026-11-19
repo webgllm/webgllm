@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>webgpu-wide</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px}</style></head>
+<body><pre id="out"></pre>
+<script type="module">
+// The engine's few-token 4-bit matvec (byte texels: a row's 32 weights of a block in 16 bytes, low nibbles values
+// 4w+i and high 16+4w+i of word w; a scale per row and block) at LFM3 1.7B's shapes, the same bytes read three ways:
+// RGBA8UI texels (as the engine reads them), RGBA32UI texels (16 bytes a fetch) and a storage buffer. Checks the
+// three agree, then times them.
+const out = document.getElementById("out")
+const log = (t) => { out.textContent += `${t}\n`; void fetch("/log", { method: "POST", body: t }).catch(() => undefined) }
+const q = new URLSearchParams(location.search)
+try {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" })
+  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize, maxBufferSize: adapter.limits.maxBufferSize } })
+  log(`WIDE ${navigator.userAgent}`)
+  const shapes = [["in_proj", 6144, 2048], ["gate+up", 15360, 2048], ["down", 2048, 7680], ["out", 2048, 2048]]
+  const fragments = +(q.get("frags") ?? 8192)
+  const wgX = +(q.get("wg") ?? 64)
+  const variants = (q.get("v") ?? "b8,b32,buf,b32x2").split(",")
+  const kernel = (v) => {
+    const W = v === "b8" ? "var tW: texture_2d<u32>;" : v.startsWith("b32") ? "var tW: texture_2d<u32>;" : "var<storage, read> bW: array<vec4<u32>>;"
+    // Word w of row r in block kb, as a vec4 of bytes' (lo, hi) per i.
+    const words = v === "b8"
+      ? `let base = u.wx + kb * 16u + r * 4u;
+        let B0 = textureLoad(tW, vec2u(base, gr), 0); let B1 = textureLoad(tW, vec2u(base + 1u, gr), 0);
+        let B2 = textureLoad(tW, vec2u(base + 2u, gr), 0); let B3 = textureLoad(tW, vec2u(base + 3u, gr), 0);
+        let L0 = vec4f(B0 & vec4u(15u)); let H0 = vec4f(B0 >> vec4u(4u));
+        let L1 = vec4f(B1 & vec4u(15u)); let H1 = vec4f(B1 >> vec4u(4u));
+        let L2 = vec4f(B2 & vec4u(15u)); let H2 = vec4f(B2 >> vec4u(4u));
+        let L3 = vec4f(B3 & vec4u(15u)); let H3 = vec4f(B3 >> vec4u(4u));`
+      : `let Q = ${v.startsWith("b32") ? "textureLoad(tW, vec2u(u.wx / 4u + kb * 4u + r, gr), 0)" : "bW[(gr * u.w32) + u.wx / 4u + kb * 4u + r]"};
+        let L0 = vec4f((vec4u(Q.x) >> SL) & vec4u(15u)); let H0 = vec4f((vec4u(Q.x) >> SH) & vec4u(15u));
+        let L1 = vec4f((vec4u(Q.y) >> SL) & vec4u(15u)); let H1 = vec4f((vec4u(Q.y) >> SH) & vec4u(15u));
+        let L2 = vec4f((vec4u(Q.z) >> SL) & vec4u(15u)); let H2 = vec4f((vec4u(Q.z) >> SH) & vec4u(15u));
+        let L3 = vec4f((vec4u(Q.w) >> SL) & vec4u(15u)); let H3 = vec4f((vec4u(Q.w) >> SH) & vec4u(15u));`
+    const rows = v === "b32x2" ? 2 : 1
+    return `
+struct U { kb: u32, slices: u32, kbSlice: u32, groups: u32, wx: u32, w32: u32 }
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) ${W}
+@group(0) @binding(2) var tS: texture_2d<f32>;
+@group(0) @binding(3) var tA: texture_2d<u32>;
+@group(0) @binding(4) var<storage, read_write> o: array<vec4f>;
+const SL = vec4u(0u, 8u, 16u, 24u);
+const SH = vec4u(4u, 12u, 20u, 28u);
+fn h(a: vec4u) -> array<vec4f, 2> {
+  let x = unpack2x16float(a.x); let y = unpack2x16float(a.y); let z = unpack2x16float(a.z); let w = unpack2x16float(a.w);
+  return array<vec4f, 2>(vec4f(x.x, x.y, y.x, y.y), vec4f(z.x, z.y, w.x, w.y));
+}
+@compute @workgroup_size(${wgX}, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  for (var k = 0u; k < ${rows}u; k++) {
+  let gr = id.x * ${rows}u + k;
+  if (gr >= u.groups) { return; }
+  let slice = id.y;
+  let kb0 = slice * u.kbSlice;
+  let kb1 = min(u.kb, kb0 + u.kbSlice);
+  var acc = vec4f(0.0);
+  for (var kb = kb0; kb < kb1; kb++) {
+    let d = textureLoad(tS, vec2u(kb, gr), 0);
+    let a0 = h(textureLoad(tA, vec2u(kb * 4u, 0u), 0)); let a1 = h(textureLoad(tA, vec2u(kb * 4u + 1u, 0u), 0));
+    let a2 = h(textureLoad(tA, vec2u(kb * 4u + 2u, 0u), 0)); let a3 = h(textureLoad(tA, vec2u(kb * 4u + 3u, 0u), 0));
+    // Values 0..7 as texels 0..3's lo/hi halves: A_j = values 4j .. 4j+3.
+    let A0 = a0[0]; let A1 = a0[1]; let A2 = a1[0]; let A3 = a1[1];
+    let A4 = a2[0]; let A5 = a2[1]; let A6 = a3[0]; let A7 = a3[1];
+    let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4f(1.0));
+    var b = vec4f(0.0);
+    for (var r = 0u; r < 4u; r++) {
+      ${words}
+      b[r] = dot(L0, A0) + dot(L1, A1) + dot(L2, A2) + dot(L3, A3) + dot(H0, A4) + dot(H1, A5) + dot(H2, A6) + dot(H3, A7);
+    }
+    acc += d * (b - 8.0 * sa);
+  }
+  o[slice * u.groups + gr] = acc;
+  }
+}`
+  }
+  for (const [name, N, K] of shapes) {
+    const groups = N / 4, kb = K / 32, w32 = kb * 4, bytes = groups * w32 * 16
+    const data = new Uint8Array(bytes)
+    for (let i = 0; i < bytes; i += 65536) crypto.getRandomValues(data.subarray(i, Math.min(bytes, i + 65536)))
+    const t8 = device.createTexture({ size: [w32 * 4, groups], format: "rgba8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    device.queue.writeTexture({ texture: t8 }, data, { bytesPerRow: w32 * 16 }, [w32 * 4, groups])
+    const t32 = device.createTexture({ size: [w32, groups], format: "rgba32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    device.queue.writeTexture({ texture: t32 }, data, { bytesPerRow: w32 * 16 }, [w32, groups])
+    const bW = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+    device.queue.writeBuffer(bW, 0, data)
+    const sData = new Float32Array(kb * groups * 4).map(() => Math.random() * 0.01)
+    const tS = device.createTexture({ size: [kb, groups], format: "rgba32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    device.queue.writeTexture({ texture: tS }, sData, { bytesPerRow: kb * 16 }, [kb, groups])
+    const aData = new Uint32Array(K / 2)
+    const hf = (x) => { const f = new Float32Array([x]); const i = new Uint32Array(f.buffer)[0]; return ((i >> 16) & 0x8000) | ((((i >> 23) & 0xff) - 112) << 10) | ((i >> 13) & 0x3ff) }
+    for (let i = 0; i < aData.length; i++) aData[i] = hf(Math.random() - 0.5) | (hf(Math.random() - 0.5) << 16)
+    const tA = device.createTexture({ size: [K / 8, 1], format: "rgba32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+    device.queue.writeTexture({ texture: tA }, aData, { bytesPerRow: K / 8 * 16 }, [K / 8, 1])
+    const results = {}
+    for (const sliceMul of [1, 2]) {
+      const slices = Math.max(1, Math.min(32, Math.ceil(fragments * sliceMul / groups), kb / 4))
+      const kbSlice = Math.ceil(kb / slices)
+      const ob = device.createBuffer({ size: slices * groups * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+      const ub = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+      device.queue.writeBuffer(ub, 0, new Uint32Array([kb, slices, kbSlice, groups, 0, w32, 0, 0]))
+      for (const v of variants) {
+        const rows = v === "b32x2" ? 2 : 1
+        const pipe = await device.createComputePipelineAsync({ layout: "auto", compute: { module: device.createShaderModule({ code: kernel(v) }), entryPoint: "main" } })
+        const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: { buffer: ub } },
+          { binding: 1, resource: v === "b8" ? t8.createView() : v.startsWith("b32") ? t32.createView() : { buffer: bW } },
+          { binding: 2, resource: tS.createView() }, { binding: 3, resource: tA.createView() }, { binding: 4, resource: { buffer: ob } }] })
+        const run = async (n) => {
+          const e = device.createCommandEncoder()
+          const p = e.beginComputePass()
+          p.setPipeline(pipe); p.setBindGroup(0, bg)
+          for (let i = 0; i < n; i++) p.dispatchWorkgroups(Math.ceil(groups / rows / wgX), slices)
+          p.end(); device.queue.submit([e.finish()])
+          await device.queue.onSubmittedWorkDone()
+        }
+        await run(20)
+        let best = Infinity
+        for (let i = 0; i < 6; i++) { const t = performance.now(); await run(100); best = Math.min(best, (performance.now() - t) / 100) }
+        // The check: slice sums of group 0..3, against b8's.
+        const rb = device.createBuffer({ size: 64 * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        const e = device.createCommandEncoder(); e.copyBufferToBuffer(ob, 0, rb, 0, 64 * 16); device.queue.submit([e.finish()])
+        await rb.mapAsync(GPUMapMode.READ); const got = [...new Float32Array(rb.getMappedRange())].slice(0, 8).map((x) => x.toFixed(4)).join(","); rb.unmap()
+        const ok = results[sliceMul] == null ? (results[sliceMul] = got, "ref") : got === results[sliceMul] ? "same" : `DIFF ${got} vs ${results[sliceMul]}`
+        log(`WIDE ${name} ${N}x${K} ${v} slices ${slices}: ${best.toFixed(3)} ms, ${(bytes / best / 1e6).toFixed(1)} GB/s (${ok})`)
+      }
+    }
+  }
+  log("WIDE ALL DONE")
+} catch (e) { log(`WIDE ERROR: ${e?.stack ?? e}`) }
+</script></body></html>

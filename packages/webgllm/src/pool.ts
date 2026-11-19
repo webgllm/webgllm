@@ -25,6 +25,8 @@ export type PoolOptions = {
   worker?: Worker
   /** Bytes all loaded models may take together. */
   memoryBudget: () => number
+  /** WebGLLMOptions.webgpu: false loads on WebGL 2 even where there's WebGPU. */
+  webgpu?: "auto" | false
   storage: ModelStorage
   /** Every load's and download's progress (the instance's listeners). */
   onProgress: (progress: LoadProgress) => void
@@ -59,6 +61,10 @@ type Entry = {
   watched: Promise<void> | null
   /** Aborted when it's dropped: its claims for memory stop. */
   gone: AbortController
+  /** The worker webgllm started (or reused) for it: kept for the next load once the model is freed (see park). */
+  own: Worker | null
+  /** Once dropped: settles when its memory is free and "unload" says so (see drop). */
+  dropped?: Promise<void>
 }
 
 /** Getting a model's files into storage: one at a time per model. */
@@ -100,20 +106,40 @@ const unloaded = (model: string) =>
 
 let nextId = 0
 
+/** How long a worker of webgllm's whose model was unloaded is kept for the next load (see ModelPool.parked). */
+export const PARKED_MS = 30_000
+
 export class ModelPool {
   private readonly entries = new Map<string, Entry>()
   private readonly downloads = new Map<string, Download>()
   private readonly budget: MemoryBudget
   private readonly queue = new TaskQueue()
   private stopFrames: (() => void) | undefined
-  private askedToKeep = false
+  /** Whether the browser agreed, when first asked, to keep this site's storage (see keepDownloads). */
+  private keeping: Promise<boolean> | undefined
   /** Unloads asked for, by model and for every model: a load waiting meanwhile stops (see unloadMark). */
   private readonly unloads = new Map<string, number>()
   private unloadsOfAll = 0
+  /** Told of each unload: waits that end when their model is unloaded (see unlessUnloaded). */
+  private readonly unloadListeners = new Set<() => void>()
   /** Models dropped from the caller's worker that it hasn't freed yet: their memory is held, and no load starts, until it has. */
   private readonly freeing = new Set<Promise<void>>()
   /** Downloads stopped in the caller's worker whose files aren't closed yet, by model. */
   private readonly closing = new Map<string, Promise<void>>()
+  /**
+   * A worker of webgllm's whose model was unloaded, kept for the next load
+   * (see park): one ended after each model left a little of its memory
+   * behind in Safari on an iPhone (2 MB a load, kept by the page), and
+   * reused, nothing. Ended once idle for PARKED_MS: it holds what the last
+   * load left for the collector (about 350 MB after Qwen3.5 2B), which an
+   * idle worker never collects.
+   */
+  private parked: Worker | null = null
+  private parkedTimer: ReturnType<typeof setTimeout> | undefined
+  /** Workers of webgllm's the pool ended: never taken back (see unpark). */
+  private readonly ended = new WeakSet<Worker>()
+  /** Models dropped whose memory isn't free yet, by model: settles once it is (see drop, evict). */
+  private readonly releasing = new Map<string, Promise<void>>()
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
   private turns: Promise<void> = Promise.resolve()
 
@@ -185,8 +211,15 @@ export class ModelPool {
       since?: number
     } = {}
   ): Promise<void> {
-    const { contextLength, signal } = options
     const since = options.since ?? this.unloadMark(model)
+    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }), options.signal, { model, since })
+  }
+
+  private async loadOnce(
+    model: string,
+    options: Parameters<ModelPool["load"]>[1] & { since: number }
+  ): Promise<void> {
+    const { contextLength, signal, since } = options
     throwIfAborted(signal)
     this.throwIfDead()
     // A download of it in another worker: let it finish (they'd write the same files).
@@ -212,6 +245,14 @@ export class ModelPool {
       this.throwIfUnloaded(model, since)
       entry = this.entries.get(model)
     }
+    // A model still being freed in a worker of webgllm's: its worker is the one
+    // to reuse, and its memory goes before the next model's comes.
+    if (!entry && !this.options.worker && this.freeing.size) {
+      await abortable(Promise.all(this.freeing), signal)
+      throwIfAborted(signal)
+      this.throwIfUnloaded(model, since)
+      entry = this.entries.get(model)
+    }
     entry ??= this.spawn(model)
     if (options.keepLoaded !== undefined) {
       entry.keepLoaded = options.keepLoaded
@@ -229,6 +270,33 @@ export class ModelPool {
   /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
   unloadMark(model: string): number {
     return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
+  }
+
+  /** `wait`, unless `model` is unloaded first (since `mark`): then rejects as an unloaded model's load does. */
+  private unlessUnloaded<T>(wait: Promise<T>, model: string, mark: number): Promise<T> {
+    if (this.unloadMark(model) !== mark) {
+      // (`wait` is this call's: its rejection is handled here, not left unhandled.)
+      wait.catch(() => undefined)
+      throw unloaded(model)
+    }
+    return new Promise<T>((resolve, reject) => {
+      const check = () => {
+        if (this.unloadMark(model) === mark) return
+        this.unloadListeners.delete(check)
+        reject(unloaded(model))
+      }
+      this.unloadListeners.add(check)
+      wait.then(
+        (value) => {
+          this.unloadListeners.delete(check)
+          resolve(value)
+        },
+        (error: unknown) => {
+          this.unloadListeners.delete(check)
+          reject(error)
+        }
+      )
+    })
   }
 
   /** Rejects as an unloaded model's load does if `model` was unloaded since `mark`. */
@@ -336,6 +404,7 @@ export class ModelPool {
     // entry to drop: they see this and stop.
     if (model === undefined) this.unloadsOfAll++
     else this.unloads.set(model, (this.unloads.get(model) ?? 0) + 1)
+    for (const listener of [...this.unloadListeners]) listener()
     for (const entry of [...this.entries.values()]) {
       if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }
@@ -390,7 +459,7 @@ export class ModelPool {
         waiters: 0,
         listeners: new Set()
       }
-      created.promise = this.fetchFiles(model, created).finally(() => {
+      created.promise = this.withStorageRetry(() => this.fetchFiles(model, created), created.abort.signal).finally(() => {
         this.endDownload(model, created, new Error("The download ended."))
       })
       created.promise.catch(() => undefined)
@@ -441,7 +510,14 @@ export class ModelPool {
     if (await abortable(this.options.storage.downloaded(model), signal)) return
     // Canceled as the check came back: there was no worker to stop yet.
     throwIfAborted(signal)
-    const worker = this.modelWorker(model, {
+    // (A retry: the failed attempt's worker freed first, and, the caller's,
+    // its files closed before the same worker writes them again.)
+    if (download.worker) {
+      this.releaseDownloadWorker(model, download.worker, new Error("The download is tried again."))
+      download.worker = null
+      await abortable(this.closing.get(model) ?? Promise.resolve(), signal)
+    }
+    const worker = this.modelWorker(model, null, {
       onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
       onClaim: () => Promise.resolve(),
       onLog: (text) => this.options.log("info", text),
@@ -461,7 +537,12 @@ export class ModelPool {
   /** Frees a download's worker (the caller's: stops the download there, and waits for its files to close). */
   private endDownload(model: string, download: Download, reason: Error) {
     if (this.downloads.get(model) === download) this.downloads.delete(model)
-    const closed = download.worker?.terminate(reason)
+    this.releaseDownloadWorker(model, download.worker, reason)
+  }
+
+  /** Frees one download attempt's worker: webgllm's own is ended; the caller's is stopped, and its files' closing tracked (see closing). */
+  private releaseDownloadWorker(model: string, worker: ModelWorker | null, reason: Error) {
+    const closed = worker?.terminate(reason)
     if (!closed) return
     const both = Promise.all([this.closing.get(model), closed]).then(() => {
       if (this.closing.get(model) === both) this.closing.delete(model)
@@ -515,10 +596,53 @@ export class ModelPool {
     }, signal)
   }
 
-  /** `model`'s side of a worker: the caller's, else one started for it. */
-  private modelWorker(model: string, events: WorkerEvents): ModelWorker {
-    const given = this.options.worker
-    return new ModelWorker(model, given ?? this.options.createWorker(), !given, events)
+  /**
+   * `model`'s side of a worker: the caller's, or `own`, one of webgllm's
+   * the pool ends or keeps (see park), both left running when the model
+   * goes; else one started for it alone and ended with it (a download's).
+   */
+  private modelWorker(model: string, own: Worker | null, events: WorkerEvents): ModelWorker {
+    const kept = this.options.worker ?? own
+    return new ModelWorker(model, kept ?? this.options.createWorker(), !kept, events, this.options.webgpu ?? "auto")
+  }
+
+  /** The kept worker, taken for a new model (see park). */
+  private unpark(): Worker | null {
+    const worker = this.parked
+    this.parked = null
+    clearTimeout(this.parkedTimer)
+    if (worker) worker.removeEventListener("error", this.parkedError)
+    return worker && !this.ended.has(worker) ? worker : null
+  }
+
+  /** Ends a worker of webgllm's for good. */
+  private end(worker: Worker) {
+    this.ended.add(worker)
+    worker.terminate()
+  }
+
+  /**
+   * Keeps a worker of webgllm's whose model was freed for the next load, or
+   * ends it: one that failed or crashed, or one more than the one kept.
+   */
+  private park(worker: Worker, reusable: boolean) {
+    if (!reusable || this.parked || this.ended.has(worker)) return void this.end(worker)
+    this.parked = worker
+    worker.addEventListener("error", this.parkedError)
+    this.parkedTimer = setTimeout(() => {
+      const idle = this.unpark()
+      if (idle) this.end(idle)
+    }, PARKED_MS)
+    // (Node: a pending timer doesn't keep the process alive.)
+    ;(this.parkedTimer as { unref?: () => void }).unref?.()
+  }
+
+  /** A kept worker that fails is ended, not reused. */
+  private readonly parkedError = (event: Event) => {
+    const worker = event.target as Worker | null
+    if (!worker || worker !== this.parked) return
+    this.unpark()
+    this.end(worker)
   }
 
   /**
@@ -554,7 +678,10 @@ export class ModelPool {
   }
 
   private spawn(model: string): Entry {
+    // A worker of webgllm's own: the one kept from an earlier model, else a new one.
+    const own = this.options.worker ? null : this.unpark() ?? this.options.createWorker()
     const entry: Entry = {
+      own,
       model,
       keepLoaded: false,
       waiters: 0,
@@ -562,7 +689,7 @@ export class ModelPool {
       evicting: null,
       watched: null,
       gone: new AbortController(),
-      worker: this.modelWorker(model, {
+      worker: this.modelWorker(model, own, {
         onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
         onClaim: async (bytes) => {
           if (this.entries.get(model) !== entry) return
@@ -610,10 +737,24 @@ export class ModelPool {
   }
 
   /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
-  private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
+  /**
+   * Drops `entry`: its model's worker stops and frees it. Once only (a load
+   * failing after an unload asked for it drops it again): the first
+   * reason stands. Settles when the memory is free and "unload" says so.
+   */
+  private drop(entry: Entry, reason: Error, why: ModelUnloadReason): Promise<void> {
+    if (entry.dropped) return entry.dropped
     const freed = entry.worker.terminate(reason)
+    // A worker of webgllm's: kept for the next load once it has freed the
+    // model (see park), unless it failed, even while it was freeing it.
+    const own = entry.own
+    if (own) {
+      const park = () => this.park(own, why !== "failed" && why !== "crashed" && !entry.worker.failed)
+      if (freed) void freed.then(park)
+      else park()
+    }
     entry.gone.abort(reason)
-    if (this.entries.get(entry.model) !== entry) return
+    if (this.entries.get(entry.model) !== entry) return (entry.dropped = freed ?? Promise.resolve())
     this.entries.delete(entry.model)
     if (why === "failed" || why === "crashed") this.options.onModelEvent?.({ type: "error", model: entry.model, error: reason })
     // Its memory is free, and "unload" says so, once it is: the caller's
@@ -622,17 +763,22 @@ export class ModelPool {
       this.budget.release(entry.model)
       this.options.onModelEvent?.({ type: "unload", model: entry.model, reason: why })
     }
+    let done = Promise.resolve()
     if (freed) {
-      const done = freed.then(() => {
+      done = freed.then(() => {
         this.freeing.delete(done)
+        if (this.releasing.get(entry.model) === done) this.releasing.delete(entry.model)
         release()
       })
       this.freeing.add(done)
+      this.releasing.set(entry.model, done)
     } else release()
+    entry.dropped = done
     if (this.entries.size === 0) {
       this.stopFrames?.()
       this.stopFrames = undefined
     }
+    return done
   }
 
   /**
@@ -643,21 +789,23 @@ export class ModelPool {
    */
   private evict(model: string, signal?: AbortSignal): Promise<boolean> {
     const entry = this.entries.get(model)
-    if (!entry) return Promise.resolve(true)
+    // Gone already (an unload asked for it): done once its memory is free.
+    if (!entry) return (this.releasing.get(model) ?? Promise.resolve()).then(() => true)
     if (entry.evicting) return entry.evicting.then(() => this.entries.get(model) !== entry)
     const evicting = abortable(entry.worker.idle(), signal).then(
       () => true,
       () => false
     ).then((go) => {
-      if (this.entries.get(model) !== entry) return true
+      // Dropped meanwhile (an unload asked for it): done once its memory is free.
+      if (this.entries.get(model) !== entry) return (entry.dropped ?? this.releasing.get(model) ?? Promise.resolve()).then(() => true)
       // The claimant went away while it waited: the model stays.
       if (!go || signal?.aborted) {
         if (entry.evicting === done) entry.evicting = null
         return false
       }
       this.options.log("info", `Unloaded ${model} to make room for another model.`)
-      this.drop(entry, unloaded(model), "evicted")
-      return true
+      // (Done once its memory is free: the claim waiting on this counts it out then.)
+      return this.drop(entry, unloaded(model), "evicted").then(() => true)
     })
     const done = evicting.then(() => undefined)
     entry.evicting = done
@@ -672,15 +820,49 @@ export class ModelPool {
 
   /**
    * Asks the browser to keep this site's storage, so a downloaded model isn't
-   * deleted to free space: once, when a model first downloads. Not in
-   * Firefox, which asks the user with a permission prompt. Browsers may say
-   * no; only pages can ask.
+   * deleted to free space: once, when a model first downloads. Some browsers
+   * also give a site more room once it's kept (Firefox for Android stores
+   * about 360 MB for a site otherwise, less than a model), and some ask the
+   * user first (Firefox, with a permission prompt). Browsers may say no;
+   * only pages can ask.
    */
   private keepDownloads() {
-    if (this.askedToKeep || typeof navigator === "undefined") return
-    this.askedToKeep = true
-    if (/Firefox\//.test(navigator.userAgent)) return
-    navigator.storage?.persist?.().catch(() => undefined)
+    if (this.keeping || typeof navigator === "undefined") return
+    const storage = navigator.storage
+    this.keeping = (async () => {
+      if (!storage?.persist || (await storage.persisted?.())) return false
+      return storage.persist()
+    })().catch(() => false)
+  }
+
+  /**
+   * Runs `attempt`, and once more if it ran out of room and the browser has
+   * since agreed to keep this site's storage (keepDownloads): a user can
+   * answer the prompt after a download has filled the room it had. The
+   * retry resumes the download where it stopped. `signal` (the load's, or
+   * the download's own) ends the wait for that answer, as does unloading
+   * a load's model (`load`: the model, and its unloadMark at the start).
+   */
+  private async withStorageRetry(
+    attempt: () => Promise<void>,
+    signal?: AbortSignal,
+    load?: { model: string; since: number }
+  ): Promise<void> {
+    try {
+      await attempt()
+    } catch (error) {
+      if (!(error instanceof WebGLLMError && error.code === "storage-full")) throw error
+      // (The browser's prompt may never be answered: a canceled or unloaded
+      // load, or a canceled download, stops waiting for it, and doesn't retry.)
+      // (Canceled or unloaded already, as a listener of the failure can do: no wait at all.)
+      throwIfAborted(signal)
+      if (load) this.throwIfUnloaded(load.model, load.since)
+      const answer = abortable(this.keeping ?? Promise.resolve(false), signal)
+      if (!(await (load ? this.unlessUnloaded(answer, load.model, load.since) : answer))) throw error
+      throwIfAborted(signal)
+      if (load) this.throwIfUnloaded(load.model, load.since)
+      await attempt()
+    }
   }
 }
 

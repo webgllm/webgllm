@@ -38,7 +38,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     const stopped = new Set(), aborts = new Map(), TUNING = {}, WEBGLLM = "webgllm"
     ${source.slice(claimsStart, claimsEnd)}
     const downloadModel = () => undefined
-    // The idle warm-up after a load (see warmConstraint): counted, never compiled here.
+    // Constraint compilations (none at load): counted, never compiled here.
     const createConstraint = async () => { state.warmups = (state.warmups ?? 0) + 1; return { dispose() {} } }
     async function generate(request) {
       const model = await startLoad(request.model, request.contextLength)
@@ -322,26 +322,14 @@ test("the handler takes only the page's requests: the worker's own messages chan
   assert.equal(w.loads.length, 1)
 })
 
-test("the constraint compiler is warmed once the worker is idle after a load, not ahead of a request waiting", async () => {
-  const idle = worker()
-  idle.send({ type: "load", model: MODEL, loadId: 1 })
+test("a load builds no structured-output tables: only a request for structured output does", async () => {
+  // (llguidance's tables for a 248k-token vocabulary are ~150 MB of
+  // JavaScript: built after every load, they took an iPhone's tab past
+  // iOS's 2 GB limit.)
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
   await settle()
-  idle.loads[0].finish()
+  w.loads[0].finish()
   await settle()
-  assert.equal(idle.warmups(), 1)
-  // The same model again: nothing new to warm.
-  idle.send({ type: "load", model: MODEL, loadId: 2 })
-  await settle()
-  assert.equal(idle.warmups(), 1)
-
-  const busy = worker()
-  busy.send({ type: "load", model: MODEL, loadId: 1 })
-  busy.send(generate("first"))
-  await settle()
-  busy.loads[0].finish()
-  await settle()
-  // The request does that work itself if it needs it.
-  assert.equal(busy.warmups(), 0)
-  busy.generations[0]?.finish()
-  await settle()
+  assert.equal(w.warmups(), 0)
 })

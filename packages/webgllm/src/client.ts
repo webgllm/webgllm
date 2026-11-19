@@ -92,9 +92,12 @@ export class ModelWorker {
   /** The context the model was asked for: undefined for the model's own. */
   contextLength: number | undefined
   private gone: Error | null = null
+  /** Whether the worker failed (its script, or a crash), before this was gone or while it was cleaning up: not one to use again. */
+  failed = false
 
   private readonly onMessage = (event: MessageEvent<unknown>) => this.handle(event.data)
   private readonly onError = (event: ErrorEvent) => {
+    this.failed = true
     // (Gone already: a worker that fails owes nothing more.)
     if (this.gone) {
       for (const settle of [...this.owed.values()]) settle()
@@ -115,10 +118,18 @@ export class ModelWorker {
     readonly model: string,
     private readonly worker: Worker,
     private readonly owned: boolean,
-    private readonly events: WorkerEvents
+    private readonly events: WorkerEvents,
+    /**
+     * WebGLLMOptions.webgpu, sent before anything else (and so before any
+     * load): to a worker started for this model only when false ("auto" is
+     * a new worker's default), to the caller's every time, as an earlier
+     * client may have told it otherwise.
+     */
+    webgpu: "auto" | false = "auto"
   ) {
     worker.addEventListener("message", this.onMessage)
     worker.addEventListener("error", this.onError)
+    if (webgpu === false || !owned) this.post({ type: "configure", webgpu })
   }
 
   get loading(): boolean {

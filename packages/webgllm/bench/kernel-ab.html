@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Kernel A/B</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px;background:#13171c;color:#eef3f8}pre{white-space:pre-wrap}</style></head>
+<body><h1>One pass, WebGL 2 against WebGPU</h1>
+<p>Replays passes from a shader dump (<code>tune=dumpShaders:1</code> on webgl-perf.html writes <code>shaders.jsonl</code>) on random inputs of the same sizes:
+<code>?name=head</code>, <code>&amp;which=last|biggest</code>, <code>&amp;reps=20</code>, <code>&amp;lanes=0</code> (WebGPU's coopThreads).</p>
+<pre id="out"></pre>
+<script type="module" src="/bundle/bench/kernel-ab.js"></script></body></html>

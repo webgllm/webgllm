@@ -1,9 +1,13 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
+import { dequantizeNBitsRow } from "./load-onnx.js"
+import { toHalf } from "./half.js"
 import {
   dequantizeQ4_1,
   dequantizeQ5_K,
+  matrixRow,
   newQuantMatrix,
+  quantizeQ8,
   packMatMulNBits,
   packMatMulNBitsScales,
   quantsFromRaw,
@@ -137,4 +141,35 @@ describe("ggml dequantization", () => {
     assert.equal(out[128], -0.5)
     assert.equal(out[159], -0.5)
   })
+})
+
+test("matrixRow reads 4-bit rows raw and repacked, and 8-bit rows, as the loader dequantizes them", () => {
+  const N = 8, K = 64, blocks = K / 32
+  let seed = 7
+  const rand = () => ((seed = (seed * 1103515245 + 12345) >>> 0) >>> 8) / 2 ** 24
+  const quant = Uint8Array.from({ length: N * blocks * 16 }, () => (rand() * 256) | 0)
+  const scales = new Uint8Array(N * blocks * 2)
+  for (let i = 0; i < N * blocks; i++) {
+    const h = toHalf(0.01 + rand() * 0.1)
+    scales[2 * i] = h & 255
+    scales[2 * i + 1] = h >> 8
+  }
+  const zp = Uint8Array.from({ length: N * Math.ceil(blocks / 2) }, () => (rand() * 256) | 0)
+  const raw = { ...newQuantMatrix(N, K, 4, true), quants: new Uint32Array(0), raw: quant.slice() }
+  packMatMulNBitsScales(raw, 0, scales, zp, N)
+  const packed = newQuantMatrix(N, K, 4, true)
+  packMatMulNBits(packed, 0, quant, scales, zp, N)
+  const want = new Float32Array(K)
+  for (let n = 0; n < N; n++) {
+    dequantizeNBitsRow(4, K, quant, scales, zp, n, want)
+    assert.deepEqual(matrixRow(raw, n), want)
+    assert.deepEqual(matrixRow(packed, n), want)
+  }
+  const values = Float32Array.from({ length: N * K }, () => rand() * 2 - 1)
+  const q8 = newQuantMatrix(N, K, 8, false)
+  quantizeQ8(q8, 0, values, N)
+  for (let n = 0; n < N; n++) {
+    const row = matrixRow(q8, n) as Float32Array
+    for (let k = 0; k < K; k++) assert.ok(Math.abs(row[k] - values[n * K + k]) < 0.01)
+  }
 })

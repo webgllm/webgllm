@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>webgpu-prompt-mm</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px}</style></head>
+<body><pre id="out"></pre>
+<script type="module">
+// Prompt (multi-token) matmul variants for Q4_0 weights, M = 512 tokens at LFM3's shapes.
+// Families (?v=comma list):
+//   tex:R:T:WX:WY[:h|:pwa]  the engine's f16 path: weights dequantized to RGBA16F (texel (kq,row)), activations RGBA16F,
+//                           R rows x T tokens an invocation from texture loads (:pwa both as h2 RGBA32UI texels).
+//   deq[:h2]                the engine's dequant pass alone (q4 words in a storage buffer -> RGBA16F / h2 texture).
+//   q4:RI:T:WX:WY[:h]       4-bit weights read directly (no dequant pass), 4*RI rows x T tokens an invocation; weights
+//                           block-major (row r of block kb at word (kb*N+r)*4), activations f32 [tok][K] (:h f16 math).
+//   sm:RI:TJ:WX:WY:BK[:m]   workgroup tile in shared memory: q4 dequantized into it once per workgroup; thread tile
+//                           4*RI rows x 4*TJ tokens; activations transposed [K][M]. m = f32 | h (f16 smem+FMA, f32 sum
+//                           per tile) | hh (f16 accumulation).
+//   bf:R:T:WX:WY[:h]        f16 weights from a storage buffer, [K/8][N] 16-byte words (neighbours read neighbours).
+const out = document.getElementById("out")
+const log = (t) => { out.textContent += `${t}\n`; void fetch("/log", { method: "POST", body: `GEMM ${t}` }).catch(() => undefined) }
+const params = new URLSearchParams(location.search)
+try {
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" })
+  if (!adapter) throw new Error("no WebGPU")
+  const f16 = adapter.features.has("shader-f16")
+  const L = adapter.limits
+  const device = await adapter.requestDevice({ requiredFeatures: f16 ? ["shader-f16"] : [], requiredLimits: { maxTextureDimension2D: L.maxTextureDimension2D, maxStorageBufferBindingSize: L.maxStorageBufferBindingSize, maxBufferSize: L.maxBufferSize, maxComputeWorkgroupStorageSize: L.maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup: L.maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX: L.maxComputeWorkgroupSizeX, maxComputeWorkgroupSizeY: L.maxComputeWorkgroupSizeY, maxStorageBuffersPerShaderStage: L.maxStorageBuffersPerShaderStage } })
+  let errors = 0
+  device.addEventListener("uncapturederror", (e) => { if (errors++ < 5) log(`GPU ERROR: ${e.error.message.slice(0, 300)}`) })
+  log(`${navigator.userAgent} | ${adapter.info?.vendor} ${adapter.info?.architecture} | f16 ${f16} | tex ${L.maxTextureDimension2D} wgStorage ${L.maxComputeWorkgroupStorageSize} invocations ${L.maxComputeInvocationsPerWorkgroup} subgroups ${adapter.features.has("subgroups")} ${adapter.info?.subgroupMinSize}-${adapter.info?.subgroupMaxSize}`)
+
+  const V4 = (h) => (h ? "vec4<f16>" : "vec4<f32>")
+  // ---- tex: the engine's matmulF16 (4 rows x 4 tokens at R=T=4), translated to a compute shader as the engine does.
+  const TEX = (R, T, WX, WY, half, SWAP, KS = 1) => {
+    const Ls = [], ln = (s) => Ls.push(`    ${s}`)
+    for (let i = 0; i < R; i++) ln(`let w${i} = ${half ? "vec4<f16>(" : ""}textureLoad(Wt, vec2<u32>(kq, row + ${i}u), 0)${half ? ")" : ""};`)
+    for (let j = 0; j < T; j++) {
+      ln(`{ let a = ${half ? "vec4<f16>(" : ""}textureLoad(At, vec2<u32>(kq, tok + ${j}u), 0)${half ? ")" : ""};`)
+      for (let i4 = 0; i4 < R / 4; i4++) ln(`  c${j}_${i4} += vec4<f32>(${[0, 1, 2, 3].map((r) => `f32(dot(w${4 * i4 + r}, a))`).join(", ")});`)
+      ln(`}`)
+    }
+    const decl = [], wr = []
+    for (let j = 0; j < T; j++) for (let i4 = 0; i4 < R / 4; i4++) { decl.push(`var c${j}_${i4} = vec4<f32>(0.0);`); wr.push(`O[(tok + ${j}u) * (P.x / 4u) + row / 4u + ${i4}u] = c${j}_${i4};`) }
+    return `${half ? "enable f16;" : ""}
+@group(0) @binding(0) var Wt: texture_2d<f32>;
+@group(0) @binding(1) var At: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read_write> O: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> P: vec4<u32>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${SWAP ? `let row = (wg.y * ${WX}u + lid.x) * ${R}u; let tok = (wg.x * ${WY}u + lid.y) * ${T}u;` : `let row = id.x * ${R}u; let tok = id.y * ${T}u;`} if (row >= P.x || tok >= P.z) { return; }
+  ${decl.join(" ")}
+  let kqs = P.y / ${4 * KS}u; let o0 = wg.z * (P.x / 4u) * P.z;
+  for (var kq = wg.z * kqs; kq < wg.z * kqs + kqs; kq++) {
+${Ls.join("\n")}
+  }
+  ${wr.map((w) => w.replace("O[", "O[o0 + ")).join("\n  ")}
+}`
+  }
+  // h2 texels for both (the engine's f16Pack 3): 8 halves a load, split by unpack2x16float.
+  const TEXH = (R, T, WX, WY, SWAP) => {
+    const Ls = [], ln = (s) => Ls.push(`    ${s}`)
+    for (let i = 0; i < R; i++) ln(`let W${i} = textureLoad(Wh, vec2<u32>(kh, row + ${i}u), 0);`)
+    for (let j = 0; j < T; j++) ln(`let A${j} = textureLoad(Ah, vec2<u32>(kh, tok + ${j}u), 0);`)
+    for (const h of [0, 1]) {
+      ln(`{`)
+      for (let i = 0; i < R; i++) ln(`  let w${i} = vec4<f32>(unpack2x16float(W${i}.${h ? "z" : "x"}), unpack2x16float(W${i}.${h ? "w" : "y"}));`)
+      for (let j = 0; j < T; j++) {
+        ln(`  { let a = vec4<f32>(unpack2x16float(A${j}.${h ? "z" : "x"}), unpack2x16float(A${j}.${h ? "w" : "y"}));`)
+        for (let i4 = 0; i4 < R / 4; i4++) ln(`    c${j}_${i4} += vec4<f32>(${[0, 1, 2, 3].map((r) => `dot(w${4 * i4 + r}, a)`).join(", ")});`)
+        ln(`  }`)
+      }
+      ln(`}`)
+    }
+    const decl = [], wr = []
+    for (let j = 0; j < T; j++) for (let i4 = 0; i4 < R / 4; i4++) { decl.push(`var c${j}_${i4} = vec4<f32>(0.0);`); wr.push(`O[(tok + ${j}u) * (P.x / 4u) + row / 4u + ${i4}u] = c${j}_${i4};`) }
+    return `
+@group(0) @binding(0) var Wh: texture_2d<u32>;
+@group(0) @binding(1) var Ah: texture_2d<u32>;
+@group(0) @binding(2) var<storage, read_write> O: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> P: vec4<u32>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${SWAP ? `let row = (wg.y * ${WX}u + lid.x) * ${R}u; let tok = (wg.x * ${WY}u + lid.y) * ${T}u;` : `let row = id.x * ${R}u; let tok = id.y * ${T}u;`} if (row >= P.x || tok >= P.z) { return; }
+  ${decl.join(" ")}
+  for (var kh = 0u; kh < P.y / 8u; kh++) {
+${Ls.join("\n")}
+  }
+  ${wr.join("\n  ")}
+}`
+  }
+  // ---- deq: the engine's bufferDequant (no columns): q4 words in the engine's layout (row group g, block kb: words
+  // (g*Kb + kb)*16 + r*4 + w), scales texel (kb, g) = 4 rows; one RGBA16F texel (kq, row) an invocation, or (h2) two.
+  const DEQ = (h2) => `
+@group(0) @binding(0) var<uniform> P: vec4<u32>;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> bW: array<u32>;
+@group(0) @binding(3) var out0: texture_storage_2d<${h2 ? "rgba32uint" : "rgba16float"}, write>;
+fn deq(kq: u32, row: u32) -> vec4<f32> {
+  let g = row / 4u; let r = row - g * 4u; let kb = kq / 8u; let j = kq - kb * 8u;
+  let word = bW[(g * (P.y / 32u) + kb) * 16u + r * 4u + (j & 3u)];
+  let b = (vec4<u32>(word) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(255u);
+  let q = vec4<f32>(select(b >> vec4<u32>(4u), b & vec4<u32>(15u), j < 4u));
+  let d = textureLoad(tS, vec2<u32>(kb, g), 0)[r];
+  return (q - 8.0) * d;
+}
+@compute @workgroup_size(64, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= P.y / ${h2 ? 8 : 4}u || id.y >= P.x) { return; }
+${h2 ? `  let a = deq(id.x * 2u, id.y); let b = deq(id.x * 2u + 1u, id.y);
+  textureStore(out0, id.xy, vec4<u32>(pack2x16float(a.xy), pack2x16float(a.zw), pack2x16float(b.xy), pack2x16float(b.zw)));` : `  textureStore(out0, id.xy, deq(id.x, id.y));`}
+}`
+  // ---- q4: direct 4-bit reads. Rows: row groups g_i = (wg.x*RI + i)*WX + lid.x (neighbours read neighbouring 16-byte
+  // words); tokens tok = gid.y*T + j. Weights fma'd to (n - 8)*d in registers, dots against f32 (or f16) activations.
+  const Q4 = (RI, T, WX, WY, h) => {
+    const V = V4(h), Ls = [], ln = (s) => Ls.push(`    ${s}`)
+    for (let i = 0; i < RI; i++) ln(`let d${i} = ${h ? "vec4<f16>(" : ""}S4[kb * (P.x / 4u) + g${i}]${h ? ")" : ""}; let e${i} = d${i} * ${h ? "255.0h" : "255.0"}; let z${i} = d${i} * ${h ? "-8.0h" : "-8.0"};`)
+    ln(`for (var w = 0u; w < 4u; w++) {`)
+    for (let i = 0; i < RI; i++) for (let r = 0; r < 4; r++) {
+      ln(`  let q${i}${r} = Wq[(kb * P.x + g${i} * 4u + ${r}u) * 4u + w];`)
+      ln(`  let lo${i}${r} = fma(${V}(unpack4x8unorm(q${i}${r} & 0x0F0F0F0Fu)), ${V}(e${i}[${r}]), ${V}(z${i}[${r}])); let hi${i}${r} = fma(${V}(unpack4x8unorm((q${i}${r} >> 4u) & 0x0F0F0F0Fu)), ${V}(e${i}[${r}]), ${V}(z${i}[${r}]));`)
+    }
+    for (let j = 0; j < T; j++) {
+      ln(`  { let al = A[(tok + ${j}u) * (P.y / 4u) + kb * 8u + w]; let ah = A[(tok + ${j}u) * (P.y / 4u) + kb * 8u + 4u + w];`)
+      for (let i = 0; i < RI; i++) ln(`    c${j}_${i} += vec4<f32>(${[0, 1, 2, 3].map((r) => `${h ? "f32(" : ""}dot(lo${i}${r}, al) + dot(hi${i}${r}, ah)${h ? ")" : ""}`).join(", ")}); `)
+      ln(`  }`)
+    }
+    ln(`}`)
+    const decl = [], wr = [], gs = []
+    for (let i = 0; i < RI; i++) gs.push(`let g${i} = (wg.x * ${RI}u + ${i}u) * ${WX}u + lid.x;`)
+    for (let j = 0; j < T; j++) for (let i = 0; i < RI; i++) { decl.push(`var c${j}_${i} = vec4<f32>(0.0);`); wr.push(`O[(tok + ${j}u) * (P.x / 4u) + g${i}] = c${j}_${i};`) }
+    return `${h ? "enable f16;" : ""}
+@group(0) @binding(0) var<storage, read> Wq: array<u32>;
+@group(0) @binding(1) var<storage, read> S4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> A: array<${V}>;
+@group(0) @binding(3) var<storage, read_write> O: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> P: vec4<u32>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${gs.join(" ")}
+  let tok = id.y * ${T}u;
+  ${decl.join(" ")}
+  for (var kb = 0u; kb < P.y / 32u; kb++) {
+${Ls.join("\n")}
+  }
+  ${wr.join("\n  ")}
+}`
+  }
+  // ---- sm: shared-memory tiles. Workgroup tile BN = 4*RI*WX rows x BM = 4*TJ*WY tokens, BK K values a step (16 or
+  // 32: a q4 block's low or high nibbles, or both). Each step the workgroup dequantizes its BN rows' q4 into Ws[k][rowgroup]
+  // (vec4 = 4 rows) and copies activations into As[k][tokgroup] (vec4 = 4 tokens), then every thread does an outer
+  // product per k: RI + TJ vec4 loads for 16*RI*TJ FMAs.
+  const SM = (RI, TJ, WX, WY, BK, m) => {
+    const h = m !== "f32", V = V4(h), TH = WX * WY, BN = 4 * RI * WX, BM = 4 * TJ * WY, GN = BN / 4, GM = BM / 4
+    const acc = m === "hh" ? "vec4<f16>" : "vec4<f32>"
+    const decl = [], wr = [], body = [], flush = [], zero = []
+    for (let j = 0; j < 4 * TJ; j++) for (let i = 0; i < RI; i++) {
+      decl.push(`var c${j}_${i} = ${acc}(0.0);`)
+      if (m === "h") { decl.push(`var p${j}_${i} = vec4<f16>(0.0);`); zero.push(`p${j}_${i} = vec4<f16>(0.0);`); flush.push(`c${j}_${i} += vec4<f32>(p${j}_${i});`) }
+      const tgi = `(${Math.floor(j / 4)}u * ${WY}u + lid.y)`
+      wr.push(`O[((wg.y * ${GM}u + ${tgi}) * 4u + ${j % 4}u) * (P.x / 4u) + wg.x * ${GN}u + ${i}u * ${WX}u + lid.x] = ${m === "hh" ? `vec4<f32>(c${j}_${i})` : `c${j}_${i}`};`)
+    }
+    for (let i = 0; i < RI; i++) body.push(`let w${i} = Ws[k * ${GN}u + ${i}u * ${WX}u + lid.x];`)
+    for (let j4 = 0; j4 < TJ; j4++) body.push(`let a${j4} = As[k * ${GM}u + ${j4}u * ${WY}u + lid.y];`)
+    for (let j = 0; j < 4 * TJ; j++) for (let i = 0; i < RI; i++) body.push(m === "h" ? `p${j}_${i} = fma(w${i}, ${V}(a${j >> 2}[${j & 3}]), p${j}_${i});` : `c${j}_${i} = fma(w${i}, ${V}(a${j >> 2}[${j & 3}]), c${j}_${i});`)
+    const halves = BK === 16 ? [0, 1] : [0]
+    const steps = halves.map((hf) => `
+    workgroupBarrier();
+    for (var it = li; it < ${BN}u; it += ${TH}u) {
+      let gg = it >> 2u; let p = it & 3u; let row = (wg.x * ${GN}u + gg) * 4u;
+      let base = (kb * P.x + row) * 4u + p;
+      let q0 = Wq[base]; let q1 = Wq[base + 4u]; let q2 = Wq[base + 8u]; let q3 = Wq[base + 12u];
+      let d = ${V}(S4[kb * (P.x / 4u) + wg.x * ${GN}u + gg]); let e = d * ${h ? "255.0h" : "255.0"}; let z = d * ${h ? "-8.0h" : "-8.0"};
+      ${(BK === 16 ? [hf] : [0, 1]).map((hi) => `{
+        let u0 = unpack4x8unorm(${hi ? "(q0 >> 4u)" : "q0"} & 0x0F0F0F0Fu); let u1 = unpack4x8unorm(${hi ? "(q1 >> 4u)" : "q1"} & 0x0F0F0F0Fu);
+        let u2 = unpack4x8unorm(${hi ? "(q2 >> 4u)" : "q2"} & 0x0F0F0F0Fu); let u3 = unpack4x8unorm(${hi ? "(q3 >> 4u)" : "q3"} & 0x0F0F0F0Fu);
+        ${[0, 1, 2, 3].map((c) => `Ws[(${BK === 16 ? "" : `${16 * hi}u + `}p * 4u + ${c}u) * ${GN}u + gg] = fma(${V}(vec4<f32>(u0[${c}], u1[${c}], u2[${c}], u3[${c}])), e, z);`).join("\n        ")}
+      }`).join("\n      ")}
+    }
+    for (var it = li; it < ${BK * GM}u; it += ${TH}u) {
+      let kk = it / ${GM}u; let t = it - kk * ${GM}u;
+      As[it] = A[(kb * 32u + ${hf * 16}u + kk) * (P.z / 4u) + wg.y * ${GM}u + t];
+    }
+    workgroupBarrier();
+    ${m === "h" ? zero.join(" ") : ""}
+    for (var k = 0u; k < ${BK}u; k++) {
+      ${body.join("\n      ")}
+    }
+    ${m === "h" ? flush.join(" ") : ""}`).join("\n")
+    return `${h ? "enable f16;" : ""}
+@group(0) @binding(0) var<storage, read> Wq: array<u32>;
+@group(0) @binding(1) var<storage, read> S4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> A: array<${V}>;
+@group(0) @binding(3) var<storage, read_write> O: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> P: vec4<u32>;
+var<workgroup> Ws: array<${V}, ${BK * GN}>;
+var<workgroup> As: array<${V}, ${BK * GM}>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(local_invocation_index) li: u32, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${decl.join(" ")}
+  for (var kb = 0u; kb < P.y / 32u; kb++) {${steps}
+  }
+  ${wr.join("\n  ")}
+}`
+  }
+  // ---- bf: f16 weights in a storage buffer, word (kc, row) = 8 halves at kc*N + row; activations f16 [tok][K/8] words.
+  // Rows row_i = (wg.x*R + i)*WX + lid.x, tokens tok = gid.y*T + j.
+  const BF = (R, T, WX, WY, h) => {
+    const Ls = [], ln = (s) => Ls.push(`    ${s}`)
+    const un = (x, hf) => h ? `vec4<f16>(bitcast<vec2<f16>>(${x}.${hf ? "z" : "x"}), bitcast<vec2<f16>>(${x}.${hf ? "w" : "y"}))` : `vec4<f32>(unpack2x16float(${x}.${hf ? "z" : "x"}), unpack2x16float(${x}.${hf ? "w" : "y"}))`
+    for (let i = 0; i < R; i++) ln(`let W${i} = Wb[kc * P.x + r${i}]; let wl${i} = ${un(`W${i}`, 0)}; let wh${i} = ${un(`W${i}`, 1)};`)
+    for (let j = 0; j < T; j++) {
+      ln(`{ let Aj = Ab[(tok + ${j}u) * (P.y / 8u) + kc]; let al = ${un("Aj", 0)}; let ah = ${un("Aj", 1)};`)
+      for (let i = 0; i < R; i++) ln(`  c${j}_${i} += ${h ? "f32(" : ""}dot(wl${i}, al) + dot(wh${i}, ah)${h ? ")" : ""};`)
+      ln(`}`)
+    }
+    const decl = [], wr = [], rs = []
+    for (let i = 0; i < R; i++) rs.push(`let r${i} = (wg.x * ${R}u + ${i}u) * ${WX}u + lid.x;`)
+    for (let j = 0; j < T; j++) for (let i = 0; i < R; i++) { decl.push(`var c${j}_${i} = 0.0;`); wr.push(`O[(tok + ${j}u) * P.x + r${i}] = c${j}_${i};`) }
+    return `${h ? "enable f16;" : ""}
+@group(0) @binding(0) var<storage, read> Wb: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> Ab: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> O: array<f32>;
+@group(0) @binding(3) var<uniform> P: vec4<u32>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${rs.join(" ")}
+  let tok = id.y * ${T}u;
+  ${decl.join(" ")}
+  for (var kc = 0u; kc < P.y / 8u; kc++) {
+${Ls.join("\n")}
+  }
+  ${wr.join("\n  ")}
+}`
+  }
+
+  // ---- qt: 4-bit weights from an RGBA32UI texture (texel (kb, row) = row's 16 bytes of block kb), scales RGBA32F (kb,
+  // row group), no dequant pass; R rows x T tokens an invocation, rows id.x*R + i. f32: nibbles by unpack4x8unorm,
+  // fma'd to n - 8, activations RGBA16F; h: nibbles as f16 1024 + n (OR 0x6400), minus 1032, activations h2 texels,
+  // block partial sums in f16, scaled into f32 sums.
+  const QT = (R, T, WX, WY, h, SWAP) => {
+    const Ls = [], ln = (s) => Ls.push(`    ${s}`)
+    for (let i4 = 0; i4 < R / 4; i4++) ln(`let d${i4} = textureLoad(St, vec2<u32>(kb, row / 4u + ${i4}u), 0);`)
+    for (let i = 0; i < R; i++) {
+      ln(`let q${i} = textureLoad(Wq, vec2<u32>(kb, row + ${i}u), 0);`)
+      for (let w = 0; w < 4; w++) {
+        const c = "xyzw"[w]
+        if (h) ln(`let l${i}${w} = vec4<f16>(bitcast<vec2<f16>>((q${i}.${c} & 0x000F000Fu) | 0x64006400u), bitcast<vec2<f16>>(((q${i}.${c} >> 8u) & 0x000F000Fu) | 0x64006400u)) - vec4<f16>(1032.0h); let h${i}${w} = vec4<f16>(bitcast<vec2<f16>>(((q${i}.${c} >> 4u) & 0x000F000Fu) | 0x64006400u), bitcast<vec2<f16>>(((q${i}.${c} >> 12u) & 0x000F000Fu) | 0x64006400u)) - vec4<f16>(1032.0h);`)
+        else ln(`let l${i}${w} = fma(unpack4x8unorm(q${i}.${c} & 0x0F0F0F0Fu), vec4<f32>(255.0), vec4<f32>(-8.0)); let h${i}${w} = fma(unpack4x8unorm((q${i}.${c} >> 4u) & 0x0F0F0F0Fu), vec4<f32>(255.0), vec4<f32>(-8.0));`)
+      }
+    }
+    for (let j = 0; j < T; j++) {
+      ln(`{`)
+      if (h) {
+        // h2 texel u of block kb = halves 8u .. 8u + 7: words x,y = k 8u..8u+3, z,w = 8u+4..8u+7. Weight vectors are
+        // in order (4w, 4w+2, 4w+1, 4w+3): activations swizzled .xzyw to match.
+        ln(`  let A0 = textureLoad(Ah, vec2<u32>(kb * 4u, tok + ${j}u), 0); let A1 = textureLoad(Ah, vec2<u32>(kb * 4u + 1u, tok + ${j}u), 0); let A2 = textureLoad(Ah, vec2<u32>(kb * 4u + 2u, tok + ${j}u), 0); let A3 = textureLoad(Ah, vec2<u32>(kb * 4u + 3u, tok + ${j}u), 0);`)
+        const hv = (A, a, b) => `vec4<f16>(bitcast<vec2<f16>>(${A}.${a}), bitcast<vec2<f16>>(${A}.${b})).xzyw`
+        // k 4w..4w+3: w=0: A0.xy, w=1: A0.zw, w=2: A1.xy, w=3: A1.zw; k 16+4w: A2, A3.
+        ln(`  let a0 = ${hv("A0", "x", "y")}; let a1 = ${hv("A0", "z", "w")}; let a2 = ${hv("A1", "x", "y")}; let a3 = ${hv("A1", "z", "w")};`)
+        ln(`  let b0 = ${hv("A2", "x", "y")}; let b1 = ${hv("A2", "z", "w")}; let b2 = ${hv("A3", "x", "y")}; let b3 = ${hv("A3", "z", "w")};`)
+      } else {
+        for (let w = 0; w < 4; w++) ln(`  let a${w} = textureLoad(At, vec2<u32>(kb * 8u + ${w}u, tok + ${j}u), 0); let b${w} = textureLoad(At, vec2<u32>(kb * 8u + ${4 + w}u, tok + ${j}u), 0);`)
+      }
+      for (let i4 = 0; i4 < R / 4; i4++) {
+        const sm = (i) => [0, 1, 2, 3].map((w) => `dot(l${i}${w}, a${w}) + dot(h${i}${w}, b${w})`).join(" + ")
+        ln(`  c${j}_${i4} = fma(vec4<f32>(${[0, 1, 2, 3].map((r) => h ? `f32(${sm(4 * i4 + r)})` : sm(4 * i4 + r)).join(", ")}), d${i4}, c${j}_${i4});`)
+      }
+      ln(`}`)
+    }
+    const decl = [], wr = []
+    for (let j = 0; j < T; j++) for (let i4 = 0; i4 < R / 4; i4++) { decl.push(`var c${j}_${i4} = vec4<f32>(0.0);`); wr.push(`O[(tok + ${j}u) * (P.x / 4u) + row / 4u + ${i4}u] = c${j}_${i4};`) }
+    return `${h ? "enable f16;" : ""}
+@group(0) @binding(0) var Wq: texture_2d<u32>;
+@group(0) @binding(1) var St: texture_2d<f32>;
+@group(0) @binding(2) var ${h ? "Ah: texture_2d<u32>" : "At: texture_2d<f32>"};
+@group(0) @binding(3) var<storage, read_write> O: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> P: vec4<u32>;
+@compute @workgroup_size(${WX}, ${WY})
+fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+  ${SWAP ? `let row = (wg.y * ${WX}u + lid.x) * ${R}u; let tok = (wg.x * ${WY}u + lid.y) * ${T}u;` : `let row = id.x * ${R}u; let tok = id.y * ${T}u;`} if (row >= P.x || tok >= P.z) { return; }
+  ${decl.join(" ")}
+  for (var kb = 0u; kb < P.y / 32u; kb++) {
+${Ls.join("\n")}
+  }
+  ${wr.join("\n  ")}
+}`
+  }
+
+  const compile = async (name, code) => {
+    device.pushErrorScope("validation")
+    const module = device.createShaderModule({ code })
+    const info = await module.getCompilationInfo()
+    const msgs = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.message}`)
+    let p = null
+    try { p = await device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main" } }) } catch (e) { msgs.push(e.message) }
+    const err = await device.popErrorScope()
+    if (err) msgs.push(err.message)
+    if (msgs.length || !p) { log(`COMPILE FAIL ${name}: ${msgs.join(" | ").slice(0, 400)}`); if (params.has("dump")) log(code); return null }
+    if (params.get("dump") === name) log(code)
+    return p
+  }
+  // Variant: { name, p, bind(x) -> entries, groups(x) -> [gx, gy], flops: bool, check: bool }
+  const make = async (s) => {
+    const f = s.split(":"), kind = f[0], n = f.slice(1).flatMap((t) => t.split("x").map(Number))
+    if (kind === "tex") {
+      const [rt, wg, opt] = [f[1], f[2], f[3]], [R, T] = rt.split("x").map(Number), [WX, WY] = wg.split("x").map(Number)
+      const sw = (opt ?? "").endsWith("s"), o = (opt ?? "").replace(/s$/, ""), packed = o === "pwa", half = o === "h", KS = Number((f[4] ?? "k1").slice(1))
+      if (half && !f16) return null
+      const p = await compile(s, packed ? TEXH(R, T, WX, WY, sw) : TEX(R, T, WX, WY, half, sw, KS))
+      return p && { name: s, p, check: true, ks: KS, bind: (x) => [packed ? x.Wh.createView() : x.Wt.createView(), packed ? x.Ah.createView() : x.At.createView(), { buffer: x.O }, { buffer: x.U }], groups: (x) => sw ? [x.M / T / WY, x.N / R / WX, KS] : [x.N / R / WX, x.M / T / WY, KS] }
+    }
+    if (kind === "deq") {
+      const h2 = f[1] === "h2"
+      const p = await compile(s, DEQ(h2))
+      return p && { name: s, p, check: false, deq: true, bind: (x) => [{ buffer: x.U }, x.St.createView(), { buffer: x.Qe }, h2 ? x.Wh.createView() : x.Wt.createView()], groups: (x) => [Math.ceil(x.K / (h2 ? 8 : 4) / 64), x.N] }
+    }
+    if (kind === "qt") {
+      const [R, T, WX, WY] = n, h = (f[4] ?? "").startsWith("h"), sw = (f[4] ?? "").endsWith("s")
+      if (h && !f16) return null
+      const p = await compile(s, QT(R, T, WX, WY, h, sw))
+      return p && { name: s, p, check: true, bind: (x) => [x.Wq4.createView(), x.St.createView(), h ? x.Ah.createView() : x.At.createView(), { buffer: x.O }, { buffer: x.U }], groups: (x) => sw ? [x.M / T / WY, x.N / R / WX] : [x.N / R / WX, x.M / T / WY] }
+    }
+    if (kind === "q4") {
+      const [RI, T, WX, WY] = n, h = f[4] === "h"
+      if (h && !f16) return null
+      const p = await compile(s, Q4(RI, T, WX, WY, h))
+      return p && { name: s, p, check: true, bind: (x) => [{ buffer: x.Qb }, { buffer: x.S4 }, { buffer: h ? x.Anh : x.An }, { buffer: x.O }, { buffer: x.U }], groups: (x) => [x.N / 4 / RI / WX, x.M / T / WY] }
+    }
+    if (kind === "sm") {
+      const [RI, TJ, WX, WY, BK] = n, m = f[6] ?? "f32"
+      if (m !== "f32" && !f16) return null
+      const p = await compile(s, SM(RI, TJ, WX, WY, BK, m))
+      return p && { name: s, p, check: true, bind: (x) => [{ buffer: x.Qb }, { buffer: x.S4 }, { buffer: m === "f32" ? x.At32 : x.At16 }, { buffer: x.O }, { buffer: x.U }], groups: (x) => [x.N / (4 * RI * WX), x.M / (4 * TJ * WY)] }
+    }
+    if (kind === "bf") {
+      const [R, T, WX, WY] = n, h = f[4] === "h"
+      if (h && !f16) return null
+      const p = await compile(s, BF(R, T, WX, WY, h))
+      return p && { name: s, p, check: true, bind: (x) => [{ buffer: x.Wb }, { buffer: x.Ab }, { buffer: x.O }, { buffer: x.U }], groups: (x) => [x.N / R / WX, x.M / T / WY] }
+    }
+    log(`unknown variant ${s}`)
+    return null
+  }
+
+  const F1 = new Float32Array(1), U1 = new Uint32Array(F1.buffer)
+  const f2h = (v) => { F1[0] = v; const u = U1[0]; const sgn = (u >>> 16) & 0x8000; let e = ((u >>> 23) & 255) - 112, m = u & 0x7fffff; if (e <= 0) return sgn; if (e >= 31) return sgn | 0x7c00; let r = (e << 10) | (m >>> 13); const rem = m & 0x1fff; if (rem > 0x1000 || (rem === 0x1000 && (r & 1))) r++; return sgn | r }
+  const h2f = (h) => { const s = h & 0x8000 ? -1 : 1, e = (h >>> 10) & 31, m = h & 1023; return e === 0 ? s * m * 2 ** -24 : s * (1 + m / 1024) * 2 ** (e - 15) }
+  const buf = (data, usage = GPUBufferUsage.STORAGE) => { const b = device.createBuffer({ size: Math.max(16, data.byteLength), usage: usage | GPUBufferUsage.COPY_DST }); device.queue.writeBuffer(b, 0, data); return b }
+  const tex = (w, h, format, data, bpr) => { const t = device.createTexture({ size: [w, h], format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST }); if (data) device.queue.writeTexture({ texture: t }, data, { bytesPerRow: bpr }, [w, h]); return t }
+  // Shape data: random nibbles and f16 scales; f16 activations. `exact` keeps f32 copies for the check.
+  const data = (N, K, M, exact) => {
+    const Kb = K / 32, G = N / 4
+    const Qb = new Uint32Array(N * K / 8)  // block-major: (kb*N + row)*4 + w
+    for (let i = 0; i < Qb.length; i++) Qb[i] = (Math.random() * 2 ** 32) >>> 0
+    const sh = new Uint16Array(N * Kb), S = new Float32Array(N * Kb)  // [kb][row]
+    for (let i = 0; i < S.length; i++) { sh[i] = f2h(0.002 + Math.random() * 0.02); S[i] = h2f(sh[i]) }
+    const nib = (row, k) => { const kb = k >> 5, kk = k & 31, w = (kk & 15) >> 2, i = kk & 3; return (Qb[(kb * N + row) * 4 + w] >>> (8 * i + (kk >= 16 ? 4 : 0))) & 15 }
+    // engine layout (row group g, block kb): (g*Kb + kb)*16 + r*4 + w
+    const Qe = new Uint32Array(Qb.length)
+    for (let kb = 0; kb < Kb; kb++) for (let g = 0; g < G; g++) for (let r = 0; r < 4; r++) for (let w = 0; w < 4; w++) Qe[(g * Kb + kb) * 16 + r * 4 + w] = Qb[(kb * N + g * 4 + r) * 4 + w]
+    // f16 weights for bf (word (kc, row) = 8 halves): dequantized on the CPU, f16-rounded.
+    const Wbh = new Uint16Array(wantBf ? N * K : 8)
+    if (wantBf) for (let kc = 0; kc < K / 8; kc++) for (let row = 0; row < N; row++) for (let i = 0; i < 8; i++) { const k = kc * 8 + i; Wbh[(kc * N + row) * 8 + i] = f2h((nib(row, k) - 8) * S[(k >> 5) * N + row]) }
+    const ah = new Uint16Array(M * K), a = new Float32Array(M * K)  // [tok][k]
+    for (let i = 0; i < a.length; i++) { ah[i] = f2h(Math.random() * 2 - 1); a[i] = h2f(ah[i]) }
+    const at32 = new Float32Array(M * K), at16 = new Uint16Array(M * K)  // [k][tok]
+    for (let t = 0; t < M; t++) for (let k = 0; k < K; k++) { at32[k * M + t] = a[t * K + k]; at16[k * M + t] = ah[t * K + k] }
+    const S4 = new Float32Array(N * Kb), St = new Float32Array(N * Kb)  // S4 [kb][g] vec4 = same as [kb][row]; St texel (kb, g) row-major
+    S4.set(S)
+    for (let kb = 0; kb < Kb; kb++) for (let g = 0; g < G; g++) for (let r = 0; r < 4; r++) St[(g * Kb + kb) * 4 + r] = S[kb * N + g * 4 + r]
+    const Qt = new Uint32Array(Qb.length)  // texel (kb, row): [row][kb] words
+    for (let kb = 0; kb < Kb; kb++) for (let row = 0; row < N; row++) for (let w = 0; w < 4; w++) Qt[(row * Kb + kb) * 4 + w] = Qb[(kb * N + row) * 4 + w]
+    const x = { N, K, M, Wq4: tex(Kb, N, "rgba32uint", Qt, Kb * 16),
+      Qb: buf(Qb), Qe: buf(Qe), S4: buf(S4), St: tex(Kb, G, "rgba32float", St, Kb * 16),
+      Wt: tex(K / 4, N, "rgba16float"), Wh: tex(K / 8, N, "rgba32uint"),
+      At: tex(K / 4, M, "rgba16float", ah, K * 2), Ah: tex(K / 8, M, "rgba32uint", ah, K * 2),
+      An: buf(a), Anh: buf(ah), At32: buf(at32), At16: buf(at16), Wb: buf(Wbh), Ab: buf(ah),
+      O: device.createBuffer({ size: N * M * 4 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
+      U: buf(new Uint32Array([N, K, M, 0]), GPUBufferUsage.UNIFORM) }
+    if (exact) x.ref = (row, t) => { let s = 0; for (let k = 0; k < K; k++) s += (nib(row, k) - 8) * S[(k >> 5) * N + row] * a[t * K + k]; return s }
+    x.destroy = () => { for (const v of Object.values(x)) if (v && v.destroy) v.destroy() }
+    return x
+  }
+  const deqT = await compile("deq", DEQ(false)), deqH = await compile("deq:h2", DEQ(true))
+  const dequantize = (x) => {
+    const enc = device.createCommandEncoder(), p = enc.beginComputePass()
+    for (const [pl, t, w] of [[deqT, x.Wt, x.K / 4], [deqH, x.Wh, x.K / 8]]) {
+      p.setPipeline(pl); p.setBindGroup(0, device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: [{ buffer: x.U }, x.St.createView(), { buffer: x.Qe }, t.createView()].map((resource, binding) => ({ binding, resource })) }))
+      p.dispatchWorkgroups(Math.ceil(w / 64), x.N)
+    }
+    p.end(); device.queue.submit([enc.finish()])
+  }
+  const run = (v, x, n) => {
+    const bg = device.createBindGroup({ layout: v.p.getBindGroupLayout(0), entries: v.bind(x).map((resource, binding) => ({ binding, resource })) })
+    const enc = device.createCommandEncoder()
+    const [gx, gy, gz = 1] = v.groups(x)
+    for (let i = 0; i < n; i++) { const p = enc.beginComputePass(); p.setPipeline(v.p); p.setBindGroup(0, bg); p.dispatchWorkgroups(gx, gy, gz); p.end() }
+    device.queue.submit([enc.finish()])
+    return device.queue.onSubmittedWorkDone()
+  }
+  const wantBf = (params.get("v") ?? "").includes("bf:")
+  const specs = (params.get("v") ?? "tex:4x4:8x8,tex:4x4:8x8:pwa,deq,deq:h2,q4:1:4:8x8,sm:1:1:8:8:32").split(",")
+  const variants = []
+  for (const s of specs) { const v = await make(s); if (v) variants.push(v) }
+  {
+    // Check: N = 256, K = 1024, M = 128, every output against the exact sum.
+    const [N, K, M] = [256, 1024, 128]
+    const x = data(N, K, M, true)
+    dequantize(x)
+    const ref = new Float64Array(N * M)
+    let mx = 0
+    for (let t = 0; t < M; t++) for (let r = 0; r < N; r++) { ref[t * N + r] = x.ref(r, t); mx = Math.max(mx, Math.abs(ref[t * N + r])) }
+    for (const v of variants) {
+      if (!v.check) continue
+      const enc0 = device.createCommandEncoder(); enc0.clearBuffer(x.O); device.queue.submit([enc0.finish()])
+      await run(v, x, 1)
+      const ks = v.ks ?? 1
+      const rb = device.createBuffer({ size: N * M * 4 * ks, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+      const enc = device.createCommandEncoder(); enc.copyBufferToBuffer(x.O, 0, rb, 0, N * M * 4 * ks); device.queue.submit([enc.finish()])
+      await rb.mapAsync(GPUMapMode.READ); const os = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap(); rb.destroy()
+      const o = new Float32Array(N * M)
+      for (let z = 0; z < ks; z++) for (let i = 0; i < N * M; i++) o[i] += os[z * N * M + i]
+      let e = 0, at = 0
+      for (let i = 0; i < N * M; i++) { const d = Math.abs(o[i] - ref[i]); if (!(d <= e)) { e = Number.isNaN(d) ? Infinity : d; at = i } }
+      v.err = e / mx
+      log(`check ${v.name}: max error / max |ref| ${v.err.toExponential(2)} ${v.err < 1e-3 ? "PASS" : `FAIL (at tok ${Math.floor(at / N)} row ${at % N}: ${o[at]} vs ${ref[at].toFixed(5)})`}`)
+    }
+    x.destroy()
+  }
+  const time = async (f, reps) => { await f(1); let best = Infinity; for (let r = 0; r < 3; r++) { const t = performance.now(); await f(reps); best = Math.min(best, (performance.now() - t) / reps) } return best }
+  const shapes = [["gate+up", 15360, 2048], ["down", 2048, 7680]].filter(([l]) => !params.has("shape") || params.get("shape") === l)
+  const M = Number(params.get("m") ?? 512)
+  for (const [label, N, K] of shapes) {
+    const x = data(N, K, M, false)
+    dequantize(x)
+    await device.queue.onSubmittedWorkDone()
+    const fl = 2 * N * K * M
+    // Rounds interleave the variants (A, B, C, A, B, C, ...); the median round is reported.
+    const rounds = Number(params.get("rounds") ?? 3), ts = variants.map(() => [])
+    for (let r = 0; r < rounds; r++) for (const [i, v] of variants.entries()) ts[i].push(await time((n) => run(v, x, n), Number(params.get("reps") ?? 3)))
+    for (const [i, v] of variants.entries()) {
+      const sorted = [...ts[i]].sort((a, b) => a - b), ms = sorted[Math.floor(sorted.length / 2)]
+      log(`${label} ${N}x${K} M=${M} ${v.name}: ${ms.toFixed(2)} ms${v.deq ? "" : `, ${(fl / ms / 1e6).toFixed(0)} GFLOP/s`} [${ts[i].map((t) => t.toFixed(1)).join(" ")}]${v.err === undefined ? "" : v.err < 1e-3 ? " (check pass)" : " (CHECK FAIL)"}`)
+    }
+    x.destroy()
+  }
+} catch (e) { log(`ERROR: ${e?.message ?? e}`) }
+log("DONE")
+</script></body></html>

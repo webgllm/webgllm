@@ -75,6 +75,12 @@ export type WebGLLMOptions = {
   /** Which worker and engine messages reach the console ("warn" by default). */
   logLevel?: LogLevel
   /**
+   * "auto" (the default): models run on WebGPU where the browser has it, on
+   * WebGL 2 elsewhere. false: on WebGL 2 even where there's WebGPU. Read
+   * when a model's worker starts: set it in the constructor.
+   */
+  webgpu?: "auto" | false
+  /**
    * A Web Worker of your own to run models in, in place of the ones webgllm
    * starts: one running `WebGLLMWorkerHandler`. It holds one model, so
    * loading another replaces the one there (whatever `keepLoaded` says), and
@@ -178,11 +184,14 @@ export class WebGLLM {
     for (const [name, bytes] of [["promptCacheBytes", cacheBytes], ["promptCacheDiskBytes", diskBytes]] as const)
       if (bytes !== undefined && (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0))
         throw new TypeError(`${name} must be a nonnegative number.`)
+    if (options.webgpu !== undefined && options.webgpu !== "auto" && options.webgpu !== false)
+      throw new TypeError(`webgpu must be "auto" or false.`)
     this.storage = internals.storage
     this.pool = new ModelPool({
       createWorker: internals.createWorker,
       ...(options.worker && { worker: options.worker }),
       memoryBudget: () => options.memoryBudget ?? defaultMemoryBudget(),
+      ...(options.webgpu !== undefined && { webgpu: options.webgpu }),
       storage: this.storage,
       onProgress: (progress) => {
         options.onProgress?.(progress)
@@ -260,9 +269,10 @@ export class WebGLLM {
 
   /**
    * Unloads `model`, or every model, freeing its GPU memory; its running
-   * generation fails. webgllm's own worker for the model ends; a worker of
-   * your own (`worker`) frees the model and stays running. Resolves, after
-   * the model's "unload" event, once the memory is free.
+   * generation fails. webgllm's own worker frees the model and is kept for
+   * the next load for 30 s, then ends; a worker of your own (`worker`)
+   * frees the model and stays running. Resolves, after the model's
+   * "unload" event, once the memory is free.
    */
   async unloadModel(model?: WebGlModelId): Promise<void> {
     await this.pool.unload(model)

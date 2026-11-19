@@ -95,6 +95,12 @@ export type TokenLogprob = {
 
 export type WorkerRequest =
   | {
+      /** Settings for every load in this worker from now on (WebGLLMOptions'). */
+      type: "configure"
+      /** false: WebGL 2 even where the browser has WebGPU. */
+      webgpu: "auto" | false
+    }
+  | {
       type: "load"
       model: string
       /**
@@ -119,7 +125,7 @@ export type WorkerRequest =
       reportPhases?: boolean
       /** The model to run it on: loaded first if it isn't (or its GPU context was lost). */
       model: string
-      /** The context to load it for, if it's loaded first (see "load"). */
+      /** The context to load it for, if it's loaded first (see "load"); left out, the one it's loaded or loading at. */
       contextLength?: number
       chat: Array<ChatMessage>
       /** A raw prompt in place of `chat`: tokenized as it is, with no chat template (OpenAI's Completions). */

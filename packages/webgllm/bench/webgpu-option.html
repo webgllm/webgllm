@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>webgpu option</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>WebGLLMOptions.webgpu</h1>
+  <p>Loads <code>?model=</code> (LFM2.5 350M GGUF by default) through the public API with <code>?webgpu=auto|false</code>, then times a reply and <code>predictSpeed</code> with the same option. Logs <code>WEBGPU-OPTION ...</code>.</p>
+  <pre id="out"></pre>
+  <script type="module">
+    const { WebGLLM, predictSpeed } = await import("/bundle/src/index.js")
+    const out = document.getElementById("out")
+    const log = (line) => {
+      out.textContent += line + "\n"
+      fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "LiquidAI/LFM2.5-350M-GGUF"
+    const webgpu = params.get("webgpu") === "false" ? false : "auto"
+    try {
+      const prediction = await predictSpeed(model, { decode: false, force: true, webgpu })
+      const llm = new WebGLLM({ webgpu })
+      await llm.loadModel(model)
+      for (let round = 0; round < 2; round++) {
+        const started = performance.now()
+        let first = 0, tokens = 0
+        const stream = await llm.chat.completions.create({
+          model,
+          stream: true,
+          max_tokens: 64,
+          temperature: 0,
+          messages: [{ role: "user", content: "Write a paragraph about a river." }]
+        })
+        for await (const chunk of stream) {
+          if (!chunk.choices[0]?.delta?.content) continue
+          if (!first) first = performance.now()
+          tokens++
+        }
+        const tps = (tokens - 1) / ((performance.now() - first) / 1000)
+        log(`WEBGPU-OPTION webgpu=${webgpu} round ${round}: ${tps.toFixed(1)} tok/s, predicted prompt ${Math.round(prediction.prompt)} pp/s`)
+      }
+      log("WEBGPU-OPTION DONE")
+    } catch (error) {
+      log(`WEBGPU-OPTION ERROR ${error?.stack ?? error}`)
+    }
+  </script>

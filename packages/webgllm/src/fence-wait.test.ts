@@ -71,6 +71,53 @@ test("a prompt's wait sleeps on timers once it isn't a short one", async (t) => 
   assert.ok(sleeps >= 6)
 })
 
+test("a prompt's wait doesn't sleep on timers where its polls wait inside the call", async (t) => {
+  let now = 0,
+    polls = 0,
+    yields = 0,
+    sleeps = 0
+  const timeouts: number[] = []
+  t.mock.method(performance, "now", () => (now += 0.05))
+  t.mock.method(globalThis, "setTimeout", (resolve: () => void) => {
+    sleeps++
+    now += 1
+    resolve()
+  })
+  const gpu = Object.create(Gpu.prototype) as Gpu
+  Object.assign(gpu, {
+    lost: false,
+    submissionBudget: new SubmissionBudget(),
+    phase: "prompt",
+    pollsBeforeSleep: 32,
+    polls: 0,
+    promptSpinMs: 0.25,
+    throttledUntil: 0,
+    timedPolls: true,
+    maxPollNs: 1e6,
+    yieldOnce: async () => {
+      yields++
+    },
+    gl: {
+      isContextLost: () => false,
+      WAIT_FAILED: 1,
+      TIMEOUT_EXPIRED: 2,
+      ALREADY_SIGNALED: 3,
+      CONDITION_SATISFIED: 4,
+      // (Each timed poll is a millisecond inside the call.)
+      clientWaitSync: (_sync: object, _flags: number, timeout: number) => {
+        timeouts.push(timeout)
+        if (timeout > 0) now += 1
+        return ++polls < 12 ? 2 : 3
+      }
+    }
+  })
+  await Reflect.get(Gpu.prototype, "wait").call(gpu, {})
+  // The same 12 looks as with timers: the first in passing, the rest timed, a turn of the event loop before each.
+  assert.equal(sleeps, 0)
+  assert.equal(yields, 11)
+  assert.deepEqual(timeouts, [0, ...Array.from({ length: 11 }, () => 1e6)])
+})
+
 test("a wait's fence polls wait inside the call where the browser allows a timeout, and not where it doesn't", () => {
   const timeouts: number[] = []
   const gpu = Object.create(Gpu.prototype) as Gpu

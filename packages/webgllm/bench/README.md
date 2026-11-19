@@ -29,6 +29,7 @@ Pages:
 - `mem.html`: memory and speed over a chat, also the iPhone page (below).
 - `webgl-perf.html`: load, prompt and writing throughput with painted-frame cadence (below).
 - `gl-info.html`: what this browser's WebGL 2 offers against what the engine needs.
+- `predict-speed.html`: `predictSpeed` measured afresh for each model (`?models=a,b`, LFM3 1.7B's GGUF and ONNX by default; `&rounds=3`), with its timings, time taken and GPU memory, then the public API's remembered answer; compare with a real run of `webgl-perf.html?rounds=1&model=<id>&tokens=64&render=css`.
 - `api.html`: the public API end to end, each check a `PASS` or `FAIL` line (`?model=<id>`, LFM2.5 350M GGUF by default; `&second=<id>` also loads a second model at once).
 - `bandwidth.html`, `mm2.html`, `q4-matmul.html`, `tf.html`: kernel and texture-layout experiments (below).
 - `lfm2-gguf.html`: LFM2.5 GGUF logits against llama.cpp's CPU ([LFM2-GGUF.md](LFM2-GGUF.md)).
@@ -134,6 +135,36 @@ Textures (M3, a 535-token prompt; LFM3 GGUF / Qwen3.5 GGUF, at load and the peak
 | bytes, f16Pack 0 (before) | 1,316 / 1,384 | 1,549 / 1,604 |
 | bytes, f16Pack 3 | 1,299 / 1,367 | 1,535 / 1,590 |
 
+## A prompt's other passes on WebGPU (M3 Ultra, Chrome, Nov 18)
+
+Where a 548-token prompt's time went with the matmuls native (`webgl-perf.html?…&tune=webgpu:1,pskip_<pass>:1`, each kind of pass left out in turn; LFM3 1.7B, 104 ms): matmuls 79%, the dequantization passes 5%, attention 6% (its head passes 2.5%, scores 1%, the weighted values 2.7%), conv 2.6%, SwiGLU 1.7%, the adds 1.4%, the norms 0.9%. LFM2.5 350M (24 ms): matmuls 67%, dequantization 7%, attention's weighted values 7%, conv 3%, SwiGLU 3%. Qwen3.5 2B (117 ms after its 8-bit matrices went through the scratch): matmuls 68%, the recurrence 14%, dequantization 5%, the Gated DeltaNet block's other passes 3%, attention 5%. A small pass costs 20 to 40 µs whatever it does (the recurrence's 34 chunk passes a layer 0.75 ms, the 350M's 64 dequantizations 1.7 ms), so a chain of small dependent passes is paid by the pass.
+
+What paid (medians of rounds 2 to 4, arms alternating load by load; tokens/s):
+
+| | LFM2.5 350M | LFM2.5 1.2B | LFM3 1.7B | Qwen3.5 2B |
+|---|---|---|---|---|
+| The residual add in one native pass (`fusedAdd` 2 against 1, where y's sums, the add and its sums were three) | 21,570 → 21,950 | 7,350 → 7,410 | 4,920 → 5,060 | 3,426 → 3,433 |
+| The buffer dequant a row's block a thread (4 words and the scale fetched once for 4 h2 texels) | 22,060 → 22,320 | 7,470 → 7,640 | 5,090 → 5,180 | 3,420 → 3,470 |
+| 8-bit matrices through the f16 scratch and the native matmul (`bufferGemm8`) | none | none | none | 3,504 → 4,285 |
+| …the 8-bit beta\|decay matmul too, into the block's output textures | | | | 4,450 → 4,530 |
+| The recurrence's chunks in one dispatch (`chunkLoop`) | | | | 4,440 → 4,590 |
+| Queries, keys and values in one pass (`promptPrep`) | 21,960 → 21,820 (noise) | 7,610 → 7,680 | 5,155 → 5,300 | 4,765 → 4,880 |
+| The short convolution and its state in one pass (`promptConv`) | 21,870 → 22,030 | 7,690 → 7,750 | 5,330 → 5,410 | none |
+
+- The dequant, the chunk loop, the prompt prep and the prompt conv compute the same bits as the passes they replace (`gemm-exact.html` compares the dequant's buffers; for the others, every token's logprob over two 128-token replies agrees to 6 decimals: `webgl-perf.html?…&logprobs=1`). The GLSL passes' `s += v * v` compiles to a fused multiply-add on Metal: a native pass that stores the squares and adds them moves logprobs by up to 0.012, one that sums with `fma` by nothing.
+- The fused add and the 8-bit matrices' f16 weights round differently: logprobs move by up to 0.014, as much as regrouping the norms' partial sums does (`rmsParts` 16 against 64: 0.024). A near-tie can flip a token deep in a reply.
+- Unsloth's Qwen3.5 2B Q4_0 has 18 Q5_K `ssm_out` and 3 Q4_1 `ffn_down` tensors, kept as 8-bit: the native pair matmul ran them at 2.7 TFLOP/s (2.1 ms a pass) where the dequantized f16 matmul runs 17 to 19, a quarter of the prompt's time for a twelfth of its multiply-adds.
+- The chunk loop is bound by its threads' own chains, not by the GPU's throughput: 17 chunks of two 32-step loops take 0.38 ms a layer (each loop 0.16), the same with the decays shared through workgroup memory or constant loop bounds, and 0.43 with a thread 4 key rows (a quarter of the fetches, more work a step).
+
+What lost:
+
+- A matmul straight from the 4-bit weights (no dequantization pass; `gemm-exact.html?v=q1_16x4,q1_8x8,q2_8x8,q1e_16x4`): 0.37 to 0.41× the f16 matmul's speed with one row group a thread, 0.09× with two. Every token tile decodes the weights again; the dequant pass decodes them once.
+- The f16 matmul's products in half floats (`shader-f16`; `gemm-exact.html?v=x11_16x4h4,x11_16x4h8`): 3.5% faster, 6e-4 off.
+- Row groups a thread pinned (`gemmRowGroups` 1 against 2) on Qwen3.5 2B: 4,785 against 4,748 tokens/s, noise.
+- The dequant a block of a row group a thread (16 words): no faster than a row's block.
+
+What's left is mostly the matmuls (17.5 to 18.9 TFLOP/s alone in `gemm-exact.html`), then the dequantization passes, attention's scores and weighted values, and SwiGLU. This Chrome (157) doesn't list WebGPU's subgroup matrix feature among the adapter's.
+
 ## Writing experiments that lost (Pixel 10 Pro, Oct 31)
 
 - gate|up and SwiGLU in one pass with no K-split (576 fragments for the 350M, each over all of K): 3× slower on the Pixel and 1.8× on an M3. Writing passes need thousands of fragments; a pass fewer doesn't pay for that.
@@ -213,6 +244,51 @@ Pixel 10 Pro, LFM3 GGUF, 548-token prompt, each browser in one tab of its own (`
 - Not kept: floors on the queue and on layers per wait from an idle fence's time (it measured 1.5–2.7 ms with timed polls, either side of any threshold, and cost frames: 68–87 FPS); a second step to 4 layers a wait (10.2 against 10.4 tokens/s, 85–96 FPS against 100–113); blocking on a one-pixel read (the wait is no shorter).
 - Every slice of work costs Firefox frames far faster than Chrome on the same GPU. With the prompt pacing held: Firefox reads 57–67 tokens/s at 80 FPS with small slices drained every 6 frames or more (48–56 every 2), and falls to 37 FPS at Chrome's slice size (68–72 tokens/s; Chrome 103 at 60 FPS). With no waits at all Firefox reads 87 and Chrome 112, and both freeze the page for seconds. Kept: where an idle fence is slow to report (the engine's own test, which finds Firefox), the pacing defends 40 frames a second (`slowFencePromptFps`), not 75 for prompts and the display's rate for writing; the page may go as low as 30 there and no lower. Prompts, 75 against 40 alternated: 51–56 → 58–68 tokens/s, 76–84 → 49–57 FPS. Writing judged against it too, alternated on a day Firefox's frames ran to 42–50 ms at the 99th percentile: 4.4–5.1 → 7.2–8.0 tokens/s, 88–96 → 73–84 FPS. Chrome reports no slow fence and is as it was (10–11 tokens/s, 92–98 for prompts, 60 FPS).
 - What's left: Firefox's prompts at about 62 tokens/s against Chrome's 95, and its writing at 7.4–10.4 by how its frames are running, against 10–11.
+
+## WebGL prompts on a Pixel 10 Pro, Firefox and Chrome (Nov 18)
+
+Firefox 160 and Chrome 157, `webgl-perf.html?rounds=…&render=css&speculative=0&tune=webgpu:0,…`, a 547 or 548-token prompt, each browser in one tab of its own (`driver.html?job=…`), arms alternated run by run, every arm named. Each load of another arm tunes again (the notes keep one entry a model), so every run times its own packing probe. Thermal status 0 to 1 throughout. A round's speed follows how long the GPU's clock (`/sys/class/devfreq/34f00000.gpu0/cur_freq`, sampled every 50 ms) holds its top step: LFM3 in Firefox reads 94 to 96 tokens/s at 96% of the prompt there and about 80 at 60 to 70%, the same build and settings.
+
+- Where a prompt's time goes (`pskip_<pass>:1`, LFM3 1.7B, 548 tokens). Firefox: 5.8 to 6.5 s; 1.3 to 1.8 s without the matmuls, 6.0 to 6.4 without the dequantization, 5.7 to 6.0 without the adds. Chrome: 5.4 s, 2.2 s without the matmuls. Unpaced (`submissionReads:0`) Firefox reads no faster (96 tokens/s at best, 45 to 51 in three rounds of six), at 108 to 120 frames a second with one 117 ms frame in two of those rounds.
+- Bands of columns (`glColumnBands:1`) against bands of rows, 4 rounds an arm, tokens/s:
+
+  | | Firefox rows | Firefox columns | Chrome rows | Chrome columns |
+  |---|---|---|---|---|
+  | LFM2.5 350M | 415 (386–444) | 395 (324–438) | 445 (438–455) | 444 (426–461) |
+  | LFM2.5 1.2B | 123 (119–134) | 135 (123–147) | 146 (142–150) | 152 (148–155) |
+  | LFM3 1.7B | 83 (81–90) | 89 (82–95) | 98 (95–100) | 101 (100–103) |
+  | Qwen3.5 2B | 79 (71–82) | 80 (78–84) | 72 (68–76) | 75 (73–78) |
+
+  LFM3 again, 8 rounds an arm: Firefox 85 and 90, Chrome 99 and 102. Firefox paints 120 frames a second with none over 17 ms in either; Chrome 58 to 60, its long frames no more with columns (Qwen3.5: 10 over 34 ms in each, the longest 75 ms where 83). Bands of 16, 32 or 64 columns read alike in Chrome (LFM3: 99, 99 and 101 over 8 rounds each, 98 with rows). The knob is still off: an M3 Ultra and an iPhone haven't been timed with it.
+- Kept: a prompt's wait doesn't sleep on timers where its fence polls wait inside the call (Firefox). 8 rounds an arm, the build before against after, columns on in both: LFM2.5 350M 435 → 448 tokens/s, 1.2B 142 → 144, LFM3 92 → 96 (84–98 → 93–98), Qwen3.5 2B 80 → 86 (73–85 → 84–87); no frame over 17 ms in either. It costs CPU: reading Qwen3.5's prompts the page's process takes 72% of a core where 47%, Firefox's GPU process 112% where 96%.
+- Tiles of the f16 matmul (`mm2.html?batch=512&only=LFM3&pick=^PURE …`, gate|up as 2 K-slices, ms a draw, best of 3 rounds of 10, each read):
+
+  | | Firefox | Chrome |
+  |---|---|---|
+  | 4 rows × 4 tokens, f16 weights and activations (the engine's f16Pack 0) | 86–87 | 86–87 |
+  | …h2 weights and activations (f16Pack 3) | 99 | 99 |
+  | …constant loop bound; 4 K texels a step; mediump | 85; 90; 89 | 85; –; 89 |
+  | 8 × 4, dots | 78 | 77 |
+  | 8 × 4, each token's sums as the rows' columns scaled and added | 71 | 79 |
+  | 4 × 8, dots | 79 | 78 |
+  | 4 × 8, scaled columns | 66 | 78 |
+  | 4 × 12; 4 × 16, scaled columns | 72; 81 | |
+  | 8 × 8, dots; scaled columns | 75; 100 | 75 |
+  | 16 × 4, dots | 102 | |
+
+  The same in both browsers until the sums are written as scaled columns, which only Firefox's compiler turns into speed. The down matmul as 4 K-slices follows (Firefox 45 → 36 ms for 4 × 8 scaled columns, Chrome 45 → 42).
+- Not kept: that 4 × 8 kernel as f16Pack 0's (commit `experiment(engine): TUNING.octMatmul`, reverted after it: four output textures of half the height, readers picking one of four by the token, bands of columns). In the engine, 8 rounds an arm, tokens/s:
+
+  | Firefox | 4 tokens | 8 tokens |
+  |---|---|---|
+  | LFM2.5 350M | 424 | 457 |
+  | LFM2.5 1.2B | 146 | 157 |
+  | LFM3 1.7B | 90 (rows: 85) | 99 (rows: 101, up to 115) |
+  | Qwen3.5 2B | 81 | 82 |
+
+  Chrome, LFM3: 102 → 100 with a fragment charged 1.5 times a 4-token one (and frames of 42 to 50 ms), 102 → 96 to 97 charged twice (frames as before), and 99 → 89 in bands of rows, which can't end on tile rows for it. Everything but its matmuls takes Chrome no longer (2.2 s → 2.0 s with them skipped), so it's the matmul itself that loses there, where mm2 has it 10% ahead: not explained. Firefox's replies are the same text with either kernel; Chrome's differ from the fourth word in one round of two. Its packing probe would still take it in Chrome (498 ms against f16Pack 3's 530; the 4-token kernel 481), so one kernel can't serve both browsers, and the engine keeps the 4-token one.
+- Not kept: no K-slices (`quadMaxSplit:1`: 72 to 77 tokens/s where 81 to 93) or slices of 256 (the same); a full drain never (`presentationFrames:0`: 85 and 93, inside the spread).
+- Writing in Firefox is not the fences: LFM2.5 350M writes 19.3 to 19.9 tokens/s with 2 layers a wait (Chrome 37), and 20 to 21.5 with 4, 8, 16 or no waits at all (`decodePaceLayers`). With its matmuls, heads and pick left out (`skip_…`) it still writes only 26 to 31. Issuing a token's 233 passes takes the worker 2 to 3 ms in Firefox and 1.5 to 2 in Chrome (`cpuRuns:1`); the rest of a token's time is spent waiting for them.
 
 ## Fewer render passes per written token (Nov 1)
 

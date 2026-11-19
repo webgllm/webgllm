@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Read bandwidth</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px;background:#13171c;color:#eef3f8}pre{white-space:pre-wrap}</style></head>
+<body><h1>WebGPU read bandwidth: 256 MB from a texture and from a buffer</h1><pre id="out"></pre>
+<script type="module">
+const out = document.querySelector("#out")
+const log = (s) => { out.textContent += s + "\n"; fetch("/log", { method: "POST", body: s }) }
+try {
+  const adapter = await navigator.gpu.requestAdapter()
+  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize, maxBufferSize: adapter.limits.maxBufferSize } })
+  const W = 4096, H = 4096 // rgba32uint: 256 MB
+  const tex = device.createTexture({ size: [W, H], format: "rgba32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+  const buf = device.createBuffer({ size: W * H * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+  // Random contents (a cleared texture reads compressed): 16 MB of noise, repeated.
+  const noise = new Uint8Array(16 << 20)
+  for (let i = 0; i < noise.length; i += 65536) crypto.getRandomValues(noise.subarray(i, i + 65536))
+  for (let y = 0; y < H; y += 256) device.queue.writeTexture({ texture: tex, origin: [0, y] }, noise, { bytesPerRow: W * 16 }, [W, 256])
+  for (let o = 0; o < W * H * 16; o += noise.length) device.queue.writeBuffer(buf, o, noise)
+  await device.queue.onSubmittedWorkDone()
+  const tex8 = device.createTexture({ size: [8192, 8192], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+  const tex2 = device.createTexture({ size: [W * 2, H], format: "rg32uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+  for (let y = 0; y < H; y += 256) { device.queue.writeTexture({ texture: tex8, origin: [0, y * 2] }, noise, { bytesPerRow: 8192 * 4 }, [8192, 512]); device.queue.writeTexture({ texture: tex2, origin: [0, y] }, noise, { bytesPerRow: W * 16 }, [W * 2, 256]) }
+  await device.queue.onSubmittedWorkDone()
+  const outb = device.createBuffer({ size: 4 * W * H / 16, usage: GPUBufferUsage.STORAGE })
+  const kernels = {
+    // Each thread 16 texels of a row, threads of a workgroup on neighbouring rows (as the matmuls read).
+    "texture rows": `@group(0) @binding(0) var T: texture_2d<u32>; @group(0) @binding(1) var<storage, read_write> O: array<u32>;
+      @compute @workgroup_size(16, 4) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let x0 = id.y * 16u; let y = id.x; var s = vec4<u32>(0u);
+      for (var i = 0u; i < 16u; i++) { s ^= textureLoad(T, vec2<u32>(x0 + i, y), 0); } O[id.y * ${H}u + y] = s.x ^ s.y ^ s.z ^ s.w; }`,
+    "texture columns": `@group(0) @binding(0) var T: texture_2d<u32>; @group(0) @binding(1) var<storage, read_write> O: array<u32>;
+      @compute @workgroup_size(64, 1) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let x = id.x; let y0 = id.y * 16u; var s = vec4<u32>(0u);
+      for (var i = 0u; i < 16u; i++) { s ^= textureLoad(T, vec2<u32>(x, y0 + i), 0); } O[id.y * ${W}u + x] = s.x ^ s.y ^ s.z ^ s.w; }`,
+    "rgba8unorm texture rows": `@group(0) @binding(0) var T: texture_2d<f32>; @group(0) @binding(1) var<storage, read_write> O: array<u32>;
+      @compute @workgroup_size(16, 4) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let x0 = id.y * 64u; let y = id.x; var s = vec4<f32>(0.0);
+      for (var i = 0u; i < 64u; i++) { s += textureLoad(T, vec2<u32>(x0 + i, y), 0); } O[(id.y * 8192u + y) % ${W * H / 16}u] = u32(s.x + s.y + s.z + s.w); }`,
+    "rg32uint texture rows": `@group(0) @binding(0) var T: texture_2d<u32>; @group(0) @binding(1) var<storage, read_write> O: array<u32>;
+      @compute @workgroup_size(16, 4) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let x0 = id.y * 32u; let y = id.x; var s = vec4<u32>(0u);
+      for (var i = 0u; i < 32u; i++) { s ^= textureLoad(T, vec2<u32>(x0 + i, y), 0); } O[id.y * ${H}u + y] = s.x ^ s.y; }`,
+    "buffer": `@group(0) @binding(0) var<storage, read> B: array<vec4<u32>>; @group(0) @binding(1) var<storage, read_write> O: array<u32>;
+      @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let n = ${W * H / 16}u; var s = vec4<u32>(0u);
+      for (var i = 0u; i < 16u; i++) { s ^= B[i * n + id.x + id.y * 65535u * 64u]; } O[id.x + id.y * 65535u * 64u] = s.x ^ s.y ^ s.z ^ s.w; }`
+  }
+  for (const [name, code] of Object.entries(kernels)) {
+    const p = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: "main" } })
+    const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: name === "buffer" ? { buffer: buf } : name.startsWith("rgba8") ? tex8.createView() : name.startsWith("rg32") ? tex2.createView() : tex.createView() }, { binding: 1, resource: { buffer: outb } }] })
+    const groups = name.startsWith("rgba8") ? [8192 / 16, 8192 / 64 / 4] : name.endsWith("texture rows") ? [H / 16, W / 16 / 4] : name === "texture columns" ? [W / 64, H / 16] : [Math.min(65535, W * H / 16 / 64), Math.ceil(W * H / 16 / 64 / 65535)]
+    const go = (n) => { const e = device.createCommandEncoder(); const c = e.beginComputePass(); c.setPipeline(p); c.setBindGroup(0, bg); for (let i = 0; i < n; i++) c.dispatchWorkgroups(...groups); c.end(); device.queue.submit([e.finish()]); return device.queue.onSubmittedWorkDone() }
+    await go(2)
+    let best = Infinity
+    for (let r = 0; r < 4; r++) { const t = performance.now(); await go(5); best = Math.min(best, (performance.now() - t) / 5) }
+    log(`STREAM ${name}: ${best.toFixed(2)} ms for 256 MB, ${(256 * 1.048576 / best).toFixed(0)} GB/s`)
+  }
+} catch (e) { log(`ERROR: ${e.message}`) }
+log("ALL DONE")
+</script></body></html>

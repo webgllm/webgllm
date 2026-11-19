@@ -119,6 +119,14 @@ const reply = await webgllm.chat.completions.create({
 
 The image is resized the way the model's processor does it, and `detail` sets how much of it the model reads. Qwen3.5 and LFM3-VL read an image whole (in whole 32-pixel blocks), within a pixel budget: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image. LFM2.5-VL reads an image of up to about 512 × 512 pixels whole, as 64 to 256 tokens; a larger one as its processor cuts it, a grid of 512-pixel tiles (up to 10, 256 tokens each) and the whole image again as a thumbnail (about 1,800 tokens for a photo), and `"low"` reads any image whole, as one view. The vision encoder (62 MB for Qwen3.5 0.8B's ONNX build, 197 MB for 2B's, 668 MB for 2B's GGUF; 103 to 583 MB for Liquid AI's) downloads the first time a request has an image, loads on the GPU for the request's new images and is freed after them, so text chats never pay for it in memory or speed. Each image's embedding rows are kept for a few recent images, and the prompt cache tells images apart by content, so a follow-up about an image in the history reads only the new turn. `timings.images_ms` says how long a request's images took (fetching, resizing and encoding, the encoder's load included), before `prompt_ms`. On a GPU whose textures are shorter than an image's count of 16-pixel patches (4,096 at `"high"`), the image is made smaller to fit.
 
+### WebGPU or WebGL
+
+Models run on WebGPU where the browser has it, and on WebGL 2 elsewhere (no `navigator.gpu`, no adapter, or a model WebGPU fails to load). `webgpu: false` keeps them on WebGL 2 even where there's WebGPU; it takes only `"auto"` (the default) or `false`, and applies to the models the instance loads from then on.
+
+```ts
+const webgllm = new WebGLLM({ webgpu: false })
+```
+
 ### Several models
 
 Several models can be loaded at once, one worker each, up to a memory budget (`new WebGLLM({ memoryBudget })`, picked from the device by default; a [worker of your own](#a-worker-of-your-own) holds one model). Loading past it unloads the least recently used model, unless it was loaded with `keepLoaded: true`. Generations run one at a time across models.
@@ -162,6 +170,25 @@ const webgllm = new WebGLLM({
 })
 webgllm.addEventListener("unload", ({ model }) => registry.release(`webgllm:${model}`))
 ```
+
+### Speed on this device
+
+`predictSpeed` says how fast a model would read prompts and write on this device before its weights download, so an app can choose to run it here or in the cloud. It reads the model's shapes (a GGUF's header, or an ONNX model's graph and config), runs one layer of each kind the model has, with random weights, through the engine's own passes on this GPU (WebGPU where the browser has it, else WebGL 2, as a model would run), and scales that to the whole model. It's a quick guess, not a benchmark. The answer is remembered per GPU, browser, backend, model and webgllm version, so later calls return at once (`force: true` measures again). Call it while no model is loading or answering: they share the GPU.
+
+```ts
+import { predictSpeed } from "webgllm"
+
+// Whether prompts are fast enough to download the model: prompt speed only, sooner.
+const { prompt } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF", { decode: false })
+const downloadLocal = prompt >= 300
+
+// Prompt and writing speed.
+const { prompt: p, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF")
+```
+
+`prompt` is tokens read per second; `decode` is tokens written per second, one at a time (speculative drafts can make replies faster), absent with `decode: false`. With `webgpu: false` it measures on WebGL 2, as models run with `new WebGLLM({ webgpu: false })` (see [WebGPU or WebGL](#webgpu-or-webgl)).
+
+The first call for LFM3 1.7B GGUF, prompt only: about 0.2 s on an M3 Ultra (Chrome), 0.3-0.9 s on an iPad Pro M4 (Safari), 1.3-1.5 s on a Pixel 10 Pro in Chrome and 1.7-1.9 s in Firefox. With writing: 0.25 s on the M3 Ultra, 2.7-2.8 s in the Pixel's Firefox.
 
 ### Tokens and logits
 

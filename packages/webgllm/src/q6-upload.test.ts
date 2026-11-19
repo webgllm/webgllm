@@ -115,7 +115,7 @@ test("GPU upload borrows existing storage and routes chunk data across panels an
 
 test('embedding panels allocate incrementally without increasing final storage',()=>{
  const made:Array<{internal:number;width:number;height:number}>=[]
- const state={bytes:true,headChoice:{expanded:true,split:2},buffers:{act:{internal:0x8d70,width:512,height:1}},gpu:{limits:{maxTextureSize:16384,maxTextureUnits:16},readsPerSlice:2**28,texture:(internal:number,width:number,height:number)=>{const t={internal,width,height};made.push(t);return t},write:()=>undefined,program:()=>({}),run:()=>undefined}}
+ const state={bytes:true,headChoice:{expanded:true,split:2},buffers:{act:{internal:0x8d70,width:512,height:1}},gpu:{limits:{maxTextureSize:16384,maxTextureUnits:16},readsPerSlice:2**28,slowZeroFill:true,texture:(internal:number,width:number,height:number)=>{const t={internal,width,height};made.push(t);return t},write:()=>undefined,program:()=>({}),run:()=>undefined}}
  const matrix=Reflect.get(Engine.prototype,'allocateMatrix').call(state,32768,2048,6,false)
  assert.equal(matrix.quantPanels.length,4);assert.equal(matrix.quantPanels.filter(Boolean).length,1);assert.equal(made.length,2)
  const m=newQuantMatrix(4,2048,6,false)

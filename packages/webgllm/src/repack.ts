@@ -127,25 +127,74 @@ export function packQ8_0(
 /**
  * MatMulNBits rows (see QuantMatrix.raw) as `quants` in this module's
  * layout: what packMatMulNBits does to the quants, for a matrix whose
- * quants were left raw.
+ * quants were left raw. Works on 32-bit words (4 nibble pairs at a time),
+ * about 3× faster than byte by byte; writes into `out` when it's big
+ * enough (an upload scratch, reused across matrices).
  */
-export function quantsFromRaw(raw: Uint8Array, N: number, K: number) {
+export function quantsFromRaw(raw: Uint8Array, N: number, K: number, out?: Uint32Array) {
   const blocks = K / 32
-  const quants = new Uint32Array(N * blocks * 4)
-  const q = new Uint8Array(quants.buffer)
+  const words = N * blocks * 4
+  const quants = out && out.length >= words ? out.subarray(0, words) : new Uint32Array(words)
+  const src = raw.byteOffset & 3
+    ? new Uint32Array(raw.slice(0, words * 4).buffer)
+    : new Uint32Array(raw.buffer, raw.byteOffset, words)
   for (let n = 0; n < N; n++) {
-    let p = n * blocks * 16
-    let qi = ((n >> 2) * blocks * 4 + (n & 3)) * 16
-    for (let b = 0; b < blocks; b++, p += 16, qi += 64) {
-      for (let k = 0; k < 8; k++) {
-        const lo = raw[p + k]
-        const hi = raw[p + 8 + k]
-        q[qi + 2 * k] = (lo & 0x0f) | ((hi & 0x0f) << 4)
-        q[qi + 2 * k + 1] = (lo >> 4) | (hi & 0xf0)
+    let s = n * blocks * 4
+    let o = ((n >> 2) * blocks * 4 + (n & 3)) * 4
+    for (let b = 0; b < blocks; b++, s += 4, o += 16) {
+      // A block: 8 low-half bytes, then 8 high-half bytes. Byte 2k of the
+      // result is the low nibbles of low byte k and high byte k, byte 2k + 1
+      // their high nibbles.
+      for (let h = 0; h < 2; h++) {
+        const lo = src[s + h]
+        const hi = src[s + 2 + h]
+        const even = (lo & 0x0f0f0f0f) | ((hi & 0x0f0f0f0f) << 4)
+        const odd = ((lo >>> 4) & 0x0f0f0f0f) | (hi & 0xf0f0f0f0)
+        const e0 = even & 0xffff
+        const o0 = odd & 0xffff
+        const e1 = even >>> 16
+        const o1 = odd >>> 16
+        quants[o + 2 * h] = ((e0 | (e0 << 8)) & 0x00ff00ff) | (((o0 | (o0 << 8)) & 0x00ff00ff) << 8)
+        quants[o + 2 * h + 1] = ((e1 | (e1 << 8)) & 0x00ff00ff) | (((o1 | (o1 << 8)) & 0x00ff00ff) << 8)
       }
     }
   }
   return quants
+}
+
+/**
+ * quantsFromRaw through WebAssembly SIMD, 247 bytes assembled by hand: a
+ * row's 16-byte block is split into its low and high nibbles (an and, a
+ * shift), the two interleaved into weights 0-15 and 16-31 (two
+ * shuffles) and joined a byte each (a shift, an or), stored at its place
+ * in the row group. 20 GB/s on an M3 Ultra where the JavaScript's 5 (an
+ * ONNX model's ~0.85 GB repack had cost LFM3 1.7B's load 300 ms there).
+ * The module: q4(src, dst, N, blocks) over its own memory, `mem`.
+ */
+const Q4_WASM = "AGFzbQEAAAABCAFgBH9/f38AAwIBAAUDAQABBwwCAnE0AAADbWVtAgAKywEByAECBX8DeyAAIQZBACEEAkADQCAEIAJJRQ0BIAEgBEECdiADbEECdCAEQQNxakEEdGohB0EAIQUCQANAIAUgA0lFDQEgBv0ABAAhCSAJ/QwPDw8PDw8PDw8PDw8PDw8P/U4hCiAJQQT9bSELIAcgCiAL/Q0AEAERAhIDEwQUBRUGFgcXIAogC/0NCBgJGQoaCxsMHA0dDh4PH0EE/Wv9UP0LBAAgBkEQaiEGIAdBwABqIQcgBUEBaiEFDAALCyAEQQFqIQQMAAsLCw=="
+
+/**
+ * A repacker for one load (its memory, twice the largest matrix's quants,
+ * goes with it), or null where WebAssembly SIMD isn't available (then
+ * quantsFromRaw). Its result is a view of that memory, good until its next
+ * call.
+ */
+export function q4Repacker(): ((raw: Uint8Array, N: number, K: number) => Uint32Array) | null {
+  let exports: { q4: (src: number, dst: number, N: number, blocks: number) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q4_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  return (raw, N, K) => {
+    const length = (N * K) / 2
+    if (exports.mem.buffer.byteLength < 2 * length)
+      exports.mem.grow(Math.ceil((2 * length - exports.mem.buffer.byteLength) / 65536))
+    new Uint8Array(exports.mem.buffer, 0, length).set(raw.subarray(0, length))
+    exports.q4(0, length, N, K / 32)
+    return new Uint32Array(exports.mem.buffer, length, length / 4)
+  }
 }
 
 /**
@@ -154,10 +203,13 @@ export function quantsFromRaw(raw: Uint8Array, N: number, K: number) {
  * texels of 4 weights, the first in the low nibble): each row's 16-byte
  * block is already those 8 texels, so it's moved into place, not repacked.
  */
-export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number) {
+export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number, scratch?: Uint32Array) {
   const blocks = K / 32
-  const src = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2)
-  const out = new Uint32Array(rows * blocks * 4)
+  const src = raw.byteOffset & 3
+    ? new Uint32Array(raw.slice(0, raw.byteLength & ~3).buffer)
+    : new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2)
+  const words = rows * blocks * 4
+  const out = scratch && scratch.length >= words ? scratch.subarray(0, words) : new Uint32Array(words)
   for (let i = 0; i < rows; i++) {
     let s = (n0 + i) * blocks * 4
     let o = ((i >> 2) * blocks * 4 + (i & 3)) * 4
@@ -168,7 +220,7 @@ export function rawRgba4(raw: Uint8Array, K: number, n0: number, rows: number) {
       out[o + 3] = src[s + 3]
     }
   }
-  return new Uint16Array(out.buffer)
+  return new Uint16Array(out.buffer, out.byteOffset, words * 2)
 }
 
 /**
@@ -380,6 +432,57 @@ export function dequantizeQ5_K(
 }
 
 /**
+ * dequantizeQ5_K or dequantizeQ4_1 and then quantizeQ8, in one
+ * WebAssembly SIMD pass (1,771 bytes, assembled from src/q8.wat with wabt): a block's 32
+ * values in f32 lanes (the dequantizers' products and differences are
+ * exact in f32, so the values are theirs), its scale through toHalf's
+ * rounding, its codes rounded in f64 as quantizeQ8 rounds them: the same
+ * bytes. Qwen3.5 2B GGUF's 18 Q5_K and 3 Q4_1 matrices in 117 ms on an M3
+ * Ultra where 379. The module: q5k and q41(src, codes, scales, rows,
+ * super-blocks or blocks a row) over its memory, `mem`, whose first 256 KiB
+ * hold halfTable.
+ */
+const Q8_WASM = "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"
+
+/**
+ * A converter for one load (its memory goes with it), or null where
+ * WebAssembly SIMD isn't available: writes rows [row0, row0 + rows) of a
+ * Q5_K or Q4_1 tensor into 8-bit `m` as quantizeQ8 would, and returns
+ * false (writing nothing) unless both are multiples of 4.
+ */
+export function q8Converter(): ((kind: "q5k" | "q41", m: QuantMatrix, row0: number, src: Uint8Array, rows: number) => boolean) | null {
+  let exports: { q5k: (...args: number[]) => void; q41: (...args: number[]) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q8_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  const TABLE = 65536 * 4
+  let tabled = false
+  return (kind, m, row0, src, rows) => {
+    if (row0 % 4 || rows % 4 || m.bits !== 8) return false
+    const K = m.K, blocks = K / 32
+    const srcBytes = kind === "q5k" ? (rows * K / 256) * 176 : rows * blocks * 20
+    const codes = TABLE + ((srcBytes + 15) & ~15)
+    const scales = codes + rows * K
+    const need = scales + rows * blocks * 2
+    const mem = exports.mem
+    if (mem.buffer.byteLength < need) mem.grow(Math.ceil((need - mem.buffer.byteLength) / 65536))
+    if (!tabled) {
+      new Float32Array(mem.buffer, 0, 65536).set(halfTable())
+      tabled = true
+    }
+    new Uint8Array(mem.buffer, TABLE, srcBytes).set(src.subarray(0, srcBytes))
+    exports[kind](TABLE, codes, scales, rows, kind === "q5k" ? K / 256 : blocks)
+    // Rows from a multiple of 4 are whole row groups: one contiguous run each.
+    new Int8Array(m.quants.buffer, m.quants.byteOffset + row0 * K, rows * K).set(new Int8Array(mem.buffer, codes, rows * K))
+    m.scales.set(new Uint16Array(mem.buffer, scales, rows * blocks), row0 * blocks)
+    return true
+  }
+}
+
+/**
  * Quantizes float rows (rows × K) to 8 bits: per block of 32, scale =
  * max|w| / 127 rounded to fp16, q = round(w / scale) in -127..127 (ties
  * round up).
@@ -480,6 +583,86 @@ export function packQ6_K(
   repackTime.ggufQ6Ms += performance.now() - started
 }
 
+/**
+ * Row groups [g0, g0 + groups) of a Q6_K embedding as packQ6_K stores them
+ * (a row group's super-blocks, each row's 208 bytes: ql, qh, scales) in
+ * the split layout's upload order (see kernels.ts's Q6_SPLIT): `low`
+ * RGBA4 texels (group, 32-weight block, row, 8), `high` RGBA4 texels
+ * (group, block, row, 4), `sub` RGBA32UI texels (group, super-block, row:
+ * the row's 16 scale bytes as they are). A texel's nibbles in RGBA4 order:
+ * the first in bits 0-3 (read .wzyx).
+ */
+export function q6SplitRows(m: QuantMatrix, g0: number, groups: number, low: Uint16Array, high: Uint16Array, sub: Uint32Array) {
+  const sbs = m.K / 256
+  const src = new Uint32Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength >> 2)
+  const four = (v: number) => {
+    const p = (v | (v >>> 4)) & 0x00ff00ff
+    return (p | (p >>> 8)) & 0xffff
+  }
+  for (let gl = 0; gl < groups; gl++)
+    for (let s = 0; s < sbs; s++)
+      for (let r = 0; r < 4; r++) {
+        const W = (((g0 + gl) * sbs + s) * 4 + r) * 52
+        const S = ((gl * sbs + s) * 4 + r) * 4
+        for (let w = 0; w < 4; w++) sub[S + w] = src[W + 48 + w]
+        for (let b = 0; b < 8; b++) {
+          const n = b >> 2, qq = b & 3
+          const k = s * 8 + b
+          const L = ((gl * sbs * 8 + k) * 4 + r) * 8
+          const ql = W + 16 * n + 8 * (qq & 1)
+          for (let t = 0; t < 8; t++) {
+            const a = src[ql + t]
+            low[L + t] = four(qq < 2 ? a & 0x0f0f0f0f : (a >>> 4) & 0x0f0f0f0f)
+          }
+          const H = ((gl * sbs * 8 + k) * 4 + r) * 4
+          const qh = W + 32 + 8 * n
+          const shift = 2 * qq
+          for (let t = 0; t < 4; t++)
+            high[H + t] = four(((src[qh + t] >>> shift) & 0x03030303) | (((src[qh + 4 + t] >>> shift) & 0x03030303) << 2))
+        }
+      }
+}
+
+/**
+ * q6SplitRows through WebAssembly SIMD (497 bytes, assembled from
+ * src/q6split.wat with wabt): a block's 32 nibbles or top-bit pairs paired
+ * into RGBA4 bytes by two shuffles. The same texels, 3.4× faster on an M3
+ * Ultra. The module: split(src, low, high, sub, groups, super-blocks) over
+ * its memory, `mem`.
+ */
+const Q6SPLIT_WASM = "AGFzbQEAAAABEAJgAnt7AXtgBn9/f39/fwADAwIAAQUDAQABBw8CA21lbQIABXNwbGl0AAEKuQMCNAAgACAB/Q0AAgQGCAoMDhASFBYYGhweIAAgAf0NAQMFBwkLDQ8RExUXGRsdH0EE/Wv9UAuBAwIKfwR7AkADQCAGIARPDQFBACEHAkADQCAHIAVPDQFBACEIAkADQCAIQQRPDQEgBiAFbCAHakEEbCAIaiEMIAAgDEHQAWxqIQogAyAMQQR0aiAK/QAEwAH9CwQAQQAhCQJAA0AgCUEITw0BIAdBCGwgCWohCyAKIAlBAnZBwABsaiAJQQFxQSBsaiENIA39AAQAIRAgDf0ABBAhESAJQQNxQQJJBEAgEEEP/Q/9TiEQIBFBD/0P/U4hEQUgEEEE/W0hECARQQT9bSERCyABIAYgBWxBCGwgC2pBBGwgCGpBBHRqIBAgERAA/QsEACAKQYABaiAJQQJ2QSBsaiEOIAlBA3FBAXQhD0ED/Q8hEiAO/QAEACAP/W0gEv1OIA79AAQQIA/9bSAS/U5BAv1r/VAhEyACIAYgBWxBCGwgC2pBBGwgCGpBA3RqIBMgExAA/VsDAAAgCUEBaiEJDAALCyAIQQFqIQgMAAsLIAdBAWohBwwACwsgBkEBaiEGDAALCws="
+
+/**
+ * A splitter for one load (its memory goes with it), or null where
+ * WebAssembly SIMD isn't available: q6SplitRows' texels for row groups
+ * [g0, g0 + groups), as views of its memory good until its next call.
+ */
+export function q6Splitter(): ((m: QuantMatrix, g0: number, groups: number) => { low: Uint16Array; high: Uint16Array; sub: Uint32Array }) | null {
+  let exports: { split: (...args: number[]) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q6SPLIT_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  return (m, g0, groups) => {
+    const sbs = m.K / 256
+    const srcBytes = groups * sbs * 4 * 208
+    const low = (srcBytes + 15) & ~15, lowBytes = groups * sbs * 512
+    const high = low + lowBytes, highBytes = groups * sbs * 256
+    const sub = high + highBytes, subBytes = groups * sbs * 64
+    const mem = exports.mem
+    if (mem.buffer.byteLength < sub + subBytes) mem.grow(Math.ceil((sub + subBytes - mem.buffer.byteLength) / 65536))
+    new Uint8Array(mem.buffer, 0, srcBytes).set(new Uint8Array(m.quants.buffer, m.quants.byteOffset + g0 * sbs * 4 * 208, srcBytes))
+    exports.split(0, low, high, sub, groups, sbs)
+    return {
+      low: new Uint16Array(mem.buffer, low, lowBytes >> 1),
+      high: new Uint16Array(mem.buffer, high, highBytes >> 1),
+      sub: new Uint32Array(mem.buffer, sub, subBytes >> 2)
+    }
+  }
+}
+
 /** Q4_0 bytes to RGBA4 upload order: four low-nibble texels then four high.
  * Each word is compacted with whole-word masks/shifts; shaders read .wzyx.
  */
@@ -527,4 +710,38 @@ export function headPermutation(
     }
   }
   return perm
+}
+
+/**
+ * Row `n` of a 4- or 8-bit matrix as floats, as the GPU dequantizes it
+ * (scale · (q − zero point), zero point 8 for 4 bits without them, none for
+ * 8): `raw` MatMulNBits rows or this module's layout. Null for 6-bit
+ * matrices. For checking what the GPU read against the CPU.
+ */
+export function matrixRow(m: QuantMatrix, n: number): Float32Array | null {
+  if (m.bits === 6) return null
+  const half = halfTable()
+  const blocks = m.K / 32
+  const out = new Float32Array(m.K)
+  const q = new Uint8Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength)
+  for (let b = 0; b < blocks; b++) {
+    const si = (n >> 2) * blocks * 4 + (n & 3) + 4 * b
+    const scale = half[m.scales[si]]
+    if (m.bits === 8) {
+      for (let j = 0; j < 32; j++) out[b * 32 + j] = scale * ((q[si * 32 + j] << 24) >> 24)
+      continue
+    }
+    const zero = m.zeros ? m.zeros[si] : 8
+    for (let j = 0; j < 32; j++) {
+      // Raw: element 2i in byte i's low nibble. This module's: elements
+      // 0–15 in their bytes' low nibbles, 16–31 in the high nibbles of 0–15.
+      const nibble = m.raw
+        ? (m.raw[(n * blocks + b) * 16 + (j >> 1)] >> ((j & 1) << 2)) & 15
+        : j < 16
+          ? q[(si - 4 * b) * 16 + b * 64 + j] & 15
+          : q[(si - 4 * b) * 16 + b * 64 + j - 16] >> 4
+      out[b * 32 + j] = scale * (nibble - zero)
+    }
+  }
+  return out
 }

@@ -6,7 +6,8 @@
  * `createWritable`). A file counts as downloaded once its `.done` marker
  * exists, so an interrupted download is never mistaken for a whole one.
  */
-import type { Tuned } from "./engine.js"
+import { withHandle } from "./byte-source.js"
+import type { HeadChoice, Tuned } from "./engine.js"
 import { fileUrl, isCatalogModel, WEBGL_MODEL_META } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
 
@@ -73,7 +74,8 @@ export async function storedFile(file: ModelFile): Promise<File | null> {
   try {
     const folder = await dir()
     await folder.getFileHandle(marker(file))
-    return await (await folder.getFileHandle(diskName(file))).getFile()
+    const handle = await folder.getFileHandle(diskName(file))
+    return withHandle(await handle.getFile(), handle, [DIR])
   } catch {
     return null
   }
@@ -177,11 +179,13 @@ export type GpuNote = {
   /** Proven during real prompt processing, never inferred from startup probes. */
   pacing?: { reads: number; window: number; frameMs: number }
   selfCheck: number
-  head?: { expanded: boolean; split: number }
+  head?: HeadChoice
   /** Engine.tune's picks (older notes have none: tuned again). */
   tuned?: Tuned
   /** The weights' shape (see gguf.ts ggufShape): a model with the same one starts from this tuning (see sharedGpuTuning). */
   shape?: string
+  /** When these choices were first made (Date.now()): the newest are an incumbent's (see incumbentGpuTuning). */
+  at?: number
 }
 
 const NOTES = "gpu-notes.json"
@@ -232,6 +236,29 @@ export function sharedGpuTuning(
     note.calibrated === true && note.tuned &&
     note.selfCheck >= 0 && note.selfCheck <= maxError
   )?.[1]
+}
+
+/**
+ * The newest checked choices for the same GPU (`renderer`), model and
+ * passes, from any browser version, engine code or settings: what a fresh
+ * tuning keeps unless another way is clearly faster (Engine.incumbent), so
+ * a browser update or a new release doesn't re-pick a device's kernels by
+ * the noise of one timing. Undefined where there are none.
+ */
+export function incumbentGpuTuning(
+  notes: Record<string, GpuNote>,
+  renderer: string,
+  model: string,
+  passes: string,
+  maxError: number
+): GpuNote | undefined {
+  let newest: GpuNote | undefined
+  for (const [key, note] of Object.entries(notes)) {
+    if (!key.startsWith(`${renderer}|`) || !key.includes(`|${model}|${passes}|`)) continue
+    if (note?.calibrated !== true || !note.tuned || !(note.selfCheck >= 0 && note.selfCheck <= maxError)) continue
+    if (!newest || (note.at ?? 0) > (newest.at ?? 0)) newest = note
+  }
+  return newest
 }
 
 /**
@@ -404,7 +431,7 @@ export async function download(
   // Another download may have finished it while this one waited for the lock.
   if (await storedFile(file)) {
     access.close()
-    return handle.getFile()
+    return withHandle(await handle.getFile(), handle, [DIR])
   }
   /** The bytes on disk, through a new handle if the browser closed this one. */
   const size = async () => {
@@ -493,8 +520,12 @@ export async function download(
           for (;;) {
             const { done: end, value } = await reader.read()
             if (end) break
-            access.write(value, { at: loaded })
-            loaded += value.byteLength
+            // A write the storage has no room for can come back short
+            // instead of throwing (Firefox for Android): out of room all the same.
+            const wrote = access.write(value, { at: loaded })
+            loaded += wrote
+            if (wrote !== value.byteLength)
+              throw new DOMException(`There's no room to store ${file.path} past ${loaded} bytes.`, "QuotaExceededError")
             onProgress(loaded, total)
           }
           access.flush()
@@ -538,5 +569,5 @@ export async function download(
     }
   }
   await removeOldVersions(folder, file)
-  return handle.getFile()
+  return withHandle(await handle.getFile(), handle, [DIR])
 }

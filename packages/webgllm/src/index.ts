@@ -22,6 +22,8 @@ export { WebGLLMWorkerHandler } from "./handler.js"
 export type { LogitProcessor } from "./handler.js"
 export { WebGLLMError } from "./errors.js"
 export type { WebGLLMErrorCode } from "./errors.js"
+export { predictSpeed } from "./predict-speed.js"
+export type { PredictSpeedOptions, SpeedPrediction } from "./predict-speed.js"
 export type {
   ChatCompletion,
   ChatCompletionAssistantMessageParam,

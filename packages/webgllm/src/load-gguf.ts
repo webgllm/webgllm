@@ -26,11 +26,13 @@ import { halfTable, bytesToFloats, halvesToFloats } from "./half.js"
 import {
   GgmlType,
   readGgufHeader,
+  tensorByteLength,
   type GgufHeader,
   type GgufTensorInfo,
   type GgufValue
 } from "./gguf.js"
 import { ReadPlan } from "./read-plan.js"
+import { pooledBuffers } from "./upload-staging.js"
 import { headPermutation } from "./repack.js"
 
 export { headPermutation }
@@ -42,6 +44,7 @@ import {
   packQ4_0,
   packQ8_0,
   packQ6_K,
+  q8Converter,
   quantizeQ8,
   type RequantStats
 } from "./repack.js"
@@ -68,6 +71,12 @@ export type LoadGgufOptions = {
   releaseReadBuffers?: boolean
   /** Filled with the error of requantizing a float embedding to 8 bits. */
   requantStats?: RequantStats
+  /**
+   * A yielded matrix's buffers may hold a later one of its role and shape:
+   * only for a consumer done with each piece before it asks for the next
+   * (the engine, which uploads it). Otherwise each is a matrix of its own.
+   */
+  reusePieces?: boolean
 }
 
 /**
@@ -79,6 +88,8 @@ export async function* loadGguf(
   options: LoadGgufOptions = {}
 ): AsyncGenerator<WeightPiece, void, undefined> {
   const header = options.header ?? (await readGgufHeader(source))
+  // Q5_K and Q4_1 matrices converted through WebAssembly SIMD where it runs (its memory goes with the load).
+  const q8 = [...header.tensors.values()].some((t) => t.type === GgmlType.Q5_K || t.type === GgmlType.Q4_1) ? q8Converter() : null
   const tensor = (name: string): GgufTensorInfo => {
     const info = header.tensors.get(name)
     if (!info) throw new Error(`GGUF: missing tensor ${name}`)
@@ -204,6 +215,24 @@ export async function* loadGguf(
     return perm ? permuteVector(values, perm) : values
   }
 
+  // With reusePieces, each layer's matrices in the same buffers as the
+  // last layer's of their role and shape (the engine has uploaded those by
+  // the time the next layer is read): a fresh matrix a layer costs a first
+  // touch of every page (most of what the repack measured: 350 ms of an
+  // iPhone's load), and a model's worth of freed buffers the allocator
+  // keeps resident.
+  const pool = new Map<string, QuantMatrix>()
+  const pooled = (key: string, N: number, K: number, bits: 4 | 6 | 8): QuantMatrix => {
+    if (!options.reusePieces) return newQuantMatrix(N, K, bits, false)
+    let m = pool.get(key)
+    if (!m) {
+      m = newQuantMatrix(N, K, bits, false)
+      for (const view of [m.quants, m.scales]) pooledBuffers.add(view.buffer)
+      pool.set(key, m)
+    }
+    return { ...m }
+  }
+
   /** Rows of a matrix: tensors with [K, rows] dims, in order, into one QuantMatrix. */
   const matrix = async (
     K: number,
@@ -223,12 +252,8 @@ export async function* loadGguf(
           `GGUF: ${info.name} can't be combined with ${infos[0].name}`
         )
     }
-    const m = newQuantMatrix(
-      parts.reduce((n, p) => n + p.rows, 0),
-      K,
-      bits,
-      false
-    )
+    const N = parts.reduce((n, p) => n + p.rows, 0)
+    const m = pooled(`${parts.map((p) => p.name.replace(/^blk\.\d+\./, "")).join("+")}:${N}x${K}:${bits}`, N, K, bits)
     let row0 = 0
     // A tensor two parts read (Qwen3.5's q and gate) is taken once.
     const taken = new Map<string, Uint8Array>()
@@ -247,7 +272,7 @@ export async function* loadGguf(
       }
       let bytes = taken.get(name)
       if (!bytes) taken.set(name, (bytes = await plan.take(name)))
-      packRows(m, row0, info, bytes, rows, perm)
+      packRows(m, row0, info, bytes, rows, perm, q8)
       if (lastUse.get(name) === p) { plan.release(bytes); taken.delete(name) }
       row0 += rows
     } } finally { for (const bytes of taken.values()) plan.release(bytes) }
@@ -405,16 +430,22 @@ export async function* loadGguf(
   for (let r = 0; r < vocab; r += chunkRows) {
     const rows = Math.min(chunkRows, vocab - r)
     const bytes = await plan.take(`token_embd.weight@${r}`)
-    const m = newQuantMatrix(rows, D, bits, false)
+    const m = pooled(`token_embd:${rows}x${D}:${bits}`, rows, D, bits)
     if (q6) packQ6_K(m, 0, bytes, rows)
     else if (floats) {
       const values = floats.subarray(0, rows * D)
       rowsToFloats(embedding, bytes, rows, values)
       quantizeQ8(m, 0, values, rows, options.requantStats)
-    } else packRows(m, 0, embedding, bytes, rows)
+    } else packRows(m, 0, embedding, bytes, rows, undefined, q8)
     plan.release(bytes)
     yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
+  // (Everything is uploaded: the pooled buffers go now, not at the next collection.)
+  if (options.releaseReadBuffers)
+    for (const m of pool.values())
+      for (const view of [m.quants, m.scales])
+        (view.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
+  pool.clear()
 }
 
 /** Keep embedding I/O amortized without exceeding the existing tensor working set. */
@@ -432,7 +463,7 @@ export function defaultEmbeddingRows(
 }
 
 /** The bits a tensor gets in a QuantMatrix. */
-function bitsOf(info: GgufTensorInfo): 4 | 8 {
+export function bitsOf(info: GgufTensorInfo): 4 | 8 {
   switch (info.type) {
     case GgmlType.Q4_0:
       return 4
@@ -450,16 +481,38 @@ function bitsOf(info: GgufTensorInfo): 4 | 8 {
   }
 }
 
+/** Rows converted through floats at a time, and their buffer (see packRows). */
+const FLOAT_ROWS = 32
+let floatScratch = new Float32Array(0)
+
 function packRows(
   m: QuantMatrix,
   row0: number,
   info: GgufTensorInfo,
   bytes: Uint8Array,
   rows: number,
-  perm?: Int32Array
+  perm?: Int32Array,
+  /** The load's WebAssembly converter (see q8Converter), where it runs. */
+  q8?: ReturnType<typeof q8Converter>
 ): void {
   if (info.type === GgmlType.Q4_0) return packQ4_0(m, row0, bytes, rows, perm)
   if (info.type === GgmlType.Q8_0) return packQ8_0(m, row0, bytes, rows, perm)
+  if (!perm && q8 && (info.type === GgmlType.Q5_K || info.type === GgmlType.Q4_1) &&
+    q8(info.type === GgmlType.Q5_K ? "q5k" : "q41", m, row0, bytes, rows)) return
+  if (!perm) {
+    // A few rows at a time through one small reused buffer: a float copy of
+    // the whole tensor (16 MB for each of Qwen3.5 2B's Q5_K ssm_out) was
+    // fresh memory touched for every tensor, most of the conversion's time.
+    const rowBytes = tensorByteLength(info.type, [m.K, 1])
+    if (floatScratch.length < FLOAT_ROWS * m.K) floatScratch = new Float32Array(FLOAT_ROWS * m.K)
+    for (let r = 0; r < rows; r += FLOAT_ROWS) {
+      const count = Math.min(FLOAT_ROWS, rows - r)
+      const values = floatScratch.subarray(0, count * m.K)
+      rowsToFloats(info, bytes.subarray(r * rowBytes, (r + count) * rowBytes), count, values)
+      quantizeQ8(m, row0 + r, values, count)
+    }
+    return
+  }
   const values = new Float32Array(rows * m.K)
   rowsToFloats(info, bytes, rows, values)
   if (perm) {
@@ -520,7 +573,7 @@ function f32Decimal(value: number): number {
   return Number(value.toPrecision(7))
 }
 
-function ggufConfig(
+export function ggufConfig(
   header: GgufHeader,
   freqFactors: Float32Array | undefined
 ): ModelConfig {
