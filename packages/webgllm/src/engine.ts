@@ -3169,8 +3169,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const y = g - column * gm.rowsPerColumn
       const part = split.parts[Math.floor(column / split.colsPerPart)]
       const lc = column % split.colsPerPart
-      // (A few row groups at a time: the upload scratch stays small.)
-      const run = Math.min(g0 + groups - g, gm.rowsPerColumn - y, Math.max(1, Math.floor((256 << 10) / (sbs * 256))))
+      // (A loader's chunk at a time, as far as a column goes: in runs of
+      // 128 row groups, four writes each, Qwen3.5 2B GGUF's upload took
+      // Firefox on a Pixel 10 Pro 2.7-2.8 s where 2.1.)
+      const run = Math.min(g0 + groups - g, gm.rowsPerColumn - y)
       const local = g - g0
       const t = performance.now()
       if (this.q6SplitWasm === undefined) this.q6SplitWasm = q6Splitter()
