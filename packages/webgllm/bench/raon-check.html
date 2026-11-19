@@ -40,7 +40,10 @@
         layers: params.get("layers") !== "0",
         selfCheck: params.get("selfcheck") === "1",
         profile: params.get("profile") === "1",
-        tune: params.get("tune") ?? ""
+        tune: params.get("tune") ?? "",
+        timing: params.get("timing") ?? "",
+        promptProfile: Number(params.get("promptProfile") ?? 0),
+        tuned: params.get("tuned") === "1"
       })
     </script>
   </body>

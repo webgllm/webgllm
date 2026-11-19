@@ -43,6 +43,16 @@
       }
     try {
       let shown = -1
+      // ?cold=1: this origin's stored GPU tuning notes are deleted first, so the load tunes afresh (as a first visit).
+      if (params.get("cold") === "1") {
+        try {
+          const directory = await (await navigator.storage.getDirectory()).getDirectoryHandle("webgl-models")
+          await directory.removeEntry("gpu-notes.json")
+          log("COLD: the stored GPU notes are deleted")
+        } catch (error) {
+          log(`COLD: no stored GPU notes (${error?.name})`)
+        }
+      }
       const llm = new WebGLLM({
         ...(params.get("webgpu") === "0" && { webgpu: false }),
         ...(params.get("ctx") && { contextLength: Number(params.get("ctx")) }),
@@ -99,6 +109,38 @@
         log(`REPLY ${JSON.stringify(text)}`)
         messages.push({ role: "assistant", content: text })
       }
+      // ?rounds=n: after the chat, n fresh prompts of about `len` tokens (each
+      // begins differently, so the cache holds nothing of it) with `max`
+      // tokens written: prompt tokens/s (to the first token) and tokens/s, and their medians.
+      const rounds = Number(params.get("rounds") ?? 0)
+      const read = []
+      const wrote = []
+      for (let round = 0; round < rounds; round++) {
+        const content = `Trial ${round + 1}, at ${Math.random().toString(36).slice(2, 8)}.\n${filler.repeat(Math.ceil(length / 22))}\n\nDescribe the harbour scene in a detailed paragraph of at least two hundred words.`
+        t = performance.now()
+        let first = 0
+        let usage
+        let timings
+        const stream = await llm.chat.completions.create({
+          model, messages: [{ role: "user", content }], max_tokens: max, temperature: 0, stream: true,
+          stream_options: { include_usage: true }, reasoning_effort: think ? "high" : "none"
+        })
+        for await (const chunk of stream) {
+          const delta = chunk.choices[0]?.delta
+          if (((delta?.reasoning_content ?? "") + (delta?.content ?? "")) && !first) first = performance.now()
+          if (chunk.usage) usage = chunk.usage
+          if (chunk.timings) timings = chunk.timings
+        }
+        const done = performance.now()
+        const pp = (usage.prompt_tokens * 1000) / (first - t)
+        const tg = ((usage.completion_tokens - 1) * 1000) / (done - first)
+        read.push(pp)
+        wrote.push(tg)
+        log(`ROUND ${round + 1} prompt ${usage.prompt_tokens} tokens at ${pp.toFixed(0)} tokens/s, ${usage.completion_tokens} written at ${tg.toFixed(1)} tokens/s`)
+        if (params.get("usage") === "1") log(`USAGE ${JSON.stringify(usage)} TIMINGS ${JSON.stringify(timings)} wall to first ${(first - t).toFixed(0)} ms`)
+      }
+      const median = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]
+      if (rounds) log(`RESULT prompt ${median(read).toFixed(0)} tokens/s, writing ${median(wrote).toFixed(1)} tokens/s (medians of ${rounds})`)
       status.textContent = "done"
       log("ALL DONE")
     } catch (error) {
