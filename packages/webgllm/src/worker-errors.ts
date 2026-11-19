@@ -22,6 +22,15 @@ const GPU_CODES: Array<[RegExp, WorkerErrorCode]> = [
   [/no WebGL 2|no OffscreenCanvas|EXT_color_buffer_float|textures go up to/i, "webgl2-unavailable"]
 ]
 
+/**
+ * Whether a load failed at the model's files (downloading or storing
+ * them): nothing another GPU backend does differently, so not a reason to
+ * load the model on WebGL 2 where WebGPU was asked for.
+ */
+export function isFilesError(error: unknown): boolean {
+  return error instanceof CodedError && (error.code === "download-failed" || error.code === "storage-full")
+}
+
 /** The code for `error`, if the worker can tell what it was. */
 export function errorCode(error: unknown): WorkerErrorCode | undefined {
   if (error instanceof CodedError) return error.code

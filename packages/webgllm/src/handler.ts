@@ -43,7 +43,7 @@ import { planToolChoice } from "./tool-choice.js"
 import { createStopFilter } from "./stop-sequences.js"
 import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
 import { seededUniforms } from "./seeded-random.js"
-import { CodedError, downloadError, errorCode } from "./worker-errors.js"
+import { CodedError, downloadError, errorCode, isFilesError } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
 import { imageProcessorConfig, type ImageProcessorConfig } from "./image.js"
 import { loadVision, planVision } from "./load-vision.js"
@@ -375,7 +375,9 @@ async function load(
   plain = false,
   reuseTuning = true,
   /** On WebGL 2 even where there's WebGPU: after WebGPU failed this model. */
-  webgl = false
+  webgl = false,
+  /** A second try after the model's files failed to download (see the catch below). */
+  again = false
 ): Promise<Loaded> {
   const meta = await resolveModel(model)
   // The GPU first: a browser or GPU that can't run the model says so before
@@ -673,7 +675,16 @@ async function load(
       post({ type: "log", text: `${model} didn't load with another load's GPU tuning (${error.message}); tuning afresh.` })
       return load(model, signal, contextLength, plain, false, webgl)
     }
-    // Whatever WebGPU couldn't do, WebGL 2 may.
+    // Whatever WebGPU couldn't do, WebGL 2 may: but not download the model's
+    // files or find room for them. A failed download is tried once more as it
+    // was (it goes on from the bytes stored), then reported: an iPad whose
+    // download met a passing storage error loaded Raon-1 nano on WebGL 2
+    // instead, and wrote 26 tokens/s where WebGPU's 47.
+    if (webgpu && !signal.aborted && isFilesError(error)) {
+      if (again || errorCode(error) === "storage-full") throw error
+      post({ type: "log", text: `${model}'s files didn't download (${error instanceof Error ? error.message : String(error)}); trying once more.` })
+      return load(model, signal, contextLength, plain, reuseTuning, webgl, true)
+    }
     if (webgpu && !signal.aborted && !(error instanceof Superseded)) {
       post({ type: "log", text: `${model} didn't load on WebGPU (${error instanceof Error ? error.message : String(error)}); loading it on WebGL 2.` })
       return load(model, signal, contextLength, plain, reuseTuning, true)
