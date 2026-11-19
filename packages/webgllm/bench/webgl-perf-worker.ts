@@ -85,7 +85,7 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
         // (The first layers' matrices: their layout flags, and whether they're in storage buffers.)
         const layers = (Reflect.get(this, "layers") as Array<Record<string, unknown>>) ?? []
         const flags = (m: Record<string, unknown> | undefined) => m ? `b${m.bits}${m.bytes ? "B" : ""}${m.rgba4 ? "R4" : ""}${m.zeros ? "Z" : ""}${m.packed ? "P" : ""}${m.raw ? "W" : ""}${m.quantPanels ? "Q" : ""}${m.stored ? "S" : ""}` : "-"
-        const mats = layers.slice(0, 3).map((l, i) => {
+        const mats = layers.slice(0, 4).map((l, i) => {
           const parts: Array<[string, Record<string, unknown> | undefined]> = [["gateUp", l.gateUp as Record<string, unknown>], ["down", l.down as Record<string, unknown>]]
           for (const k of ["conv", "attention", "linear"]) {
             const op = l[k] as Record<string, Record<string, unknown>> | undefined
@@ -142,6 +142,23 @@ for (const [name, key] of [["write", (a: unknown[]) => `write ${(a[0] as { inter
       try { return Reflect.apply(original, this, args) } finally { const x = (loadSteps[key(args)] ??= { n: 0, ms: 0 }); x.n++; x.ms += performance.now() - t }
     }
   })
+}
+// (WebGPU: a pass binding a texture already deleted is logged once with its name and stack, tune "deletedUse:1".)
+{
+  const deleted = new WeakSet<object>()
+  const logged = new Set<string>()
+  const del = Reflect.get(WebGpu.prototype, "delete") as (t: object) => void
+  Reflect.set(WebGpu.prototype, "delete", function (this: WebGpu, t: object) { deleted.add(t); return del.call(this, t) })
+  for (const name of ["run", "runAsync"] as const) {
+    const original = Reflect.get(WebGpu.prototype, name) as (pass: { name?: string; inputs: Record<string, object> }, ...rest: unknown[]) => unknown
+    Reflect.set(WebGpu.prototype, name, function (this: WebGpu, pass: { name?: string; inputs: Record<string, object> }, ...rest: unknown[]) {
+      for (const [k, t] of Object.entries(pass.inputs ?? {})) if (deleted.has(t)) {
+        const key = `${pass.name}:${k}`
+        if (!logged.has(key)) { logged.add(key); void fetch("/log", { method: "POST", body: `DELETED USE ${key} ${(t as { width?: number }).width}x${(t as { height?: number }).height} ${new Error().stack?.split("\n").slice(1, 8).join(" <- ")}` }) }
+      }
+      return original.call(this, pass, ...rest)
+    })
+  }
 }
 // (Pipelines by program: how many variants each program compiled into, for the warm-up's stage events.)
 const pipelineGroups = new Map<string, number>()

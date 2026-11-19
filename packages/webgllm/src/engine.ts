@@ -4790,6 +4790,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         return
       }
     }
+    // (The passes below read the weights' texture, deleted once they're in a storage buffer.)
+    if (w.stored) throw new GpuError("A matrix in a storage buffer reached a texture matmul.")
     if (w.rgba4) {
       // Narrow matrices split K in two, stacked in the output, so there are
       // enough fragments to fill the GPU (consumers add the slices).
@@ -6291,8 +6293,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // (An 8-bit `ba` that goes through the scratch buffer writes a 4-token
     // matmul's two textures: the block's output's, free until out_proj.
     // Its 32 rows over all of K took a prompt 0.25 ms a layer as a pair
-    // matmul on an M3 Ultra, 0.05 ms dequantized and in 4 K-slices.)
-    const baOut = rows > SPLIT_ROWS && this.eightScratch(layer.ba, b.opOut) ? b.opOut : t.ba
+    // matmul on an M3 Ultra, 0.05 ms dequantized and in 4 K-slices. So does
+    // a 4-bit one in a storage buffer (an ONNX model's), whose texture is
+    // gone: written into t.ba, it had no 4-token pass and bound the deleted
+    // texture, voiding the GPU's submissions.)
+    const baStored = layer.ba.bits === 4 && !!layer.ba.stored && this.quads.has(b.opOut.id) && TUNING.quad > 0 && this.takesF16(layer.ba)
+    const baOut = rows > SPLIT_ROWS && (baStored || this.eightScratch(layer.ba, b.opOut)) ? b.opOut : t.ba
     const baSplit = await this.project(input.a, layer.ba, baOut, rows, input.norm)
     const baIn = baSplit ? this.partials() : baOut
     this.gpu.run({
