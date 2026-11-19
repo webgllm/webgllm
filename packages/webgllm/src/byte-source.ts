@@ -170,6 +170,52 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
 }
 
 /**
+ * A stored file read now and then for as long as a model is loaded (a
+ * token's row of Raon's per-layer table), through a synchronous access
+ * handle kept open: a `Blob.slice().arrayBuffer()` of a few kilobytes took a
+ * Pixel 10 Pro's Chrome about 10 ms, an iPad Pro M4's Safari 1.3 and an M3
+ * Ultra's Chrome 0.7, before every token not read lately. The handle locks
+ * the file, as a load's do (see storedSources: another reader of it gets
+ * the Blob). A read the handle fails (iOS closes a suspended page's
+ * handles) is read from the Blob, and the handle opened again for the
+ * next. `close()` releases it: call it when the model is unloaded.
+ */
+export async function keptSource(blob: Blob): Promise<{ source: ByteSource; close: () => Promise<void> }> {
+  const plain = blobSource(blob)
+  let stored: StoredSources | null = await storedSources([blob])
+  let closed = false
+  return {
+    source: {
+      size: blob.size,
+      recycle: (buffer) => stored?.sources[0].recycle?.(buffer),
+      read: async (offset, length) => {
+        const now = stored
+        if (now) {
+          try {
+            return await now.sources[0].read(offset, length)
+          } catch (error) {
+            if (error instanceof RangeError) throw error
+            if (stored === now) {
+              stored = null
+              await now.close()
+              if (!closed) stored = await storedSources([blob]).catch(() => null)
+              if (closed) await stored?.close()
+            }
+          }
+        }
+        return plain.read(offset, length)
+      }
+    },
+    close: async () => {
+      closed = true
+      const now = stored
+      stored = null
+      await now?.close()
+    }
+  }
+}
+
+/**
  * The reader worker: opens files by path through synchronous access handles
  * and answers reads with the bytes, transferred. One read at a time, in the
  * order asked.

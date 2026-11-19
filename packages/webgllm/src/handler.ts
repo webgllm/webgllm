@@ -8,7 +8,7 @@ import type { GpuNote } from "./storage.js"
  * behind a worker's messages (the package's worker.ts, or a caller's).
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
-import { blobSource, storedSources } from "./byte-source.js"
+import { blobSource, keptSource, storedSources } from "./byte-source.js"
 import { ggufShape, readGgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
@@ -254,8 +254,14 @@ function hash(text: string) {
 /** Frees an engine's GPU memory now (see Gpu.dispose). */
 const release = (engine: Engine) => {
   if (pacingEngine === engine) pacingEngine = null
+  // (Its file's lock too: see keptSource.)
+  void keptFiles.get(engine)?.()
+  keptFiles.delete(engine)
   engine.gpu.dispose()
 }
+
+/** What closes the stored file an engine reads while its model is loaded (Raon's per-layer table: see keptSource). */
+const keptFiles = new Map<Engine, () => Promise<void>>()
 
 /**
  * Prompt tokens per forward batch, the same on every device and model (the
@@ -464,6 +470,7 @@ async function load(
     // access handles. They take no GPU memory, so not the estimate's either.
     const perLayerTable = ggufHeader?.tensors.get("per_layer_token_embd.weight")
     if (perLayerTable) {
+      // (As a Blob while the load holds the file's handles: its probes may run a forward.)
       engine.perLayerSource = blobSource(weightFiles[0])
       await claimMemory(model, (weightBytes - perLayerTable.byteLength) * TEXTURES_PER_FILE_BYTE, signal)
       if (signal.aborted) throw new Superseded()
@@ -542,6 +549,12 @@ async function load(
       }
     }, signal).finally(stored.close)
     if (signal.aborted) throw new Superseded()
+    if (perLayerTable && TUNING.syncReads > 0) {
+      // Through a handle kept open from here on (see keptSource), now that the load's are closed: they lock the same file.
+      const kept = await keptSource(weightFiles[0])
+      keptFiles.set(engine, kept.close)
+      engine.perLayerSource = kept.source
+    }
     if (retime) engine.tuned = retimedTuning(retime, engine.tuned)
     lap("weights")
     timings.headExpanded = engine.headChoice?.expanded ? 1 : 0

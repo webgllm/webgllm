@@ -7088,6 +7088,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         const bytes = await source.read(p.table.offset + token * p.table.rowBytes, p.table.rowBytes)
         const row = new Float32Array(width)
         rowsToFloats(info, bytes, 1, row)
+        source.recycle?.(bytes.buffer as ArrayBuffer)
         read.set(token, row)
       })
     )
