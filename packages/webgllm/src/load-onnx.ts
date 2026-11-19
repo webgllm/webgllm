@@ -235,7 +235,8 @@ export async function* loadOnnx(
         zeros: withZeros ? new Uint8Array(N * rowBlocks) : null,
         raw: new Uint8Array(N * rowBlocks * 16)
       }
-      pool.set(key, buffers)
+      // (Kept for the next layer, and retired after the layers, only with reusePieces.)
+      if (options.reusePieces) pool.set(key, buffers)
     }
     buffers.zeros?.fill(8)
     const m: QuantMatrix = { N, K, bits: 4, quants: new Uint32Array(0), ...buffers }
@@ -430,7 +431,9 @@ export async function* loadOnnx(
       quants: new Uint32Array(0),
       scales: chunkScales.subarray(0, rows * blocks),
       zeros: zp && chunkZeros ? chunkZeros.subarray(0, rows * blocks).fill(8) : null,
-      raw: quant.subarray(0, rows * blocks * 16)
+      // (The read's bytes, retired once resumed where they're the loader's to free:
+      // a copy of its own where the consumer may keep the piece.)
+      raw: options.reusePieces ? quant.subarray(0, rows * blocks * 16) : quant.slice(0, rows * blocks * 16)
     }
     packMatMulNBitsScales(m, 0, scales, zp, rows)
     yield { kind: "embedding", value: m, row0: r, totalRows: emb.N }

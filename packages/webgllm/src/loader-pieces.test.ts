@@ -86,3 +86,35 @@ test("the ONNX loader's pieces are each their own unless the consumer takes them
   assert.equal(await shared(loadOnnx({ graph, data: zeros, config, embeddingChunkRows: 16384 })), false)
   assert.equal(await shared(loadOnnx({ graph, data: zeros, config, embeddingChunkRows: 16384, reusePieces: true })), true)
 })
+
+test("with read buffers retired (releaseReadBuffers) and reuse off, no piece the ONNX loader yielded is detached", async () => {
+  const dir = join(process.cwd(), "src/test-fixtures/lfm2-350m-onnx")
+  const graph = new Uint8Array(readFileSync(join(dir, "model_q4f16.onnx")))
+  const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8")) as unknown
+  const zeros: ByteSource = { size: 2 ** 31, read: async (_, length) => new Uint8Array(length) }
+  const kept: Array<{ kind: string; views: Array<ArrayBufferView> }> = []
+  for await (const piece of loadOnnx({ graph, data: zeros, config, embeddingChunkRows: 16384, releaseReadBuffers: true })) {
+    const views: Array<ArrayBufferView> = []
+    const walk = (v: unknown, depth: number) => {
+      if (!v || typeof v !== "object" || depth > 4) return
+      const m = v as { quants?: Uint32Array; scales?: ArrayBufferView; zeros?: ArrayBufferView | null; raw?: ArrayBufferView }
+      if (m.quants instanceof Uint32Array && m.scales) {
+        for (const view of [m.scales, m.zeros, m.raw]) if (view && view.byteLength) views.push(view)
+        return
+      }
+      for (const x of Object.values(v)) walk(x, depth + 1)
+    }
+    walk("value" in piece ? piece.value : piece, 0)
+    kept.push({ kind: piece.kind, views })
+  }
+  const detached = kept.flatMap(({ kind, views }) => views.filter((v) => v.buffer.byteLength === 0).map(() => kind))
+  assert.deepEqual([...new Set(detached)], [], "pieces whose buffers were detached")
+})
+
+test("with read buffers retired (releaseReadBuffers) and reuse off, no piece the GGUF loader yielded is detached", async () => {
+  const f = ggufFixture()
+  const kept: Array<WeightPiece> = []
+  for await (const piece of loadGguf(f.source, { header: f.header, embeddingChunkRows: 4, releaseReadBuffers: true })) kept.push(piece)
+  const detached = kept.filter((piece) => buffers(piece).some((b) => b.byteLength === 0)).map((piece) => piece.kind)
+  assert.deepEqual(detached, [])
+})
