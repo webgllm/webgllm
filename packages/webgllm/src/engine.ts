@@ -1909,18 +1909,23 @@ export class Engine {
     const choose = async (
       key: "shortSplit" | "f16Matmul" | "f16Pack" | "flashDecode" | "lanes" | "matvec",
       candidates: Array<number>,
-      sample: () => unknown
+      sample: () => unknown,
+      // Run before each timed stretch and outside it: what a sample needs
+      // but isn't being timed (see the lanes' forwards below).
+      prepare: () => void = () => undefined
     ): Promise<number | null> => {
       // The alternatives once untimed (first use costs more; the warm-up
       // already ran TUNING's), and TUNING's timed once: each sample repeats
       // the matmuls to about 25 ms, so a fast GPU's few milliseconds
       // aren't lost in the wait for it.
       if (stop()) throw new Stopped()
+      prepare()
       for (let c = 1; c < candidates.length; c++) {
         this.tuned[key] = candidates[c]
         await sample()
       }
       this.tuned[key] = candidates[0]
+      prepare()
       await this.gpu.finish()
       if (stop()) throw new Stopped()
       const t0 = performance.now()
@@ -1937,6 +1942,7 @@ export class Engine {
         !options.alreadyBusy && performance.now() - start < 100;
       ) {
         if (stop()) throw new Stopped()
+        prepare()
         for (let r = 0; r < reps; r++) await sample()
         await this.gpu.finish()
       }
@@ -1947,6 +1953,7 @@ export class Engine {
           const c = round === 0 ? i : candidates.length - 1 - i
           if (stop()) throw new Stopped()
           this.tuned[key] = candidates[c]
+          prepare()
           await this.gpu.finish()
           const t = performance.now()
           for (let r = 0; r < reps; r++) await sample()
@@ -2082,6 +2089,14 @@ export class Engine {
       // or a thread a texel (see TUNING.lanes), timed on a token's forward
       // through every layer (a layer's matmuls alone came out even on a Mac
       // whose whole token ran 31% faster). Forwards need the cache.
+      // (The cache is emptied before each timed stretch, not inside it:
+      // a model with recurrent states zeroes them all, which on an M3 Ultra
+      // took Raon-1 nano 17 ms beside a 10 ms forward, and the choice below
+      // then went either way from load to load.)
+      const restart = () => {
+        forwards = true
+        this.reset()
+      }
       const lanes = !this.gpu.sharesLoops || TUNING.lanes < 0
         ? null
         : free
@@ -2090,10 +2105,8 @@ export class Engine {
               // (Shared K loops with bufferMatvec, else bufferPairs: an M3
               // Ultra's lanes won only so; see matvec below.)
               this.tuned.matvec = this.gpu.coopThreads > 0 && this.layers.some((l) => l.gateUp.stored) ? 1 : 0
-              forwards = true
-              this.reset()
               await this.forwardHidden([1000])
-            })
+            }, restart)
           : (before.lanes ?? null)
       this.gpu.coopThreads = Math.max(0, lanes ?? TUNING.lanes)
       // Where the lanes won, bufferMatvec against bufferPairs on the same
@@ -2108,11 +2121,7 @@ export class Engine {
         : (lanes ?? TUNING.lanes) <= 0
           ? 0
           : free
-            ? (await choose("matvec", [1, 0], async () => {
-                forwards = true
-                this.reset()
-                await this.forwardHidden([1000])
-              })) ?? 1
+            ? (await choose("matvec", [1, 0], () => this.forwardHidden([1000]), restart)) ?? 1
             : (before.matvec ?? 0)
       if (forwards) this.reset()
       picked = {
