@@ -34,14 +34,19 @@
         }
         keep.push(device)
       } else if (what === "textures") {
+        // 2 MB each, alternating r16uint (1024 × 1024, 2 bytes a texel) and rgba16float (512 × 512, 8 bytes a texel).
         const device = await gpu()
-        const data = new Uint8Array(1024 * 1024 * 2)
+        const data = new Uint8Array(2 << 20)
+        device.pushErrorScope("validation")
         for (let i = 0; i < 300; i++) {
-          const t = device.createTexture({ size: { width: 1024, height: 1024 }, format: i % 2 ? "r16uint" : "rgba16float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
-          device.queue.writeTexture({ texture: t }, data, { bytesPerRow: 2048 }, { width: 1024, height: 1024 })
+          const [format, side, texel] = i % 2 ? ["r16uint", 1024, 2] : ["rgba16float", 512, 8]
+          const t = device.createTexture({ size: { width: side, height: side }, format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST })
+          device.queue.writeTexture({ texture: t }, data, { bytesPerRow: side * texel }, { width: side, height: side })
           keep.push(t)
           if (i % 32 === 31) await device.queue.onSubmittedWorkDone()
         }
+        const invalid = await device.popErrorScope()
+        if (invalid) throw new Error(`a write was rejected: ${invalid.message}`)
         keep.push(device)
       } else if (what === "readback") {
         const device = await gpu()
