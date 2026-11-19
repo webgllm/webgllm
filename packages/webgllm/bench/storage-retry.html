@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Storage retry</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Out of room: the storage prompt and the retry</h1>
+  <p>
+    Drives the public API where a download runs out of room (cap the origin's quota first, e.g. CDP
+    <code>Storage.overrideQuotaForOrigin</code>), with <code>navigator.storage.persist()</code> answered only by
+    <code>grant(true|false)</code>. <code>?mode=abort</code>: once the download stalls, aborts the load and times its
+    rejection. <code>?mode=retry</code>: <code>downloadModel</code>; once it stalls, waits for <code>grant</code> (lift the
+    cap first), then reports every model worker the page started and whether each was ended.
+    <code>?model=</code> (LFM2.5 350M GGUF by default), <code>?baseline=1</code> (another checkout's sources, see api.html).
+    Logs <code>STORAGE-RETRY ...</code>.
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const mode = params.get("mode") ?? "abort"
+    const model = params.get("model") ?? "LiquidAI/LFM2.5-350M-GGUF"
+    const out = document.getElementById("out")
+    const log = (text) => {
+      out.textContent += text + "\n"
+      fetch("/log", { method: "POST", body: `STORAGE-RETRY ${mode} ${text}` }).catch(() => {})
+    }
+
+    // The browser's answer to keeping the site's storage, given only by grant().
+    let answer
+    const answered = new Promise((resolve) => (answer = resolve))
+    window.grant = (granted) => answer(granted)
+    let asked = false
+    Object.defineProperty(navigator.storage, "persisted", { value: async () => false, configurable: true })
+    Object.defineProperty(navigator.storage, "persist", {
+      value: () => {
+        asked = true
+        log("persist() asked")
+        return answered
+      },
+      configurable: true
+    })
+
+    // Every worker the page starts, and whether it was ended.
+    const workers = []
+    const Original = window.Worker
+    window.Worker = class extends Original {
+      constructor(...args) {
+        super(...args)
+        this.ended = false
+        workers.push(this)
+      }
+      terminate() {
+        this.ended = true
+        super.terminate()
+      }
+    }
+
+    const { WebGLLM } = await import(params.get("baseline") === "1" ? "/bundle/bench/baseline-src/index.js" : "/bundle/src/index.js")
+    let lastProgress = 0
+    const llm = new WebGLLM({ onProgress: () => (lastProgress = performance.now()) })
+    // Stalled: the prompt asked and no progress for 3 s (the download out of room, the retry waiting on the answer).
+    const stalled = async () => {
+      while (!(asked && lastProgress && performance.now() - lastProgress > 3000)) await new Promise((r) => setTimeout(r, 250))
+      const { usage, quota } = await navigator.storage.estimate()
+      log(`STALLED usage ${(usage / 2 ** 20).toFixed(0)} MB of ${(quota / 2 ** 20).toFixed(0)} MB`)
+    }
+
+    try {
+      if (mode === "abort") {
+        const controller = new AbortController()
+        const loading = llm.loadModel(model, { signal: controller.signal })
+        let settled = null
+        loading.then(() => (settled = "resolved"), (error) => (settled = `rejected ${error?.name}: ${error?.message}`))
+        await stalled()
+        const t = performance.now()
+        controller.abort()
+        while (!settled && performance.now() - t < 5000) await new Promise((r) => setTimeout(r, 20))
+        log(settled ? `ABORT -> ${settled} in ${Math.round(performance.now() - t)} ms` : "ABORT -> STILL PENDING after 5000 ms")
+      } else {
+        const downloading = llm.downloadModel(model)
+        let settled = null
+        downloading.then(() => (settled = "done"), (error) => (settled = `failed ${error?.name}: ${error?.message}`))
+        await stalled()
+        log("waiting for grant()")
+        while (!settled) await new Promise((r) => setTimeout(r, 100))
+        // (A moment for the pool's cleanup after the promise settles.)
+        await new Promise((r) => setTimeout(r, 500))
+        log(`DOWNLOAD ${settled}; workers started ${workers.length}, ended ${workers.filter((w) => w.ended).length}, alive ${workers.filter((w) => !w.ended).length}`)
+      }
+    } catch (error) {
+      log(`ERROR ${error?.stack ?? error}`)
+    }
+    log("DONE")
+  </script>
