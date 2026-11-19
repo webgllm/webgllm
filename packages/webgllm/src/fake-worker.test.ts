@@ -37,6 +37,8 @@ export type FakeOptions = {
   hold?: (model: string) => Promise<void>
   /** Holds a download until this resolves. */
   holdDownload?: (model: string) => Promise<void>
+  /** Fails the download (after its first progress) with this error. */
+  downloadError?: (model: string) => { message: string; code?: Extract<WorkerResponse, { type: "download-error" }>["code"] } | undefined
   /** A worker whose script never loaded: it takes messages and answers none. */
   dead?: boolean
   /** Holds an "unload" (the model still in memory) until this resolves. */
@@ -159,6 +161,8 @@ export class FakeWorker {
       if (this.stoppedDownloads.includes(message.id))
         return this.emit({ type: "download-error", model: message.model, id: message.id, message: "The download was stopped." })
       this.emit({ type: "progress", model: message.model, progress: 0.45, cached: false, loadedBytes: 50, totalBytes: 100 })
+      const error = this.options.downloadError?.(message.model)
+      if (error) return this.emit({ type: "download-error", model: message.model, id: message.id, ...error })
       this.emit({ type: "downloaded", model: message.model, id: message.id })
     } else if (message.type === "generate") {
       const reply = this.options.reply?.(message)

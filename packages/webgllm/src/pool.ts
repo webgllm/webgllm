@@ -189,7 +189,7 @@ export class ModelPool {
     } = {}
   ): Promise<void> {
     const since = options.since ?? this.unloadMark(model)
-    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }))
+    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }), options.signal)
   }
 
   private async loadOnce(
@@ -400,7 +400,7 @@ export class ModelPool {
         waiters: 0,
         listeners: new Set()
       }
-      created.promise = this.withStorageRetry(() => this.fetchFiles(model, created)).finally(() => {
+      created.promise = this.withStorageRetry(() => this.fetchFiles(model, created), created.abort.signal).finally(() => {
         this.endDownload(model, created, new Error("The download ended."))
       })
       created.promise.catch(() => undefined)
@@ -451,6 +451,13 @@ export class ModelPool {
     if (await abortable(this.options.storage.downloaded(model), signal)) return
     // Canceled as the check came back: there was no worker to stop yet.
     throwIfAborted(signal)
+    // (A retry: the failed attempt's worker freed first, and, the caller's,
+    // its files closed before the same worker writes them again.)
+    if (download.worker) {
+      this.releaseDownloadWorker(model, download.worker, new Error("The download is tried again."))
+      download.worker = null
+      await abortable(this.closing.get(model) ?? Promise.resolve(), signal)
+    }
     const worker = this.modelWorker(model, {
       onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
       onClaim: () => Promise.resolve(),
@@ -471,7 +478,12 @@ export class ModelPool {
   /** Frees a download's worker (the caller's: stops the download there, and waits for its files to close). */
   private endDownload(model: string, download: Download, reason: Error) {
     if (this.downloads.get(model) === download) this.downloads.delete(model)
-    const closed = download.worker?.terminate(reason)
+    this.releaseDownloadWorker(model, download.worker, reason)
+  }
+
+  /** Frees one download attempt's worker: webgllm's own is ended; the caller's is stopped, and its files' closing tracked (see closing). */
+  private releaseDownloadWorker(model: string, worker: ModelWorker | null, reason: Error) {
+    const closed = worker?.terminate(reason)
     if (!closed) return
     const both = Promise.all([this.closing.get(model), closed]).then(() => {
       if (this.closing.get(model) === both) this.closing.delete(model)
@@ -701,13 +713,18 @@ export class ModelPool {
    * Runs `attempt`, and once more if it ran out of room and the browser has
    * since agreed to keep this site's storage (keepDownloads): a user can
    * answer the prompt after a download has filled the room it had. The
-   * retry resumes the download where it stopped.
+   * retry resumes the download where it stopped. `signal` (the load's, or
+   * the download's own) ends the wait for that answer.
    */
-  private async withStorageRetry(attempt: () => Promise<void>): Promise<void> {
+  private async withStorageRetry(attempt: () => Promise<void>, signal?: AbortSignal): Promise<void> {
     try {
       await attempt()
     } catch (error) {
-      if (!(error instanceof WebGLLMError && error.code === "storage-full") || !(await this.keeping)) throw error
+      if (!(error instanceof WebGLLMError && error.code === "storage-full")) throw error
+      // (The browser's prompt may never be answered: a canceled load or
+      // download stops waiting for it, and doesn't retry.)
+      if (!(await abortable(this.keeping ?? Promise.resolve(false), signal))) throw error
+      throwIfAborted(signal)
       await attempt()
     }
   }

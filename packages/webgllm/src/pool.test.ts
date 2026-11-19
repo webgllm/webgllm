@@ -202,6 +202,34 @@ test("a load out of room loads again once the browser agrees to keep the site's 
   }
 })
 
+test("aborting a load out of room stops its wait for the storage prompt's answer", async (t) => {
+  // A permission prompt nobody answers.
+  t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: () => new Promise<boolean>(() => undefined) } }))
+  const { pool: p } = pool({ downloads: true, loadError: () => ({ message: "no room", code: "storage-full" }) })
+  const controller = new AbortController()
+  const loading = p.load(A, { signal: controller.signal })
+  loading.catch(() => undefined)
+  // (The first attempt failed: now waiting on the prompt.)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  controller.abort()
+  const pending = new Promise((_, reject) => setTimeout(() => reject(new Error("still waiting on the prompt")), 500))
+  await assert.rejects(Promise.race([loading, pending]), (error: unknown) => (error as Error).name === "AbortError")
+  t.mock.restoreAll()
+})
+
+test("a download retried after running out of room frees every attempt's worker", async (t) => {
+  t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: async () => true } }))
+  let fails = 1
+  const { pool: p, workers } = pool({ downloadError: () => (fails-- > 0 ? { message: "no room", code: "storage-full" } : undefined) })
+  await p.download(A)
+  assert.equal(workers.workers.length, 2)
+  for (const worker of workers.workers) {
+    assert.equal(worker.terminated, true)
+    assert.equal(worker.listening, 0)
+  }
+  t.mock.restoreAll()
+})
+
 test("an uncoded load error is a plain Error", async () => {
   const { pool: p } = pool({ loadError: () => ({ message: "boom" }) })
   await assert.rejects(p.load(A), (error: unknown) => !(error instanceof WebGLLMError) && (error as Error).message === "boom")
