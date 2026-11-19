@@ -1932,7 +1932,10 @@ export class Engine {
       sample: () => unknown,
       // Run before each timed stretch and outside it: what a sample needs
       // but isn't being timed (see the lanes' forwards below).
-      prepare: () => void = () => undefined
+      prepare: () => void = () => undefined,
+      // The most samples a stretch may hold after its `prepare` (a
+      // forward a sample fills the cache a token at a time).
+      most = 16
     ): Promise<number | null> => {
       // The alternatives once untimed (first use costs more; the warm-up
       // already ran TUNING's), and TUNING's timed once: each sample repeats
@@ -1953,7 +1956,7 @@ export class Engine {
       await this.gpu.finish()
       const reps = Math.max(
         1,
-        Math.min(16, Math.ceil(25 / (performance.now() - t0)))
+        Math.min(16, most, Math.ceil(25 / (performance.now() - t0)))
       )
       // An idle GPU clocks down: busy it ~100 ms first, so the clock has
       // come up before anything is timed.
@@ -2112,7 +2115,8 @@ export class Engine {
       // (The cache is emptied before each timed stretch, not inside it:
       // a model with recurrent states zeroes them all, which on an M3 Ultra
       // took Raon-1 nano 17 ms beside a 10 ms forward, and the choice below
-      // then went either way from load to load.)
+      // then went either way from load to load. A stretch holds no more
+      // forwards than the cache has room for.)
       const restart = () => {
         forwards = true
         this.reset()
@@ -2126,7 +2130,7 @@ export class Engine {
               // Ultra's lanes won only so; see matvec below.)
               this.tuned.matvec = this.gpu.coopThreads > 0 && this.layers.some((l) => l.gateUp.stored) ? 1 : 0
               await this.forwardHidden([1000])
-            }, restart)
+            }, restart, this.contextLength)
           : (before.lanes ?? null)
       this.gpu.coopThreads = Math.max(0, lanes ?? TUNING.lanes)
       // Where the lanes won, bufferMatvec against bufferPairs on the same
@@ -2141,7 +2145,7 @@ export class Engine {
         : (lanes ?? TUNING.lanes) <= 0
           ? 0
           : free
-            ? (await choose("matvec", [1, 0], () => this.forwardHidden([1000]), restart)) ?? 1
+            ? (await choose("matvec", [1, 0], () => this.forwardHidden([1000]), restart, this.contextLength)) ?? 1
             : (before.matvec ?? 0)
       if (forwards) this.reset()
       picked = {
