@@ -92,9 +92,12 @@ export class ModelWorker {
   /** The context the model was asked for: undefined for the model's own. */
   contextLength: number | undefined
   private gone: Error | null = null
+  /** Whether the worker failed (its script, or a crash), before this was gone or while it was cleaning up: not one to use again. */
+  failed = false
 
   private readonly onMessage = (event: MessageEvent<unknown>) => this.handle(event.data)
   private readonly onError = (event: ErrorEvent) => {
+    this.failed = true
     // (Gone already: a worker that fails owes nothing more.)
     if (this.gone) {
       for (const settle of [...this.owed.values()]) settle()

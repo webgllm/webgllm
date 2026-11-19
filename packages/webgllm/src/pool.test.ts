@@ -183,6 +183,66 @@ test("a worker kept after its model was unloaded is reused until it has been idl
   t.mock.restoreAll()
 })
 
+/** Settles with "pending" if `promise` hasn't after `ms`. */
+const within = <T>(promise: Promise<T>, ms = 300) =>
+  Promise.race([promise.then(() => "settled", () => "settled"), new Promise<string>((resolve) => setTimeout(() => resolve("pending"), ms))])
+
+test("unloading a model during its load keeps its worker usable: the next model loads there", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const { pool: p, workers } = pool({ hold: (model) => (model === A ? held : Promise.resolve()) })
+  const loadingA = p.load(A)
+  loadingA.catch(() => undefined)
+  await settle()
+  await p.unload(A)
+  release()
+  await settle()
+  assert.equal(await within(p.load(B)), "settled", "B never loaded")
+  assert.equal(p.isLoaded(B), true)
+  assert.ok(workers.workers.every((w) => !w.terminated || !w.sent.some((m) => m.type === "load" && m.model === B)), "B was sent to an ended worker")
+})
+
+test("an eviction for room completes once the evicted model is freed, not before", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const { pool: p } = pool({ holdUnload: (model) => (model === A ? held : Promise.resolve()) })
+  await p.load(A)
+  const loadingB = p.load(B)
+  assert.equal(await within(loadingB), "pending", "B loaded while A was still in memory")
+  assert.equal(p.isLoaded(B), false)
+  release()
+  await loadingB
+  assert.equal(p.isLoaded(B), true)
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("a worker whose script fails after its load was canceled isn't kept for the next model", async () => {
+  // The first worker never starts (its script fails, once the load is canceled); the next one works.
+  const made: Array<FakeWorker> = []
+  const p = new ModelPool({
+    createWorker: () => {
+      const worker = new FakeWorker({ bytes: () => 60, dead: made.length === 0 })
+      made.push(worker)
+      return worker as unknown as Worker
+    },
+    memoryBudget: () => 100,
+    storage: fakeStorage(),
+    onProgress: () => undefined,
+    log: () => undefined
+  })
+  const controller = new AbortController()
+  const loading = p.load(A, { signal: controller.signal })
+  loading.catch(() => undefined)
+  await settle()
+  controller.abort()
+  await settle()
+  made[0]!.failToLoad()
+  await settle()
+  assert.equal(await within(p.load(B)), "settled", "B never loaded")
+  assert.equal(made.length, 2, "the failed worker was reused")
+  assert.equal(made[0]!.terminated, true)
+})
+
 test("aborting stops the worker's generation", async () => {
   const { pool: p, workers } = pool()
   await p.load(A)

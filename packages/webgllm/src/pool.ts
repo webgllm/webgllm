@@ -63,6 +63,8 @@ type Entry = {
   gone: AbortController
   /** The worker webgllm started (or reused) for it: kept for the next load once the model is freed (see park). */
   own: Worker | null
+  /** Once dropped: settles when its memory is free and "unload" says so (see drop). */
+  dropped?: Promise<void>
 }
 
 /** Getting a model's files into storage: one at a time per model. */
@@ -134,6 +136,8 @@ export class ModelPool {
    */
   private parked: Worker | null = null
   private parkedTimer: ReturnType<typeof setTimeout> | undefined
+  /** Workers of webgllm's the pool ended: never taken back (see unpark). */
+  private readonly ended = new WeakSet<Worker>()
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
   private turns: Promise<void> = Promise.resolve()
 
@@ -606,7 +610,13 @@ export class ModelPool {
     this.parked = null
     clearTimeout(this.parkedTimer)
     if (worker) worker.removeEventListener("error", this.parkedError)
-    return worker
+    return worker && !this.ended.has(worker) ? worker : null
+  }
+
+  /** Ends a worker of webgllm's for good. */
+  private end(worker: Worker) {
+    this.ended.add(worker)
+    worker.terminate()
   }
 
   /**
@@ -614,10 +624,13 @@ export class ModelPool {
    * ends it: one that failed or crashed, or one more than the one kept.
    */
   private park(worker: Worker, reusable: boolean) {
-    if (!reusable || this.parked) return void worker.terminate()
+    if (!reusable || this.parked || this.ended.has(worker)) return void this.end(worker)
     this.parked = worker
     worker.addEventListener("error", this.parkedError)
-    this.parkedTimer = setTimeout(() => this.unpark()?.terminate(), PARKED_MS)
+    this.parkedTimer = setTimeout(() => {
+      const idle = this.unpark()
+      if (idle) this.end(idle)
+    }, PARKED_MS)
     // (Node: a pending timer doesn't keep the process alive.)
     ;(this.parkedTimer as { unref?: () => void }).unref?.()
   }
@@ -627,7 +640,7 @@ export class ModelPool {
     const worker = event.target as Worker | null
     if (!worker || worker !== this.parked) return
     this.unpark()
-    worker.terminate()
+    this.end(worker)
   }
 
   /**
@@ -722,17 +735,24 @@ export class ModelPool {
   }
 
   /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
-  private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
+  /**
+   * Drops `entry`: its model's worker stops and frees it. Once only (a load
+   * failing after an unload asked for it drops it again): the first
+   * reason stands. Settles when the memory is free and "unload" says so.
+   */
+  private drop(entry: Entry, reason: Error, why: ModelUnloadReason): Promise<void> {
+    if (entry.dropped) return entry.dropped
     const freed = entry.worker.terminate(reason)
-    // A worker of webgllm's: kept for the next load once it has freed the model (see park).
+    // A worker of webgllm's: kept for the next load once it has freed the
+    // model (see park), unless it failed, even while it was freeing it.
     const own = entry.own
     if (own) {
-      const reusable = why !== "failed" && why !== "crashed"
-      if (freed) void freed.then(() => this.park(own, reusable))
-      else this.park(own, reusable)
+      const park = () => this.park(own, why !== "failed" && why !== "crashed" && !entry.worker.failed)
+      if (freed) void freed.then(park)
+      else park()
     }
     entry.gone.abort(reason)
-    if (this.entries.get(entry.model) !== entry) return
+    if (this.entries.get(entry.model) !== entry) return (entry.dropped = freed ?? Promise.resolve())
     this.entries.delete(entry.model)
     if (why === "failed" || why === "crashed") this.options.onModelEvent?.({ type: "error", model: entry.model, error: reason })
     // Its memory is free, and "unload" says so, once it is: the caller's
@@ -741,17 +761,20 @@ export class ModelPool {
       this.budget.release(entry.model)
       this.options.onModelEvent?.({ type: "unload", model: entry.model, reason: why })
     }
+    let done = Promise.resolve()
     if (freed) {
-      const done = freed.then(() => {
+      done = freed.then(() => {
         this.freeing.delete(done)
         release()
       })
       this.freeing.add(done)
     } else release()
+    entry.dropped = done
     if (this.entries.size === 0) {
       this.stopFrames?.()
       this.stopFrames = undefined
     }
+    return done
   }
 
   /**
@@ -775,8 +798,8 @@ export class ModelPool {
         return false
       }
       this.options.log("info", `Unloaded ${model} to make room for another model.`)
-      this.drop(entry, unloaded(model), "evicted")
-      return true
+      // (Done once its memory is free: the claim waiting on this counts it out then.)
+      return this.drop(entry, unloaded(model), "evicted").then(() => true)
     })
     const done = evicting.then(() => undefined)
     entry.evicting = done
