@@ -7520,7 +7520,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     layer.convState.reverse()
     this.gpu.run({
       name: "linear",
-      program: this.gpu.program(K.linPrep(dk)),
+      program: this.gpu.program(K.linPrep(dk, true)),
       inputs: { uQKV: t.qkv },
       uniforms: { uK4: { int: K4 } },
       output: t.qk,

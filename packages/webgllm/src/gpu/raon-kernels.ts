@@ -457,8 +457,9 @@ void main() {
     vec4 v = texelFetch(uQKV, ivec2(uK4 + kb + i, m), 0);
     sk += v * v;
   }
-  float invq = inversesqrt(dot(sq, vec4(1.0)) + 1e-6);
-  float invk = inversesqrt(dot(sk, vec4(1.0)) + 1e-6);
+  // (x / max(|x|, 1e-6), as kernels.ts's linPrep with its floor.)
+  float invq = 1.0 / max(sqrt(dot(sq, vec4(1.0))), 1e-6);
+  float invk = 1.0 / max(sqrt(dot(sk, vec4(1.0))), 1e-6);
   vec4 kv = vec4(0.0);
   vec4 qs = vec4(0.0);
   float qk = 0.0;
