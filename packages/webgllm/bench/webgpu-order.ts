@@ -2,6 +2,8 @@
  * Checks on the WebGPU backend, on real WebGPU, each with its control:
  * - a small decode pass waiting to be merged (WebGpu.queue) still runs
  *   before a later upload to, or deletion of, a texture it uses;
+ * - deleting a texture a queued pass reads leaves no bind group or index
+ *   entry for it (the caches stay bounded);
  * - a K loop shared by cooperating lanes (coopThreads) sums its terms onto
  *   the value its accumulator held before the loop once, not once a lane.
  * Logs `WEBGPU-ORDER ...` lines and `ALL DONE`. `?baseline=1` runs another
@@ -65,6 +67,28 @@ async function order(wg: WebGpu, then: "write" | "delete", merge: boolean) {
   WebGpu.merge = true
 }
 
+/** Inputs made, read by a queued copy, deleted, four times: the bind group caches stay bounded. */
+async function deletedCaches(wg: WebGpu) {
+  WebGpu.merge = true
+  wg.setPhase("decode")
+  wg.errors.length = 0
+  const program = wg.program(COPY)
+  const b = wg.texture(GL.RGBA32F, 1, 1)
+  const sizes: Array<string> = []
+  for (let i = 0; i < 4; i++) {
+    const a = wg.texture(GL.RGBA32F, 1, 1, pixel(i + 1))
+    wg.run({ program, inputs: { uX: a }, output: b })
+    wg.delete(a)
+    await wg.finish()
+    const index = Reflect.get(wg, "groupsByTexture") as Map<number, Set<string>>
+    sizes.push(`${(Reflect.get(wg, "bindGroups") as Map<string, unknown>).size}/${index.has(a.id) ? "indexed" : "gone"}`)
+  }
+  const got = (await wg.read(b))[0]
+  const bounded = sizes.every((x) => x === sizes[0]) && sizes.every((x) => x.endsWith("gone"))
+  log(`deleted queued inputs: bind groups/index after each ${sizes.join(" ")}; copy read ${got} (want 4) ${bounded && got === 4 && !wg.errors.length ? "OK" : "FAIL"}`)
+  wg.delete(b)
+}
+
 async function lanes(wg: WebGpu, threads: number, subgroups: boolean, step: number) {
   wg.coopThreads = threads
   Reflect.set(wg, "subgroups", subgroups)
@@ -88,6 +112,7 @@ try {
   if (!wg) throw new Error("No WebGPU.")
   log(`${baseline ? "baseline sources; " : ""}device: ${wg.limits.renderer}; subgroups ${Reflect.get(wg, "subgroups")}`)
   for (const then of ["write", "delete"] as const) for (const merge of [false, true]) await order(wg, then, merge)
+  await deletedCaches(wg)
   const subgroups = Reflect.get(wg, "subgroups") as boolean
   for (const step of [0, 1]) {
     await lanes(wg, 0, false, step)

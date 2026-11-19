@@ -609,13 +609,14 @@ export class WebGpu extends PacedGpu<Fence> {
   }
 
   delete(texture: Texture) {
+    // A queued pass that uses it is dispatched first: its bind groups are
+    // made then, so they go with the texture's below.
+    this.flushQueueUsing(texture)
     for (const key of this.groupsByTexture.get(texture.id) ?? []) this.bindGroups.delete(key)
     this.touched.delete(texture.id)
     this.writers.delete(texture.id)
     this.groupsByTexture.delete(texture.id)
-    // (Passes issued and not yet submitted may read it: destroyed after
-    // they're sent. A queued pass that uses it is dispatched first.)
-    this.flushQueueUsing(texture)
+    // (Passes issued and not yet submitted may read it: destroyed after they're sent.)
     if (this.encoder) this.doomed.push(texture.tex as GPUTexture | GPUBuffer)
     else (texture.tex as GPUTexture | GPUBuffer).destroy()
     if (this.live.delete(texture)) this.bytes -= texture.bytes
