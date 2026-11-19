@@ -215,6 +215,53 @@ describe("predictHere's memory", () => {
     assert.deepEqual(x.prediction, y.prediction)
   })
 
+  test("a call aborted while its note is read rejects, and a note isn't returned to an aborted call", async () => {
+    const f = fakeDeps()
+    let release!: () => void
+    const slow: SpeedDeps = { ...f.deps, store: { ...f.deps.store, read: () => new Promise((r) => (release = () => r(undefined))) } }
+    const controller = new AbortController()
+    const call = predictHere("m", { signal: controller.signal }, slow)
+    controller.abort()
+    await assert.rejects(call, { name: "AbortError" })
+    release()
+    await predictHere("m", {}, f.deps)
+    const aborted = new AbortController()
+    aborted.abort()
+    await assert.rejects(predictHere("m", { signal: aborted.signal }, f.deps), { name: "AbortError" })
+  })
+
+  test("calls sharing a measurement abort on their own; the measurement stops only once every call has", async () => {
+    const f = fakeDeps()
+    const signals: Array<AbortSignal | undefined> = []
+    let finish!: () => void
+    const held: SpeedDeps = {
+      ...f.deps,
+      measure: async (model, signal, decode, webgpu) => {
+        signals.push(signal)
+        await new Promise<void>((r) => (finish = r))
+        return f.deps.measure(model, signal, decode, webgpu)
+      }
+    }
+    const a = new AbortController()
+    const b = new AbortController()
+    const first = predictHere("m", { signal: a.signal }, held)
+    const second = predictHere("m", { signal: b.signal }, held)
+    await new Promise((r) => setTimeout(r, 5))
+    a.abort()
+    await assert.rejects(first, { name: "AbortError" })
+    assert.equal(signals[0]?.aborted, false, "the measurement stopped while a call still wants it")
+    finish()
+    assert.equal((await second).report.cached, false)
+    // Every call aborted: the measurement is called off.
+    const c = new AbortController()
+    const third = predictHere("n", { signal: c.signal }, held)
+    await new Promise((r) => setTimeout(r, 5))
+    c.abort()
+    await assert.rejects(third, { name: "AbortError" })
+    assert.equal(signals[1]?.aborted, true)
+    finish()
+  })
+
   test("a failed measurement isn't remembered", async () => {
     const f = fakeDeps()
     const failing: SpeedDeps = { ...f.deps, measure: async () => { throw new Error("no GPU") } }

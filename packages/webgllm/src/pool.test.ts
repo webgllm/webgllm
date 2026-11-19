@@ -217,6 +217,24 @@ test("aborting a load out of room stops its wait for the storage prompt's answer
   t.mock.restoreAll()
 })
 
+test("unloading a model out of room stops its load's wait for the storage prompt's answer", async (t) => {
+  t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: () => new Promise<boolean>(() => undefined) } }))
+  const { pool: p } = pool({ downloads: true, loadError: () => ({ message: "no room", code: "storage-full" }) })
+  const loading = p.load(A)
+  loading.catch(() => undefined)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await p.unload(A)
+  const pending = () => new Promise((_, reject) => setTimeout(() => reject(new Error("still waiting on the prompt")), 500))
+  await assert.rejects(Promise.race([loading, pending()]), (error: unknown) => (error as WebGLLMError).code === "model-not-loaded")
+  // Unloading every model ends the wait too.
+  const again = p.load(A)
+  again.catch(() => undefined)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await p.unload()
+  await assert.rejects(Promise.race([again, pending()]), (error: unknown) => (error as WebGLLMError).code === "model-not-loaded")
+  t.mock.restoreAll()
+})
+
 test("a download retried after running out of room frees every attempt's worker", async (t) => {
   t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: async () => true } }))
   let fails = 1
@@ -833,4 +851,16 @@ test("webgpu false is sent to each worker before its load; auto sends nothing", 
   const auto = pool({ webgpu: "auto" })
   await auto.pool.load(A)
   assert.ok(!auto.workers.workers[0]?.sent.some(({ type }: { type: string }) => type === "configure"))
+})
+
+test("a worker of the caller's is told the webgpu setting on every attachment, auto too", async () => {
+  // One worker, used by a client with webgpu false and then by one with "auto".
+  const worker = new FakeWorker({ bytes: () => 60 })
+  const off = pool({ worker: worker as unknown as Worker, webgpu: false })
+  await off.pool.load(A)
+  await off.pool.unload(A)
+  const auto = pool({ worker: worker as unknown as Worker, webgpu: "auto" })
+  await auto.pool.load(A)
+  const told = worker.sent.filter((m) => m.type === "configure" || m.type === "load").map(({ type, webgpu }: { type: string; webgpu?: unknown }) => (type === "load" ? type : webgpu))
+  assert.deepEqual(told, [false, "load", "auto", "load"])
 })

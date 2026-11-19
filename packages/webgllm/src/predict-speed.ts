@@ -13,7 +13,7 @@
  */
 import { Engine, TUNING } from "./engine.js"
 import { monitorFrames } from "./frame-pacing.js"
-import { throwIfAborted } from "./errors.js"
+import { abortable, abortError, throwIfAborted } from "./errors.js"
 import type { WebGlModelId } from "./model-meta.js"
 import { resolveModel } from "./resolve-model.js"
 import { probeSpeed, speedShape, type ProbeReport, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
@@ -326,37 +326,65 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
   }
 })
 
-/** Measures at most once at a time per model in this context. */
-const pending = new Map<string, Promise<{ prediction: SpeedPrediction; report: SpeedReport }>>()
+/**
+ * Measures at most once at a time per model in this context: one run, the
+ * calls waiting on it, and what calls it off once every one of them has
+ * aborted.
+ */
+const pending = new Map<
+  string,
+  { run: Promise<{ prediction: SpeedPrediction; report: SpeedReport }>; waiters: number; stop: AbortController }
+>()
 
 /**
  * predictSpeed in this context (a worker's, or a test's with `deps`):
  * the remembered prediction unless `force`, else measured and remembered.
+ * Each call's `signal` ends its own wait; a measurement calls share stops
+ * only once every call waiting on it has aborted.
  */
 export function predictHere(
   model: string,
   options: PredictSpeedOptions = {},
   deps: SpeedDeps = realSpeedDeps()
 ): Promise<{ prediction: SpeedPrediction; report: SpeedReport }> {
+  const { signal } = options
+  if (signal?.aborted) return Promise.reject(abortError(signal))
   const webgpu = options.webgpu !== false
   const key = speedKey(deps.renderer(webgpu), deps.userAgent, model)
   const decode = options.decode !== false
   // (A prompt-only measurement doesn't answer a call that wants writing too.)
-  const running = pending.get(`${key}|${decode}`) ?? (decode ? undefined : pending.get(`${key}|true`))
-  if (running) return running
-  const run = (async () => {
-    if (!options.force) {
-      const note = await deps.store.read(key)
-      if (note && (!decode || note.decode !== undefined))
-        return { prediction: { prompt: note.prompt, ...(note.decode !== undefined && { decode: note.decode }) }, report: { cached: true as const } }
+  let shared = pending.get(`${key}|${decode}`) ?? (decode ? undefined : pending.get(`${key}|true`))
+  if (!shared) {
+    const stop = new AbortController()
+    const run = (async () => {
+      if (!options.force) {
+        const note = await deps.store.read(key)
+        if (note && (!decode || note.decode !== undefined))
+          return { prediction: { prompt: note.prompt, ...(note.decode !== undefined && { decode: note.decode }) }, report: { cached: true as const } }
+      }
+      throwIfAborted(stop.signal)
+      const { shape, report } = await deps.measure(model, stop.signal, decode, webgpu)
+      const prediction = speedFromTimes(report.times, shape.config.layerTypes, shape.config.vocabSize)
+      await deps.store.write(key, { ...prediction, at: Date.now() })
+      return { prediction, report: { ...report, cached: false as const } }
+    })()
+    const entry = { run, waiters: 0, stop }
+    const name = `${key}|${decode}`
+    pending.set(name, entry)
+    const clear = () => {
+      if (pending.get(name) === entry) pending.delete(name)
     }
-    const { shape, report } = await deps.measure(model, options.signal, decode, webgpu)
-    const prediction = speedFromTimes(report.times, shape.config.layerTypes, shape.config.vocabSize)
-    await deps.store.write(key, { ...prediction, at: Date.now() })
-    return { prediction, report: { ...report, cached: false as const } }
-  })()
-  pending.set(`${key}|${decode}`, run)
-  const clear = () => pending.delete(`${key}|${decode}`)
-  run.then(clear, clear)
-  return run
+    run.then(clear, clear)
+    shared = entry
+  }
+  const entry = shared
+  entry.waiters++
+  return abortable(entry.run, signal).finally(() => {
+    entry.waiters--
+    // The last call waiting gave up: the measurement is called off, and the next call starts afresh.
+    if (entry.waiters === 0 && signal?.aborted) {
+      entry.stop.abort(abortError(signal))
+      for (const [name, e] of pending) if (e === entry) pending.delete(name)
+    }
+  })
 }

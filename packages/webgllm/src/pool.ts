@@ -113,6 +113,8 @@ export class ModelPool {
   /** Unloads asked for, by model and for every model: a load waiting meanwhile stops (see unloadMark). */
   private readonly unloads = new Map<string, number>()
   private unloadsOfAll = 0
+  /** Told of each unload: waits that end when their model is unloaded (see unlessUnloaded). */
+  private readonly unloadListeners = new Set<() => void>()
   /** Models dropped from the caller's worker that it hasn't freed yet: their memory is held, and no load starts, until it has. */
   private readonly freeing = new Set<Promise<void>>()
   /** Downloads stopped in the caller's worker whose files aren't closed yet, by model. */
@@ -189,7 +191,7 @@ export class ModelPool {
     } = {}
   ): Promise<void> {
     const since = options.since ?? this.unloadMark(model)
-    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }), options.signal)
+    await this.withStorageRetry(() => this.loadOnce(model, { ...options, since }), options.signal, { model, since })
   }
 
   private async loadOnce(
@@ -239,6 +241,29 @@ export class ModelPool {
   /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
   unloadMark(model: string): number {
     return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
+  }
+
+  /** `wait`, unless `model` is unloaded first (since `mark`): then rejects as an unloaded model's load does. */
+  private unlessUnloaded<T>(wait: Promise<T>, model: string, mark: number): Promise<T> {
+    this.throwIfUnloaded(model, mark)
+    return new Promise<T>((resolve, reject) => {
+      const check = () => {
+        if (this.unloadMark(model) === mark) return
+        this.unloadListeners.delete(check)
+        reject(unloaded(model))
+      }
+      this.unloadListeners.add(check)
+      wait.then(
+        (value) => {
+          this.unloadListeners.delete(check)
+          resolve(value)
+        },
+        (error: unknown) => {
+          this.unloadListeners.delete(check)
+          reject(error)
+        }
+      )
+    })
   }
 
   /** Rejects as an unloaded model's load does if `model` was unloaded since `mark`. */
@@ -346,6 +371,7 @@ export class ModelPool {
     // entry to drop: they see this and stop.
     if (model === undefined) this.unloadsOfAll++
     else this.unloads.set(model, (this.unloads.get(model) ?? 0) + 1)
+    for (const listener of [...this.unloadListeners]) listener()
     for (const entry of [...this.entries.values()]) {
       if (model === undefined || entry.model === model) this.drop(entry, unloaded(entry.model), "unloaded")
     }
@@ -714,17 +740,24 @@ export class ModelPool {
    * since agreed to keep this site's storage (keepDownloads): a user can
    * answer the prompt after a download has filled the room it had. The
    * retry resumes the download where it stopped. `signal` (the load's, or
-   * the download's own) ends the wait for that answer.
+   * the download's own) ends the wait for that answer, as does unloading
+   * a load's model (`load`: the model, and its unloadMark at the start).
    */
-  private async withStorageRetry(attempt: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+  private async withStorageRetry(
+    attempt: () => Promise<void>,
+    signal?: AbortSignal,
+    load?: { model: string; since: number }
+  ): Promise<void> {
     try {
       await attempt()
     } catch (error) {
       if (!(error instanceof WebGLLMError && error.code === "storage-full")) throw error
-      // (The browser's prompt may never be answered: a canceled load or
-      // download stops waiting for it, and doesn't retry.)
-      if (!(await abortable(this.keeping ?? Promise.resolve(false), signal))) throw error
+      // (The browser's prompt may never be answered: a canceled or unloaded
+      // load, or a canceled download, stops waiting for it, and doesn't retry.)
+      const answer = abortable(this.keeping ?? Promise.resolve(false), signal)
+      if (!(await (load ? this.unlessUnloaded(answer, load.model, load.since) : answer))) throw error
       throwIfAborted(signal)
+      if (load) this.throwIfUnloaded(load.model, load.since)
       await attempt()
     }
   }
