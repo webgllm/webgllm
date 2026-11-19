@@ -54,7 +54,7 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
 ` }, outfile, bundle: true, format: "esm", platform: "node", logLevel: "error" })
 const { makeWorker } = await import(pathToFileURL(outfile).href)
 
-type Engine = { contextLength: number; released: boolean; gpu: { isLost: boolean } }
+type Engine = { contextLength: number; released: boolean; gpu: { isLost: boolean }; reset: () => void }
 type Loaded = { model: string; contextLength: number | undefined; engine: Engine; cached: number[]; tokenizer?: { constraintTokenizer: object } }
 
 /** A request as the page sends it: with webgllm's mark (a message without one is the worker's own). */
@@ -70,7 +70,7 @@ const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) 
 function worker() {
   const messages: WorkerResponse[] = []
   const loads: Array<{ contextLength: number | undefined; signal: AbortSignal; finish: () => void; engine: Engine }> = []
-  const generations: Array<{ engine: Engine; finish: () => void; releasedMidway?: boolean }> = []
+  const generations: Array<{ engine: Engine; finish: () => void; fail: (error: Error) => void; releasedMidway?: boolean }> = []
   let active = 0, most = 0
   const state = {
     messages,
@@ -80,7 +80,7 @@ function worker() {
       active++
       most = Math.max(most, active)
       const done = gate()
-      const engine: Engine = { contextLength: contextLength ?? 4096, released: false, gpu: { isLost: false } }
+      const engine: Engine = { contextLength: contextLength ?? 4096, released: false, gpu: { isLost: false }, reset: () => undefined }
       loads.push({ contextLength, signal, finish: done.release, engine })
       try {
         await done.promise
@@ -91,10 +91,12 @@ function worker() {
     },
     async generate(model: Loaded) {
       const done = gate()
-      const entry = { engine: model.engine, finish: done.release, releasedMidway: false }
+      let failure: Error | undefined
+      const entry = { engine: model.engine, finish: done.release, fail: (error: Error) => { failure = error; done.release() }, releasedMidway: false }
       generations.push(entry)
       await done.promise
       entry.releasedMidway = model.engine.released
+      if (failure) throw failure
     }
   }
   makeWorker(state)
@@ -239,7 +241,7 @@ function claiming() {
       await files.get(model)?.promise
       await claimMemory(model, 10, signal)
       if (signal.aborted) throw new Error("stopped")
-      return { model, contextLength, engine: { contextLength: 4096, released: false, gpu: { isLost: false } }, cached: [] }
+      return { model, contextLength, engine: { contextLength: 4096, released: false, gpu: { isLost: false }, reset: () => undefined }, cached: [] }
     },
     // A generation with an image: a claim for the vision encoder, then one for the model alone once it's freed.
     async generate(model: Loaded, _request: unknown, claimMemory: Claim, signal: AbortSignal) {
@@ -332,4 +334,54 @@ test("a load builds no structured-output tables: only a request for structured o
   w.loads[0].finish()
   await settle()
   assert.equal(w.warmups(), 0)
+})
+
+test("a generation that loses the GPU context, or fails and can't reset its cache, releases the engine it drops (and the file it keeps open)", async () => {
+  for (const how of ["lost", "reset"] as const) {
+    const w = worker()
+    w.send({ type: "load", model: MODEL, loadId: 1 })
+    await settle()
+    w.loads[0].finish()
+    await settle()
+    w.send(generate("g"))
+    await settle()
+    const { engine } = w.loads[0]
+    if (how === "lost") engine.gpu.isLost = true
+    else engine.reset = () => { throw new Error("the cache can't be reset") }
+    w.generations[0].fail(new Error("the pass failed"))
+    await settle()
+    assert.equal(engine.released, true, `${how}: the dropped engine is released`)
+    assert.ok(w.messages.some((m) => m.type === "error" && m.id === "g"))
+    // The next request loads the model afresh.
+    w.send(generate("h"))
+    await settle()
+    assert.equal(w.loads.length, 2, `${how}: loaded again`)
+  }
+  // A failure the cache survives keeps the engine.
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  w.send(generate("g"))
+  await settle()
+  w.generations[0].fail(new Error("the pass failed"))
+  await settle()
+  assert.equal(w.loads[0].engine.released, false)
+})
+
+test("a load claims memory once, after its header says what stays in the file", async () => {
+  // What stays in the file (Raon's per-layer table) isn't claimed: a model that fits beside it stays loaded.
+  const { loadEstimate } = await import("./handler.js")
+  const tensors = new Map([["per_layer_token_embd.weight", { name: "per_layer_token_embd.weight", dims: [6144, 4], type: 12, offset: 0, byteLength: 600 }]])
+  assert.equal(loadEstimate(1000), loadEstimate(1000, { tensors: new Map() }))
+  assert.equal(loadEstimate(1000, { tensors }), loadEstimate(400))
+  assert.ok(loadEstimate(1000, { tensors }) < loadEstimate(1000))
+  const load = source.slice(source.indexOf("async function load("), source.indexOf("\n/**\n * The context length a request runs at"))
+  assert.ok(load.length > 1000)
+  const uploading = load.indexOf("engine.load(")
+  const claims = [...load.matchAll(/claimMemory\(/g)].map((m) => m.index).filter((at) => at < uploading)
+  assert.equal(claims.length, 1, "one estimate before the weights upload: a second, smaller one brings back nothing the first had unloaded")
+  assert.ok(load.indexOf("readGgufHeader(") < claims[0], "the header is read before the claim")
+  assert.match(load.slice(claims[0], claims[0] + 80), /loadEstimate\(weightBytes, ggufHeader\)/)
 })

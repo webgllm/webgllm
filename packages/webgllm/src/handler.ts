@@ -9,7 +9,7 @@ import type { GpuNote } from "./storage.js"
  */
 import { uploadedGgufWeights, canReleaseStaging } from "./upload-staging.js"
 import { blobSource, keptSource, storedSources } from "./byte-source.js"
-import { ggufShape, readGgufHeader } from "./gguf.js"
+import { ggufShape, readGgufHeader, type GgufHeader } from "./gguf.js"
 import { Engine, MAX_CHUNKS, retimedTuning, timesAgain, TUNING, tuningToRetime } from "./engine.js"
 import { MIN_TEXTURE_SIZE } from "./limits.js"
 import { GpuError } from "./gpu/gl.js"
@@ -179,6 +179,14 @@ const RECLAIM_BYTES = 32 * 2 ** 20
  */
 const TEXTURES_PER_FILE_BYTE = 1.4
 
+/** A GGUF tensor the engine reads from the file a row at a time, never as textures (Raon's per-layer token embeddings). */
+const DISK_ONLY_TENSOR = "per_layer_token_embd.weight"
+
+/** The memory claimed before a load: its files' bytes as textures (TEXTURES_PER_FILE_BYTE), without what stays in the file. */
+export function loadEstimate(weightBytes: number, header?: Pick<GgufHeader, "tensors">): number {
+  return (weightBytes - (header?.tensors.get(DISK_ONLY_TENSOR)?.byteLength ?? 0)) * TEXTURES_PER_FILE_BYTE
+}
+
 type Loaded = {
   model: string
   /** The contextLength it was loaded for (the model's own when undefined). */
@@ -262,6 +270,7 @@ const release = (engine: Engine) => {
 
 /** What closes the stored file an engine reads while its model is loaded (Raon's per-layer table: see keptSource). */
 const keptFiles = new Map<Engine, () => Promise<void>>()
+
 
 /**
  * Prompt tokens per forward batch, the same on every device and model (the
@@ -438,7 +447,18 @@ async function load(
     // took): the weights, the cache and the working textures.
     const weightBytes = weightFiles.reduce((sum, f) => sum + f.size, 0)
     if (signal.aborted) throw new Superseded()
-    await claimMemory(model, weightBytes * TEXTURES_PER_FILE_BYTE, signal)
+    // The weights' header before the claim: what stays in the file isn't
+    // claimed (a claim of the whole file had the page unload models that
+    // fit beside this one, and a smaller claim after it brings none back).
+    // The weights read through synchronous access handles where they can be (see storedSources).
+    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: async () => undefined }
+    closeStored = stored.close
+    timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
+    const weightSources = stored.sources
+    // (The header is read once: the load below takes it too.)
+    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
+    if (signal.aborted) throw new Superseded()
+    await claimMemory(model, loadEstimate(weightBytes, ggufHeader), signal)
     if (signal.aborted) throw new Superseded()
     const tokenizer = loadTokenizer({
       tokenizerJson: JSON.parse(await tokenizerFile.text()) as object,
@@ -456,25 +476,14 @@ async function load(
     const noteKey = `${scope}${code}`
     const notes = await readGpuNotes()
     const checkedNote = notes[noteKey]
-    // The weights' shape, from their header: a model of the same shape as
-    // one already tuned here starts from its tuning.
-    // (The header is read once: the load below takes it too.)
-    // The weights read through synchronous access handles where they can be (see storedSources).
-    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: async () => undefined }
-    closeStored = stored.close
-    timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
-    const weightSources = stored.sources
-    let ggufHeader = meta.files.kind === "gguf" ? await readGgufHeader(weightSources[0]) : undefined
     // Per-layer embeddings (Raon) stay in the file, a token's row read when
     // the token is: from the stored file itself, which outlives the load's
-    // access handles. They take no GPU memory, so not the estimate's either.
-    const perLayerTable = ggufHeader?.tensors.get("per_layer_token_embd.weight")
-    if (perLayerTable) {
-      // (As a Blob while the load holds the file's handles: its probes may run a forward.)
-      engine.perLayerSource = blobSource(weightFiles[0])
-      await claimMemory(model, (weightBytes - perLayerTable.byteLength) * TEXTURES_PER_FILE_BYTE, signal)
-      if (signal.aborted) throw new Superseded()
-    }
+    // access handles.
+    const perLayerTable = !!ggufHeader?.tensors.has(DISK_ONLY_TENSOR)
+    // (As a Blob while the load holds the file's handles: its probes may run a forward.)
+    if (perLayerTable) engine.perLayerSource = blobSource(weightFiles[0])
+    // The weights' shape, from their header: a model of the same shape as
+    // one already tuned here starts from its tuning.
     const shape = ggufHeader && ggufShape(ggufHeader)
     // A code update may only change scheduling. Keep compatible tuning
     // choices and check the new engine before saving them under its key.
@@ -776,6 +785,18 @@ function startLoad(
   }
   loading = entry
   return entry.promise
+}
+
+/** Drops the loaded model after a failure it can't go on from, its engine released (a lost context's too: what it holds isn't only the GPU's). */
+function discard() {
+  const dropped = current
+  current = null
+  if (!dropped) return
+  try {
+    release(dropped.engine)
+  } catch {
+    // A lost context may not dispose: the next load starts afresh either way.
+  }
 }
 
 /**
@@ -1982,14 +2003,15 @@ function receive(data: WorkerRequest) {
         // A lost GPU context can't be used again: the next generation
         // loads the model afresh. Otherwise the cache may hold part of a
         // batch (or a failed growth): forget it.
+        // (Dropped, its engine is released: the file it keeps open is locked until then.)
         const lost = !!current?.engine.gpu.isLost
-        if (lost) current = null
+        if (lost) discard()
         else if (current) {
           current.cached.length = 0
           try {
             current.engine.reset()
           } catch {
-            current = null
+            discard()
           }
         }
         post({ type: "error", id: data.id, message: errorMessage(error), code: lost ? "gpu-context-lost" : errorCode(error) })
