@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reload loop</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 14px ui-monospace, monospace; margin: 20px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Load, reply, unload, again: what a page keeps</h1>
+  <p>
+    Through the public API, as an app does: <code>loadModel</code>, one short reply, <code>unloadModel</code>,
+    <code>?n=</code> times (6), with <code>?rest=</code> ms (3000) after each unload for a memory reading.
+    <code>?own=1</code>: one worker of the page's, kept for every load (what's left is the engine's); otherwise
+    webgllm's own worker per model, ended at each unload. <code>&amp;trace=1</code> with it: the bench worker, every GPU allocation traced (MEMTRACE). <code>?model=</code> (Qwen3.5 2B GGUF). Logs
+    <code>RELOAD-LOOP ...</code>.
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const model = params.get("model") ?? "unsloth/Qwen3.5-2B-GGUF"
+    const n = Number(params.get("n") ?? 6)
+    const rest = Number(params.get("rest") ?? 3000)
+    const own = params.get("own") === "1"
+    const out = document.getElementById("out")
+    const log = (text) => {
+      out.textContent += text + "\n"
+      fetch("/log", { method: "POST", body: `RELOAD-LOOP ${text}` }).catch(() => {})
+    }
+    const { WebGLLM } = await import("/bundle/src/index.js")
+    // (?own=1&trace=1: the bench worker, the same handler with every GPU allocation traced: MEMTRACE lines.)
+    const trace = own && params.get("trace") === "1"
+    const worker = own ? new Worker(trace ? "/bundle/bench/webgl-perf-worker.js" : "/bundle/src/worker.js", { type: "module" }) : undefined
+    if (trace) worker.postMessage({ type: "tune", values: { memTrace: 1 }, webgllm: true })
+    const llm = new WebGLLM({ ...(worker && { worker }) })
+    log(`${own ? "own worker" : "a worker per model"}, ${model}, ${n} loads`)
+    try {
+      for (let i = 1; i <= n; i++) {
+        const started = performance.now()
+        await llm.loadModel(model, { contextLength: 8192 })
+        const loaded = performance.now() - started
+        const reply = await llm.chat.completions.create({
+          model,
+          messages: [{ role: "user", content: "Describe a river at dawn in two sentences." }],
+          max_tokens: 24,
+          temperature: 0
+        })
+        await llm.unloadModel(model)
+        log(`load ${i}: ${Math.round(loaded)} ms, reply ${JSON.stringify(reply.choices[0].message.content?.slice(0, 30))}; unloaded at ${Date.now()}`)
+        await new Promise((r) => setTimeout(r, rest))
+      }
+    } catch (error) {
+      log(`ERROR ${error?.stack ?? error}`)
+    }
+    log("ALL DONE")
+  </script>

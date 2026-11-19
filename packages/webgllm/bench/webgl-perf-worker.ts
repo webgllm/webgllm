@@ -63,6 +63,8 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
           })()
         }
       }
+      // (tune "drainLoad:1": each weight piece waits for the GPU to finish the work and uploads issued
+      // so far before the next is read, so no upload's copy waits in this process for the GPU.)
       if (name === "load") warmed = false
       // (tune "pauseMs:<ms>": still before the weights and after each phase, so a memory trace shows each as a plateau.)
       if (pauseMs > 0 && name === "load") await new Promise((r) => setTimeout(r, pauseMs))
@@ -175,6 +177,60 @@ for (const [name, key] of [["write", (a: unknown[]) => `write ${(a[0] as { inter
     })
   }
 }
+// (tune "memTrace:1": every GPU buffer and texture the device makes and destroys, untracked ones too,
+// the live bytes by kind logged as `MEMTRACE <epoch ms> ...` every 100 ms while they change, and the most.)
+const memTrace = (() => {
+  const live = new Map<object, { bytes: number; kind: string }>()
+  let on = false, most = 0, last = -1
+  const FORMAT: Record<string, number> = { r16uint: 2, rgba32uint: 16, rgba32float: 16, rgba16float: 8, rgba8uint: 4, rgba8sint: 4, rgba8unorm: 4, r32float: 4, r32uint: 4, r8uint: 1 }
+  const totals = () => {
+    const by: Record<string, number> = {}
+    let total = 0
+    for (const { bytes, kind } of live.values()) { by[kind] = (by[kind] ?? 0) + bytes; total += bytes }
+    return { total, by }
+  }
+  const install = () => {
+    if (on || typeof GPUDevice === "undefined") return
+    on = true
+    // (What WebGpu.dispose finds: an encoder still open, and resources waiting on it to be destroyed.)
+    const dispose = Reflect.get(WebGpu.prototype, "dispose") as () => void
+    Reflect.set(WebGpu.prototype, "dispose", function (this: WebGpu) {
+      const doomed = (Reflect.get(this, "doomed") as Array<unknown>).length, liveBefore = totals().total
+      const r = dispose.call(this)
+      void fetch("/log", { method: "POST", body: `MEMTRACE-DISPOSE encoder ${Reflect.get(this, "encoder") ? "open" : "none"}; doomed before ${doomed}, after ${(Reflect.get(this, "doomed") as Array<unknown>).length}; live ${Math.round(liveBefore / 2 ** 20)} MB before, ${Math.round(totals().total / 2 ** 20)} MB after` })
+      return r
+    })
+    const device = GPUDevice.prototype as unknown as Record<string, (...a: Array<unknown>) => object>
+    const createBuffer = device.createBuffer, createTexture = device.createTexture
+    device.createBuffer = function (this: GPUDevice, ...a: Array<unknown>) {
+      const d = a[0] as GPUBufferDescriptor
+      const b = createBuffer.apply(this, a)
+      const u = d.usage
+      const kind = u & GPUBufferUsage.MAP_READ ? "readback" : u & GPUBufferUsage.STORAGE ? "storage" : u & GPUBufferUsage.UNIFORM ? "uniform" : u & GPUBufferUsage.QUERY_RESOLVE ? "query" : d.mappedAtCreation ? "staging" : "otherBuffer"
+      live.set(b, { bytes: Number(d.size), kind })
+      return b
+    }
+    device.createTexture = function (this: GPUDevice, ...a: Array<unknown>) {
+      const d = a[0] as GPUTextureDescriptor & { size: { width: number; height: number } }
+      const t = createTexture.apply(this, a)
+      live.set(t, { bytes: d.size.width * d.size.height * (FORMAT[d.format] ?? 4), kind: "texture" })
+      return t
+    }
+    for (const proto of [GPUBuffer.prototype, GPUTexture.prototype] as Array<{ destroy: () => void }>) {
+      const destroy = proto.destroy
+      proto.destroy = function (this: object) { live.delete(this); return destroy.call(this) }
+    }
+    setInterval(() => {
+      const { total, by } = totals()
+      most = Math.max(most, total)
+      if (Math.abs(total - last) < 4 << 20) return
+      last = total
+      const mb = (n: number) => Math.round(n / 2 ** 20)
+      void fetch("/log", { method: "POST", body: `MEMTRACE ${Date.now()} total ${mb(total)} most ${mb(most)} engine ${mb(loadedEngine?.gpu.bytes ?? 0)} | ${Object.entries(by).map(([k, v]) => `${k} ${mb(v)}`).join(", ")}` })
+    }, 100)
+  }
+  return { install }
+})()
 // (tune "zeroStats:1": per layer matrix with zero points, how many aren't 8, logged at the first layers.)
 {
   const original = Reflect.get(Engine.prototype, "matrix") as (m: { N: number; K: number; bits: number; zeros?: Uint8Array | null }, ...rest: unknown[]) => unknown
@@ -514,6 +570,10 @@ const handle = async (event: MessageEvent) => {
       for (const key of Object.keys(event.data.values ?? {}))
         if (key === "zeroStats") {
           ;(globalThis as { zeroStats?: boolean }).zeroStats = event.data.values[key] > 0
+          delete event.data.values[key]
+        }
+        else if (key === "memTrace") {
+          if (event.data.values[key] > 0) memTrace.install()
           delete event.data.values[key]
         }
         else if (key === "bigAllocs") {
