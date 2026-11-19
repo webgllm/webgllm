@@ -14,7 +14,7 @@ import { WEBGPU_CODE, type NativeSpec, type WebGpu } from "./gpu/webgpu.js"
 import * as NATIVE from "./gpu/native.js"
 import { WGSL_CODE } from "./gpu/wgsl.js"
 import { PacedGpu } from "./gpu/paced.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, q4WordHead, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, q4WordHead, streamSite, streamSiteFits, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import * as R from "./gpu/raon-kernels.js"
@@ -539,6 +539,17 @@ export const TUNING = {
    * Engine.streamSite). 0: the batch's passes.
    */
   streamInline: 1,
+  /** 1: a prompt batch's stream selectors (20 rows) as split matmuls into a texture of their own (see Engine.streamSite); 0: pair matmuls. */
+  streamSplit: 1,
+  /**
+   * WebGPU: a written token's mHC site as two native dispatches (the
+   * selector over the f32 streams, then native.ts's streamSite), where
+   * workgroups' threads cooperating win (see workgroupFusions). 0: the
+   * kernels' four passes. An M3 Ultra wrote Raon-1 nano's tokens in 9.95 ms
+   * where 10.6 (601 passes where 697); the selector in that one workgroup
+   * too took it 8.6 ms a forward where 8.1, its threads' reads in turn.
+   */
+  streamNative: 1,
   /**
    * Prompt batches run at most paceAhead chunks ahead of the GPU, each
    * about this many full-batch layers of matmul work (attention counted
@@ -1521,8 +1532,17 @@ export class Engine {
       ones: this.vector(new Float32Array(S * D).fill(1)),
       /** A selector's outputs. */
       mixes: this.pair(20, 2 * M),
+      /** ...as a batch's split matmul leaves them: a row a token and K-slice (see streamSite). */
+      selector: this.gpu.texture(
+        // (As the partial buffer: what the split matmuls write.)
+        TUNING.halfPartials > 0 && this.gpu.canRender([GL.RGBA16F]) ? GL.RGBA16F : GL.RGBA32F,
+        5,
+        Math.min(this.gpu.limits.maxTextureSize, M * TUNING.maxSplit)
+      ),
       /** A site's coefficients: pre, post, the mixing matrix (6 texels), then a few rows' streams' dot products (3). */
       coef: this.f32(36, M),
+      /** A written token's selector outputs, f32 (see native.ts's streamSite). */
+      picked: this.f32(20, M),
       /** The per-layer inputs, made from the tokens' table rows. */
       inputs: this.f32(Math.max(ple, 4), M),
       gate: this.pair(c.perLayer?.dim ?? 4, 2 * M),
@@ -5219,7 +5239,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     rows: number,
     norm?: Texture | "prescaled",
     /** The output's first texel column (another matmul's slices beside it: see linearAttend). */
-    x0 = 0
+    x0 = 0,
+    /** Where the partial sums go, when not the partial buffer (a prompt batch's stream selector: see streamSite). */
+    out = this.buffers.partial
   ) {
     // RGBA4 and 4-bit byte texels have the split kernel that folds norms;
     // the generic one folds the add's prescaled input (see foldEach).
@@ -5244,7 +5266,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     const stored = this.storedQuants(w)
     if (stored) {
       const gpu = this.gpu as unknown as { nativeProgram(spec: NativeSpec): unknown }
-      const format = this.buffers.partial.internal === GL.RGBA16F ? "rgba16float" : "rgba32float"
+      const format = out.internal === GL.RGBA16F ? "rgba16float" : "rgba32float"
       const normed = !norm ? false : norm === "prescaled" ? norm : "weights"
       // bufferPairs: lanes over K about TUNING.bufferBlocks blocks each (a
       // power of 2, at most maxSplit slices); else bufferMatvec, one slice.
@@ -5280,7 +5302,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           uParts: { int: norm === "prescaled" && this.sumsInOne(a) ? 1 : this.parts },
           uEps: this.config.normEps
         },
-        output: this.buffers.partial,
+        output: out,
         rect: { x: x0, y: 0, width: w.groups, height: rows }
       })
       return lanes
@@ -5342,7 +5364,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             uEps: this.config.normEps
           })
         },
-        output: this.buffers.partial,
+        output: out,
         rect: { x: x0, y: 0, width: w.groups, height: rows * slices }
       })
       return slices
@@ -7086,8 +7108,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   /** How a kernel reads a matmul's output `name`: the pair tensor `tex`, or a split matmul's `split` partial sums. */
-  private reading(name: string, tex: Texture, split: number) {
-    const input = split ? this.partials() : tex
+  private reading(name: string, tex: Texture, split: number, partials = this.partials()) {
+    const input = split ? partials : tex
     return {
       program: (source: string) =>
         this.gpu.program(split ? this.fromSplit(source, [name], split) : this.readPair(source, name, input)),
@@ -7109,6 +7131,39 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (!sb || !c.streams) throw new Error("The model's config has no residual streams.")
     const T = c.hiddenSize / 4
     const texels = c.streams.count * T
+    const stored = this.storedQuants(mix.fn)
+    if (
+      TUNING.streamNative > 0 && rows <= SPLIT_ROWS && stored && this.workgroupFusions() && !mix.fn.zeros && mix.fn.bits !== 6 &&
+      mix.fn.groups >= 5 && mix.fn.groups <= sb.picked.width && "nativeProgram" in this.gpu && streamSiteFits({ texels: T, streams: c.streams.count })
+    ) {
+      const gpu = this.gpu as unknown as { nativeProgram(spec: NativeSpec): unknown }
+      // The selector over the streams as they are (f32: no pass to make them halves), a workgroup a row group.
+      const bits = mix.fn.bits === 8 ? 8 : 4
+      const key = `f32 ${bits} ${mix.fn.packed}`
+      let matvec = this.bufferSpecs.get(key)
+      if (!matvec) this.bufferSpecs.set(key, (matvec = bufferMatvec({ normed: false, f32: true, wg: TUNING.bufferMatvecThreads, format: "rgba32float", bits, zeros: mix.fn.packed })))
+      this.gpu.run({
+        name: "matmul",
+        program: gpu.nativeProgram(matvec) as Program,
+        inputs: { uA: sb.s[0], uS: mix.fn.scales, uW: stored },
+        uniforms: {
+          uKb: { int: mix.fn.blocks }, uH: { int: mix.fn.rowsPerColumn }, uRowTexels: { int: mix.fn.rowTexels }, uWidth: { int: mix.fn.quants.width },
+          uAOff: { int: 0 }, uROff: { int: 0 }, uTexels: { int: T }, uParts: { int: 1 }, uEps: c.normEps
+        },
+        output: sb.picked,
+        rect: { x: 0, y: 0, width: mix.fn.groups, height: rows }
+      })
+      this.siteSpec ??= streamSite({ texels: T })
+      this.gpu.run({
+        name: "streams",
+        program: gpu.nativeProgram(this.siteSpec) as Program,
+        inputs: { uS: sb.s[0], uMix: sb.picked, uBase: mix.base, uChart: mix.chart, uNorm: norm },
+        uniforms: { uEps: c.normEps, uStreamEps: c.streams.eps },
+        output: [b.normed, sb.coef],
+        rect: { x: 0, y: 0, width: 1, height: rows }
+      })
+      return b.normed
+    }
     // A few rows: the selector reads the streams as they are (scaled down
     // into halves' range), the coefficients' pass applies their 1 / RMS and
     // sums the streams' dot products, and the branch's input is normed as
@@ -7124,8 +7179,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         rect: { x: 0, y: 0, width: texels / 2 + 3 * R.STREAM_PARTS, height: rows }
       })
     else this.normToH2(sb.s[0], sb.ones, sb.flat, rows, -1, false, texels, c.streams.eps)
-    const split = await this.project(sb.flat, mix.fn, sb.mixes, rows)
-    const r = this.reading("uMix", sb.mixes, split)
+    // A batch's selector as a split matmul too, into a tall texture of its
+    // own (a row a token and K-slice): its few rows are a handful of
+    // fragments a token as a pair matmul, each walking all of K (0.5 ms a
+    // site for 512 tokens on an M3 Ultra, a quarter of the batch's matmul time).
+    const tall = !few && TUNING.streamSplit > 0 && rows * TUNING.maxSplit <= sb.selector.height
+    const split = tall ? this.splitPartials(sb.flat, mix.fn, rows, undefined, 0, sb.selector) : await this.project(sb.flat, mix.fn, sb.mixes, rows)
+    const r = this.reading("uMix", sb.mixes, split, tall ? sb.selector : undefined)
     this.gpu.run({
       name: "streams",
       program: r.program(R.streamCoefficients(few)),
@@ -7156,6 +7216,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.normToH2(b.residual[1], norm, b.normed, rows, -1, false)
     return b.normed
   }
+
+  private siteSpec: NativeSpec | undefined
 
   /** The streams after a branch: mixed, plus the branch's output `y` (a pair tensor, or `split` partial sums). */
   private streamMix(y: Texture, split: number, rows: number) {

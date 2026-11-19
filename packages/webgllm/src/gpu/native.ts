@@ -1193,12 +1193,16 @@ ${o.gate === "dim"
  * uAOff of uA; either way the sums are times the row's 1 / RMS, from uR's
  * partial sums of squares (kernels.ts's matmulSplitRgba4 alike).
  */
-export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8; zeros?: boolean }): NativeSpec {
+export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: number; format: "rgba16float" | "rgba32float"; bits?: 4 | 8; zeros?: boolean; f32?: boolean }): NativeSpec {
   const weights = o.normed === "weights"
   const rms = !!o.normed
+  if (o.f32 && o.normed) throw new Error("The buffer matvec reads f32 inputs as they are, or normed ones.")
+  // (f32: the input's f32 texels as they are, from column uAOff.)
   const A = weights
     ? Array.from({ length: 8 }, (_, j) => `    let A${j} = textureLoad(tA, vec2<i32>(kb * 8 + ${j}, m), 0) * textureLoad(tNorm, vec2<i32>(kb * 8 + ${j}, 0), 0);`).join("\n")
-    : [0, 1, 2, 3].map((j) => `    let a${j} = textureLoad(tA, vec2<i32>(u.aOff + kb * 4 + ${j}, m), 0);
+    : o.f32
+      ? Array.from({ length: 8 }, (_, j) => `    let A${j} = textureLoad(tA, vec2<i32>(u.aOff + kb * 8 + ${j}, m), 0);`).join("\n")
+      : [0, 1, 2, 3].map((j) => `    let a${j} = textureLoad(tA, vec2<i32>(u.aOff + kb * 4 + ${j}, m), 0);
     let A${2 * j} = lo(a${j});
     let A${2 * j + 1} = hi(a${j});`).join("\n")
   const rows = o.bits === 8
@@ -1215,7 +1219,7 @@ export function bufferMatvec(o: { normed: false | "weights" | "prescaled"; wg: n
   const code = `
 struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, width: i32, aOff: i32, rOff: i32, texels: i32, parts: i32, eps: f32 }
 @group(0) @binding(0) var<uniform> u: Uni;
-@group(0) @binding(1) var tA: texture_2d<${weights ? "f32" : "u32"}>;
+@group(0) @binding(1) var tA: texture_2d<${weights || o.f32 ? "f32" : "u32"}>;
 @group(0) @binding(2) var tS: texture_2d<${o.zeros ? "u32" : "f32"}>;
 ${weights ? "@group(0) @binding(3) var tNorm: texture_2d<f32>;" : ""}
 ${rms ? `@group(0) @binding(${weights ? 4 : 3}) var tR: texture_2d<f32>;` : ""}
@@ -1263,7 +1267,7 @@ ${rms ? `    var s = vec4<f32>(0.0);
   return {
     code,
     inputs: [
-      { name: "uA", kind: weights ? "f" : "u" },
+      { name: "uA", kind: weights || o.f32 ? "f" : "u" },
       { name: "uS", kind: o.zeros ? "u" : "f" },
       ...(weights ? [{ name: "uNorm", kind: "f" as const }] : []),
       ...(rms ? [{ name: "uR", kind: "f" as const }] : [])
@@ -1912,4 +1916,155 @@ ${I.map((i) => `  if (ok${i}) {
 }
 
 /** This module's code besides its exports, for Engine.fingerprint: list every new top-level declaration here. */
-export const NATIVE_CODE: Array<unknown> = [PRESCALE]
+/** Threads of streamSite's workgroup: each takes `texels` / 64 of every stream's texels. */
+const SITE_COLUMNS = 64
+
+/** Whether streamSite has a kernel for these streams: four, its threads taking whole h2 texels. */
+export function streamSiteFits(o: { texels: number; streams: number }) {
+  return o.streams === 4 && o.texels % (2 * SITE_COLUMNS) === 0
+}
+
+/**
+ * A written token's mHC site (Raon) after its selector, a workgroup a
+ * token: what raon-kernels.ts's streamH2, streamCoefficients and
+ * STREAM_INPUT do as three dependent dispatches, the selector between
+ * them, in one after it (the selector reads the streams as they are: see
+ * bufferMatvec's f32).
+ * - The streams (uS, four of `texels` texels) and their dot products;
+ * - the coefficients into the second output as streamCoefficients writes
+ *   them (texel 0 sigmoid(pre), 1 sigmoid(post), 2..5 the mixing matrix),
+ *   from the selector's outputs (uMix: texel g its rows 4g..4g+3) times the
+ *   streams' 1 / RMS, a thread a row of the chart;
+ * - the branch's input into the first, h2: Σ pre[i] · stream i over the
+ *   sum's RMS, times uNorm.
+ * A thread's reads come one after another (an M3 Ultra: ~0.2 µs each), so
+ * no thread has many.
+ */
+export function streamSite(o: { texels: number }): NativeSpec {
+  const T = o.texels
+  const per = T / SITE_COLUMNS
+  if (!streamSiteFits({ texels: T, streams: 4 })) throw new Error(`No stream site kernel for ${T} texels a stream.`)
+  const code = `
+struct U { rect: vec4<u32>, eps: f32, streamEps: f32 }
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tMix: texture_2d<f32>;
+@group(0) @binding(3) var tBase: texture_2d<f32>;
+@group(0) @binding(4) var tChart: texture_2d<f32>;
+@group(0) @binding(5) var tNorm: texture_2d<f32>;
+@group(0) @binding(6) var out0: texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(7) var out1: texture_storage_2d<rgba32float, write>;
+const T = ${T};
+var<workgroup> gram0: array<vec4<f32>, ${SITE_COLUMNS}>;
+var<workgroup> gram1: array<vec4<f32>, ${SITE_COLUMNS}>;
+var<workgroup> gram2: array<vec4<f32>, ${SITE_COLUMNS}>;
+var<workgroup> chart: array<f32, 16>;
+var<workgroup> sharedPre: vec4<f32>;
+var<workgroup> sharedInv: f32;
+fn sig(x: vec4<f32>) -> vec4<f32> { return 1.0 / (1.0 + exp(-x)); }
+fn h2(a: vec4<f32>, b: vec4<f32>) -> vec4<u32> {
+  let x = clamp(a, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  let z = clamp(b, vec4<f32>(-65504.0), vec4<f32>(65504.0));
+  return vec4<u32>(pack2x16float(x.xy), pack2x16float(x.zw), pack2x16float(z.xy), pack2x16float(z.zw));
+}
+/* The selector's row group i for token m, with its biases. */
+fn mix(i: i32, m: i32, scale: f32) -> vec4<f32> {
+  return textureLoad(tMix, vec2<i32>(i, m), 0) * scale + textureLoad(tBase, vec2<i32>(i, 0), 0);
+}
+@compute @workgroup_size(${SITE_COLUMNS})
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let m = i32(u.rect.y + w.y);
+  // The streams' texels (each thread its own) and their dot products.
+  var keep: array<vec4<f32>, ${4 * per}>;
+  var g0 = vec4<f32>(0.0);
+  var g1 = vec4<f32>(0.0);
+  var g2 = vec4<f32>(0.0);
+  for (var i = 0; i < ${per}; i++) {
+    let c = i32(l) * ${per} + i;
+    let s0 = textureLoad(tS, vec2<i32>(c, m), 0);
+    let s1 = textureLoad(tS, vec2<i32>(T + c, m), 0);
+    let s2 = textureLoad(tS, vec2<i32>(2 * T + c, m), 0);
+    let s3 = textureLoad(tS, vec2<i32>(3 * T + c, m), 0);
+    keep[4 * i] = s0;
+    keep[4 * i + 1] = s1;
+    keep[4 * i + 2] = s2;
+    keep[4 * i + 3] = s3;
+    g0 += vec4<f32>(dot(s0, s0), dot(s0, s1), dot(s0, s2), dot(s0, s3));
+    g1 += vec4<f32>(dot(s1, s1), dot(s1, s2), dot(s1, s3), dot(s2, s2));
+    g2 += vec4<f32>(dot(s2, s3), dot(s3, s3), 0.0, 0.0);
+  }
+  gram0[l] = g0;
+  gram1[l] = g1;
+  gram2[l] = g2;
+  workgroupBarrier();
+  for (var s = ${SITE_COLUMNS >> 1}u; s > 0u; s >>= 1u) {
+    if (l < s) {
+      gram0[l] += gram0[l + s];
+      gram1[l] += gram1[l + s];
+      gram2[l] += gram2[l + s];
+    }
+    workgroupBarrier();
+  }
+  let G0 = gram0[0];
+  let G1 = gram1[0];
+  let G2 = gram2[0];
+  // The selector read the streams as they are: over all four's RMS here.
+  let scale = inverseSqrt((G0.x + G1.x + G1.w + G2.y) / f32(16 * T) + u.streamEps);
+  // The chart's 16 rows (see raon-kernels.ts's streamCoefficients), a thread each.
+  if (l < 16u) {
+    var a = 0.0;
+    for (var i = 0; i < 5; i++) { a += dot(textureLoad(tChart, vec2<i32>(i, i32(l)), 0), mix(i, m, scale)); }
+    chart[l] = a;
+  }
+  workgroupBarrier();
+  if (l < 4u) {
+    // The mixing matrix's column for stream l: e / rho + c0, rho = 1 + max(e · r) over all four.
+    var rho = 0.0;
+    var mine = vec4<f32>(0.0);
+    for (var s = 0u; s < 4u; s++) {
+      let e = vec4<f32>(chart[4u * s], chart[4u * s + 1u], chart[4u * s + 2u], chart[4u * s + 3u]);
+      let er = e * textureLoad(tChart, vec2<i32>(i32(s), 16), 0);
+      rho = max(rho, max(max(er.x, er.y), max(er.z, er.w)));
+      if (s == l) { mine = e; }
+    }
+    textureStore(out1, vec2<i32>(2 + i32(l), m), mine / (1.0 + rho) + textureLoad(tChart, vec2<i32>(i32(l), 17), 0));
+  }
+  if (l == 4u) { textureStore(out1, vec2<i32>(1, m), sig(mix(1, m, scale))); }
+  if (l == 5u) {
+    let pre = sig(mix(0, m, scale));
+    textureStore(out1, vec2<i32>(0, m), pre);
+    let q = pre.x * pre.x * G0.x + pre.y * pre.y * G1.x + pre.z * pre.z * G1.w + pre.w * pre.w * G2.y
+      + 2.0 * (pre.x * pre.y * G0.y + pre.x * pre.z * G0.z + pre.x * pre.w * G0.w
+        + pre.y * pre.z * G1.y + pre.y * pre.w * G1.z + pre.z * pre.w * G2.x);
+    sharedPre = pre;
+    sharedInv = inverseSqrt(max(q, 0.0) / f32(4 * T) + u.eps);
+  }
+  workgroupBarrier();
+  let pre = sharedPre;
+  let inv = sharedInv;
+  for (var i = 0; i < ${per}; i += 2) {
+    let c = i32(l) * ${per} + i;
+    let a = pre.x * keep[4 * i] + pre.y * keep[4 * i + 1] + pre.z * keep[4 * i + 2] + pre.w * keep[4 * i + 3];
+    let b = pre.x * keep[4 * i + 4] + pre.y * keep[4 * i + 5] + pre.z * keep[4 * i + 6] + pre.w * keep[4 * i + 7];
+    textureStore(out0, vec2<i32>(c / 2, m), h2(a * inv * textureLoad(tNorm, vec2<i32>(c, 0), 0), b * inv * textureLoad(tNorm, vec2<i32>(c + 1, 0), 0)));
+  }
+}`
+  return {
+    code,
+    inputs: [
+      { name: "uS", kind: "f" },
+      { name: "uMix", kind: "f" },
+      { name: "uBase", kind: "f" },
+      { name: "uChart", kind: "f" },
+      { name: "uNorm", kind: "f" }
+    ],
+    uniforms: [
+      { name: "uEps", type: "float" },
+      { name: "uStreamEps", type: "float" }
+    ],
+    // A workgroup a token.
+    groups: (rect) => [1, rect.height]
+  }
+}
+
+export const NATIVE_CODE: Array<unknown> = [PRESCALE, SITE_COLUMNS]
