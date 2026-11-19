@@ -37,6 +37,34 @@ test("an unsplit expanded Q6 head uses its format-aware kernel rather than the o
 })
 
 
+test("a 4-bit embedding in word texels takes the native word head on WebGPU", async () => {
+  let native = 0
+  const state = {
+    lastRowOnly: false,
+    headScaled: false,
+    buffers: { residual: [{}], lastNormed: {} },
+    finalNorm: {},
+    embedding: { bits: 4, bytes: false, rgba4: false },
+    normToH2() {
+      return undefined
+    },
+    q4WordsHead: Reflect.get(Engine.prototype, "q4WordsHead"),
+    nativeHeadOn: true,
+    async headQ4Words() {
+      native++
+      return {}
+    },
+    gpu: {
+      run() {
+        throw new Error("used the generic matmul head")
+      }
+    }
+  }
+  const head = Reflect.get(Engine.prototype, "head") as (row: number) => Promise<object>
+  await head.call(state, 0)
+  assert.equal(native, 1)
+})
+
 test("head work stays constant when the automatic submission quota grows", async () => {
   const work: number[] = []
   const state = {

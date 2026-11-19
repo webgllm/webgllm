@@ -3751,27 +3751,30 @@ void main() {
  * quantsFromRaw did on the CPU: a word's bytes interleave the low and the
  * high half bytes' nibbles. `unorm`: RGBA8 normalized texels, else RGBA8UI.
  */
-export function rawQ4Bytes(unorm: boolean) {
+export function rawQ4Bytes(unorm: boolean, words = false) {
   return `${HEADER}
 uniform usampler2D uRaw;
 uniform int uX0;
 uniform int uY0;
 out ${unorm ? "vec4" : "uvec4"} o;
-void main() {
-  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
-  int b = p.x >> 4;
-  int r = (p.x >> 2) & 3;
-  int w = p.x & 3;
-  uvec4 t = texelFetch(uRaw, ivec2(b, 4 * p.y + r), 0);
+uint rawWord(uvec4 t, int w) {
   uint lo = (w >> 1) == 0 ? t.x : t.y;
   uint hi = (w >> 1) == 0 ? t.z : t.w;
   uint even = (lo & 0x0f0f0f0fu) | ((hi & 0x0f0f0f0fu) << 4u);
   uint odd = ((lo >> 4u) & 0x0f0f0f0fu) | (hi & 0xf0f0f0f0u);
   uint e = (w & 1) == 0 ? (even & 0xffffu) : (even >> 16u);
   uint d = (w & 1) == 0 ? (odd & 0xffffu) : (odd >> 16u);
-  uint word = ((e | (e << 8u)) & 0x00ff00ffu) | (((d | (d << 8u)) & 0x00ff00ffu) << 8u);
+  return ((e | (e << 8u)) & 0x00ff00ffu) | (((d | (d << 8u)) & 0x00ff00ffu) << 8u);
+}
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(uX0, uY0);
+${words ? `  // Word texels: a texel a row's block, its 4 words.
+  uvec4 t = texelFetch(uRaw, ivec2(p.x >> 2, 4 * p.y + (p.x & 3)), 0);
+  o = uvec4(rawWord(t, 0), rawWord(t, 1), rawWord(t, 2), rawWord(t, 3));` : `  int b = p.x >> 4;
+  int r = (p.x >> 2) & 3;
+  uint word = rawWord(texelFetch(uRaw, ivec2(b, 4 * p.y + r), 0), p.x & 3);
   uvec4 bytes = uvec4(word & 255u, (word >> 8u) & 255u, (word >> 16u) & 255u, word >> 24u);
-  o = ${unorm ? "vec4(bytes) / 255.0" : "bytes"};
+  o = ${unorm ? "vec4(bytes) / 255.0" : "bytes"};`}
 }`
 }
 

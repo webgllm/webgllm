@@ -11,7 +11,7 @@ import { queriesFit, slotRuns } from "./cache-slots.js"
 import { checkpointsToDrop, type SnapshotRole } from "./checkpoint-policy.js"
 import { GL, Gpu, GpuError, type Pass, type Program } from "./gpu/gl.js"
 import type { NativeSpec, WebGpu } from "./gpu/webgpu.js"
-import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, wordHead } from "./gpu/native.js"
+import { attentionPrep, bufferDequant, bufferMatvec, bufferPairMatmul, bufferPairs, chunkArgmax, linChunkLoop, linRecurrence, promptConv, promptMatmul, promptMatmulBuffer, promptPrep, chunkMax, expandedHead, FLASH_KEYS, flashChunks, flashCombine, flashFits, fusedAdd, q4WordHead, wordHead } from "./gpu/native.js"
 import type { PendingRead, Texture } from "./gpu/gl.js"
 import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
@@ -325,6 +325,16 @@ export const TUNING = {
   unormBytes: 1,
   /** 1: raw MatMulNBits rows go into 4-bit byte texels through a GPU pass, not repacked on the CPU (see writeMatrix). */
   rawUploadGpu: 1,
+  /**
+   * WebGPU: 4-bit embeddings (an ONNX model's) in word texels, the head a
+   * native pass (gpu/native.ts's q4WordHead), not RGBA4 (which WebGPU holds
+   * as r16uint: 2 bytes a fetch). LFM3 1.7B ONNX decoded at 20.6 tokens/s
+   * on a Pixel 10 Pro where 18.4 (its GGUF's 21.2), the same on an M3 Ultra
+   * and an iPhone 16 Pro Max (set before the model loads). WebGL keeps
+   * RGBA4: byte texels were 5% faster on the Pixel's Firefox, 3% slower on
+   * the M3 Ultra and the same on the iPhone; word texels slower on all.
+   */
+  wordEmbedding: 1,
   /**
    * 4-bit layer weights in RGBA4 textures (1) or byte textures (0); -1:
    * whichever this GPU writes faster (timed at load; see chooseLayout).
@@ -1049,7 +1059,9 @@ export class Engine {
           else if (!this.headChoice) await this.chooseHead(value)
         }
         if (row0 === 0) this.resizeScoreBuffers(value.bits)
-        if (row0 === 0)
+        if (row0 === 0) {
+          // On WebGPU, word texels for the native head (TUNING.wordEmbedding).
+          const words = value.bits === 4 && TUNING.wordEmbedding > 0 && this.nativeHeadOn
           this.embedding = this.allocateMatrix(
             totalRows,
             value.K,
@@ -1057,8 +1069,11 @@ export class Engine {
             !!value.zeros,
             // RGBA4 where it fits this GPU's textures; else byte texels
             // (half as wide: Qwen3.5's 248,320 × 2048 on an 8,192-texel GPU).
-            value.bits === 4 && this.fitsRgba4(totalRows, value.K)
+            value.bits === 4 && !words && this.fitsRgba4(totalRows, value.K),
+            false,
+            words
           )
+        }
         // Written in chunks: zeroed on the GPU first, or the browser
         // zero-fills it on the first chunk's write, far more slowly (430 ms
         // for Qwen3.5 2B's on an iPhone 16 Pro Max, against a 60 ms clear).
@@ -2209,7 +2224,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     withZeros: boolean,
     rgba4 = false,
     /** A layer matrix: scales and zero points may be packed (see GpuMatrix.packed). */
-    layer = false
+    layer = false,
+    /** 4- or 8-bit weights in RGBA32UI word texels, not byte texels. */
+    words = false
   ): GpuMatrix {
     const max = this.gpu.limits.maxTextureSize
     if (rgba4) {
@@ -2260,7 +2277,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
     const bytes =
       bits === 6
         ? TUNING.q6Words <= 0
-        : this.bytes && columns * blocks * 4 * byteTexels <= max
+        : !words && this.bytes && columns * blocks * 4 * byteTexels <= max
     const expanded =
       bits === 6 &&
       (TUNING.q6Expanded > 0 ||
@@ -3048,7 +3065,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // pass (K.rawQ4Bytes: an ONNX model's ~0.8 GB repacked on the CPU took
     // LFM3 1.7B's load 300 ms on an M3 Ultra); other layouts get the rows
     // repacked here.
-    const gpuRaw = !!m.raw && !gm.rgba4 && gm.bytes && m.bits === 4 && TUNING.rawUploadGpu > 0
+    const gpuRaw = !!m.raw && !gm.rgba4 && m.bits === 4 && !gm.quantPanels && TUNING.rawUploadGpu > 0
     if (m.raw && !gm.rgba4 && !gpuRaw) {
       const words = (m.N * m.K) / 8
       if (this.repackUpload.length < words) this.repackUpload = new Uint32Array(words)
@@ -3114,7 +3131,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           const rect = { x: column * rowTexels, y: y + r0, width: rowTexels, height: h }
           this.gpu.run({
             name: "upload",
-            program: this.gpu.program(K.rawQ4Bytes(gm.unorm)),
+            program: this.gpu.program(K.rawQ4Bytes(gm.unorm, !gm.bytes)),
             inputs: { uRaw: stage },
             uniforms: { uX0: { int: rect.x }, uY0: { int: rect.y } },
             output: gm.quants,
@@ -7265,11 +7282,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // The last add drew h2(x · final norm weights): no norm pass.
       return e.rgba4
         ? this.headRgba4(e, rows, row0, sum)
-        : this.headQ6K(e, rows, sum, row0)
+        : e.bits === 4
+          ? this.headQ4Words(e, rows, row0, sum)
+          : this.headQ6K(e, rows, sum, row0)
     }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) return this.headRgba4(e, rows, undefined, sum)
     if (e.bits === 6) return this.headQ6K(e, rows, sum)
+    if (this.q4WordsHead(e)) return this.headQ4Words(e, rows, undefined, sum)
     this.gpu.run({
       name: "head",
       program: this.gpu.program(K.matmul({
@@ -7419,6 +7439,70 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           uOutW: { int: OUT_WIDTH },
           uLogitRows: { int: sliceRows },
           uKbSlice: { int: Math.ceil(e.blocks / split) },
+          uRows: { int: rows },
+          ...(prescaled && {
+            uRowA0: { int: scaledRow0 },
+            uAOff: { int: this.config.hiddenSize / 4 + K.RMS_PARTS },
+            uROff: { int: this.config.hiddenSize / 4 },
+            uParts: { int: oneSums ? 1 : this.parts },
+            uTexels: { int: this.config.hiddenSize / 4 },
+            uEps: this.config.normEps
+          })
+        },
+        output: target,
+        rect: { x: 0, y: 0, width: OUT_WIDTH, height: split * rows * sliceRows }
+      },
+      rows,
+      split
+    )
+    return this.headSlices(target, split, rows, sum)
+  }
+
+  /** Whether `e` is a 4-bit embedding in word texels the native head reads (see q4WordHead). */
+  private q4WordsHead(e: GpuMatrix) {
+    return e.bits === 4 && !e.rgba4 && !e.bytes && !e.quantPanels && this.nativeHeadOn
+  }
+
+  /**
+   * The output head through a 4-bit embedding in word texels, as the
+   * native pass (see q4WordHead), in TUNING.nativeHeadSplit K-slices.
+   */
+  private async headQ4Words(
+    e: GpuMatrix,
+    rows: number,
+    scaledRow0?: number,
+    sum = true
+  ): Promise<HeadOut> {
+    const b = this.buffers
+    const split = Math.max(1, Math.min(TUNING.nativeHeadSplit, 4, e.blocks))
+    const sliceRows = this.logitRows
+    const target = this.headTarget(split, rows)
+    const prescaled = scaledRow0 !== undefined
+    const kbSlice = Math.ceil(e.blocks / split)
+    const key = `q4 ${split > 1} ${prescaled} ${kbSlice} ${!!e.zeros}`
+    let spec = this.nativeHeads.get(key)
+    if (!spec) this.nativeHeads.set(key, (spec = q4WordHead({ split: split > 1, prescaled, kbSlice, zeros: !!e.zeros })))
+    const oneSums = prescaled && this.sumsInOne(b.residual[0])
+    await this.weightHead(
+      e,
+      {
+        name: "head",
+        program: (this.gpu as WebGpu).nativeProgram(spec),
+        inputs: {
+          ...(prescaled && { uR: b.residual[0] }),
+          uA: prescaled ? b.scaled[0] : b.lastNormed,
+          uW: e.quants,
+          uS: e.scales,
+          ...(e.zeros && { uZ: e.zeros })
+        },
+        uniforms: {
+          uKb: { int: e.blocks },
+          uH: { int: e.rowsPerColumn },
+          uRowTexels: { int: e.rowTexels },
+          uG: { int: e.groups },
+          uOutW: { int: OUT_WIDTH },
+          uLogitRows: { int: sliceRows },
+          uKbSlice: { int: kbSlice },
           uRows: { int: rows },
           ...(prescaled && {
             uRowA0: { int: scaledRow0 },
@@ -7617,7 +7701,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // The last add draws the final norm's scaled input for the head.
     this.headScaled =
       prescaled &&
-      (e.rgba4 || (e.bits === 6 && !e.bytes && TUNING.q6FoldNorm > 0)) &&
+      (e.rgba4 || this.q4WordsHead(e) || (e.bits === 6 && !e.bytes && TUNING.q6FoldNorm > 0)) &&
       foldFfn(this.layers.length - 1)
     if (embedFolded) {
       const texels = c.hiddenSize / 4

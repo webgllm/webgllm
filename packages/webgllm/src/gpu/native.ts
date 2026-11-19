@@ -269,6 +269,102 @@ ${o.prescaled ? `    var s = vec4<f32>(0.0);
 }
 
 /**
+ * The output head through a 4-bit embedding in word texels (a row's
+ * 32-weight block a RGBA32UI texel: word w's bytes hold weights 4w..4w+3
+ * in their low nibbles and 16+4w.. in their high ones; kernels.ts's embed
+ * reads the same), with scales (RGBA16F) and zero points (RGBA8UI) a
+ * texel a block for the group's 4 rows. As wordHead: a workgroup's 64
+ * threads are 64 neighbouring output texels of one row, sharing the
+ * slice's activations from workgroup memory, and each weight fetch is 16
+ * bytes (an RGBA4 head's is 2: WebGPU holds RGBA4 as r16uint).
+ * unpack4x8unorm splits a word's 4 nibbles at once, as expandedHead's
+ * bytes (the 255 it divides by comes out once a block). Threads splitting
+ * K within the workgroup (2 to 8 a texel) didn't speed it up on an M3
+ * Ultra; the half-float split of q6v was no faster anywhere.
+ */
+export function q4WordHead(o: { split: boolean; prescaled: boolean; kbSlice: number; zeros: boolean }): NativeSpec {
+  const inputs: NativeSpec["inputs"] = [
+    { name: "uA", kind: "u" },
+    { name: "uW", kind: "u" },
+    { name: "uS", kind: "f" },
+    ...(o.zeros ? [{ name: "uZ", kind: "u" as const }] : []),
+    ...(o.prescaled ? [{ name: "uR", kind: "f" as const }] : [])
+  ]
+  const texels = 4 * o.kbSlice
+  const C = "xyzw"
+  const row = (r: number) => `      {
+        let W = textureLoad(tW, vec2<i32>(wx + kb * 4 + ${r}, gr), 0);
+        b.${C[r]} = dot(nib(W.x, 0u), A0) + dot(nib(W.y, 0u), A1) + dot(nib(W.z, 0u), A2) + dot(nib(W.w, 0u), A3)
+          + dot(nib(W.x, 4u), A4) + dot(nib(W.y, 4u), A5) + dot(nib(W.z, 4u), A6) + dot(nib(W.w, 4u), A7);
+      }`
+  let binding = 4
+  const code = `
+struct Uni { rect: vec4<u32>, kb: i32, h: i32, rowTexels: i32, g: i32, outW: i32, logitRows: i32, kbSlice: i32, rows: i32, aOff: i32, rowA0: i32, rOff: i32, parts: i32, texels: i32, eps: f32 }
+@group(0) @binding(0) var<uniform> u: Uni;
+@group(0) @binding(1) var tA: texture_2d<u32>;
+@group(0) @binding(2) var tW: texture_2d<u32>;
+@group(0) @binding(3) var tS: texture_2d<f32>;
+${o.zeros ? `@group(0) @binding(${binding++}) var tZ: texture_2d<u32>;` : ""}
+${o.prescaled ? `@group(0) @binding(${binding++}) var tR: texture_2d<f32>;` : ""}
+@group(0) @binding(${inputs.length + 1}) var out0: texture_storage_2d<rgba32float, write>;
+var<workgroup> act: array<vec4<u32>, ${texels}>;
+// The 4 bytes' nibbles at bit s, as n / 255.
+fn nib(q: u32, s: u32) -> vec4<f32> { return unpack4x8unorm((q >> s) & 0x0F0F0F0Fu); }
+fn lo(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }
+fn hi(w: vec4<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)); }
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) l: u32, @builtin(workgroup_id) w: vec3<u32>) {
+  let x = i32(u.rect.x + w.x * 64u + l);
+  var y = i32(u.rect.y + w.y);
+  var m = y / u.logitRows;
+  y -= m * u.logitRows;
+${o.split ? `  let slice = m / u.rows;
+  m -= slice * u.rows;
+  let kb0 = slice * u.kbSlice;
+  let kb1 = min(u.kb, kb0 + u.kbSlice);` : `  let kb0 = 0;
+  let kb1 = u.kb;`}
+  let row = ${o.prescaled ? "u.rowA0 + m" : "m"};
+  let count = (kb1 - kb0) * 4;
+  for (var i = i32(l); i < count; i += 64) { act[i] = textureLoad(tA, vec2<i32>(u.aOff + kb0 * 4 + i, row), 0); }
+  workgroupBarrier();
+  let g = y * u.outW + x;
+  var o = vec4<f32>(0.0);
+  if (g < u.g && x < i32(u.rect.x + u.rect.z)) {
+    let col = g / u.h;
+    let gr = g - col * u.h;
+    let wx = col * u.rowTexels;
+    let sx = col * u.kb;
+    var acc = vec4<f32>(0.0);
+    for (var kb = kb0; kb < kb1; kb++) {
+      let a = (kb - kb0) * 4;
+      let u0 = act[a]; let u1 = act[a + 1]; let u2 = act[a + 2]; let u3 = act[a + 3];
+      let A0 = lo(u0); let A1 = hi(u0); let A2 = lo(u1); let A3 = hi(u1);
+      let A4 = lo(u2); let A5 = hi(u2); let A6 = lo(u3); let A7 = hi(u3);
+      let sa = dot(A0 + A1 + A2 + A3 + A4 + A5 + A6 + A7, vec4<f32>(1.0));
+      let d = textureLoad(tS, vec2<i32>(sx + kb, gr), 0);
+      let z = ${o.zeros ? "vec4<f32>(textureLoad(tZ, vec2<i32>(sx + kb, gr), 0))" : "vec4<f32>(8.0)"};
+      var b = vec4<f32>(0.0);
+${[0, 1, 2, 3].map(row).join("\n")}
+      acc += d * (255.0 * b - z * sa);
+    }
+${o.prescaled ? `    var s = vec4<f32>(0.0);
+    for (var p = 0; p < u.parts; p++) { s += textureLoad(tR, vec2<i32>(u.rOff + p, u.rowA0 + m), 0); }
+    o = acc * (inverseSqrt(dot(s, vec4<f32>(1.0)) / f32(u.texels * 4) + u.eps) * ${PRESCALE}.0);` : "    o = acc;"}
+  }
+  if (x < i32(u.rect.x + u.rect.z)) { textureStore(out0, vec2<i32>(x, i32(u.rect.y + w.y)), o); }
+}
+`
+  return {
+    code,
+    inputs,
+    uniforms: ["uKb", "uH", "uRowTexels", "uG", "uOutW", "uLogitRows", "uKbSlice", "uRows", "uAOff", "uRowA0", "uROff", "uParts", "uTexels"]
+      .map((name): NativeSpec["uniforms"][number] => ({ name, type: "int" }))
+      .concat([{ name: "uEps", type: "float" }]),
+    groups: (rect) => [Math.ceil(rect.width / 64), rect.height]
+  }
+}
+
+/**
  * The output head through an expanded Q6_K embedding in RGBA32UI texels
  * (kernels.ts's EXPAND_Q6_WORDS: a weight a byte, 16 a texel, in this
  * kernel's reading order), the math of kernels.ts's q6ExpandedHead: a
