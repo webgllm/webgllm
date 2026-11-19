@@ -138,6 +138,8 @@ export class ModelPool {
   private parkedTimer: ReturnType<typeof setTimeout> | undefined
   /** Workers of webgllm's the pool ended: never taken back (see unpark). */
   private readonly ended = new WeakSet<Worker>()
+  /** Models dropped whose memory isn't free yet, by model: settles once it is (see drop, evict). */
+  private readonly releasing = new Map<string, Promise<void>>()
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
   private turns: Promise<void> = Promise.resolve()
 
@@ -765,9 +767,11 @@ export class ModelPool {
     if (freed) {
       done = freed.then(() => {
         this.freeing.delete(done)
+        if (this.releasing.get(entry.model) === done) this.releasing.delete(entry.model)
         release()
       })
       this.freeing.add(done)
+      this.releasing.set(entry.model, done)
     } else release()
     entry.dropped = done
     if (this.entries.size === 0) {
@@ -785,13 +789,15 @@ export class ModelPool {
    */
   private evict(model: string, signal?: AbortSignal): Promise<boolean> {
     const entry = this.entries.get(model)
-    if (!entry) return Promise.resolve(true)
+    // Gone already (an unload asked for it): done once its memory is free.
+    if (!entry) return (this.releasing.get(model) ?? Promise.resolve()).then(() => true)
     if (entry.evicting) return entry.evicting.then(() => this.entries.get(model) !== entry)
     const evicting = abortable(entry.worker.idle(), signal).then(
       () => true,
       () => false
     ).then((go) => {
-      if (this.entries.get(model) !== entry) return true
+      // Dropped meanwhile (an unload asked for it): done once its memory is free.
+      if (this.entries.get(model) !== entry) return (entry.dropped ?? this.releasing.get(model) ?? Promise.resolve()).then(() => true)
       // The claimant went away while it waited: the model stays.
       if (!go || signal?.aborted) {
         if (entry.evicting === done) entry.evicting = null

@@ -216,6 +216,50 @@ test("an eviction for room completes once the evicted model is freed, not before
   assert.equal(p.memoryUsed, 60)
 })
 
+test("a claim arriving after an explicit unload removed the model waits for its memory to be freed", async () => {
+  let release!: () => void, start!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const starting = new Promise<void>((resolve) => (start = resolve))
+  // B's worker is running its load before A is unloaded; its claim comes after.
+  const { pool: p } = pool({ hold: (model) => (model === B ? starting : Promise.resolve()), holdUnload: (model) => (model === A ? held : Promise.resolve()) })
+  await p.load(A)
+  const loadingB = p.load(B)
+  await settle()
+  const unloading = p.unload(A)
+  await settle()
+  start()
+  assert.equal(await within(loadingB), "pending", "B was admitted while A's memory was still held")
+  release()
+  await unloading
+  await loadingB
+  assert.equal(p.isLoaded(B), true)
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("an eviction waiting for the model's reply, which an explicit unload then removes, waits for its memory to be freed", async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => (release = resolve))
+  const { pool: p, workers } = pool({ holdUnload: (model) => (model === A ? held : Promise.resolve()) })
+  await p.load(A)
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  running.catch(() => undefined)
+  await settle()
+  const a = workers.of(A)!
+  // B needs A's room: it waits for A's reply to end.
+  const loadingB = p.load(B)
+  await settle()
+  const unloading = p.unload(A)
+  await settle()
+  const generation = a.generations()[0]
+  if (generation) a.finish(generation.id, ["done"])
+  assert.equal(await within(loadingB), "pending", "B was admitted while A's memory was still held")
+  release()
+  await unloading
+  await loadingB
+  assert.equal(p.isLoaded(B), true)
+  assert.equal(p.memoryUsed, 60)
+})
+
 test("a worker whose script fails after its load was canceled isn't kept for the next model", async () => {
   // The first worker never starts (its script fails, once the load is canceled); the next one works.
   const made: Array<FakeWorker> = []
