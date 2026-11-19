@@ -285,6 +285,34 @@ test("unloading a model out of room stops its load's wait for the storage prompt
   t.mock.restoreAll()
 })
 
+test("a load out of room whose error listener aborts it and unloads the model leaves no unhandled rejection", async (t) => {
+  t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: () => new Promise<boolean>(() => undefined) } }))
+  const unhandled: Array<unknown> = []
+  const onUnhandled = (reason: unknown) => unhandled.push(reason)
+  process.on("unhandledRejection", onUnhandled)
+  const workers = fakeWorkers({ bytes: () => 60, downloads: true, loadError: () => ({ message: "no room", code: "storage-full" }) })
+  const controller = new AbortController()
+  let p!: ModelPool
+  p = new ModelPool({
+    createWorker: workers.create,
+    memoryBudget: () => 100,
+    storage: fakeStorage(),
+    onProgress: () => undefined,
+    // The application's listener: on the failure, it cancels the load and unloads the model.
+    onModelEvent: (event) => {
+      if (event.type !== "error") return
+      controller.abort()
+      void p.unload(A)
+    },
+    log: () => undefined
+  })
+  await assert.rejects(p.load(A, { signal: controller.signal }))
+  await settle(20)
+  process.off("unhandledRejection", onUnhandled)
+  t.mock.restoreAll()
+  assert.deepEqual(unhandled, [])
+})
+
 test("a download retried after running out of room frees every attempt's worker", async (t) => {
   t.mock.getter(globalThis, "navigator", () => ({ storage: { persisted: async () => false, persist: async () => true } }))
   let fails = 1

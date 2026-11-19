@@ -268,7 +268,11 @@ export class ModelPool {
 
   /** `wait`, unless `model` is unloaded first (since `mark`): then rejects as an unloaded model's load does. */
   private unlessUnloaded<T>(wait: Promise<T>, model: string, mark: number): Promise<T> {
-    this.throwIfUnloaded(model, mark)
+    if (this.unloadMark(model) !== mark) {
+      // (`wait` is this call's: its rejection is handled here, not left unhandled.)
+      wait.catch(() => undefined)
+      throw unloaded(model)
+    }
     return new Promise<T>((resolve, reject) => {
       const check = () => {
         if (this.unloadMark(model) === mark) return
@@ -821,6 +825,9 @@ export class ModelPool {
       if (!(error instanceof WebGLLMError && error.code === "storage-full")) throw error
       // (The browser's prompt may never be answered: a canceled or unloaded
       // load, or a canceled download, stops waiting for it, and doesn't retry.)
+      // (Canceled or unloaded already, as a listener of the failure can do: no wait at all.)
+      throwIfAborted(signal)
+      if (load) this.throwIfUnloaded(load.model, load.since)
       const answer = abortable(this.keeping ?? Promise.resolve(false), signal)
       if (!(await (load ? this.unlessUnloaded(answer, load.model, load.since) : answer))) throw error
       throwIfAborted(signal)
