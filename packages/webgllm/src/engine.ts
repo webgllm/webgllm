@@ -1901,7 +1901,7 @@ export class Engine {
       this.tuned.f16Matmul = f16Matmul ?? null
       if (this.packingMeasured) f16Pack = before.f16Pack
       else if (quad && this.usesF16() && this.f16Scratch())
-        f16Pack = free
+        f16Pack = free && !this.h2Weights
           ? await choose(
               "f16Pack",
               [
@@ -2578,6 +2578,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   private async choosePromptPacking(signal?: AbortSignal) {
     signal?.throwIfAborted()
+    this.h2Weights = this.layerMats().some((m) => m.bits === 8 && !!m.stored)
     if (!this.quadMatmuls) return
     const native = this.layerMats().some((m) => m.rgba4)
     // A stored tuning timed once more (Tuned.submissionRetime) keeps its
@@ -2619,9 +2620,11 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
             matmul: TUNING.f16Matmul
           }
         ]
-      : this.activationCopyFits()
-        ? [{ pack: 3 }, { pack: 0 }]
-        : [{ pack: 3 }, { pack: 1 }]
+      : this.h2Weights
+        ? [{ pack: 3 }]
+        : this.activationCopyFits()
+          ? [{ pack: 3 }, { pack: 0 }]
+          : [{ pack: 3 }, { pack: 1 }]
     if (!retained && native && TUNING.f16Matmul > 0) {
       const alternate = TUNING.f16Matmul === 2 ? 1 : 2
       options.push({ pack: options[0].pack, matmul: alternate })
@@ -4464,8 +4467,20 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** How the f16 matmul reads: this GPU's tuned choice, else TUNING.f16Pack. */
   private f16Pack() {
-    return (this.tuned.f16Pack ?? TUNING.f16Pack) & 3
+    const pack = (this.tuned.f16Pack ?? TUNING.f16Pack) & 3
+    return this.h2Weights ? pack | 2 : pack
   }
+
+  /**
+   * Whether 8-bit layer matrices are in storage buffers (a GGUF's Q5_K and
+   * Q4_1 tensors, unsloth's Qwen3.5 2B): their prompts are read only
+   * through the h2 weight scratch (see eightScratch), so every f16Pack
+   * keeps its bit 2. Packs 0 and 1, the probe's other way, had sent them to
+   * the texture matmul, binding their deleted textures (void WebGPU
+   * submissions); refused there, a Pixel 10 Pro's load fell back to WebGL
+   * (Qwen3.5 2B GGUF 62-65 prompt tokens/s where 154-173).
+   */
+  private h2Weights = false
 
   /** Frees the f16 scratch textures the current f16Matmul and f16Pack don't use. */
   private f16Trim() {
