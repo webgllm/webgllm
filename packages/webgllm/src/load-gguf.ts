@@ -44,6 +44,7 @@ import {
   packQ4_0,
   packQ8_0,
   packQ6_K,
+  q8Converter,
   quantizeQ8,
   type RequantStats
 } from "./repack.js"
@@ -81,6 +82,8 @@ export async function* loadGguf(
   options: LoadGgufOptions = {}
 ): AsyncGenerator<WeightPiece, void, undefined> {
   const header = options.header ?? (await readGgufHeader(source))
+  // Q5_K and Q4_1 matrices converted through WebAssembly SIMD where it runs (its memory goes with the load).
+  const q8 = [...header.tensors.values()].some((t) => t.type === GgmlType.Q5_K || t.type === GgmlType.Q4_1) ? q8Converter() : null
   const tensor = (name: string): GgufTensorInfo => {
     const info = header.tensors.get(name)
     if (!info) throw new Error(`GGUF: missing tensor ${name}`)
@@ -261,7 +264,7 @@ export async function* loadGguf(
       }
       let bytes = taken.get(name)
       if (!bytes) taken.set(name, (bytes = await plan.take(name)))
-      packRows(m, row0, info, bytes, rows, perm)
+      packRows(m, row0, info, bytes, rows, perm, q8)
       if (lastUse.get(name) === p) { plan.release(bytes); taken.delete(name) }
       row0 += rows
     } } finally { for (const bytes of taken.values()) plan.release(bytes) }
@@ -425,7 +428,7 @@ export async function* loadGguf(
       const values = floats.subarray(0, rows * D)
       rowsToFloats(embedding, bytes, rows, values)
       quantizeQ8(m, 0, values, rows, options.requantStats)
-    } else packRows(m, 0, embedding, bytes, rows)
+    } else packRows(m, 0, embedding, bytes, rows, undefined, q8)
     plan.release(bytes)
     yield { kind: "embedding", value: m, row0: r, totalRows: vocab }
   }
@@ -480,10 +483,14 @@ function packRows(
   info: GgufTensorInfo,
   bytes: Uint8Array,
   rows: number,
-  perm?: Int32Array
+  perm?: Int32Array,
+  /** The load's WebAssembly converter (see q8Converter), where it runs. */
+  q8?: ReturnType<typeof q8Converter>
 ): void {
   if (info.type === GgmlType.Q4_0) return packQ4_0(m, row0, bytes, rows, perm)
   if (info.type === GgmlType.Q8_0) return packQ8_0(m, row0, bytes, rows, perm)
+  if (!perm && q8 && (info.type === GgmlType.Q5_K || info.type === GgmlType.Q4_1) &&
+    q8(info.type === GgmlType.Q5_K ? "q5k" : "q41", m, row0, bytes, rows)) return
   if (!perm) {
     // A few rows at a time through one small reused buffer: a float copy of
     // the whole tensor (16 MB for each of Qwen3.5 2B's Q5_K ssm_out) was

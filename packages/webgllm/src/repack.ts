@@ -432,6 +432,57 @@ export function dequantizeQ5_K(
 }
 
 /**
+ * dequantizeQ5_K or dequantizeQ4_1 and then quantizeQ8, in one
+ * WebAssembly SIMD pass (1,771 bytes, assembled from src/q8.wat with wabt): a block's 32
+ * values in f32 lanes (the dequantizers' products and differences are
+ * exact in f32, so the values are theirs), its scale through toHalf's
+ * rounding, its codes rounded in f64 as quantizeQ8 rounds them: the same
+ * bytes. Qwen3.5 2B GGUF's 18 Q5_K and 3 Q4_1 matrices in 117 ms on an M3
+ * Ultra where 379. The module: q5k and q41(src, codes, scales, rows,
+ * super-blocks or blocks a row) over its memory, `mem`, whose first 256 KiB
+ * hold halfTable.
+ */
+const Q8_WASM = "AGFzbQEAAAABNQdgAX0Bf2ACe3sBe2AKe3t7e3t7e3t/fwBgAXsBe2AGe3t9fX9/AGACf38Bf2AFf39/f38AAwwLAAECAwMDAwQFBgYFAwEABQcTAwNtZW0CAANxNWsACQNxNDEACgqBDQv2AQEJfyAAvCEBIAFBEHZBgIACcSECIAFBF3ZB/wFxIQMgAUH///8DcSEEIANB/wFGBEAgAkGA+AFyQYAEQQAgBBtyDwsgA0HwAGshBSAFQR9OBEAgAkGA+AFyDwsgBUEATARAIAVBdkgEQCACDwsgBEGAgIAEciEEQQ4gBWshBkEBIAZBAWt0IQcgBEEBIAZ0QQFrcSEIIAQgBnYhCSAIIAdLIAggB0YgCUEBcXFyBEAgCUEBaiEJCyACIAlyDwsgBUEKdCAEQQ12ciEJIARB/z9xIQggCEGAIEsgCEGAIEYgCUEBcXFyBEAgCUEBaiEJCyACIAlyC34BAnsgAP1fIAH98wFEAAAAAAAQYED9FP3wAf38ASECIAAgAP0NCAkKCwwNDg8AAQIDBAUGB/1fIAH98wFEAAAAAAAQYED9FP3wAf38ASEDIAIgA/0NAAECAwQFBgcQERITFBUWF0GAAf0R/bEBQf8A/RH9tgFBgX/9Ef24AQuXAgUBewF9AX8BfQF7IAD94AEgAf3gAf3pASAC/eABIAP94AH96QH96QEgBP3gASAF/eAB/ekBIAb94AEgB/3gAf3pAf3pAf3pASEKIAr9HwAgCv0fAZcgCv0fAiAK/R8Dl5chCyALu0QAAAAAAMBfQKO2EAAhDCAIIAw7AQAgDEECdCoCACENIA1DAAAAAF5FBEAgCf0MAAAAAAAAAAAAAAAAAAAAAP0LBAAgCf0MAAAAAAAAAAAAAAAAAAAAAP0LBBAPCyANu/0UIQ4gCSAAIA4QASABIA4QAf2FASACIA4QASADIA4QAf2FAf1l/QsEACAJIAQgDhABIAUgDhAB/YUBIAYgDhABIAcgDhAB/YUB/WX9CwQQCw0AIAD9iQH9qQH9+wELDQAgAP2JAf2qAf37AQsNACAA/YoB/akB/fsBCw0AIAD9igH9qgH9+wELhgEBAnsgAv0TIQYgA/0TIQcgBiAAEAP95gEgB/3lASAGIAAQBP3mASAH/eUBIAYgABAF/eYBIAf95QEgBiAAEAb95gEgB/3lASAGIAEQA/3mASAH/eUBIAYgARAE/eYBIAf95QEgBiABEAX95gEgB/3lASAGIAEQBv3mASAH/eUBIAQgBRACC2kAIAFBBEkEfyAAIAFqLQAAQT9xIAAgAUEEamotAABBP3FBCHRyBSAAIAFBBGpqLQAAQQ9xIAAgAUEEa2otAABBBnZBBHRyIAAgAUEEamotAABBBHYgACABai0AAEEGdkEEdHJBCHRyCwuoAwUGfwJ9A38EewF/IARBCGwhCgJAA0AgBSADTw0BIAVBAnYgCmxBBGwgBUEDcWohCUEAIQYCQANAIAYgBE8NASAAIAUgBGwgBmpBsAFsaiEIIAgvAQBBAnQqAgAhCyAILwECQQJ0KgIAIQwgCP0ABBAhEiAI/QAEICETQQAhBwJAA0AgB0EETw0BIAhBMGogB0EgbGohDSAN/QAEACEQIA39AAQQIREgB0EBdCEPIAhBBGogDxAIIQ4gEEEP/Q/9TiASIA/9bUEB/Q/9TkEE/Wv9UCARQQ/9D/1OIBMgD/1tQQH9D/1OQQT9a/1QIAsgDkH/AXGzlCAMIA5BCHazlCACIAlBAXRqIAEgCUEFdGoQByAJQQRqIQkgD0EBaiEPIAhBBGogDxAIIQ4gEEEE/W0gEiAP/W1BAf0P/U5BBP1r/VAgEUEE/W0gEyAP/W1BAf0P/U5BBP1r/VAgCyAOQf8BcbOUIAwgDkEIdrOUIAIgCUEBdGogASAJQQV0ahAHIAlBBGohCSAHQQFqIQcMAAsLIAZBAWohBgwACwsgBUEBaiEFDAALCwuaAgIEfwV7AkADQCAFIANPDQEgBUECdiAEbEEEbCAFQQNxaiEIQQAhBgJAA0AgBiAETw0BIAAgBSAEbCAGakEUbGohByAHLwEAQQJ0KgIA/RMhDCAHLwECQQJ0KgIA/RMhDSAH/QAEBCEJIAlBD/0P/U4hCiAJQQT9bSELIAoQAyAM/eYBIA395AEgChAEIAz95gEgDf3kASAKEAUgDP3mASAN/eQBIAoQBiAM/eYBIA395AEgCxADIAz95gEgDf3kASALEAQgDP3mASAN/eQBIAsQBSAM/eYBIA395AEgCxAGIAz95gEgDf3kASACIAhBAXRqIAEgCEEFdGoQAiAIQQRqIQggBkEBaiEGDAALCyAFQQFqIQUMAAsLCw=="
+
+/**
+ * A converter for one load (its memory goes with it), or null where
+ * WebAssembly SIMD isn't available: writes rows [row0, row0 + rows) of a
+ * Q5_K or Q4_1 tensor into 8-bit `m` as quantizeQ8 would, and returns
+ * false (writing nothing) unless both are multiples of 4.
+ */
+export function q8Converter(): ((kind: "q5k" | "q41", m: QuantMatrix, row0: number, src: Uint8Array, rows: number) => boolean) | null {
+  let exports: { q5k: (...args: number[]) => void; q41: (...args: number[]) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q8_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  const TABLE = 65536 * 4
+  let tabled = false
+  return (kind, m, row0, src, rows) => {
+    if (row0 % 4 || rows % 4 || m.bits !== 8) return false
+    const K = m.K, blocks = K / 32
+    const srcBytes = kind === "q5k" ? (rows * K / 256) * 176 : rows * blocks * 20
+    const codes = TABLE + ((srcBytes + 15) & ~15)
+    const scales = codes + rows * K
+    const need = scales + rows * blocks * 2
+    const mem = exports.mem
+    if (mem.buffer.byteLength < need) mem.grow(Math.ceil((need - mem.buffer.byteLength) / 65536))
+    if (!tabled) {
+      new Float32Array(mem.buffer, 0, 65536).set(halfTable())
+      tabled = true
+    }
+    new Uint8Array(mem.buffer, TABLE, srcBytes).set(src.subarray(0, srcBytes))
+    exports[kind](TABLE, codes, scales, rows, kind === "q5k" ? K / 256 : blocks)
+    // Rows from a multiple of 4 are whole row groups: one contiguous run each.
+    new Int8Array(m.quants.buffer, m.quants.byteOffset + row0 * K, rows * K).set(new Int8Array(mem.buffer, codes, rows * K))
+    m.scales.set(new Uint16Array(mem.buffer, scales, rows * blocks), row0 * blocks)
+    return true
+  }
+}
+
+/**
  * Quantizes float rows (rows × K) to 8 bits: per block of 32, scale =
  * max|w| / 127 rounded to fp16, q = round(w / scale) in -127..127 (ties
  * round up).
