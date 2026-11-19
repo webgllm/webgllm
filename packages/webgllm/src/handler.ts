@@ -494,7 +494,9 @@ async function load(
             header: ggufHeader,
             embeddingChunkRows: TUNING.ggufEmbeddingRows > 0 ? TUNING.ggufEmbeddingRows : canReleaseStaging ? undefined : 512,
             readAhead: canReleaseStaging ? TUNING.ggufReadAhead : Math.min(3, TUNING.ggufReadAhead),
-            releaseReadBuffers: canReleaseStaging
+            releaseReadBuffers: canReleaseStaging,
+            // (The engine uploads each piece before it asks for the next.)
+            reusePieces: true
           }))
         : loadOnnx({
             config: JSON.parse(await weightFiles[0].text()) as Record<
@@ -503,6 +505,7 @@ async function load(
             >,
             ...(stored.reader && { readAhead: { reads: TUNING.readerAhead, bytes: TUNING.readerAheadMiB << 20 } }),
             releaseReadBuffers: canReleaseStaging && TUNING.releaseOnnxReads > 0,
+            reusePieces: true,
             graph: weightSources[1],
             data: onnxDataSources(meta.files, weightSources.slice(2))
           })

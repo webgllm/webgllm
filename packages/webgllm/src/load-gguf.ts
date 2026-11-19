@@ -71,6 +71,12 @@ export type LoadGgufOptions = {
   releaseReadBuffers?: boolean
   /** Filled with the error of requantizing a float embedding to 8 bits. */
   requantStats?: RequantStats
+  /**
+   * A yielded matrix's buffers may hold a later one of its role and shape:
+   * only for a consumer done with each piece before it asks for the next
+   * (the engine, which uploads it). Otherwise each is a matrix of its own.
+   */
+  reusePieces?: boolean
 }
 
 /**
@@ -209,13 +215,15 @@ export async function* loadGguf(
     return perm ? permuteVector(values, perm) : values
   }
 
-  // Each layer's matrices in the same buffers as the last layer's of their
-  // role and shape (the engine has uploaded those by the time the next
-  // layer is read): a fresh matrix a layer costs a first touch of every
-  // page (most of what the repack measured: 350 ms of an iPhone's load),
-  // and a model's worth of freed buffers the allocator keeps resident.
+  // With reusePieces, each layer's matrices in the same buffers as the
+  // last layer's of their role and shape (the engine has uploaded those by
+  // the time the next layer is read): a fresh matrix a layer costs a first
+  // touch of every page (most of what the repack measured: 350 ms of an
+  // iPhone's load), and a model's worth of freed buffers the allocator
+  // keeps resident.
   const pool = new Map<string, QuantMatrix>()
   const pooled = (key: string, N: number, K: number, bits: 4 | 6 | 8): QuantMatrix => {
+    if (!options.reusePieces) return newQuantMatrix(N, K, bits, false)
     let m = pool.get(key)
     if (!m) {
       m = newQuantMatrix(N, K, bits, false)

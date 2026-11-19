@@ -81,6 +81,13 @@ export type LoadOnnxOptions = {
    * whose reads are the caller's to free.
    */
   releaseReadBuffers?: boolean
+  /**
+   * A yielded matrix's buffers may hold a later one of its role and size
+   * (and an embedding chunk's scales and zero points the next chunk's):
+   * only for a consumer done with each piece before it asks for the next
+   * (the engine, which uploads it). Otherwise each is a matrix of its own.
+   */
+  reusePieces?: boolean
 }
 
 /** The source of a read that needs none (an inline tensor's bytes are in the graph). */
@@ -173,8 +180,8 @@ export async function* loadOnnx(
    * block of 32, symmetric (quantizeQ8), as the GGUF loader stores a
    * matrix that isn't Q4_0 or Q8_0.
    */
-  // Each layer's raw matrices in the same buffers as the last layer's of
-  // their role and size (the engine has uploaded those by the time the
+  // With reusePieces, each layer's raw matrices in the same buffers as the
+  // last layer's of their role and size (the engine has uploaded those by the time the
   // next layer is read): a model's worth of short-lived buffers would
   // otherwise stay resident in the allocator after they're freed (iOS
   // counts them against a tab's 2 GB).
@@ -221,7 +228,7 @@ export async function* loadOnnx(
     // the engine rearranges them on the GPU (QuantMatrix.raw).
     const withZeros = parts.some((p) => p.w.zp)
     const key = `${role}:${N}x${K}:${withZeros}`
-    let buffers = pool.get(key)
+    let buffers = options.reusePieces ? pool.get(key) : undefined
     if (!buffers) {
       buffers = {
         scales: new Uint16Array(N * rowBlocks),
@@ -412,7 +419,8 @@ export async function* loadOnnx(
     // into its RGBA4 texels as they are, instead of a repack there and back.
     const blocks = D / 32
     if (quant.length < rows * blocks * 16) throw new Error("MatMulNBits data is too short")
-    // (One chunk's scales and zero points, reused for every chunk.)
+    // (With reusePieces, one chunk's scales and zero points, reused for every chunk.)
+    if (!options.reusePieces) chunkScales = chunkZeros = undefined
     chunkScales ??= new Uint16Array(chunkRows * blocks)
     if (zp) chunkZeros ??= new Uint8Array(chunkRows * blocks)
     const m: QuantMatrix = {
