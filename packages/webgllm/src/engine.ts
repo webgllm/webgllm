@@ -601,6 +601,9 @@ type HeadOut = { logits: Texture; split: number; stride: number }
  * 518 ms a probe).
  */
 export const KEEP_MARGIN = 0.95
+/** chooseHead times another round while its two fastest heads are within this factor of each other, up to HEAD_ROUNDS. */
+const HEAD_CLOSE = 1.2
+const HEAD_ROUNDS = 4
 /** A fresh head choice takes the native expanded Q6_K head only below this fraction of the compact one's time (see chooseHead). */
 export const EXPANDED_MARGIN = 0.8
 
@@ -2999,15 +3002,31 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         await this.head(0, 1)
       }
       for (let i = 0; i < settings.length; i++) await sample(i)
-      for (let round = 0; round < (this.incumbent?.head ? 3 : 2); round++)
+      // (More rounds while the two fastest are within HEAD_CLOSE of each
+      // other, up to HEAD_ROUNDS: in Firefox on a Pixel 10 Pro two rounds
+      // timed Qwen3.5 2B GGUF's word and split heads 12.82 and 12.79 ms
+      // where the split one writes a third faster, and kept the slower.)
+      const fastest = () => samples.map((row) => Math.min(...row)).sort((a, b) => a - b)
+      // (12 heads a timing where the split head is a candidate, 3 elsewhere:
+      // timed 3 at a time, between waits, Firefox on a Pixel 10 Pro put the
+      // split head at 11.5-12.4 ms on Qwen3.5 2B GGUF's probe, near the word
+      // head's 13.7-14.3 and twice what it costs a token; 12 at a time,
+      // 8.2-8.3 against 10.2-11.2.)
+      const reps = this.q6SplitTimed() ? 12 : 3
+      for (let round = 0; round < HEAD_ROUNDS; round++) {
+        if (round >= (this.incumbent?.head ? 3 : 2)) {
+          const [a, b] = fastest()
+          if (!(settings.length > 1 && b < a * HEAD_CLOSE)) break
+        }
         for (let j = 0; j < settings.length; j++) {
-          const i = round ? settings.length - 1 - j : j
+          const i = round % 2 ? settings.length - 1 - j : j
           await this.gpu.finish()
           const start = performance.now()
-          for (let n = 0; n < 3; n++) await sample(i)
+          for (let n = 0; n < reps; n++) await sample(i)
           await this.gpu.finish()
-          samples[i].push((performance.now() - start) / 3)
+          samples[i].push((performance.now() - start) / reps)
         }
+      }
       this.headReport = settings.map((setting, i) => ({
         ...setting,
         ms: Math.min(...samples[i])
