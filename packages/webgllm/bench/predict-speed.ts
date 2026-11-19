@@ -14,9 +14,11 @@ const backend = params.get("webgpu")
 // (?decode=0: predictSpeed's prompt-only measurement.)
 const decode = params.get("decode") !== "0"
 const out = document.getElementById("out")!
+// (?tag=<name>: each line prefixed, so devices can run at once into one log.)
+const tag = params.get("tag")
 const log = (text: string) => {
   out.textContent += `${text}\n`
-  void fetch("/log", { method: "POST", body: text }).catch(() => undefined)
+  void fetch("/log", { method: "POST", body: tag ? `${tag} ${text}` : text }).catch(() => undefined)
 }
 const round1 = (n: number) => Math.round(n * 10) / 10
 
@@ -35,6 +37,7 @@ try {
             shapeMs: Math.round(report.shapeMs),
             loadMs: Math.round(report.loadMs),
             loadParts: report.loadParts,
+            programs: report.programs,
             measureMs: Math.round(report.measureMs),
             peakMiB: Math.round(report.peakBytes / 2 ** 20),
             phases: Object.fromEntries(Object.entries(report.phases).map(([k, v]) => [k, Math.round(v)])),

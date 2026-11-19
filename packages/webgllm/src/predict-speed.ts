@@ -212,34 +212,69 @@ export const opfsSpeedStore: SpeedStore = {
       const prefix = key.slice(0, key.lastIndexOf("|") + 1)
       for (const k of Object.keys(notes)) if (k.startsWith(prefix)) delete notes[k]
       notes[key] = note
-      const bytes = new TextEncoder().encode(JSON.stringify(notes))
-      const handle = file as FileSystemFileHandle & {
-        createSyncAccessHandle?: () => Promise<{ truncate: (n: number) => void; write: (b: Uint8Array, o: { at: number }) => number; flush: () => void; close: () => void }>
-      }
-      if (typeof document === "undefined" && handle.createSyncAccessHandle) {
-        const access = await handle.createSyncAccessHandle()
-        try {
-          access.truncate(0)
-          access.write(bytes, { at: 0 })
-          access.flush()
-        } finally {
-          access.close()
-        }
-      } else {
-        const writable = await file.createWritable()
-        await writable.write(bytes)
-        await writable.close()
-      }
+      await writeText(file, JSON.stringify(notes))
     } catch {
       // Remembering is optional.
     }
   }
 }
 
-async function speedFile() {
+/** A file's whole text: through a synchronous access handle in a worker, else createWritable. */
+async function writeText(file: FileSystemFileHandle, text: string) {
+  const bytes = new TextEncoder().encode(text)
+  const handle = file as FileSystemFileHandle & {
+    createSyncAccessHandle?: () => Promise<{ truncate: (n: number) => void; write: (b: Uint8Array, o: { at: number }) => number; flush: () => void; close: () => void }>
+  }
+  if (typeof document === "undefined" && handle.createSyncAccessHandle) {
+    const access = await handle.createSyncAccessHandle()
+    try {
+      access.truncate(0)
+      access.write(bytes, { at: 0 })
+      access.flush()
+    } finally {
+      access.close()
+    }
+  } else {
+    const writable = await file.createWritable()
+    await writable.write(bytes)
+    await writable.close()
+  }
+}
+
+async function speedFile(name = SPEED_NOTES) {
   const root = await navigator.storage.getDirectory()
   const dir = await root.getDirectoryHandle("webgl-models", { create: true })
-  return dir.getFileHandle(SPEED_NOTES, { create: true })
+  return dir.getFileHandle(name, { create: true })
+}
+
+const SPEED_SHAPES = "speed-shapes.json"
+
+/** A model's shapes as predictSpeed last read them (webgl-models/speed-shapes.json), best effort. */
+async function readShape(key: string): Promise<SpeedShape | undefined> {
+  try {
+    const shapes = JSON.parse(await (await (await speedFile(SPEED_SHAPES)).getFile()).text()) as Record<string, SpeedShape>
+    const shape = shapes[key]
+    return shape?.config && Array.isArray(shape.kinds) && shape.embedding ? shape : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function writeShape(key: string, shape: SpeedShape) {
+  try {
+    const handle = await speedFile(SPEED_SHAPES)
+    let shapes: Record<string, SpeedShape> = {}
+    try {
+      shapes = JSON.parse(await (await handle.getFile()).text()) as Record<string, SpeedShape>
+    } catch {
+      // Unreadable or empty: written over.
+    }
+    if (JSON.stringify(shapes[key]) === JSON.stringify(shape)) return
+    shapes[key] = shape
+    await writeText(handle, JSON.stringify(shapes))
+  } catch {
+    // No storage: read again next time.
+  }
 }
 
 /**
@@ -273,7 +308,12 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
   measure: async (model, signal, decode = true) => {
     const started = performance.now()
     const meta = await resolveModel(model, signal)
-    const shape = await speedShape(meta)
+    // (The shapes remembered from an earlier measurement of the same files:
+    // a GGUF's shapes follow its whole vocabulary, a second's download on
+    // an iPhone before the model is stored.)
+    const shapeKey = `${model}|${JSON.stringify(meta.files)}`
+    const shape = (await readShape(shapeKey)) ?? (await speedShape(meta))
+    void writeShape(shapeKey, shape)
     const shapeMs = performance.now() - started
     throwIfAborted(signal)
     const report = await probeSpeed(shape, { signal, onEngine, decode })

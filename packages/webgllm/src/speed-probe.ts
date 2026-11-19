@@ -378,6 +378,8 @@ export type ProbeReport = {
   loadMs: number
   /** The engine's own load times by part (Engine.loadMs). */
   loadParts: Record<string, number>
+  /** GPU programs the probe compiled. */
+  programs: number
   /** The most texture bytes the probe held. */
   peakBytes: number
   /** Milliseconds in each part of the timings: prompts, writing, the head. */
@@ -503,7 +505,10 @@ export async function probeSpeed(
       const t = performance.now()
       for (let i = 0; i < count; i++) {
         engine.reset()
-        await engine.forwardNoLogits(rows)
+        // (Every row through every layer: the last layer's last-row-only
+        // tail, a set of programs of its own, left out; the stack's last
+        // layer then costs what a middle one does.)
+        await engine.forwardHidden(rows, { fullRows: true })
       }
       await engine.gpu.finish()
       sample()
@@ -542,6 +547,7 @@ export async function probeSpeed(
         measureMs: performance.now() - started,
         loadMs,
         loadParts: Object.fromEntries(Object.entries(Reflect.get(engine, "loadMs") as Record<string, number>).map(([k, v]) => [k, Math.round(v)])),
+        programs: engine.gpu.compiled.count,
         peakBytes: peak,
         phases: { prompt: promptPhase, decode: 0, head: 0 }
       }
@@ -610,6 +616,7 @@ export async function probeSpeed(
       measureMs: performance.now() - started,
       loadMs,
       loadParts: Object.fromEntries(Object.entries(Reflect.get(engine, "loadMs") as Record<string, number>).map(([k, v]) => [k, Math.round(v)])),
+      programs: engine.gpu.compiled.count,
       peakBytes: peak,
       phases: { prompt: promptPhase, decode: decodePhase, head: lap() }
     }

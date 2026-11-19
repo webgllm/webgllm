@@ -167,7 +167,7 @@ function fakeDeps(notes = new Map<string, SpeedNote>(), renderer = "Apple M3") {
     measure: async () => {
       measured++
       await new Promise((r) => setTimeout(r, 5))
-      return { shape, report: { times, shapeMs: 1, measureMs: 2, loadMs: 1, loadParts: {}, peakBytes: 0, phases: { prompt: 0, decode: 0, head: 0 } } }
+      return { shape, report: { times, shapeMs: 1, measureMs: 2, loadMs: 1, loadParts: {}, programs: 0, peakBytes: 0, phases: { prompt: 0, decode: 0, head: 0 } } }
     }
   }
   return { deps, notes, measured: () => measured }
