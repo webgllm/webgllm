@@ -63,8 +63,6 @@ for (const name of ["load", "warmUp", "selfCheck", "tune"] as const) {
           })()
         }
       }
-      // (tune "drainLoad:1": each weight piece waits for the GPU to finish the work and uploads issued
-      // so far before the next is read, so no upload's copy waits in this process for the GPU.)
       if (name === "load") warmed = false
       // (tune "pauseMs:<ms>": still before the weights and after each phase, so a memory trace shows each as a plateau.)
       if (pauseMs > 0 && name === "load") await new Promise((r) => setTimeout(r, pauseMs))
