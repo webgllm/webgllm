@@ -1224,7 +1224,19 @@ export class WebGpu extends PacedGpu<Fence> {
   // ------------------------------------------------------------ teardown
 
   dispose() {
+    // Commands not yet sent go with the device: every texture and buffer is
+    // destroyed now. (Deleted while an encoder was open, they waited for a
+    // submission that never came: a model unloaded in a worker that stays,
+    // or reloaded for another context, kept all its GPU memory, and the next
+    // load on an iPhone crossed Safari's 2 GB.)
+    this.queued = []
+    this.computePass = null
+    this.encoder = null
     for (const t of [...this.live]) this.delete(t)
+    for (const t of this.doomed) t.destroy()
+    for (const b of this.transient) b.destroy()
+    this.doomed = []
+    this.transient = []
     this.programs.clear()
     this.bindGroups.clear()
     this.uniformBuffer.destroy()
