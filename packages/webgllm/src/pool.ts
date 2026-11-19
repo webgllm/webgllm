@@ -61,6 +61,8 @@ type Entry = {
   watched: Promise<void> | null
   /** Aborted when it's dropped: its claims for memory stop. */
   gone: AbortController
+  /** The worker webgllm started (or reused) for it: kept for the next load once the model is freed (see park). */
+  own: Worker | null
 }
 
 /** Getting a model's files into storage: one at a time per model. */
@@ -102,6 +104,9 @@ const unloaded = (model: string) =>
 
 let nextId = 0
 
+/** How long a worker of webgllm's whose model was unloaded is kept for the next load (see ModelPool.parked). */
+export const PARKED_MS = 30_000
+
 export class ModelPool {
   private readonly entries = new Map<string, Entry>()
   private readonly downloads = new Map<string, Download>()
@@ -119,6 +124,16 @@ export class ModelPool {
   private readonly freeing = new Set<Promise<void>>()
   /** Downloads stopped in the caller's worker whose files aren't closed yet, by model. */
   private readonly closing = new Map<string, Promise<void>>()
+  /**
+   * A worker of webgllm's whose model was unloaded, kept for the next load
+   * (see park): one ended after each model left a little of its memory
+   * behind in Safari on an iPhone (2 MB a load, kept by the page), and
+   * reused, nothing. Ended once idle for PARKED_MS: it holds what the last
+   * load left for the collector (about 350 MB after Qwen3.5 2B), which an
+   * idle worker never collects.
+   */
+  private parked: Worker | null = null
+  private parkedTimer: ReturnType<typeof setTimeout> | undefined
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
   private turns: Promise<void> = Promise.resolve()
 
@@ -219,6 +234,14 @@ export class ModelPool {
     while (!entry && this.options.worker && (this.entries.size || this.freeing.size)) {
       for (const other of [...this.entries.values()]) await abortable(this.evict(other.model, signal), signal)
       // (Evicted or unloaded: until the worker has freed it.)
+      await abortable(Promise.all(this.freeing), signal)
+      throwIfAborted(signal)
+      this.throwIfUnloaded(model, since)
+      entry = this.entries.get(model)
+    }
+    // A model still being freed in a worker of webgllm's: its worker is the one
+    // to reuse, and its memory goes before the next model's comes.
+    if (!entry && !this.options.worker && this.freeing.size) {
       await abortable(Promise.all(this.freeing), signal)
       throwIfAborted(signal)
       this.throwIfUnloaded(model, since)
@@ -484,7 +507,7 @@ export class ModelPool {
       download.worker = null
       await abortable(this.closing.get(model) ?? Promise.resolve(), signal)
     }
-    const worker = this.modelWorker(model, {
+    const worker = this.modelWorker(model, null, {
       onProgress: (data) => this.progress(downloadProgress(data), download.listeners),
       onClaim: () => Promise.resolve(),
       onLog: (text) => this.options.log("info", text),
@@ -563,10 +586,44 @@ export class ModelPool {
     }, signal)
   }
 
-  /** `model`'s side of a worker: the caller's, else one started for it. */
-  private modelWorker(model: string, events: WorkerEvents): ModelWorker {
-    const given = this.options.worker
-    return new ModelWorker(model, given ?? this.options.createWorker(), !given, events, this.options.webgpu ?? "auto")
+  /**
+   * `model`'s side of a worker: the caller's, or `own`, one of webgllm's
+   * the pool ends or keeps (see park), both left running when the model
+   * goes; else one started for it alone and ended with it (a download's).
+   */
+  private modelWorker(model: string, own: Worker | null, events: WorkerEvents): ModelWorker {
+    const kept = this.options.worker ?? own
+    return new ModelWorker(model, kept ?? this.options.createWorker(), !kept, events, this.options.webgpu ?? "auto")
+  }
+
+  /** The kept worker, taken for a new model (see park). */
+  private unpark(): Worker | null {
+    const worker = this.parked
+    this.parked = null
+    clearTimeout(this.parkedTimer)
+    if (worker) worker.removeEventListener("error", this.parkedError)
+    return worker
+  }
+
+  /**
+   * Keeps a worker of webgllm's whose model was freed for the next load, or
+   * ends it: one that failed or crashed, or one more than the one kept.
+   */
+  private park(worker: Worker, reusable: boolean) {
+    if (!reusable || this.parked) return void worker.terminate()
+    this.parked = worker
+    worker.addEventListener("error", this.parkedError)
+    this.parkedTimer = setTimeout(() => this.unpark()?.terminate(), PARKED_MS)
+    // (Node: a pending timer doesn't keep the process alive.)
+    ;(this.parkedTimer as { unref?: () => void }).unref?.()
+  }
+
+  /** A kept worker that fails is ended, not reused. */
+  private readonly parkedError = (event: Event) => {
+    const worker = event.target as Worker | null
+    if (!worker || worker !== this.parked) return
+    this.unpark()
+    worker.terminate()
   }
 
   /**
@@ -602,7 +659,10 @@ export class ModelPool {
   }
 
   private spawn(model: string): Entry {
+    // A worker of webgllm's own: the one kept from an earlier model, else a new one.
+    const own = this.options.worker ? null : this.unpark() ?? this.options.createWorker()
     const entry: Entry = {
+      own,
       model,
       keepLoaded: false,
       waiters: 0,
@@ -610,7 +670,7 @@ export class ModelPool {
       evicting: null,
       watched: null,
       gone: new AbortController(),
-      worker: this.modelWorker(model, {
+      worker: this.modelWorker(model, own, {
         onProgress: (data) => this.progress(loadProgress(data), entry.listeners),
         onClaim: async (bytes) => {
           if (this.entries.get(model) !== entry) return
@@ -660,6 +720,13 @@ export class ModelPool {
   /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason) {
     const freed = entry.worker.terminate(reason)
+    // A worker of webgllm's: kept for the next load once it has freed the model (see park).
+    const own = entry.own
+    if (own) {
+      const reusable = why !== "failed" && why !== "crashed"
+      if (freed) void freed.then(() => this.park(own, reusable))
+      else this.park(own, reusable)
+    }
     entry.gone.abort(reason)
     if (this.entries.get(entry.model) !== entry) return
     this.entries.delete(entry.model)

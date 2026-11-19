@@ -269,9 +269,10 @@ export class WebGLLM {
 
   /**
    * Unloads `model`, or every model, freeing its GPU memory; its running
-   * generation fails. webgllm's own worker for the model ends; a worker of
-   * your own (`worker`) frees the model and stays running. Resolves, after
-   * the model's "unload" event, once the memory is free.
+   * generation fails. webgllm's own worker frees the model and is kept for
+   * the next load for 30 s, then ends; a worker of your own (`worker`)
+   * frees the model and stays running. Resolves, after the model's
+   * "unload" event, once the memory is free.
    */
   async unloadModel(model?: WebGlModelId): Promise<void> {
     await this.pool.unload(model)
