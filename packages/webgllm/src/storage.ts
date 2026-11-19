@@ -7,7 +7,7 @@
  * exists, so an interrupted download is never mistaken for a whole one.
  */
 import { withHandle } from "./byte-source.js"
-import type { Tuned } from "./engine.js"
+import type { HeadChoice, Tuned } from "./engine.js"
 import { fileUrl, isCatalogModel, WEBGL_MODEL_META } from "./model-meta.js"
 import type { ModelFile, WebGlModelMeta } from "./model-meta.js"
 
@@ -179,7 +179,7 @@ export type GpuNote = {
   /** Proven during real prompt processing, never inferred from startup probes. */
   pacing?: { reads: number; window: number; frameMs: number }
   selfCheck: number
-  head?: { expanded: boolean; split: number }
+  head?: HeadChoice
   /** Engine.tune's picks (older notes have none: tuned again). */
   tuned?: Tuned
   /** The weights' shape (see gguf.ts ggufShape): a model with the same one starts from this tuning (see sharedGpuTuning). */

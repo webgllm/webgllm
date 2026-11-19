@@ -3690,6 +3690,147 @@ export function matmulQ6KHeadWords(o: { split: boolean; prescaled: boolean }) {
   return source
 }
 
+/**
+ * A Q6_K embedding split for WebGL (see Engine's q6Split): each weight's
+ * low 4 bits in an RGBA4 texture laid out as a 4-bit RGBA4 matrix's (a row
+ * group's texels: 32-weight block, row, 8 texels of 4, read .wzyx), which
+ * the texture unit unpacks, as the ONNX models' 4-bit head reads; its top
+ * 2 bits in a second RGBA4 texture, half as wide (block, row, 4 texels:
+ * nibble k of texel t holds weight 4t + k's in its low 2 bits and weight
+ * 16 + 4t + k's above them); d a super-block a texel for the group's 4
+ * rows (RGBA16F) and each row's 16 int8 sub-block scales in one RGBA32UI
+ * texel. A large embedding takes several textures of each (parts: whole
+ * columns each, so a contiguous run of row groups); uCol0 is a part's
+ * first column. w = d · scale · (low + 16 · high - 32).
+ */
+const Q6_SPLIT = `
+// Weight 4t + k's top 2 bits (lo) and 16 + 4t + k's (hi) from a high texel.
+void q6High(vec4 t, out vec4 lo, out vec4 hi) {
+  vec4 v = floor(t.wzyx * 15.0 + 0.5);
+  hi = floor(v * 0.25);
+  lo = v - 4.0 * hi;
+}
+float sc8w(uint u, uint b) { return float(int(u << (24u - 8u * b)) >> 24); }`
+
+function headQ6SplitSource(o: { split: boolean }) {
+  const C = "xyzw"
+  const rows: Array<string> = []
+  for (const r of [0, 1, 2, 3]) {
+    const L = (t: number) => `texelFetch(uW, ivec2(wx + k * 32 + ${r * 8 + t}, gr), 0).wzyx`
+    rows.push(`      {
+        float lo0 = dot(${L(0)}, A0) + dot(${L(1)}, A1) + dot(${L(2)}, A2) + dot(${L(3)}, A3);
+        float lo1 = dot(${L(4)}, A4) + dot(${L(5)}, A5) + dot(${L(6)}, A6) + dot(${L(7)}, A7);
+        vec4 a, b, c, d2, e, f, g2, h;
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4}, gr), 0), a, b);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 1}, gr), 0), c, d2);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 2}, gr), 0), e, f);
+        q6High(texelFetch(uHigh, ivec2(hx + k * 16 + ${r * 4 + 3}, gr), 0), g2, h);
+        float hi0 = dot(a, A0) + dot(c, A1) + dot(e, A2) + dot(g2, A3);
+        float hi1 = dot(b, A4) + dot(d2, A5) + dot(f, A6) + dot(h, A7);
+        uint w = comp(SC${r}, kb >> 1);
+        P.${C[r]} += sc8w(w, b0) * (15.0 * lo0 + 16.0 * hi0 - 32.0 * sa0) + sc8w(w, b0 + 1u) * (15.0 * lo1 + 16.0 * hi1 - 32.0 * sa1);
+      }`)
+  }
+  return `${HEADER}${Q6_SPLIT}
+uniform usampler2D uA;
+uniform sampler2D uW;
+uniform sampler2D uHigh;
+uniform sampler2D uS;
+uniform usampler2D uSub;
+uniform int uKb;
+uniform int uH;
+uniform int uG;
+uniform int uOutW;
+uniform int uLogitRows;
+uniform int uCol0;
+${o.split ? Q6_K_SLICE_UNIFORMS : ""}
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int m = y / uLogitRows;
+  y -= m * uLogitRows;
+${o.split ? Q6_K_SLICE : Q6_K_WHOLE}
+  int g = y * uOutW + x;
+  if (g >= uG) { o = vec4(0.0); return; }
+  int col = g / uH;
+  int gr = g - col * uH;
+  int lc = col - uCol0;
+  int wx = lc * uKb * 256;
+  int hx = lc * uKb * 128;
+  int sx = lc * uKb;
+  vec4 acc = vec4(0.0);
+  for (int sb = sb0; sb < sb1; sb++) {
+    vec4 dd = texelFetch(uS, ivec2(sx + sb, gr), 0);
+    uvec4 SC0 = texelFetch(uSub, ivec2((sx + sb) * 4, gr), 0);
+    uvec4 SC1 = texelFetch(uSub, ivec2((sx + sb) * 4 + 1, gr), 0);
+    uvec4 SC2 = texelFetch(uSub, ivec2((sx + sb) * 4 + 2, gr), 0);
+    uvec4 SC3 = texelFetch(uSub, ivec2((sx + sb) * 4 + 3, gr), 0);
+    vec4 P = vec4(0.0);
+    for (int kb = 0; kb < 8; kb++) {
+      int k = sb * 8 + kb;
+      uvec4 u0 = texelFetch(uA, ivec2(k * 4, m), 0);
+      uvec4 u1 = texelFetch(uA, ivec2(k * 4 + 1, m), 0);
+      uvec4 u2 = texelFetch(uA, ivec2(k * 4 + 2, m), 0);
+      uvec4 u3 = texelFetch(uA, ivec2(k * 4 + 3, m), 0);
+      vec4 A0 = h2lo(u0); vec4 A1 = h2hi(u0); vec4 A2 = h2lo(u1); vec4 A3 = h2hi(u1);
+      vec4 A4 = h2lo(u2); vec4 A5 = h2hi(u2); vec4 A6 = h2lo(u3); vec4 A7 = h2hi(u3);
+      float sa0 = dot(A0 + A1 + A2 + A3, vec4(1.0));
+      float sa1 = dot(A4 + A5 + A6 + A7, vec4(1.0));
+      uint b0 = uint(2 * (kb & 1));
+${rows.join("\n")}
+    }
+    acc += dd * P;
+  }
+  o = acc;
+}`
+}
+
+const q6Splits = new Map<string, string>()
+/** The output head through a split Q6_K embedding (see Q6_SPLIT): one part's columns. */
+export function headQ6Split(o: { split: boolean }) {
+  const key = `${o.split}`
+  let source = q6Splits.get(key)
+  if (!source) q6Splits.set(key, (source = headQ6SplitSource(o)))
+  return source
+}
+
+/** Embedding rows from a split Q6_K embedding (see Q6_SPLIT): rows of other parts are left (discarded). */
+export const EMBED_Q6_SPLIT = `${HEADER}${Q6_SPLIT}
+uniform usampler2D uIds;
+uniform sampler2D uW;
+uniform sampler2D uHigh;
+uniform sampler2D uS;
+uniform usampler2D uSub;
+uniform int uKb;
+uniform int uH;
+uniform int uCol0;
+uniform int uCols;
+out vec4 o;
+void main() {
+  int x = int(gl_FragCoord.x);
+  int y = int(gl_FragCoord.y);
+  int id = int(texelFetch(uIds, ivec2(0, y), 0).x);
+  int g = id >> 2;
+  int r = id & 3;
+  int col = g / uH;
+  int lc = col - uCol0;
+  if (lc < 0 || lc >= uCols) discard;
+  int gr = g - col * uH;
+  int c = 4 * x;
+  int k = c >> 5;
+  int t = (c & 31) >> 2;
+  int sb = c >> 8;
+  vec4 lo = floor(texelFetch(uW, ivec2(lc * uKb * 256 + k * 32 + r * 8 + t, gr), 0).wzyx * 15.0 + 0.5);
+  vec4 h0, h1;
+  q6High(texelFetch(uHigh, ivec2(lc * uKb * 128 + k * 16 + r * 4 + (t & 3), gr), 0), h0, h1);
+  vec4 q = lo + 16.0 * (t < 4 ? h0 : h1);
+  int i = c >> 4;
+  float sc = sc8w(comp(texelFetch(uSub, ivec2((lc * uKb + sb) * 4 + r, gr), 0), (i & 15) >> 2), uint(i & 3));
+  float d = comp(texelFetch(uS, ivec2(lc * uKb + sb, gr), 0), r);
+  o = (d * sc) * (q - 32.0);
+}`
+
 /** EMBED_Q6_K for word texels (see Q6_K_WORDS). */
 export const EMBED_Q6_K_WORDS = `${HEADER}${Q6_K_WORDS}
 uniform usampler2D uIds;

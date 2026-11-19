@@ -583,6 +583,86 @@ export function packQ6_K(
   repackTime.ggufQ6Ms += performance.now() - started
 }
 
+/**
+ * Row groups [g0, g0 + groups) of a Q6_K embedding as packQ6_K stores them
+ * (a row group's super-blocks, each row's 208 bytes: ql, qh, scales) in
+ * the split layout's upload order (see kernels.ts's Q6_SPLIT): `low`
+ * RGBA4 texels (group, 32-weight block, row, 8), `high` RGBA4 texels
+ * (group, block, row, 4), `sub` RGBA32UI texels (group, super-block, row:
+ * the row's 16 scale bytes as they are). A texel's nibbles in RGBA4 order:
+ * the first in bits 0-3 (read .wzyx).
+ */
+export function q6SplitRows(m: QuantMatrix, g0: number, groups: number, low: Uint16Array, high: Uint16Array, sub: Uint32Array) {
+  const sbs = m.K / 256
+  const src = new Uint32Array(m.quants.buffer, m.quants.byteOffset, m.quants.byteLength >> 2)
+  const four = (v: number) => {
+    const p = (v | (v >>> 4)) & 0x00ff00ff
+    return (p | (p >>> 8)) & 0xffff
+  }
+  for (let gl = 0; gl < groups; gl++)
+    for (let s = 0; s < sbs; s++)
+      for (let r = 0; r < 4; r++) {
+        const W = (((g0 + gl) * sbs + s) * 4 + r) * 52
+        const S = ((gl * sbs + s) * 4 + r) * 4
+        for (let w = 0; w < 4; w++) sub[S + w] = src[W + 48 + w]
+        for (let b = 0; b < 8; b++) {
+          const n = b >> 2, qq = b & 3
+          const k = s * 8 + b
+          const L = ((gl * sbs * 8 + k) * 4 + r) * 8
+          const ql = W + 16 * n + 8 * (qq & 1)
+          for (let t = 0; t < 8; t++) {
+            const a = src[ql + t]
+            low[L + t] = four(qq < 2 ? a & 0x0f0f0f0f : (a >>> 4) & 0x0f0f0f0f)
+          }
+          const H = ((gl * sbs * 8 + k) * 4 + r) * 4
+          const qh = W + 32 + 8 * n
+          const shift = 2 * qq
+          for (let t = 0; t < 4; t++)
+            high[H + t] = four(((src[qh + t] >>> shift) & 0x03030303) | (((src[qh + 4 + t] >>> shift) & 0x03030303) << 2))
+        }
+      }
+}
+
+/**
+ * q6SplitRows through WebAssembly SIMD (497 bytes, assembled from
+ * src/q6split.wat with wabt): a block's 32 nibbles or top-bit pairs paired
+ * into RGBA4 bytes by two shuffles. The same texels, 3.4× faster on an M3
+ * Ultra. The module: split(src, low, high, sub, groups, super-blocks) over
+ * its memory, `mem`.
+ */
+const Q6SPLIT_WASM = "AGFzbQEAAAABEAJgAnt7AXtgBn9/f39/fwADAwIAAQUDAQABBw8CA21lbQIABXNwbGl0AAEKuQMCNAAgACAB/Q0AAgQGCAoMDhASFBYYGhweIAAgAf0NAQMFBwkLDQ8RExUXGRsdH0EE/Wv9UAuBAwIKfwR7AkADQCAGIARPDQFBACEHAkADQCAHIAVPDQFBACEIAkADQCAIQQRPDQEgBiAFbCAHakEEbCAIaiEMIAAgDEHQAWxqIQogAyAMQQR0aiAK/QAEwAH9CwQAQQAhCQJAA0AgCUEITw0BIAdBCGwgCWohCyAKIAlBAnZBwABsaiAJQQFxQSBsaiENIA39AAQAIRAgDf0ABBAhESAJQQNxQQJJBEAgEEEP/Q/9TiEQIBFBD/0P/U4hEQUgEEEE/W0hECARQQT9bSERCyABIAYgBWxBCGwgC2pBBGwgCGpBBHRqIBAgERAA/QsEACAKQYABaiAJQQJ2QSBsaiEOIAlBA3FBAXQhD0ED/Q8hEiAO/QAEACAP/W0gEv1OIA79AAQQIA/9bSAS/U5BAv1r/VAhEyACIAYgBWxBCGwgC2pBBGwgCGpBA3RqIBMgExAA/VsDAAAgCUEBaiEJDAALCyAIQQFqIQgMAAsLIAdBAWohBwwACwsgBkEBaiEGDAALCws="
+
+/**
+ * A splitter for one load (its memory goes with it), or null where
+ * WebAssembly SIMD isn't available: q6SplitRows' texels for row groups
+ * [g0, g0 + groups), as views of its memory good until its next call.
+ */
+export function q6Splitter(): ((m: QuantMatrix, g0: number, groups: number) => { low: Uint16Array; high: Uint16Array; sub: Uint32Array }) | null {
+  let exports: { split: (...args: number[]) => void; mem: WebAssembly.Memory }
+  try {
+    const bytes = Uint8Array.from(atob(Q6SPLIT_WASM), (c) => c.charCodeAt(0))
+    exports = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports as typeof exports
+  } catch {
+    return null
+  }
+  return (m, g0, groups) => {
+    const sbs = m.K / 256
+    const srcBytes = groups * sbs * 4 * 208
+    const low = (srcBytes + 15) & ~15, lowBytes = groups * sbs * 512
+    const high = low + lowBytes, highBytes = groups * sbs * 256
+    const sub = high + highBytes, subBytes = groups * sbs * 64
+    const mem = exports.mem
+    if (mem.buffer.byteLength < sub + subBytes) mem.grow(Math.ceil((sub + subBytes - mem.buffer.byteLength) / 65536))
+    new Uint8Array(mem.buffer, 0, srcBytes).set(new Uint8Array(m.quants.buffer, m.quants.byteOffset + g0 * sbs * 4 * 208, srcBytes))
+    exports.split(0, low, high, sub, groups, sbs)
+    return {
+      low: new Uint16Array(mem.buffer, low, lowBytes >> 1),
+      high: new Uint16Array(mem.buffer, high, highBytes >> 1),
+      sub: new Uint32Array(mem.buffer, sub, subBytes >> 2)
+    }
+  }
+}
+
 /** Q4_0 bytes to RGBA4 upload order: four low-nibble texels then four high.
  * Each word is compacted with whole-word masks/shifts; shaders read .wzyx.
  */

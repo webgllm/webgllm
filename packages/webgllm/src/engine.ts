@@ -17,7 +17,7 @@ import * as K from "./gpu/kernels.js"
 import { panelLayout } from "./panels.js"
 import { MAX_SEEN_ROWS, type SeenRow } from "./penalty-window.js"
 import { weightHeadRegions, weightPanelSource } from "./weight-panels.js"
-import { matrixRow, q4Repacker, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
+import { matrixRow, q4Repacker, q6SplitRows, q6Splitter, quantsFromRaw, rawRgba4, q4WordsToRgba4 } from "./repack.js"
 import type {
   LayerType,
   LayerWeights,
@@ -64,6 +64,8 @@ type GpuMatrix = {
   q6Ordered?: boolean
   /** An expanded Q6_K head in RGBA32UI texels for the native expanded head (kernels.ts's EXPAND_Q6_WORDS). */
   q6ExpandedWords?: boolean
+  /** WebGL: a Q6_K embedding split into its weights' low 4 and top 2 bits (kernels.ts's Q6_SPLIT, TUNING.q6Split). */
+  q6Split?: Q6SplitLayout
   scales: Texture
   zeros: Texture | null
 }
@@ -335,6 +337,15 @@ export const TUNING = {
   wordEmbedding: 1,
   /** WebGL: 8-bit layer matrices' prompts through the f16 scratch (K.dequantBytes's eight), not a pair matmul (set before the model loads). */
   glScratch8: 1,
+  /**
+   * WebGL: a Q6_K embedding's compact head split into its weights' low 4
+   * bits (RGBA4, unpacked by the texture unit) and top 2 (kernels.ts's
+   * Q6_SPLIT), not word texels split with integer math (set before the
+   * model loads). -1: where chooseHead times it faster (in Firefox on a
+   * Pixel 10 Pro Qwen3.5 2B GGUF wrote 7.1-7.5 tokens/s with it, 5.3-5.6
+   * without; an M3 Ultra's WebGL 56 against 87); 1: always.
+   */
+  q6Split: -1,
   /**
    * 4-bit layer weights in RGBA4 textures (1) or byte textures (0); -1:
    * whichever this GPU writes faster (timed at load; see chooseLayout).
@@ -862,6 +873,18 @@ const FLASH_CHUNKS = 128
 const CHUNK = 256
 /** Most chunks read back as candidates: exact for top-k up to this. */
 export const MAX_CHUNKS = 64
+/**
+ * A Q6_K head's measured layout (see chooseHead): expanded or compact, its
+ * K-slices, and (WebGL) the compact one split (GpuMatrix.q6Split).
+ */
+export type HeadChoice = { expanded: boolean; split: number; q6Split?: boolean }
+
+/** A split Q6_K embedding's textures (see GpuMatrix.q6Split): parts of whole columns, each a run of row groups. */
+type Q6SplitLayout = {
+  parts: Array<{ low: Texture; high: Texture; d: Texture; sub: Texture; cols: number }>
+  colsPerPart: number
+}
+
 /** Half-float bits of the integers 0 .. 255 (zero points packed as halves). */
 const HALF_INT = Uint16Array.from({ length: 256 }, (_, n) => {
   if (n === 0) return 0
@@ -1057,7 +1080,7 @@ export class Engine {
         const { value, row0 = 0, totalRows = value.N } = piece
         if (row0 === 0) this.embeddingRows = totalRows
         if (row0 === 0 && value.bits === 6 && TUNING.q6Expanded < 0) {
-          if (!this.canExpandHead(value.K))
+          if (!this.canExpandHead(value.K) && !this.q6SplitTimed())
             this.headChoice = { expanded: false, split: this.q6HeadSplit }
           else if (!this.headChoice) await this.chooseHead(value)
         }
@@ -1081,8 +1104,7 @@ export class Engine {
         // zero-fills it on the first chunk's write, far more slowly (430 ms
         // for Qwen3.5 2B's on an iPhone 16 Pro Max, against a 60 ms clear).
         if (row0 === 0 && value.N < totalRows)
-          for (const t of [this.embedding.quants, this.embedding.scales, this.embedding.zeros])
-            if (t) this.gpu.zero(t)
+          for (const t of this.matrixTextures(this.embedding)) this.gpu.zero(t)
         this.writeMatrix(this.embedding, value, row0)
         // The self-check's tokens' rows, as the loader gave them (headError).
         if (row0 === 0) this.embeddingSamples.clear()
@@ -1128,6 +1150,9 @@ export class Engine {
     this.expandedUpload = new Uint8Array(0)
     this.repackUpload = new Uint32Array(0)
     this.q4Repack = undefined
+    this.q6High = new Uint16Array(0)
+    this.q6Sub = new Uint32Array(0)
+    this.q6SplitWasm = undefined
     // (The upload staging textures, done with.)
     if (this.orderStage) this.gpu.delete(this.orderStage)
     this.orderStage = null
@@ -1711,7 +1736,7 @@ export class Engine {
    * incumbentGpuTuning): when tuned afresh, each stands unless another way
    * is faster in every round by KEEP_MARGIN. Null: first choices.
    */
-  incumbent: { tuned?: Tuned; head?: { expanded: boolean; split: number } } | null = null
+  incumbent: { tuned?: Tuned; head?: HeadChoice } | null = null
   /** What the last tune measured: % faster than TUNING's, % noise, per choice. */
   tuneReport: Record<string, number> = {}
 
@@ -2268,6 +2293,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 s=texelFetch(uPrev,p,0)*0.5;for(
             ? this.gpu.texture(GL.RGBA8UI, columns * blocks, rowsPerColumn)
             : null
       }
+    }
+    // WebGL: a compact Q6_K embedding split (see GpuMatrix.q6Split).
+    if (bits === 6 && !layer && (TUNING.q6Split > 0 || (TUNING.q6Split < 0 && this.headChoice?.q6Split === true)) && !("nativeProgram" in this.gpu) &&
+      !(TUNING.q6Expanded > 0 || (TUNING.q6Expanded < 0 && this.headChoice?.expanded))) {
+      const split = this.q6SplitMatrix(N, K)
+      if (split) return split
     }
     // A block row: 4-bit 16 bytes, 8-bit 32, as RGBA32UI texels (1, 2) or
     // byte texels (4, 8); a Q6_K super-block row, 208 bytes: 52 byte texels
@@ -2840,8 +2871,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   /** Measured head layout, never selected by vendor or device name. */
-  headChoice: { expanded: boolean; split: number } | null = null
-  headReport: Array<{expanded:boolean;split:number;ms:number}> = []
+  headChoice: HeadChoice | null = null
+  headReport: Array<HeadChoice & { ms: number }> = []
 
   private canExpandHead(
     K: number,
@@ -2893,7 +2924,10 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.headChoice = { expanded: false, split: this.q6HeadSplit }
       return
     }
-    const count = Math.max(1, Math.ceil(8192 / piece.N))
+    // (32,768 rows where the split head is a candidate: at 8,192 a call's
+    // fixed cost, a few ms in Firefox on a Pixel 10 Pro, hid most of its
+    // 30% lead there: 6.8 against 7.4 ms.)
+    const count = Math.max(1, Math.ceil((this.q6SplitTimed() ? 32768 : 8192) / piece.N))
     const matrix: QuantMatrix = { ...piece, N: piece.N * count }
     const original = this.embedding,
       originalScratch = this.headScratch,
@@ -2903,14 +2937,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // Compare storage formats at the existing split. Probing larger split
     // buffers increased startup work and memory without a measured gain.
     const split = Math.max(1, Math.min(this.q6HeadSplit, 4, piece.K / 256))
-    const settings = [
+    const settings: Array<HeadChoice> = [
       { expanded: false, split },
+      ...(this.q6SplitTimed() ? [{ expanded: false, split, q6Split: true }] : []),
       { expanded: true, split }
     ].filter(
       (choice) =>
         !choice.expanded || this.canExpandHead(piece.K, choice.split, true)
     )
-    const samples = settings.map(() => [] as number[])
+    let samples: Array<Array<number>> = []
     const phase = this.gpu.activePhase
     const quota = this.tuned.submissionReads ?? TUNING.submissionReads
     try {
@@ -2932,24 +2967,31 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         { x: 0, y: 0, width: input.width, height: 1 },
         { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: seed }
       )
-      for (const expanded of [false, true]) {
-        this.headChoice = { expanded, split }
+      for (let s = 0; s < settings.length; s++) {
+        this.headChoice = settings[s]
         const gm = this.allocateMatrix(matrix.N, matrix.K, 6, false)
+        // (A split layout that doesn't fit this GPU: not a candidate.)
+        if (settings[s].q6Split && !gm.q6Split) {
+          for (const t of this.matrixTextures(gm)) this.gpu.delete(t)
+          settings.splice(s--, 1)
+          continue
+        }
         for (let i = 0; i < count; i++) this.writeMatrix(gm, piece, i * piece.N)
         // Match the panel shader used for the complete embedding (where
         // it has panels: not on WebGPU, whose probe in panels timed one-row
         // bands no real head runs, and picked the head 3× slower on a Pixel).
-        if (this.gpu.slowZeroFill) gm.quantPanels ??= [gm.quants]
+        if (this.gpu.slowZeroFill && !gm.q6Split) gm.quantPanels ??= [gm.quants]
         made.push(gm)
         await this.gpu.pace(0, true)
       }
+      samples = settings.map(() => [] as number[])
       this.config.vocabSize = matrix.N
       this.headScaled = false
       this.setSeen([], matrix.N)
       const sample = async (index: number) => {
         this.headChoice = settings[index]
         this.gpu.setPhase("decode")
-        this.embedding = made[settings[index].expanded ? 1 : 0]
+        this.embedding = made[index]
         await this.head(0, 1)
       }
       for (let i = 0; i < settings.length; i++) await sample(i)
@@ -2972,20 +3014,23 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // This GPU's earlier head stands unless the other is faster in every
       // round by KEEP_MARGIN (see incumbent).
       const earlier = this.incumbent?.head
-      const standing = earlier ? settings.findIndex((s) => s.expanded === earlier.expanded && s.split === earlier.split) : -1
+      // (One chosen before the split head was a candidate (no q6Split) never
+      // met it: it doesn't stand against it.)
+      const standing = earlier && (earlier.q6Split !== undefined || !this.q6SplitTimed())
+        ? settings.findIndex((s) => s.expanded === earlier.expanded && s.split === earlier.split && !!s.q6Split === !!earlier.q6Split) : -1
       if (standing >= 0) {
         const other = this.headReport.indexOf(best)
         const keep = other === standing || !replaces(samples[other], samples[standing], keepMargin(samples))
         const pick = settings[keep ? standing : other]
-        this.headChoice = { expanded: pick.expanded, split: pick.split }
+        this.headChoice = { expanded: pick.expanded, split: pick.split, ...(this.q6SplitTimed() && { q6Split: !!pick.q6Split }) }
       } else
       // The native expanded head costs a fifth more memory: taken only when
       // it's clearly faster (a Pixel 10 Pro's: 43%; an M-series Mac's timed
       // 12% faster on the probe's slice but ran 1.5% slower whole).
       this.headChoice =
         chosen.ms < base.ms * (chosen.expanded && this.nativeHeadOn && TUNING.nativeExpanded > 0 ? EXPANDED_MARGIN : 0.94)
-          ? { expanded: chosen.expanded, split: chosen.split }
-          : { expanded: false, split }
+          ? { expanded: chosen.expanded, split: chosen.split, ...(this.q6SplitTimed() && { q6Split: !!chosen.q6Split }) }
+          : { expanded: false, split, ...(this.q6SplitTimed() && { q6Split: false }) }
     } finally {
       this.gpu.configurePacing(quota, TUNING.submissionMs)
       this.gpu.setPhase(phase)
@@ -2997,12 +3042,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       this.config.vocabSize = vocab
       this.headScaled = scaled
       for (const gm of made)
-        for (const t of [
-          ...(gm.quantPanels ?? [gm.quants]),
-          gm.scales,
-          gm.zeros
-        ])
-          if (t) this.gpu.delete(t)
+        for (const t of this.matrixTextures(gm)) this.gpu.delete(t)
     }
   }
 
@@ -3070,8 +3110,94 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     )
   }
 
+  /**
+   * A split Q6_K embedding's textures (see GpuMatrix.q6Split), or null where
+   * a row group's low texels don't fit a texture's width: columns of row
+   * groups as other matrices, as many to a texture as fit its width.
+   */
+  private q6SplitMatrix(N: number, K: number): GpuMatrix | null {
+    const max = this.gpu.limits.maxTextureSize
+    const sbs = K / 256
+    const rowTexels = sbs * 256
+    const groups = N / 4
+    const colsPerPart = Math.floor(max / rowTexels)
+    if (colsPerPart < 1 || !Number.isInteger(sbs)) return null
+    const columns = Math.ceil(groups / max)
+    const rowsPerColumn = Math.ceil(groups / columns)
+    const parts: Q6SplitLayout["parts"] = []
+    for (let c0 = 0; c0 < columns; c0 += colsPerPart) {
+      const cols = Math.min(colsPerPart, columns - c0)
+      parts.push({
+        low: this.gpu.texture(GL.RGBA4, cols * rowTexels, rowsPerColumn),
+        high: this.gpu.texture(GL.RGBA4, cols * sbs * 128, rowsPerColumn),
+        d: this.gpu.texture(GL.RGBA16F, cols * sbs, rowsPerColumn),
+        sub: this.gpu.texture(GL.RGBA32UI, cols * sbs * 4, rowsPerColumn),
+        cols
+      })
+    }
+    return {
+      N, K, bits: 6, bytes: false, unorm: false, packed: false, rgba4: false,
+      blocks: sbs, groups, rowsPerColumn, rowTexels,
+      quants: parts[0].low, scales: parts[0].d, zeros: null,
+      q6Split: { parts, colsPerPart }
+    }
+  }
+
+  /** Whether chooseHead times the split Q6_K head too (see TUNING.q6Split): WebGL only. */
+  private q6SplitTimed() {
+    return TUNING.q6Split < 0 && !("nativeProgram" in this.gpu)
+  }
+
+  /** The textures of a matrix, whatever its layout (to zero or delete them). */
+  private matrixTextures(gm: GpuMatrix): Array<Texture> {
+    if (gm.q6Split) return gm.q6Split.parts.flatMap((p) => [p.low, p.high, p.d, p.sub])
+    return [...(gm.quantPanels ?? [gm.quants]), gm.scales, ...(gm.zeros ? [gm.zeros] : []), ...(gm.stored ? [gm.stored] : [])]
+  }
+
+  /** Rows of a Q6_K embedding into its split textures (see q6SplitRows). */
+  private writeQ6Split(gm: GpuMatrix, m: QuantMatrix, row0: number) {
+    const split = gm.q6Split!
+    const sbs = gm.blocks
+    const g0 = row0 / 4
+    const groups = m.N / 4
+    for (let g = g0; g < g0 + groups;) {
+      const column = Math.floor(g / gm.rowsPerColumn)
+      const y = g - column * gm.rowsPerColumn
+      const part = split.parts[Math.floor(column / split.colsPerPart)]
+      const lc = column % split.colsPerPart
+      // (A few row groups at a time: the upload scratch stays small.)
+      const run = Math.min(g0 + groups - g, gm.rowsPerColumn - y, Math.max(1, Math.floor((256 << 10) / (sbs * 256))))
+      const local = g - g0
+      const t = performance.now()
+      if (this.q6SplitWasm === undefined) this.q6SplitWasm = q6Splitter()
+      let low: Uint16Array, high: Uint16Array, sub: Uint32Array
+      if (this.q6SplitWasm) ({ low, high, sub } = this.q6SplitWasm(m, local, run))
+      else {
+        low = new Uint16Array(this.uploadScratch((run * sbs * 256) >> 1).buffer, 0, run * sbs * 256)
+        high = this.q6High.length >= run * sbs * 128 ? this.q6High : (this.q6High = new Uint16Array(run * sbs * 128))
+        sub = this.q6Sub.length >= run * sbs * 16 ? this.q6Sub : (this.q6Sub = new Uint32Array(run * sbs * 16))
+        q6SplitRows(m, local, run, low, high, sub)
+      }
+      this.loadMs.convert += performance.now() - t
+      this.gpu.write(part.low, { x: lc * sbs * 256, y, width: sbs * 256, height: run },
+        { format: GL.RGBA, type: GL.UNSIGNED_SHORT_4_4_4_4, pixels: low.subarray(0, run * sbs * 256) })
+      this.gpu.write(part.high, { x: lc * sbs * 128, y, width: sbs * 128, height: run },
+        { format: GL.RGBA, type: GL.UNSIGNED_SHORT_4_4_4_4, pixels: high.subarray(0, run * sbs * 128) })
+      this.gpu.write(part.sub, { x: lc * sbs * 4, y, width: sbs * 4, height: run },
+        { format: GL.RGBA_INTEGER, type: GL.UNSIGNED_INT, pixels: sub.subarray(0, run * sbs * 16) })
+      this.gpu.write(part.d, { x: lc * sbs, y, width: sbs, height: run },
+        { format: GL.RGBA, type: GL.HALF_FLOAT, pixels: m.scales.subarray(local * sbs * 4, (local + run) * sbs * 4) })
+      g += run
+    }
+  }
+  private q6High = new Uint16Array(0)
+  private q6Sub = new Uint32Array(0)
+  /** The load's WebAssembly splitter (see q6Splitter): null where it can't run, undefined before the first rows. */
+  private q6SplitWasm: ReturnType<typeof q6Splitter> | undefined = undefined
+
   /** Writes `m`'s rows into rows [row0, row0 + m.N) of `gm` (row0 a multiple of 4). */
   private writeMatrix(gm: GpuMatrix, m: QuantMatrix, row0: number) {
+    if (gm.q6Split) return this.writeQ6Split(gm, m, row0)
     // Raw MatMulNBits rows go into RGBA4 as they are (16-byte runs moved
     // into place; see rawRgba4); other layouts get the rows repacked here.
     // (A GPU pass from a staging texture saved an M3 Ultra 300 ms of LFM3
@@ -7297,6 +7423,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     }
     this.normToH2(b.residual[0], this.finalNorm, b.lastNormed, rows, row0)
     if (e.rgba4) return this.headRgba4(e, rows, undefined, sum)
+    if (e.q6Split) return this.headQ6Split(e, rows, sum)
     if (e.bits === 6) return this.headQ6K(e, rows, sum)
     if (this.q4WordsHead(e)) return this.headQ4Words(e, rows, undefined, sum)
     this.gpu.run({
@@ -7464,6 +7591,53 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       rows,
       split
     )
+    return this.headSlices(target, split, rows, sum)
+  }
+
+  /**
+   * The output head through a split Q6_K embedding (see GpuMatrix.q6Split):
+   * a part's run of row groups at a time (its own textures bound), in
+   * K-slices of super-blocks as headQ6K's, paced by the measured quota.
+   */
+  private async headQ6Split(e: GpuMatrix, rows: number, sum: boolean): Promise<HeadOut> {
+    const split = Math.max(1, Math.min(TUNING.q6HeadSplit, 4, e.blocks))
+    const sliceRows = this.logitRows
+    const target = this.headTarget(split, rows)
+    const kbSlice = Math.ceil(e.blocks / split)
+    const program = this.gpu.program(K.headQ6Split({ split: split > 1 }))
+    const layout = e.q6Split!
+    const span = layout.colsPerPart * e.rowsPerColumn
+    for (let plane = 0; plane < split * rows; plane++)
+      for (let p = 0; p < layout.parts.length; p++) {
+        const part = layout.parts[p]
+        const start = p * span
+        const end = Math.min(e.groups, start + part.cols * e.rowsPerColumn)
+        // The part's logits: a partial output row, whole rows, a partial row.
+        for (let g = start; g < end;) {
+          const x = g % OUT_WIDTH
+          const width = Math.min(OUT_WIDTH - x, end - g)
+          const height = x === 0 && width === OUT_WIDTH ? Math.floor((end - g) / OUT_WIDTH) : 1
+          await this.gpu.runAsync({
+            name: "head",
+            work: kbSlice * 8 * 48,
+            program,
+            inputs: { uA: this.buffers.lastNormed, uW: part.low, uHigh: part.high, uS: part.d, uSub: part.sub },
+            uniforms: {
+              uKb: { int: e.blocks },
+              uH: { int: e.rowsPerColumn },
+              uG: { int: e.groups },
+              uOutW: { int: OUT_WIDTH },
+              uLogitRows: { int: sliceRows },
+              uCol0: { int: p * layout.colsPerPart },
+              uKbSlice: { int: kbSlice },
+              uRows: { int: rows }
+            },
+            output: target,
+            rect: { x, y: plane * sliceRows + Math.floor(g / OUT_WIDTH), width, height }
+          })
+          g += width * height
+        }
+      }
     return this.headSlices(target, split, rows, sum)
   }
 
@@ -7710,7 +7884,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // The last add draws the final norm's scaled input for the head.
     this.headScaled =
       prescaled &&
-      (e.rgba4 || this.q4WordsHead(e) || (e.bits === 6 && !e.bytes && TUNING.q6FoldNorm > 0)) &&
+      (e.rgba4 || this.q4WordsHead(e) || (e.bits === 6 && !e.bytes && !e.q6Split && TUNING.q6FoldNorm > 0)) &&
       foldFfn(this.layers.length - 1)
     if (embedFolded) {
       const texels = c.hiddenSize / 4
@@ -7743,6 +7917,22 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           rect: { x, y: 0, width, height: rows }
         })
       }
+    } else if (e.q6Split) {
+      // One pass a part; each leaves other parts' tokens (discarded).
+      e.q6Split.parts.forEach((part, p) =>
+        this.gpu.run({
+          program: this.gpu.program(K.EMBED_Q6_SPLIT),
+          inputs: { uIds: b.ids, uW: part.low, uHigh: part.high, uS: part.d, uSub: part.sub },
+          uniforms: {
+            uKb: { int: e.blocks },
+            uH: { int: e.rowsPerColumn },
+            uCol0: { int: p * e.q6Split!.colsPerPart },
+            uCols: { int: part.cols }
+          },
+          output: b.residual[0],
+          rect: { x: 0, y: 0, width: c.hiddenSize / 4, height: rows }
+        })
+      )
     } else
       this.gpu.run({
         program: this.gpu.program(
