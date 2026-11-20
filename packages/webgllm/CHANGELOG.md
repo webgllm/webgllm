@@ -1,3 +1,32 @@
+## 0.3.9 (2026-11-20)
+
+### 🚀 Features
+
+- KRAFTON's Raon-1 nano GGUFs load and run, and Q4_K matrices keep their 4 bits ([728a072](https://github.com/webgllm/webgllm/commit/728a072))
+
+### 🩹 Fixes
+
+- **predict-speed:** a GGUF shape remembered without its layers' kinds is read from the header again (one remembered before kinds went by storage timed a file whose layers of a type are stored differently on the first one's kernels, force or not), and predictions are remembered by the probe's code too, so one made before a change to how it measures is measured again ([ae34edf](https://github.com/webgllm/webgllm/commit/ae34edf))
+- **predict-speed:** the probe keeps a layer for each storage a type's layers have, and each of the model's layers stands on the one stored as the loader stores it (a Q4_K_M GGUF's down projections are Q6_K in some layers and Q4_K in others: ten of Raon-1 nano's 24 layers were timed with the other storage's kernels) ([6f8a1f6](https://github.com/webgllm/webgllm/commit/6f8a1f6))
+- **worker:** a per-layer row whose kept file handle was closed under it (iOS closes a suspended page's) is read through a handle opened anew, then from the file as stored now, and the worker logs it; a file that's no longer stored fails saying so, not with the browser's "The object can not be found here" ([6128d95](https://github.com/webgllm/webgllm/commit/6128d95))
+- **predict-speed:** predictSpeed takes Raon-1 nano (a probe model with its streams, latent attention and per-layer inputs, as loadRaon stores them), gives a GGUF's matrices the loader's storage (Q4_K parts alone as 4-bit with half zero points, by all of a matrix's tensors), and times a prompt without the cache reset before it ([472faef](https://github.com/webgllm/webgllm/commit/472faef))
+- **fingerprint:** Raon's kernels are in the engine's fingerprint, so a change to one of them alone no longer reuses the tuning and checks stored for the code before it ([46e7fff](https://github.com/webgllm/webgllm/commit/46e7fff))
+- **tune:** a timed stretch of token forwards holds no more of them than the cache has room for (a context of 3 tokens overflowed at the fourth, the reset now being before the stretch) ([87e45f9](https://github.com/webgllm/webgllm/commit/87e45f9))
+- **worker:** an engine dropped after a lost context or a cache that can't be reset is released, so the model file it keeps open is unlocked; and a load reads its header before its one memory claim, so what stays in the file (Raon's per-layer table) is never claimed and no model that fits beside it is unloaded ([44f267d](https://github.com/webgllm/webgllm/commit/44f267d))
+- **raon:** Raon Delta Attention's q and k are over max(|x|, 1e-6), as KRAFTON's graph and F.normalize have them, in the batch and the fused passes (Qwen3.5's keep sqrt(sum + 1e-6)); they differed where a head's q or k is near zero ([8591029](https://github.com/webgllm/webgllm/commit/8591029))
+- **gguf:** a matrix part packed through floats takes its permuted rows from where the tensor has them, not among its first rows (Qwen3.5's queries and gates, halves of one tensor, came out wrong where the matrix's tensors differ in type, as a Q4_K_M file's can) ([68406e0](https://github.com/webgllm/webgllm/commit/68406e0))
+- **worker:** a WebGPU load whose files fail to download is tried once more on WebGPU, then reported, not loaded on WebGL 2 (an iPad whose download met a passing storage error wrote Raon-1 nano's tokens at 26/s where WebGPU's 47) ([a46e094](https://github.com/webgllm/webgllm/commit/a46e094))
+- **tune:** the lanes and buffer-matvec choices time a token's forward without the cache reset before it (a model with recurrent states zeroes them all: 17 ms beside Raon-1 nano's 10 ms forward on an M3 Ultra, so the choice went either way from load to load) ([177ee79](https://github.com/webgllm/webgllm/commit/177ee79))
+
+### 🔥 Performance
+
+- **raon:** a token's per-layer table row is read through a synchronous access handle kept open while the model is loaded (a read about 10 ms to 1-2 on a Pixel 10 Pro, 1.3 to 0.3 on an iPad Pro M4, 0.7 to 0.24 on an M3 Ultra) ([1a11d20](https://github.com/webgllm/webgllm/commit/1a11d20))
+- **raon:** a written token's stream-mixing site is two WebGPU dispatches where the tuner's lanes win (the selector over the f32 streams, then one kernel for the coefficients and the branch's input: 10.6 to 9.95 ms a token on an M3 Ultra), and a prompt batch's selectors are split matmuls (a 512-token batch 162 to 150 ms) ([4f65bda](https://github.com/webgllm/webgllm/commit/4f65bda))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.8 (2026-11-19)
 
 ### 🚀 Features
