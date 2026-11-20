@@ -16,7 +16,7 @@ import { monitorFrames } from "./frame-pacing.js"
 import { abortable, abortError, throwIfAborted } from "./errors.js"
 import type { WebGlModelId } from "./model-meta.js"
 import { resolveModel } from "./resolve-model.js"
-import { probeSpeed, speedShape, type ProbeReport, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
+import { PROBE_CODE, probeSpeed, speedShape, type ProbeReport, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
 import type { LayerType } from "./weights.js"
 
 /** Tokens per second on this device. */
@@ -161,10 +161,17 @@ function hash(text: string) {
 /**
  * The key a prediction is remembered by: GPU, browser, model, and the
  * engine's code and settings (Engine.fingerprint and TUNING, as GPU notes
- * are keyed), so a new engine or browser measures again.
+ * are keyed) with the probe's own code (probeCode), so a new engine,
+ * browser or way of measuring measures again.
  */
-export function speedKey(renderer: string, userAgent: string, model: string, code = `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}`) {
+export function speedKey(renderer: string, userAgent: string, model: string, code = `${Engine.fingerprint}.${hash(JSON.stringify(TUNING))}.${probeCode()}`) {
   return `${renderer}|${userAgent}|${model}|${code}`
+}
+
+let probeHash: string | undefined
+/** A hash of what a prediction is measured by: the probe (speed-probe.ts's PROBE_CODE) and how its timings become tokens per second. */
+export function probeCode(): string {
+  return (probeHash ??= hash([...PROBE_CODE, speedFromTimes].map(String).join("\n")))
 }
 
 /**
@@ -259,10 +266,34 @@ async function readShape(key: string): Promise<SpeedShape | undefined> {
   try {
     const shapes = JSON.parse(await (await (await speedFile(SPEED_SHAPES)).getFile()).text()) as Record<string, SpeedShape>
     const shape = shapes[key]
-    return shape?.config && Array.isArray(shape.kinds) && shape.embedding ? shape : undefined
+    return usableShape(shape) ? shape : undefined
   } catch {
     return undefined
   }
+}
+
+/**
+ * Whether a remembered shape is one the probe can still stand a model on.
+ * A GGUF's needs each layer's kind (SpeedShape.layers): one remembered
+ * before kinds went by storage has one kind a layer type, which times a
+ * file whose layers of a type are stored differently (Q4_0 here, Q8_0
+ * there) on the first one's kernels; it's read from the header again.
+ */
+export function usableShape(shape: SpeedShape | undefined): shape is SpeedShape {
+  if (!shape?.config || !Array.isArray(shape.kinds) || !shape.embedding) return false
+  if (shape.config.format !== "gguf") return true
+  const { layers } = shape
+  return Array.isArray(layers) && layers.length === shape.config.layerTypes.length &&
+    layers.every((kind, i) => shape.kinds[kind]?.type === shape.config.layerTypes[i])
+}
+
+/** A model's shape: the one remembered under `key` where it's still usable, else read (its header or graph) and remembered. */
+export async function rememberedShape(key: string, read: () => Promise<SpeedShape>): Promise<SpeedShape> {
+  const remembered = await readShape(key)
+  if (remembered) return remembered
+  const shape = await read()
+  await writeShape(key, shape)
+  return shape
 }
 
 async function writeShape(key: string, shape: SpeedShape) {
@@ -317,8 +348,7 @@ export const realSpeedDeps = (onEngine?: (engine: Engine | null) => void): Speed
     // a GGUF's shapes follow its whole vocabulary, a second's download on
     // an iPhone before the model is stored.)
     const shapeKey = `${model}|${JSON.stringify(meta.files)}`
-    const shape = (await readShape(shapeKey)) ?? (await speedShape(meta))
-    void writeShape(shapeKey, shape)
+    const shape = await rememberedShape(shapeKey, () => speedShape(meta))
     const shapeMs = performance.now() - started
     throwIfAborted(signal)
     const report = await probeSpeed(shape, { signal, onEngine, decode, webgpu })

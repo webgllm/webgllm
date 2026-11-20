@@ -787,3 +787,17 @@ export async function probeSpeed(
     engine.gpu.dispose()
   }
 }
+
+/**
+ * What a prediction is measured by: how a model's shape is read and stood
+ * for, and what the probe times. Part of what predictions are remembered
+ * by (predict-speed.ts's speedKey), so one made before a change here is
+ * measured again.
+ */
+export const PROBE_CODE: Array<unknown> = [
+  PROMPT_TOKENS, PROMPT_STACK, PROBE_VOCAB, EMBEDDING_CHUNK_ROWS, WARM_MS,
+  kindOf, layerKinds, middleStack, ggufMatrix, ggufEmbedding, raonSpeedShape, ggufHeaderSpeedShape, onnxMatrix, onnxSpeedShape,
+  matrixShapes, Noise, randomMatrix, randomLayer, probeConfig, perLayerTable, probePerLayerSource, probePieces, warmGpu, probeSpeed,
+  // (The loaders' storage rules a shape is read by.)
+  matrixStorage, raonMatrixStorage, raonLayerMatrices
+]

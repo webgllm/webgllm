@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { predictHere, speedFromTimes, speedKey, type SpeedDeps, type SpeedNote } from "./predict-speed.js"
-import { matrixShapes, middleStack, probeConfig, PROBE_VOCAB, PROMPT_TOKENS, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
+import { predictHere, probeCode, rememberedShape, speedFromTimes, speedKey, usableShape, type SpeedDeps, type SpeedNote } from "./predict-speed.js"
+import { layerKinds, matrixShapes, middleStack, probeConfig, PROBE_VOCAB, PROMPT_TOKENS, type ProbeTimes, type SpeedShape } from "./speed-probe.js"
 import { PROMPT_BATCH } from "./handler.js"
 import type { LayerType, ModelConfig } from "./weights.js"
 
@@ -426,4 +426,71 @@ test("a GGUF's Q4_K matrices are predicted as the loader stores them: 4-bit with
   assert.deepEqual(matrixStorage([t(K)], 96), { bits: 8, halves: false })
   assert.deepEqual(matrixStorage([t(K), t(GgmlType.Q5_K)], 256), { bits: 8, halves: false })
   assert.throws(() => matrixStorage([t(K), t(GgmlType.Q4_0)], 256), /can't be combined/)
+})
+
+test("a GGUF shape remembered before kinds went by storage is read from the header again: its layers of one type stored differently each get their own", async (t) => {
+  const { useFolder } = await import("./fake-opfs.test.js")
+  const { ggufSpeedShape } = await import("./speed-probe.js")
+  const { GgmlType } = await import("./gguf.js")
+  const fake = useFolder(t)
+  // Three attention layers, the middle one's MLP in Q8_0 where the others' is Q4_0: storage [4, 8, 4].
+  const layer = (i: number, ffn: number) => [
+    ...["attn_q", "attn_output"].map((name) => ({ name: `blk.${i}.${name}.weight`, dims: [64, 64], type: GgmlType.Q4_0 })),
+    ...["attn_k", "attn_v"].map((name) => ({ name: `blk.${i}.${name}.weight`, dims: [64, 32], type: GgmlType.Q4_0 })),
+    ...["ffn_gate", "ffn_up"].map((name) => ({ name: `blk.${i}.${name}.weight`, dims: [64, 128], type: ffn })),
+    { name: `blk.${i}.ffn_down.weight`, dims: [128, 64], type: ffn }
+  ]
+  const bytes = ggufHeaderBytes(
+    {
+      "general.architecture": "lfm2", "lfm2.block_count": 3, "lfm2.embedding_length": 64, "lfm2.attention.head_count": 2,
+      "lfm2.attention.head_count_kv": 1, "lfm2.attention.key_length": 32, "lfm2.rope.freq_base": 1000000,
+      "lfm2.attention.layer_norm_rms_epsilon": 0.00001, "lfm2.shortconv.l_cache": 3, "lfm2.feed_forward_length": 128, "lfm2.context_length": 1024
+    },
+    [{ name: "token_embd.weight", dims: [64, 256], type: GgmlType.Q8_0 }, ...layer(0, GgmlType.Q4_0), ...layer(1, GgmlType.Q8_0), ...layer(2, GgmlType.Q4_0)]
+  )
+  let headers = 0
+  const read = () => {
+    headers++
+    return ggufSpeedShape({ size: bytes.length + (1 << 20), read: async (offset, length) => { const out = new Uint8Array(length); out.set(bytes.subarray(offset, offset + length)); return out } })
+  }
+  const fresh = await read()
+  headers = 0
+  const storage = (shape: SpeedShape) => layerKinds(shape).map((kind) => shape.kinds[kind].matrices.gateUp.bits)
+  assert.deepEqual(storage(fresh), [4, 8, 4])
+  // As it was remembered before: one kind a layer type (the first layer's), and no layers.
+  const { layers: _layers, ...rest } = fresh
+  const old: SpeedShape = { ...rest, kinds: [fresh.kinds[0]] }
+  assert.deepEqual(storage(old), [4, 4, 4])
+  assert.equal(usableShape(old), false)
+  assert.equal(usableShape(fresh), true)
+  const key = "model|files"
+  fake.put("speed-shapes.json", JSON.stringify({ [key]: old, onnx: { ...old, config: { ...old.config, format: "onnx" } } }))
+  const shape = await rememberedShape(key, read)
+  assert.equal(headers, 1, "the header is read again")
+  assert.deepEqual(storage(shape), [4, 8, 4])
+  // Remembered as read: the next call reads no header.
+  assert.deepEqual(storage(await rememberedShape(key, read)), [4, 8, 4])
+  assert.equal(headers, 1)
+  const stored = JSON.parse(new TextDecoder().decode(fake.files.get("speed-shapes.json"))) as Record<string, SpeedShape>
+  assert.deepEqual(stored[key].layers, [0, 1, 0])
+  // An ONNX model's shape has no such mapping to miss: used as remembered.
+  await rememberedShape("onnx", read)
+  assert.equal(headers, 1)
+  // A mapping that isn't this model's (another count of layers, a kind of another type) is read again too.
+  assert.equal(usableShape({ ...fresh, layers: [0, 1] }), false)
+  assert.equal(usableShape({ ...fresh, layers: [0, 1, 5] }), false)
+})
+
+test("a prediction remembered before the probe's code was part of its key is measured again", async () => {
+  const f = fakeDeps()
+  const key = speedKey("Apple M3", "UA/1", "m")
+  assert.ok(key.endsWith(`.${probeCode()}`))
+  // As it was keyed before: the engine's code and settings alone.
+  const before = key.slice(0, key.lastIndexOf("."))
+  f.notes.set(before, { prompt: 1, decode: 1, at: 0 })
+  const { prediction, report } = await predictHere("m", {}, f.deps)
+  assert.equal(report.cached, false)
+  assert.equal(f.measured(), 1)
+  assert.ok(prediction.prompt > 1)
+  assert.equal((await predictHere("m", {}, f.deps)).report.cached, true)
 })
