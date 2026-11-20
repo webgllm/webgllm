@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { deltaChunked, deltaSequential, type DeltaInputs } from "./delta-rule.js"
+import { deltaChunked, deltaChunkedKeys, deltaSequential, deltaSequentialKeys, type DeltaInputs, type KeyedDeltaInputs } from "./delta-rule.js"
 
 /** A small deterministic generator (mulberry32). */
 function random(seed: number) {
@@ -152,5 +152,74 @@ describe("chunked gated delta rule", () => {
     const resumed = deltaSequential(rest, after)
     assert.ok(relError(resumed.state, whole.state) < 1e-10)
     assert.ok(relError(resumed.o, whole.o.slice(33 * 16)) < 1e-10)
+  })
+})
+
+/** Raon Delta Attention's inputs: `inputs` with a log-decay per key in (lower, 0) and a write ratio. */
+function keyedInputs(seed: number, o: { dk: number; dv: number; tokens: number; similar?: number; lower?: number }): KeyedDeltaInputs {
+  const base = inputs(seed, o)
+  const rand = random(seed ^ 0x9e3779b9)
+  const g = new Float64Array(o.tokens * o.dk)
+  // (lower · sigmoid(logit): Raon-1 nano's lower bound is -5.)
+  for (let i = 0; i < g.length; i++) g[i] = (o.lower ?? -5) / (1 + Math.exp(-6 * (rand() - 0.5)))
+  const ratio = Float64Array.from({ length: o.tokens }, () => 0.25 + 1.5 * rand())
+  return { ...base, g, ratio }
+}
+
+describe("chunked delta rule with a decay per key and a write gate (Raon Delta Attention)", () => {
+  for (const [tokens, chunk, first] of [
+    [64, 16, 16],
+    [64, 32, 32],
+    [50, 16, 16],
+    [37, 32, 5], // a short first chunk, as before a saved state
+    [5, 16, 16],
+    [1, 16, 16],
+    [96, 32, 32]
+  ]) {
+    test(`matches token by token: ${tokens} tokens, chunks of ${chunk}, the first of ${first}`, () => {
+      const x = keyedInputs(tokens * 17 + chunk, { dk: 16, dv: 12, tokens })
+      const s0 = randomState(tokens + chunk, 16, 12)
+      const seq = deltaSequentialKeys(x, s0)
+      const ends: Array<number> = []
+      const chunked = deltaChunkedKeys(x, s0, chunk, first, (end) => ends.push(end))
+      assert.ok(relError(chunked.o, seq.o) < 1e-9, `outputs ${relError(chunked.o, seq.o)}`)
+      assert.ok(relError(chunked.state, seq.state) < 1e-9, `state ${relError(chunked.state, seq.state)}`)
+      assert.equal(ends[ends.length - 1], tokens)
+      if (tokens > first) assert.equal(ends[0], first)
+    })
+  }
+
+  test("the state after a chunk is the token-by-token state there", () => {
+    const x = keyedInputs(3, { dk: 16, dv: 8, tokens: 40 })
+    const s0 = randomState(4, 16, 8)
+    const states = new Map<number, Float64Array>()
+    deltaChunkedKeys(x, s0, 16, 8, (end, state) => states.set(end, Float64Array.from(state)))
+    for (const [end, state] of states) {
+      const cut = (a: Float64Array, width: number) => a.subarray(0, end * width)
+      const seq = deltaSequentialKeys({ ...x, tokens: end, q: cut(x.q, 16), k: cut(x.k, 16), v: cut(x.v, 8), g: cut(x.g, 16), beta: x.beta.subarray(0, end), ratio: x.ratio.subarray(0, end) }, s0)
+      assert.ok(relError(state, seq.state) < 1e-9, `state after ${end}: ${relError(state, seq.state)}`)
+    }
+  })
+
+  test("a scalar decay and a ratio of 1 are the Gated DeltaNet rule", () => {
+    const base = inputs(21, { dk: 16, dv: 12, tokens: 48 })
+    const g = new Float64Array(48 * 16)
+    for (let t = 0; t < 48; t++) g.fill(base.g[t], t * 16, (t + 1) * 16)
+    const x: KeyedDeltaInputs = { ...base, g, ratio: new Float64Array(48).fill(1) }
+    const s0 = randomState(22, 16, 12)
+    const keyed = deltaChunkedKeys(x, s0, 16)
+    const plain = deltaSequential(base, s0)
+    assert.ok(relError(keyed.o, plain.o) < 1e-10)
+    assert.ok(relError(keyed.state, plain.state) < 1e-10)
+  })
+
+  test("nearly collinear keys with the strongest decays stay exact and finite", () => {
+    const x = keyedInputs(5, { dk: 32, dv: 8, tokens: 64, similar: 6, lower: -5 })
+    const s0 = randomState(6, 32, 8)
+    const seq = deltaSequentialKeys(x, s0)
+    const chunked = deltaChunkedKeys(x, s0, 32)
+    for (const v of chunked.o) assert.ok(Number.isFinite(v))
+    assert.ok(relError(chunked.o, seq.o) < 1e-7, `outputs ${relError(chunked.o, seq.o)}`)
+    assert.ok(relError(chunked.state, seq.state) < 1e-7)
   })
 })

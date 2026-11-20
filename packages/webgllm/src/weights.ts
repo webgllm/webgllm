@@ -86,6 +86,17 @@ export type ModelConfig = {
   gatePerDim?: boolean
   /** Gated DeltaNet layers' shapes (Qwen3.5), when the model has them. */
   linear?: LinearConfig
+  /**
+   * The softmax's scale where it isn't 1/√headDim: latent attention scores
+   * over headDim latent dims, scaled by its full keys' width (Raon: 1/√192).
+   */
+  attentionScale?: number
+  /** The residual as several streams with learned mixing (Raon's mHC), when the model has them. */
+  streams?: StreamConfig
+  /** Latent attention's shapes (Raon's gated MLA), when the model has them. */
+  latent?: LatentConfig
+  /** Per-layer token embeddings (Raon), when the model has them. */
+  perLayer?: PerLayerConfig
   bosTokenId: number
   eosTokenId: number
   padTokenId: number
@@ -99,6 +110,44 @@ export type LinearConfig = {
   valueHeadDim: number
   /** The causal convolution's width (4). */
   convKernel: number
+  /**
+   * Raon Delta Attention: the state decays per key dim, by
+   * exp(lowerBound · sigmoid(low-rank projection + bias)), and what is
+   * written is scaled by a write gate apart from the erase gate.
+   */
+  keyDecay?: { rank: number; lowerBound: number }
+}
+
+/** Raon's mHC: the residual is `count` streams of hiddenSize each. */
+export type StreamConfig = {
+  count: number
+  /** The selector's RMS epsilon (over all streams). */
+  eps: number
+}
+
+/**
+ * Raon's gated MLA, in absorbed form: the cache holds one latent row a
+ * token (rank values, then `shared` key dims every head reads as they are);
+ * a head's query is projected into that latent (keyDim - shared dims
+ * through its own rank × (keyDim - shared) matrix) and its attended latent
+ * out to valueDim values.
+ */
+export type LatentConfig = {
+  heads: number
+  queryRank: number
+  rank: number
+  shared: number
+  /** A head's key width before absorption (the softmax's scale is 1/√keyDim). */
+  keyDim: number
+  valueDim: number
+  eps: number
+}
+
+/** Raon's per-layer embeddings: `dim` values a layer for every token. */
+export type PerLayerConfig = {
+  dim: number
+  /** Layers the per-layer table and its projection hold inputs for, where not the model's own count (predictSpeed's probe: a layer of each kind standing in for all of them). */
+  layers?: number
 }
 
 export type QuantMatrix = {
@@ -113,6 +162,13 @@ export type QuantMatrix = {
   scales: Uint16Array
   /** 4-bit only: one zero point (0..15) per row and block; null means 8. */
   zeros: Uint8Array | null
+  /**
+   * 4-bit only, instead of `zeros` (then null): the zero points as IEEE half
+   * bits, where they aren't whole numbers. A GGUF's Q4_K sub-block (32
+   * weights, d · scale · q - dmin · min) is this module's block with scale
+   * d · scale and zero point dmin · min / (d · scale).
+   */
+  zeroHalves?: Uint16Array
   /**
    * 4-bit only, instead of `quants` (then empty): the rows as onnxruntime's
    * MatMulNBits stores them ([N][K / 32][16], element 2i of a block in byte
@@ -167,6 +223,55 @@ export type LinearAttentionWeights = {
   dtBias: Float32Array
   /** The gated RMSNorm's weights (valueHeadDim, shared by the heads; not zero-centered). */
   norm: Float32Array
+  /**
+   * Raon Delta Attention (config.linear.keyDecay), where `ba` holds the
+   * decay's low-rank projection (rank rows), then b and b + write (value
+   * heads each), `dtBias` is per key dim and `a` is unused: the rank's
+   * outputs to every key dim's decay logit (K rows of rank). Its output
+   * gate is sigmoid(z), not silu.
+   */
+  decay?: QuantMatrix
+}
+
+/** One of a layer's two mHC sites (Raon): how the branch reads the streams and writes back. */
+export type StreamMixWeights = {
+  /**
+   * The selector: rows pre (count), post (count), then the (count - 1)²
+   * mixing coordinates, padded with zero rows to a multiple of 4; inputs
+   * the streams one after another (count · hiddenSize), over their RMS.
+   */
+  fn: QuantMatrix
+  /** Added to the selector's outputs (its unpadded rows). */
+  base: Float32Array
+  /**
+   * As KRAFTON's converter folds it: K (count² rows of the selector's
+   * width), then r (count²), then c0 (count × count). With e = K · mixes
+   * and rho = 1 + max(e · r): stream dst takes Σ_src (e / rho + c0)[dst +
+   * count · src] · stream src, plus sigmoid(post[dst]) · the branch.
+   */
+  chart: Float32Array
+}
+
+/** Raon's gated MLA layer (see LatentConfig). */
+export type LatentAttentionWeights = {
+  /** Rows q_a (queryRank), kv_a (rank + shared), then the output gate (heads · valueDim). */
+  inProj: QuantMatrix
+  qNorm: Float32Array
+  kvNorm: Float32Array
+  /** heads · keyDim rows over queryRank: a head's keyDim - shared dims, then its shared dims. */
+  qB: QuantMatrix
+  /** Per head, rank rows of (keyDim - shared): halves, head-major, row-major. */
+  kB: Uint16Array
+  /** Per head, valueDim rows of rank: halves, head-major, row-major. */
+  vB: Uint16Array
+  o: QuantMatrix
+}
+
+/** A layer's part of Raon's per-layer embedding: streams += RMSNorm(proj(gelu(gate · Σ streams) · input)) · norm. */
+export type PerLayerWeights = {
+  gate: QuantMatrix
+  proj: QuantMatrix
+  norm: Float32Array
 }
 
 export type LayerWeights = {
@@ -179,6 +284,10 @@ export type LayerWeights = {
   conv?: ConvWeights
   attention?: AttentionWeights
   linear?: LinearAttentionWeights
+  latent?: LatentAttentionWeights
+  /** Raon's mHC sites: before the operator, and before the MLP. */
+  mix?: { operator: StreamMixWeights; ffn: StreamMixWeights }
+  perLayer?: PerLayerWeights
   /** w1 (gate) rows, then w3 (up) rows: 2 × intermediateSize. */
   gateUp: QuantMatrix
   /** w2 (down). */
@@ -208,6 +317,18 @@ export type WeightPiece =
    */
   | { kind: "embedding"; value: QuantMatrix; row0?: number; totalRows?: number }
   | { kind: "finalNorm"; value: Float32Array }
+  /**
+   * Raon's per-layer embeddings, the model's part: the projection of the
+   * token embedding (layers · dim rows) and its norm (dim), and where the
+   * table's rows are in the file (a token's row: layers · dim values of
+   * tensor type `type`, rowBytes long, read when the token is).
+   */
+  | {
+      kind: "perLayer"
+      proj: QuantMatrix
+      norm: Float32Array
+      table: { offset: number; rowBytes: number; type: number; rows: number }
+    }
   | {
       kind: "layer"
       layer: number

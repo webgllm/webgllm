@@ -40,3 +40,43 @@ for(const mode of ["success","stopped","throw"] as const)for(const warm of [fals
     }finally{timer.mock.restore();Object.assign(TUNING,prior)}
   })
 }
+
+test("tuning's token forwards stay inside a small context: a stretch holds no more than the cache has room for", async () => {
+  for (const contextLength of [1, 3, 8, 64]) {
+    const prior = { ...TUNING }
+    Object.assign(TUNING, { lanes: 0, bufferPairs: -1, quad: 0 })
+    // A fast clock: a forward takes 0.1 ms, so a timed stretch would hold 16 of them.
+    let clock = 0
+    const timer = mock.method(performance, "now", () => (clock += 0.05))
+    const stored = { N: 8, K: 32, bits: 4, stored: {} }
+    const layers = Array.from({ length: 2 }, () => ({ gateUp: stored, down: stored }))
+    let position = 0, most = 0, forwards = 0, resets = 0
+    const probe = Object.create(Engine.prototype) as { tune: Engine["tune"] }
+    Object.assign(probe, {
+      layers, work: null, unpaced: 0, batchSize: 512, capacity: 576, contextLength,
+      buffers: {}, mrt: { chunks: false }, tuneReport: {}, tuned: {},
+      gpu: { finish: async () => undefined, pace: async () => undefined, sharesLoops: true, coopThreads: 0 },
+      matmul: () => undefined, f16Mats: () => [], f16Sized: () => true, usesF16: () => false, f16Trim: () => undefined, f16Scratch: () => false,
+      reset: () => { position = 0; resets++ },
+      forwardHidden: async (tokens: ArrayLike<number>) => {
+        if (position + tokens.length > contextLength) throw new Error(`The cache holds ${contextLength} tokens; this would need ${position + tokens.length}.`)
+        position += tokens.length
+        most = Math.max(most, position)
+        forwards++
+        return 0
+      }
+    })
+    Object.defineProperty(probe, "quadMatmuls", { value: false })
+    try {
+      const picked = await probe.tune(() => false, { alreadyBusy: true })
+      assert.ok(picked, `a context of ${contextLength} tunes`)
+      assert.ok(forwards > 4 && resets > 4)
+      assert.ok(most <= contextLength, `${most} tokens in a cache of ${contextLength}`)
+      // (Where there's room, a stretch still holds several forwards: the reset stays outside it.)
+      if (contextLength >= 16) assert.equal(most, 16)
+    } finally {
+      timer.mock.restore()
+      Object.assign(TUNING, prior)
+    }
+  }
+})

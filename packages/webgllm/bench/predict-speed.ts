@@ -27,6 +27,12 @@ const measure = (model: string) => inWorker(model, { force: true, decode }, new 
 
 try {
   log(`UA ${navigator.userAgent}`)
+  // ?cold=1: the shapes predictSpeed remembers are read afresh.
+  if (params.get("cold") === "1") {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("webgl-models", { create: true })
+    await dir.removeEntry("speed-shapes.json").catch(() => undefined)
+    log("COLD: the remembered shapes are deleted")
+  }
   for (const model of models) {
     for (let r = 0; r < rounds; r++) {
       const started = performance.now()

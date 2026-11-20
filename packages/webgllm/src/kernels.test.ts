@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
 import * as K from "./gpu/kernels.js"
+import * as R from "./gpu/raon-kernels.js"
 
 describe("the f16 prompt matmul's h2 reads (TUNING.f16Pack)", () => {
   test("f16Pack 0 builds the RGBA16F kernels as they were", () => {
@@ -61,4 +62,18 @@ test("half-float attention preserves the empty-chunk mask after storage rounding
   assert.match(K.attendPanel(128, 2, 2, true, true), /dead1 = mx1 <= -65504\.0/)
   assert.match(K.scores(128, 2), /mix\(vec4\(-1e30\), acc0, live\)/)
   assert.match(K.attendChunk(128, 1), /mx0 < -1e29/)
+})
+
+describe("the delta rule's q and k over their L2 norms", () => {
+  test("Qwen3.5's norm keeps its form; Raon's, batch and fused, is x / max(|x|, 1e-6)", () => {
+    const qwen = "inversesqrt(dot(s, vec4(1.0)) + 1e-6)"
+    const raon = "1.0 / max(sqrt(dot(s, vec4(1.0))), 1e-6)"
+    assert.equal(K.linPrep(16), K.linPrep(16, false))
+    assert.ok(K.linPrep(16).includes(qwen) && !K.linPrep(16).includes("max(sqrt"))
+    assert.ok(K.linPrep(16, true).includes(raon) && !K.linPrep(16, true).includes("inversesqrt"))
+    assert.equal(K.linPrep(16, true).replace(raon, qwen), K.linPrep(16))
+    const fused = R.rdaDeltaFused({ keyHeadDim: 128, valueHeadDim: 128 })
+    assert.ok(fused.includes("1.0 / max(sqrt(dot(sq, vec4(1.0))), 1e-6)") && fused.includes("1.0 / max(sqrt(dot(sk, vec4(1.0))), 1e-6)"))
+    assert.ok(!/inversesqrt\(dot\(s[qk]/.test(fused))
+  })
 })

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { CodedError, downloadError, errorCode } from "./worker-errors.js"
+import { CodedError, downloadError, errorCode, isFilesError } from "./worker-errors.js"
 import { GpuError } from "./gpu/gl.js"
 import { StructuredOutputError } from "./constraint/index.js"
 
@@ -27,4 +27,12 @@ test("download failures: storage-full for the quota, download-failed otherwise, 
   abort.abort()
   const reason = abort.signal.reason
   assert.equal(downloadError(reason, abort.signal), reason)
+})
+
+test("a failed download or a full storage is the files' failure, not the GPU's", () => {
+  assert.equal(isFilesError(downloadError(new TypeError("Failed to fetch"))), true)
+  assert.equal(isFilesError(downloadError({ name: "QuotaExceededError", message: "quota" })), true)
+  assert.equal(isFilesError(new CodedError("long", "context-length-exceeded")), false)
+  assert.equal(isFilesError(new GpuError("WebGPU computes the model wrong (relative error 1.0e-1).")), false)
+  assert.equal(isFilesError(new Error("other")), false)
 })

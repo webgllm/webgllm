@@ -31,6 +31,7 @@ import {
   type GgufTensorInfo,
   type GgufValue
 } from "./gguf.js"
+import { loadRaon } from "./load-raon.js"
 import { ReadPlan } from "./read-plan.js"
 import { pooledBuffers } from "./upload-staging.js"
 import { headPermutation } from "./repack.js"
@@ -38,10 +39,13 @@ import { headPermutation } from "./repack.js"
 export { headPermutation }
 import {
   dequantizeQ4_1,
+  dequantizeQ4_K,
   dequantizeQ5_K,
+  dequantizeQ8_0,
   dequantizeQ6_K,
   newQuantMatrix,
   packQ4_0,
+  packQ4_K,
   packQ8_0,
   packQ6_K,
   q8Converter,
@@ -88,6 +92,10 @@ export async function* loadGguf(
   options: LoadGgufOptions = {}
 ): AsyncGenerator<WeightPiece, void, undefined> {
   const header = options.header ?? (await readGgufHeader(source))
+  if (header.metadata.get("general.architecture") === "raon1nano") {
+    yield* loadRaon(source, header, options)
+    return
+  }
   // Q5_K and Q4_1 matrices converted through WebAssembly SIMD where it runs (its memory goes with the load).
   const q8 = [...header.tensors.values()].some((t) => t.type === GgmlType.Q5_K || t.type === GgmlType.Q4_1) ? q8Converter() : null
   const tensor = (name: string): GgufTensorInfo => {
@@ -222,12 +230,12 @@ export async function* loadGguf(
   // iPhone's load), and a model's worth of freed buffers the allocator
   // keeps resident.
   const pool = new Map<string, QuantMatrix>()
-  const pooled = (key: string, N: number, K: number, bits: 4 | 6 | 8): QuantMatrix => {
-    if (!options.reusePieces) return newQuantMatrix(N, K, bits, false)
+  const pooled = (key: string, N: number, K: number, bits: 4 | 6 | 8, halves = false): QuantMatrix => {
+    if (!options.reusePieces) return newQuantMatrix(N, K, bits, halves ? "halves" : false)
     let m = pool.get(key)
     if (!m) {
-      m = newQuantMatrix(N, K, bits, false)
-      for (const view of [m.quants, m.scales]) pooledBuffers.add(view.buffer)
+      m = newQuantMatrix(N, K, bits, halves ? "halves" : false)
+      for (const view of [m.quants, m.scales, ...(m.zeroHalves ? [m.zeroHalves] : [])]) pooledBuffers.add(view.buffer)
       pool.set(key, m)
     }
     return { ...m }
@@ -245,15 +253,9 @@ export async function* loadGguf(
     }>
   ): Promise<QuantMatrix> => {
     const infos = parts.map((p) => tensor(p.name))
-    const bits = bitsOf(infos[0])
-    for (const info of infos) {
-      if (bitsOf(info) !== bits)
-        throw new Error(
-          `GGUF: ${info.name} can't be combined with ${infos[0].name}`
-        )
-    }
+    const { bits, halves: q4k } = matrixStorage(infos, K)
     const N = parts.reduce((n, p) => n + p.rows, 0)
-    const m = pooled(`${parts.map((p) => p.name.replace(/^blk\.\d+\./, "")).join("+")}:${N}x${K}:${bits}`, N, K, bits)
+    const m = pooled(`${parts.map((p) => p.name.replace(/^blk\.\d+\./, "")).join("+")}:${N}x${K}:${bits}${q4k ? "k" : ""}`, N, K, bits, q4k)
     let row0 = 0
     // A tensor two parts read (Qwen3.5's q and gate) is taken once.
     const taken = new Map<string, Uint8Array>()
@@ -272,7 +274,8 @@ export async function* loadGguf(
       }
       let bytes = taken.get(name)
       if (!bytes) taken.set(name, (bytes = await plan.take(name)))
-      packRows(m, row0, info, bytes, rows, perm, q8)
+      if (q4k) packQ4_K(m, row0, bytes, rows, perm)
+      else packRows(m, row0, info, bytes, rows, perm, q8)
       if (lastUse.get(name) === p) { plan.release(bytes); taken.delete(name) }
       row0 += rows
     } } finally { for (const bytes of taken.values()) plan.release(bytes) }
@@ -443,7 +446,7 @@ export async function* loadGguf(
   // (Everything is uploaded: the pooled buffers go now, not at the next collection.)
   if (options.releaseReadBuffers)
     for (const m of pool.values())
-      for (const view of [m.quants, m.scales])
+      for (const view of [m.quants, m.scales, ...(m.zeroHalves ? [m.zeroHalves] : [])])
         (view.buffer as ArrayBuffer & { transfer?: (length: number) => ArrayBuffer }).transfer?.(0)
   pool.clear()
 }
@@ -462,6 +465,23 @@ export function defaultEmbeddingRows(
   return Math.max(512, Math.min(2048, Math.floor(budget / rowBytes) & ~3))
 }
 
+/**
+ * How a matrix made of these tensors' rows (K weights each) is stored: Q4_K
+ * parts alone keep their 4 bits, each sub-block a block with its own scale
+ * and a zero point as a half (`halves`: see packQ4_K); any others take
+ * their type's bits (bitsOf), which must agree. predictSpeed's probe gives
+ * its random matrices the same storage (speed-probe.ts).
+ */
+export function matrixStorage(infos: ReadonlyArray<GgufTensorInfo>, K: number): { bits: 4 | 8; halves: boolean } {
+  const halves = infos.every((info) => info.type === GgmlType.Q4_K) && K % 256 === 0
+  const bits = halves ? 4 : bitsOf(infos[0])
+  for (const info of infos) {
+    if (!halves && bitsOf(info) !== bits)
+      throw new Error(`GGUF: ${info.name} can't be combined with ${infos[0].name}`)
+  }
+  return { bits, halves }
+}
+
 /** The bits a tensor gets in a QuantMatrix. */
 export function bitsOf(info: GgufTensorInfo): 4 | 8 {
   switch (info.type) {
@@ -469,6 +489,7 @@ export function bitsOf(info: GgufTensorInfo): 4 | 8 {
       return 4
     case GgmlType.Q8_0:
     case GgmlType.Q4_1:
+    case GgmlType.Q4_K:
     case GgmlType.Q5_K:
     case GgmlType.Q6_K:
     case GgmlType.F16:
@@ -476,7 +497,7 @@ export function bitsOf(info: GgufTensorInfo): 4 | 8 {
       return 8
     default:
       throw new Error(
-        `GGUF: ${info.name} has tensor type ${info.type}, which this loader doesn't take (Q4_0, Q8_0, Q4_1, Q5_K, Q6_K, F16, F32 do)`
+        `GGUF: ${info.name} has tensor type ${info.type}, which this loader doesn't take (Q4_0, Q8_0, Q4_1, Q4_K, Q5_K, Q6_K, F16, F32 do)`
       )
   }
 }
@@ -485,7 +506,7 @@ export function bitsOf(info: GgufTensorInfo): 4 | 8 {
 const FLOAT_ROWS = 32
 let floatScratch = new Float32Array(0)
 
-function packRows(
+export function packRows(
   m: QuantMatrix,
   row0: number,
   info: GgufTensorInfo,
@@ -513,18 +534,27 @@ function packRows(
     }
     return
   }
-  const values = new Float32Array(rows * m.K)
-  rowsToFloats(info, bytes, rows, values)
-  if (perm) {
-    const src = values.slice()
-    for (let i = 0; i < rows; i++)
-      values.set(src.subarray(perm[i] * m.K, (perm[i] + 1) * m.K), i * m.K)
+  // Each row from where the tensor has it: perm may pick among more rows
+  // than the part takes (Qwen3.5's queries and gates are halves of one
+  // tensor), so the rows are found in the tensor's bytes, not among the
+  // first `rows` of them.
+  const rowBytes = tensorByteLength(info.type, [m.K, 1])
+  if (floatScratch.length < FLOAT_ROWS * m.K) floatScratch = new Float32Array(FLOAT_ROWS * m.K)
+  for (let r = 0; r < rows; r += FLOAT_ROWS) {
+    const count = Math.min(FLOAT_ROWS, rows - r)
+    const values = floatScratch.subarray(0, count * m.K)
+    for (let i = 0; i < count; i++) {
+      const from = perm[r + i]
+      if (from < 0 || (from + 1) * rowBytes > bytes.length)
+        throw new Error(`GGUF: ${info.name} has no row ${from}`)
+      rowsToFloats(info, bytes.subarray(from * rowBytes, (from + 1) * rowBytes), 1, values.subarray(i * m.K, (i + 1) * m.K))
+    }
+    quantizeQ8(m, row0 + r, values, count)
   }
-  quantizeQ8(m, row0, values, rows)
 }
 
-/** F32, F16, Q4_1, Q5_K or Q6_K rows as floats. */
-function rowsToFloats(
+/** F32, F16, Q4_1, Q4_K, Q5_K, Q6_K or Q8_0 rows as floats. */
+export function rowsToFloats(
   info: GgufTensorInfo,
   bytes: Uint8Array,
   rows: number,
@@ -533,7 +563,9 @@ function rowsToFloats(
   const K = info.dims[0]
   if (info.type === GgmlType.Q6_K) return dequantizeQ6_K(bytes, rows, K, out)
   if (info.type === GgmlType.Q5_K) return dequantizeQ5_K(bytes, rows, K, out)
+  if (info.type === GgmlType.Q4_K) return dequantizeQ4_K(bytes, rows, K, out)
   if (info.type === GgmlType.Q4_1) return dequantizeQ4_1(bytes, rows, K, out)
+  if (info.type === GgmlType.Q8_0) return dequantizeQ8_0(bytes, rows, K, out)
   if (info.type === GgmlType.F16) {
     const half = halfTable()
     for (let i = 0; i < rows * K; i++)
@@ -547,7 +579,7 @@ function rowsToFloats(
   )
 }
 
-function toFloats(info: GgufTensorInfo, bytes: Uint8Array): Float32Array {
+export function toFloats(info: GgufTensorInfo, bytes: Uint8Array): Float32Array {
   if (info.type === GgmlType.F32) return bytesToFloats(bytes)
   if (info.type === GgmlType.F16) return halvesToFloats(bytes)
   throw new Error(

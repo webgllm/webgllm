@@ -15,7 +15,8 @@ export function newQuantMatrix(
   N: number,
   K: number,
   bits: 4 | 6 | 8,
-  withZeros: boolean
+  /** "halves": fractional zero points (`zeroHalves`), for packQ4_K. */
+  withZeros: boolean | "halves"
 ): QuantMatrix {
   if (N % 4 !== 0) throw new Error(`matrix rows (${N}) must be a multiple of 4`)
   const blockSize = bits === 6 ? 256 : 32
@@ -28,7 +29,8 @@ export function newQuantMatrix(
     bits,
     quants: new Uint32Array(N * blocks * WORDS_PER_BLOCK[bits]),
     scales: new Uint16Array(N * blocks),
-    zeros: withZeros ? new Uint8Array(N * blocks).fill(8) : null
+    zeros: withZeros === true ? new Uint8Array(N * blocks).fill(8) : null,
+    ...(withZeros === "halves" && { zeroHalves: new Uint16Array(N * blocks) })
   }
 }
 
@@ -80,6 +82,86 @@ export function packQ4_0(
       q[qi + 1] = input.getUint32(p + 6, true)
       q[qi + 2] = input.getUint32(p + 10, true)
       q[qi + 3] = input.getUint32(p + 14, true)
+    }
+  }
+  repackTime.ggufQ4Ms += performance.now() - started
+}
+
+/**
+ * ggml Q4_K rows (super-blocks of 256: fp16 d, fp16 dmin, 12 bytes of 6-bit
+ * scales and mins, qs[128]) into a 4-bit matrix with fractional zero points
+ * (`zeroHalves`), no weight requantized: each sub-block of 32 is a block,
+ * its scale d · scale rounded to a half and its zero point dmin · min over
+ * that. In the file, 64 weights are 32 bytes, the first 32 their low
+ * nibbles and the next 32 their high ones; a block's bytes hold weight j
+ * low and j + 16 high. A sub-block whose scale is 0 (every weight
+ * -dmin · min) is written as q = 15 everywhere, scale -dmin · min / 15.
+ */
+export function packQ4_K(
+  m: QuantMatrix,
+  row0: number,
+  src: Uint8Array,
+  rows: number,
+  srcRows?: ArrayLike<number>
+): void {
+  check(m, row0, rows, 4)
+  const zeros = m.zeroHalves
+  if (!zeros) throw new Error("Q4_K rows go into a matrix with fractional zero points")
+  const started = performance.now()
+  const half = halfTable()
+  const blocks = m.K / 32
+  const supers = m.K / 256
+  if (src.length < rows * supers * 144) throw new Error("Q4_K data is too short")
+  const input = new DataView(src.buffer, src.byteOffset, src.byteLength)
+  const q = m.quants
+  const scales = m.scales
+  const LOW = 0x0f0f0f0f
+  for (let i = 0; i < rows; i++) {
+    const n = row0 + i
+    let p = (srcRows ? srcRows[i] : i) * supers * 144
+    let si = (n >> 2) * blocks * 4 + (n & 3)
+    for (let s = 0; s < supers; s++, p += 144) {
+      const d = half[input.getUint16(p, true)]
+      const dmin = half[input.getUint16(p + 2, true)]
+      const sc = p + 4
+      for (let is = 0; is < 8; is += 2, si += 8) {
+        // get_scale_min_k4: sub-block j's 6-bit scale and min.
+        let s1: number, m1: number, s2: number, m2: number
+        if (is < 4) {
+          s1 = src[sc + is] & 63
+          m1 = src[sc + is + 4] & 63
+          s2 = src[sc + is + 1] & 63
+          m2 = src[sc + is + 5] & 63
+        } else {
+          s1 = (src[sc + is + 4] & 15) | ((src[sc + is - 4] >> 6) << 4)
+          m1 = (src[sc + is + 4] >> 4) | ((src[sc + is] >> 6) << 4)
+          s2 = (src[sc + is + 5] & 15) | ((src[sc + is - 3] >> 6) << 4)
+          m2 = (src[sc + is + 5] >> 4) | ((src[sc + is + 1] >> 6) << 4)
+        }
+        const at = p + 16 + is * 16
+        const qi = si * 4
+        for (let w = 0; w < 4; w++) {
+          const a = input.getUint32(at + 4 * w, true)
+          const b = input.getUint32(at + 16 + 4 * w, true)
+          q[qi + w] = (a & LOW) | ((b & LOW) << 4)
+          q[qi + 16 + w] = ((a >>> 4) & LOW) | (b & ~LOW)
+        }
+        for (let j = 0; j < 2; j++) {
+          const scale = d * (j ? s2 : s1)
+          const min = dmin * (j ? m2 : m1)
+          const at = si + 4 * j
+          const h = toHalf(scale)
+          if (half[h] !== 0) {
+            scales[at] = h
+            zeros[at] = toHalf(min / half[h])
+          } else {
+            // No scale: every weight is -min.
+            for (let w = 0; w < 4; w++) q[at * 4 + w] = 0xffffffff
+            scales[at] = toHalf(-min / 15)
+            zeros[at] = 0
+          }
+        }
+      }
     }
   }
   repackTime.ggufQ4Ms += performance.now() - started
@@ -380,6 +462,68 @@ export function dequantizeQ4_1(
       out[y + j] = (q & 15) * d + m
       out[y + j + 16] = (q >> 4) * d + m
     }
+  }
+}
+
+/**
+ * Dequantizes ggml Q4_K rows (super-blocks of 256: fp16 d, fp16 dmin, 12
+ * bytes of 6-bit scales and mins, qs[128]; as dequantize_row_q4_K) into
+ * `out` (rows × K). In each 64 weights, the first 32 are 32 bytes' low
+ * nibbles and the next 32 their high ones.
+ */
+export function dequantizeQ4_K(
+  src: Uint8Array,
+  rows: number,
+  K: number,
+  out: Float32Array
+): void {
+  const half = halfTable()
+  const superBlocks = (rows * K) / 256
+  for (let s = 0; s < superBlocks; s++) {
+    const p = s * 144
+    const d = half[src[p] | (src[p + 1] << 8)]
+    const dmin = half[src[p + 2] | (src[p + 3] << 8)]
+    const sc = p + 4
+    let y = s * 256
+    for (let is = 0; is < 8; is += 2) {
+      const q = p + 16 + is * 16
+      // get_scale_min_k4: sub-block j's 6-bit scale and min.
+      let s1: number, m1: number, s2: number, m2: number
+      if (is < 4) {
+        s1 = src[sc + is] & 63
+        m1 = src[sc + is + 4] & 63
+        s2 = src[sc + is + 1] & 63
+        m2 = src[sc + is + 5] & 63
+      } else {
+        s1 = (src[sc + is + 4] & 15) | ((src[sc + is - 4] >> 6) << 4)
+        m1 = (src[sc + is + 4] >> 4) | ((src[sc + is] >> 6) << 4)
+        s2 = (src[sc + is + 5] & 15) | ((src[sc + is - 3] >> 6) << 4)
+        m2 = (src[sc + is + 5] >> 4) | ((src[sc + is + 1] >> 6) << 4)
+      }
+      const d1 = d * s1
+      const min1 = dmin * m1
+      const d2 = d * s2
+      const min2 = dmin * m2
+      for (let l = 0; l < 32; l++) out[y++] = d1 * (src[q + l] & 15) - min1
+      for (let l = 0; l < 32; l++) out[y++] = d2 * (src[q + l] >> 4) - min2
+    }
+  }
+}
+
+/** Dequantizes ggml Q8_0 rows (blocks of 32: fp16 d, 32 int8) into `out` (rows × K). */
+export function dequantizeQ8_0(
+  src: Uint8Array,
+  rows: number,
+  K: number,
+  out: Float32Array
+): void {
+  const half = halfTable()
+  const blocks = (rows * K) / 32
+  for (let b = 0; b < blocks; b++) {
+    const p = b * 34
+    const d = half[src[p] | (src[p + 1] << 8)]
+    const y = b * 32
+    for (let j = 0; j < 32; j++) out[y + j] = d * ((src[p + 2 + j] << 24) >> 24)
   }
 }
 
@@ -731,7 +875,7 @@ export function matrixRow(m: QuantMatrix, n: number): Float32Array | null {
       for (let j = 0; j < 32; j++) out[b * 32 + j] = scale * ((q[si * 32 + j] << 24) >> 24)
       continue
     }
-    const zero = m.zeros ? m.zeros[si] : 8
+    const zero = m.zeroHalves ? half[m.zeroHalves[si]] : m.zeros ? m.zeros[si] : 8
     for (let j = 0; j < 32; j++) {
       // Raw: element 2i in byte i's low nibble. This module's: elements
       // 0–15 in their bytes' low nibbles, 16–31 in the high nibbles of 0–15.

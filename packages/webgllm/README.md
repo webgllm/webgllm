@@ -256,7 +256,7 @@ const webgllm = new WebGLLM({ promptCacheBytes: 256 * 2 ** 20, promptCacheDiskBy
 
 ## Models
 
-Any Hugging Face model whose architecture webgllm runs loads by its repository name (`owner/name`): LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export. A model hosted elsewhere loads by the URL of its `.gguf` file or `.onnx` graph, with its `tokenizer.json` and `tokenizer_config.json` (and `chat_template.jinja`, `generation_config.json`, and for ONNX `config.json` and the graph's data file, where there are) in the same folder.
+Any Hugging Face model whose architecture webgllm runs loads by its repository name (`owner/name`): LFM2 and LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export, and KRAFTON's Raon-1 nano as a GGUF. A model hosted elsewhere loads by the URL of its `.gguf` file or `.onnx` graph, with its `tokenizer.json` and `tokenizer_config.json` (and `chat_template.jinja`, `generation_config.json`, and for ONNX `config.json` and the graph's data file, where there are) in the same folder.
 
 ```ts
 await webgllm.chat.completions.create({ model: "LiquidAI/LFM2-350M-GGUF", messages })
@@ -264,7 +264,7 @@ await webgllm.chat.completions.create({ model: "LiquidAI/LFM2-350M-GGUF", messag
 
 webgllm reads the repository's file list from the Hub and picks, by one rule each:
 
-- **Weights:** a GGUF file (Q4_0 first, a quantization-aware "QAD" Q4_0 before a plain one, then Q8_0, then the fewest bits among Q4_1, Q5_K, Q6_K and F16), else an ONNX graph under `onnx/` that the loader takes, checked by reading the graph before its weights download (4-bit `MatMulNBits` in blocks of 32, with 8-bit ones where the export keeps a matrix at 8 bits; its weights in the external data files the graph names; q4f16 tried first, then q4).
+- **Weights:** a GGUF file (Q4_0 first, a quantization-aware "QAD" Q4_0 before a plain one, then Q4_K, then Q8_0, then the fewest bits among Q4_1, Q5_K, Q6_K and F16; of two files of a type, the one without a multi-token-prediction block, `MTP`), else an ONNX graph under `onnx/` that the loader takes, checked by reading the graph before its weights download (4-bit `MatMulNBits` in blocks of 32, with 8-bit ones where the export keeps a matrix at 8 bits; its weights in the external data files the graph names; q4f16 tried first, then q4).
 - **Tokenizer and chat template:** the repository's own, else those in a folder named in the weights file's name (Liquid AI's `qad/`), else the base model's (the card's `base_model`).
 - **Thinking and tool calls:** from the chat template (`enable_thinking` makes thinking switchable; a template that opens `<think>`, or a model named "Thinking" or "Reasoning", always thinks). `<tool_call>` means the XML call format, otherwise LFM2's Pythonic calls.
 - **Sampling:** the repository's `generation_config.json` as Transformers reads it: its values when it sets `do_sample`, else greedy decoding.

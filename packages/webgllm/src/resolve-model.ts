@@ -7,8 +7,10 @@
  * The rules:
  * - Weights: a `.gguf` file (not a vision projector, not a split file) makes
  *   a GGUF model: Q4_0 first (a quantization-aware "QAD" Q4_0 before a plain
- *   one), then Q8_0, then the fewest bits among the other types the loader
- *   takes (Q4_1, Q5_K, Q6_K, F16), then unlabeled files. Otherwise an ONNX
+ *   one), then Q4_K, then Q8_0, then the fewest bits among the other types
+ *   the loader takes (Q4_1, Q5_K, Q6_K, F16), then unlabeled files; of two
+ *   files of a type, the one without a multi-token-prediction block
+ *   (`MTP`), which the engine doesn't run. Otherwise an ONNX
  *   graph under `onnx/` that the ONNX loader takes, read before anything
  *   else downloads: its own checks (4-bit MatMulNBits in blocks of 32, the
  *   layer layout, config.json's shapes) pass, and its weights are in
@@ -56,7 +58,7 @@ import type { ByteSource } from "./weights.js"
 const HUB = "https://huggingface.co"
 
 /** GGUF architectures the GGUF loader runs (load-gguf.ts). */
-export const GGUF_ARCHITECTURES = ["lfm2", "lfm3", "qwen35"] as const
+export const GGUF_ARCHITECTURES = ["lfm2", "lfm3", "qwen35", "raon1nano"] as const
 /** config.json model types the ONNX loader runs (load-onnx.ts). */
 export const ONNX_MODEL_TYPES = ["lfm2", "lfm3", "qwen3_5", "lfm2_vl", "lfm3_vl"] as const
 
@@ -341,7 +343,7 @@ async function fileJson(file: ModelFile): Promise<Record<string, unknown> | unde
 const filesOf = (info: HubModel) => new Set((info.siblings ?? []).map((s) => s.rfilename))
 
 /** GGUF types by preference (see the rules above); a file's type is the label ending its name. */
-const GGUF_TYPES = ["Q4_0", "Q8_0", "Q4_1", "Q5_K_S", "Q5_K_M", "Q6_K", "F16"]
+const GGUF_TYPES = ["Q4_0", "Q4_K_S", "Q4_K_M", "Q8_0", "Q4_1", "Q5_K_S", "Q5_K_M", "Q6_K", "F16"]
 
 /** The GGUF file to load, or undefined when the repository has no loadable one. */
 export function pickGguf(files: Iterable<string>): string | undefined {
@@ -353,11 +355,11 @@ export function pickGguf(files: Iterable<string>): string | undefined {
     const name = file.split("/").pop()!.replace(/\.gguf$/i, "")
     const type = GGUF_TYPES.findIndex((t) => label(name, t))
     if (type < 0) {
-      // A labeled type the loader can't take (Q4_K_M, IQ4_XS, Q5_0, BF16…) never loads.
+      // A labeled type the loader can't take (IQ4_XS, Q3_K_M, Q5_0, BF16…) never loads.
       return label(name, "IQ\\d\\w*|Q\\d_K(_[A-Z]+)?|Q\\d_\\d|BF16") ? Infinity : GGUF_TYPES.length * 2
     }
-    // A quantization-aware build of a type before the plain one.
-    return type * 2 + (label(name, "QAD") ? 0 : 1)
+    // A quantization-aware build of a type before the plain one, and a file with an MTP block after one without.
+    return type * 2 + (label(name, "QAD") ? 0 : 1) + (label(name, "MTP") ? 0.5 : 0)
   }
   const ranked = ggufs.map((f) => ({ f, r: rank(f) })).filter((x) => x.r < Infinity)
   ranked.sort((a, b) => a.r - b.r || a.f.localeCompare(b.f))
@@ -526,7 +528,7 @@ export async function hubModelMeta(repo: string): Promise<WebGlModelMeta> {
     const config = files.has("config.json") && onnxCandidates(files).length ? await fileJson({ repo, path: "config.json" }) : undefined
     if (!config) {
       throw notSupported(
-        `${repo} has no weights webgllm loads: no GGUF file of a type it reads (Q4_0, Q8_0, Q4_1, Q5_K, Q6_K, F16), and no ONNX graph under onnx/ with a config.json.`
+        `${repo} has no weights webgllm loads: no GGUF file of a type it reads (Q4_0, Q4_K, Q8_0, Q4_1, Q5_K, Q6_K, F16), and no ONNX graph under onnx/ with a config.json.`
       )
     }
     const type = info.config?.model_type ?? config.model_type

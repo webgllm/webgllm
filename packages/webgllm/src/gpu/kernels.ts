@@ -1638,8 +1638,12 @@ void main() {
 }`
 }
 
-/** q̂ and k̂: each head's q and k over its L2 norm (q also over √dk). */
-function linPrepSource(keyHeadDim: number) {
+/**
+ * q̂ and k̂: each head's q and k over its L2 norm (q also over √dk). The
+ * norm is √(Σx² + 1e-6), as Qwen3.5's; with `floor` max(√Σx², 1e-6), as
+ * Raon's (F.normalize's): they differ where a head's q or k is near zero.
+ */
+function linPrepSource(keyHeadDim: number, floor = false) {
   const T = keyHeadDim / 4
   return `${HEADER}
 uniform sampler2D uQKV;
@@ -1654,7 +1658,7 @@ void main() {
     vec4 v = texelFetch(uQKV, ivec2(base + i, m), 0);
     s += v * v;
   }
-  float inv = inversesqrt(dot(s, vec4(1.0)) + 1e-6);
+  float inv = ${floor ? "1.0 / max(sqrt(dot(s, vec4(1.0))), 1e-6)" : "inversesqrt(dot(s, vec4(1.0)) + 1e-6)"};
   o = texelFetch(uQKV, ivec2(x, m), 0) * inv * (x < uK4 ? ${(1 / Math.sqrt(keyHeadDim)).toFixed(9)} : 1.0);
 }`
 }

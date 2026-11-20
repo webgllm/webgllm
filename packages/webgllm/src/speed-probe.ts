@@ -8,17 +8,18 @@
 import { Engine, TUNING } from "./engine.js"
 import { GL, type Gpu } from "./gpu/gl.js"
 import { WebGpu } from "./gpu/webgpu.js"
-import { GgmlType, readGgufHeader, type GgufHeader } from "./gguf.js"
-import { bytesToFloats, halvesToFloats } from "./half.js"
+import { GgmlType, readGgufHeader, tensorByteLength, type GgufHeader } from "./gguf.js"
+import { bytesToFloats, halvesToFloats, toHalf } from "./half.js"
 import { PROMPT_BATCH } from "./handler.js"
-import { bitsOf, ggufConfig } from "./load-gguf.js"
+import { ggufConfig, matrixStorage } from "./load-gguf.js"
+import { raonConfig, raonLayerMatrices, raonMatrixStorage } from "./load-raon.js"
 import { OnnxModel, planOnnx, type NBits } from "./load-onnx.js"
 import { parseOnnxModel } from "./onnx.js"
 import { source } from "./model-files.js"
 import { fileUrl, type ModelFile, type WebGlModelMeta } from "./model-meta.js"
 import { storedFile } from "./storage.js"
 import { newQuantMatrix } from "./repack.js"
-import type { LayerType, LayerWeights, ModelConfig, QuantMatrix, WeightPiece } from "./weights.js"
+import type { ByteSource, LayerType, LayerWeights, ModelConfig, QuantMatrix, StreamMixWeights, WeightPiece } from "./weights.js"
 
 /** How a matrix is stored: as the loader would hand it to the engine. */
 export type MatrixStorage = {
@@ -26,6 +27,8 @@ export type MatrixStorage = {
   zeros: boolean
   /** 4-bit rows as MatMulNBits stores them (QuantMatrix.raw: ONNX). */
   raw: boolean
+  /** 4-bit blocks' zero points as halves beside their scales (QuantMatrix.zeroHalves: a GGUF's Q4_K matrices). */
+  halves?: true
 }
 
 /** A layer kind's matrices, by role (see LayerWeights). */
@@ -34,10 +37,19 @@ export type KindStorage = Record<string, MatrixStorage>
 /** A model as the GPU sees it, without its weights. */
 export type SpeedShape = {
   config: ModelConfig
-  /** Each kind of layer the model has, in order of first appearance: its matrices' storage. */
+  /**
+   * Each kind of layer the model has, in order of first appearance: its
+   * type and its matrices' storage. Layers of one type whose matrices are
+   * stored differently are kinds apart (a Q4_K_M GGUF's: some layers'
+   * down projections are Q6_K, 8-bit here, the others' Q4_K, 4-bit).
+   */
   kinds: Array<{ type: LayerType; matrices: KindStorage }>
+  /** Each of the model's layers' kind, an index into `kinds`; left out (a shape remembered from before kinds went by storage), the first kind of its type. */
+  layers?: Array<number>
   /** The embedding, also the output head. */
   embedding: MatrixStorage
+  /** Raon's per-layer token embeddings: the model's projection, and the tensor type of the table's rows in the file. */
+  perLayer?: { proj: MatrixStorage; type: number }
 }
 
 /** (The engine's: a prompt's rows a split matmul takes.) */
@@ -55,15 +67,28 @@ export const PROMPT_TOKENS = 256
 /** Most middle layers the probe's prompts run (see middleStack): about one of each kind. */
 export const PROMPT_STACK = 2
 
+/** The kind (an index into `kinds`) of a layer of `type` with these matrices: one already there, or a new one. */
+function kindOf(kinds: SpeedShape["kinds"], type: LayerType, matrices: KindStorage): number {
+  const storage = JSON.stringify(matrices)
+  const found = kinds.findIndex((k) => k.type === type && JSON.stringify(k.matrices) === storage)
+  return found >= 0 ? found : kinds.push({ type, matrices }) - 1
+}
+
+/** Each of the model's layers' kind (an index into shape.kinds): the layer of the probe's model that stands in for it. */
+export function layerKinds(shape: SpeedShape): Array<number> {
+  return shape.layers ?? shape.config.layerTypes.map((type) => shape.kinds.findIndex((k) => k.type === type))
+}
+
 /**
  * Up to `slots` of a model's middle layers (all but its first and last),
  * its kinds in proportion (largest remainders), each kind's picks spread
- * evenly over its own layers, in the model's order.
+ * evenly over its own layers, in the model's order. `layerTypes`: each
+ * layer's kind, whatever tells them apart (a type, an index into kinds).
  */
-export function middleStack(layerTypes: ReadonlyArray<LayerType>, slots: number): Array<LayerType> {
+export function middleStack<T>(layerTypes: ReadonlyArray<T>, slots: number): Array<T> {
   const middle = layerTypes.slice(1, -1)
   if (middle.length <= slots) return middle
-  const at = new Map<LayerType, Array<number>>()
+  const at = new Map<T, Array<number>>()
   middle.forEach((t, i) => at.set(t, [...(at.get(t) ?? []), i]))
   const kinds = [...at.entries()].map(([type, indices]) => {
     const share = (indices.length * slots) / middle.length
@@ -89,11 +114,45 @@ export function middleStack(layerTypes: ReadonlyArray<LayerType>, slots: number)
  */
 export const PROBE_VOCAB = 8192
 
-/** The engine's per-matrix storage for a GGUF tensor type. */
-const ggufMatrix = (header: GgufHeader, name: string): MatrixStorage => {
-  const info = header.tensors.get(name)
-  if (!info) throw new Error(`GGUF: missing tensor ${name}`)
-  return { bits: bitsOf(info), zeros: false, raw: false }
+/** The loader's storage for a matrix made of these tensors' rows (K weights each): see load-gguf.ts's matrixStorage. */
+const ggufMatrix = (header: GgufHeader, K: number, names: ReadonlyArray<string>, rule = matrixStorage): MatrixStorage => {
+  const infos = names.map((name) => {
+    const info = header.tensors.get(name)
+    if (!info) throw new Error(`GGUF: missing tensor ${name}`)
+    return info
+  })
+  const { bits, halves } = rule(infos, K)
+  return { bits, zeros: false, raw: false, ...(halves && { halves: true as const }) }
+}
+
+/** The embedding's storage, as the loaders give it: Q6_K and Q4_0 as they are, others as 8-bit. */
+const ggufEmbedding = (header: GgufHeader): MatrixStorage => {
+  const embedding = header.tensors.get("token_embd.weight")
+  if (!embedding) throw new Error("GGUF: missing tensor token_embd.weight")
+  return { bits: embedding.type === GgmlType.Q6_K ? 6 : embedding.type === GgmlType.Q4_0 ? 4 : 8, zeros: false, raw: false }
+}
+
+/** A Raon-1 nano GGUF's shape (see load-raon.ts): each kind's matrices as loadRaon stores them, and the per-layer embeddings'. */
+function raonSpeedShape(header: GgufHeader): SpeedShape {
+  const config = raonConfig(header)
+  const kinds: SpeedShape["kinds"] = []
+  const layers = config.layerTypes.map((type, i) => {
+    const matrices: KindStorage = {}
+    for (const [role, m] of Object.entries(raonLayerMatrices(config, type)))
+      matrices[role] = ggufMatrix(header, m.K, m.parts.map((part) => `blk.${i}.${part.tensor}.weight`), raonMatrixStorage)
+    return kindOf(kinds, type, matrices)
+  })
+  const table = header.tensors.get("per_layer_token_embd.weight")
+  if (!table) throw new Error("GGUF: missing tensor per_layer_token_embd.weight")
+  // (As loadRaon stores the embedding: Q6_K as it is, others as 8-bit.)
+  const embedding = ggufEmbedding(header)
+  return {
+    config,
+    kinds,
+    layers,
+    embedding: { ...embedding, bits: embedding.bits === 6 ? 6 : 8 },
+    perLayer: { proj: ggufMatrix(header, config.hiddenSize, ["per_layer_model_proj.weight"], raonMatrixStorage), type: table.type }
+  }
 }
 
 /** A GGUF's shape from its header (a range request or two) and its rope_freqs (a few hundred bytes). */
@@ -101,36 +160,42 @@ export async function ggufSpeedShape(read: { size: number; read: (offset: number
   const header = await readGgufHeader(read)
   const freqs = header.tensors.get("rope_freqs.weight")
   let factors: Float32Array | undefined
-  if (freqs) {
+  if (freqs && header.metadata.get("general.architecture") !== "raon1nano") {
     const bytes = await read.read(freqs.offset, freqs.byteLength)
     // (As the loader reads it: F32 or F16.)
     factors = freqs.type === GgmlType.F16 ? halvesToFloats(bytes) : bytesToFloats(bytes)
   }
+  return ggufHeaderSpeedShape(header, factors)
+}
+
+/** A GGUF's shape from its header as read (and its rope_freqs' values, where it has them): each matrix stored as its loader stores it. */
+export function ggufHeaderSpeedShape(header: GgufHeader, factors?: Float32Array): SpeedShape {
+  if (header.metadata.get("general.architecture") === "raon1nano") return raonSpeedShape(header)
   const config = ggufConfig(header, factors)
   const qwen = !!config.linear
+  const lfm2 = header.metadata.get("general.architecture") === "lfm2"
+  const D = config.hiddenSize
   const kinds: SpeedShape["kinds"] = []
-  config.layerTypes.forEach((type, i) => {
-    if (kinds.some((k) => k.type === type)) return
-    const blk = `blk.${i}.`
-    const m = (name: string) => ggufMatrix(header, `${blk}${name}.weight`)
-    const matrices: KindStorage = { gateUp: m("ffn_gate"), down: m("ffn_down") }
+  const layers = config.layerTypes.map((type, i) => {
+    // Each matrix from the tensors loadGguf makes it of: its storage follows all of them.
+    const m = (K: number, ...names: Array<string>) => ggufMatrix(header, K, names.map((name) => `blk.${i}.${name}.weight`))
+    const matrices: KindStorage = { gateUp: m(D, "ffn_gate", "ffn_up"), down: m(config.intermediateSize, "ffn_down") }
     if (type === "linear_attention") {
-      matrices.inProj = m("attn_qkv")
-      matrices.ba = m("ssm_beta")
-      matrices.outProj = m("ssm_out")
+      const l = config.linear!
+      matrices.inProj = m(D, "attn_qkv", "attn_gate")
+      matrices.ba = m(D, "ssm_beta", "ssm_alpha")
+      matrices.outProj = m(l.numValueHeads * l.valueHeadDim, "ssm_out")
     } else if (type === "conv" && !qwen) {
-      matrices.inProj = m("shortconv.in_proj")
-      matrices.outProj = m("shortconv.out_proj")
+      matrices.inProj = m(D, "shortconv.in_proj")
+      matrices.outProj = m(D, "shortconv.out_proj")
     } else {
-      matrices.qkvg = m("attn_q")
-      matrices.o = m("attn_output")
+      // (Qwen3.5's gate rows are the other half of attn_q; LFM3 has a tensor for them, LFM2 no gate.)
+      matrices.qkvg = m(D, "attn_q", "attn_k", "attn_v", ...(qwen || lfm2 ? [] : ["attn_gate"]))
+      matrices.o = m(config.numHeads * config.headDim, "attn_output")
     }
-    kinds.push({ type, matrices })
+    return kindOf(kinds, type, matrices)
   })
-  const embedding = header.tensors.get("token_embd.weight")
-  if (!embedding) throw new Error("GGUF: missing tensor token_embd.weight")
-  const bits = embedding.type === GgmlType.Q6_K ? 6 : embedding.type === GgmlType.Q4_0 ? 4 : 8
-  return { config, kinds, embedding: { bits, zeros: false, raw: false } }
+  return { config, kinds, layers, embedding: ggufEmbedding(header) }
 }
 
 /** Storage of an ONNX matrix made of MatMulNBits parts, as loadOnnx stores it. */
@@ -191,6 +256,8 @@ async function fileBytes(file: ModelFile): Promise<Uint8Array> {
 
 /** The rows and columns of each matrix role of a layer kind (see LayerWeights). */
 export function matrixShapes(config: ModelConfig, type: LayerType): Record<string, { N: number; K: number }> {
+  if (config.streams)
+    return Object.fromEntries(Object.entries(raonLayerMatrices(config, type)).map(([role, m]) => [role, { N: m.N, K: m.K }]))
   const D = config.hiddenSize
   const F = config.intermediateSize
   const shapes: Record<string, { N: number; K: number }> = {
@@ -256,6 +323,18 @@ class Noise {
     if (this.points.length < length) this.points = new Uint8Array(length).fill(8)
     return this.points.subarray(0, length)
   }
+  private halfPoints = new Uint16Array(0)
+  /** Zero points of 8 as halves (a Q4_K block's: see QuantMatrix.zeroHalves). */
+  halfZeros(length: number) {
+    if (this.halfPoints.length < length) this.halfPoints = new Uint16Array(length).fill(toHalf(8))
+    return this.halfPoints.subarray(0, length)
+  }
+  private small = new Uint16Array(0)
+  /** Values of 0.01 as halves (a latent attention's per-head matrices). */
+  smallHalves(length: number) {
+    if (this.small.length < length) this.small = new Uint16Array(length).fill(toHalf(0.01))
+    return this.small.subarray(0, length)
+  }
 }
 
 /** A matrix of random weights in `storage`, as the loader would give it. */
@@ -275,7 +354,8 @@ function randomMatrix(noise: Noise, N: number, K: number, storage: MatrixStorage
     N, K, bits: storage.bits,
     quants: noise.u32(N * wordsPerRow),
     scales: noise.scales(N * blocks),
-    zeros: storage.bits === 4 && storage.zeros ? noise.zeros(N * blocks) : null
+    zeros: storage.bits === 4 && storage.zeros ? noise.zeros(N * blocks) : null,
+    ...(storage.bits === 4 && storage.halves && { zeroHalves: noise.halfZeros(N * blocks) })
   }
 }
 
@@ -290,6 +370,51 @@ function randomLayer(noise: Noise, config: ModelConfig, type: LayerType, matrice
     return randomMatrix(noise, shapes[role].N, shapes[role].K, storage)
   }
   const ones = (n: number) => new Float32Array(n).fill(1)
+  if (config.streams && config.latent && config.perLayer && config.linear) {
+    // Raon-1 nano: a layer's two mixing sites, its operator and its per-layer part (see load-raon.ts).
+    const S = config.streams.count
+    const mixRows = 2 * S + (S - 1) ** 2
+    const mix = (role: string): StreamMixWeights => ({
+      fn: m(role),
+      base: new Float32Array(mixRows),
+      chart: new Float32Array(mixRows * S * S + 2 * S * S).fill(0.01)
+    })
+    const layer: LayerWeights = {
+      type,
+      operatorNorm: ones(D),
+      ffnNorm: ones(D),
+      gateUp: m("gateUp"),
+      down: m("down"),
+      mix: { operator: mix("mixOperator"), ffn: mix("mixFfn") },
+      perLayer: { gate: m("perLayerGate"), proj: m("perLayerProj"), norm: ones(D) }
+    }
+    const l = config.linear
+    const latent = config.latent
+    if (type === "linear_attention") {
+      const inner = l.numKeyHeads * l.keyHeadDim
+      layer.linear = {
+        inProj: m("inProj"),
+        ba: m("ba"),
+        decay: m("decay"),
+        outProj: m("outProj"),
+        conv: new Float32Array(3 * inner * l.convKernel).fill(0.1),
+        a: new Float32Array(l.numKeyHeads),
+        dtBias: new Float32Array(inner),
+        norm: ones(l.valueHeadDim)
+      }
+    } else {
+      layer.latent = {
+        inProj: m("latentIn"),
+        qB: m("qB"),
+        kB: noise.smallHalves((latent.keyDim - latent.shared) * latent.rank * latent.heads),
+        vB: noise.smallHalves(latent.rank * latent.valueDim * latent.heads),
+        o: m("o"),
+        qNorm: ones(latent.queryRank),
+        kvNorm: ones(latent.rank)
+      }
+    }
+    return layer
+  }
   const lfm3 = config.attentionGate && !config.linear
   const layer: LayerWeights = {
     type,
@@ -325,14 +450,42 @@ export function probeConfig(shape: SpeedShape): ModelConfig {
     ...shape.config,
     numLayers: shape.kinds.length,
     layerTypes: shape.kinds.map((k) => k.type),
-    vocabSize: vocab
+    vocabSize: vocab,
+    // (Per-layer inputs for every layer of the model: each kind's one layer stands in for all of its kind, at its own place.)
+    ...(shape.config.perLayer && { perLayer: { ...shape.config.perLayer, layers: shape.config.numLayers } })
   }
 }
 
+/** The per-layer table's rows in the probe: a row's bytes for its tensor type. */
+function perLayerTable(shape: SpeedShape, config: ModelConfig) {
+  if (!shape.perLayer || !config.perLayer) return undefined
+  const width = config.perLayer.dim * (config.perLayer.layers ?? config.numLayers)
+  return { offset: 0, rowBytes: tensorByteLength(shape.perLayer.type, [width, 1]), type: shape.perLayer.type, rows: config.vocabSize }
+}
+
+/**
+ * What the probe's engine reads a token's per-layer row from: zero bytes
+ * (every type's zero weights), as many as asked for. The read itself isn't
+ * what the probe times (the GPU's passes are).
+ */
+export function probePerLayerSource(shape: SpeedShape): ByteSource | undefined {
+  const table = perLayerTable(shape, probeConfig(shape))
+  if (!table) return undefined
+  return { size: table.rows * table.rowBytes, read: async (_offset, length) => new Uint8Array(length) }
+}
+
 /** The probe model's pieces, as a loader yields them. */
-async function* probePieces(shape: SpeedShape, noise: Noise): AsyncGenerator<WeightPiece> {
+export async function* probePieces(shape: SpeedShape, noise = new Noise()): AsyncGenerator<WeightPiece> {
   const config = probeConfig(shape)
   yield { kind: "config", config }
+  const table = perLayerTable(shape, config)
+  if (table && shape.perLayer && config.perLayer)
+    yield {
+      kind: "perLayer",
+      proj: randomMatrix(noise, config.perLayer.dim * (config.perLayer.layers ?? config.numLayers), config.hiddenSize, shape.perLayer.proj),
+      norm: new Float32Array(config.perLayer.dim).fill(1),
+      table
+    }
   for (const [i, kind] of shape.kinds.entries())
     yield { kind: "layer", layer: i, value: randomLayer(noise, config, kind.type, kind.matrices) }
   yield { kind: "finalNorm", value: new Float32Array(config.hiddenSize).fill(1) }
@@ -471,7 +624,9 @@ export async function probeSpeed(
   onEngine?.(engine)
   try {
     if (WARM_MS > 0) await warmGpu(engine.gpu)
-    await engine.load(probePieces(shape, new Noise()), sample, signal)
+    const perLayerSource = probePerLayerSource(shape)
+    if (perLayerSource) engine.perLayerSource = perLayerSource
+    await engine.load(probePieces(shape), sample, signal)
     sample()
     const loadMs = performance.now() - started
     // As the worker leaves the GPU's pacing after a load.
@@ -486,8 +641,9 @@ export async function probeSpeed(
     }
     const inner = engine as unknown as Internals
     const loaded = inner.layers.slice()
-    const byKind = new Map(shape.kinds.map((k, i) => [k.type, loaded[i]]))
-    const types = shape.config.layerTypes
+    // Each of the model's layers by its kind: the probe's layer of that type and storage stands in for it.
+    const types = layerKinds(shape)
+    const byKind = new Map(shape.kinds.map((_, i) => [i, loaded[i]]))
     const first = byKind.get(types[0])!
     const last = byKind.get(types[types.length - 1])!
     const use = (layers: Array<unknown>) => {
@@ -499,14 +655,18 @@ export async function probeSpeed(
 
     // Prompts, `count` back to back (the cache reset before each), waited
     // for once: the GPU kept busy as through a whole prompt, its clock up
-    // and no readback's wait in each.
+    // and no readback's wait in each. The first one's reset is before the
+    // timing, not in it: a model with recurrent states zeroes them all
+    // there, a fifth of what an M3 Ultra took for Qwen3.5 2B's and Raon-1
+    // nano's stacks, and no part of reading a prompt.
     const prompts = async (layers: Array<unknown>, count: number, rows = tokens) => {
       signal?.throwIfAborted()
       use(layers)
+      engine.reset()
       await engine.gpu.finish()
       const t = performance.now()
       for (let i = 0; i < count; i++) {
-        engine.reset()
+        if (i > 0) engine.reset()
         // (Every row through every layer: the last layer's last-row-only
         // tail, a set of programs of its own, left out; the stack's last
         // layer then costs what a middle one does.)
@@ -627,3 +787,17 @@ export async function probeSpeed(
     engine.gpu.dispose()
   }
 }
+
+/**
+ * What a prediction is measured by: how a model's shape is read and stood
+ * for, and what the probe times. Part of what predictions are remembered
+ * by (predict-speed.ts's speedKey), so one made before a change here is
+ * measured again.
+ */
+export const PROBE_CODE: Array<unknown> = [
+  PROMPT_TOKENS, PROMPT_STACK, PROBE_VOCAB, EMBEDDING_CHUNK_ROWS, WARM_MS,
+  kindOf, layerKinds, middleStack, ggufMatrix, ggufEmbedding, raonSpeedShape, ggufHeaderSpeedShape, onnxMatrix, onnxSpeedShape,
+  matrixShapes, Noise, randomMatrix, randomLayer, probeConfig, perLayerTable, probePerLayerSource, probePieces, warmGpu, probeSpeed,
+  // (The loaders' storage rules a shape is read by.)
+  matrixStorage, raonMatrixStorage, raonLayerMatrices
+]

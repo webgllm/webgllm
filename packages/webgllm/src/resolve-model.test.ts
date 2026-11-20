@@ -146,7 +146,7 @@ test("a repository with no weights webgllm loads fails clearly", async () => {
   fakeHub({
     [api("someone/only-k-quants-GGUF")]: {
       status: 200,
-      body: { siblings: [{ rfilename: "m-Q4_K_M.gguf" }, { rfilename: "m-IQ4_XS.gguf" }, { rfilename: "tokenizer.json" }], gguf: { architecture: "lfm2" } }
+      body: { siblings: [{ rfilename: "m-Q3_K_M.gguf" }, { rfilename: "m-IQ4_XS.gguf" }, { rfilename: "tokenizer.json" }], gguf: { architecture: "lfm2" } }
     },
     [api("someone/split-onnx")]: {
       status: 200,
@@ -249,14 +249,18 @@ test("a repository without a tokenizer, here or in its base model, fails clearly
   await assert.rejects(resolveModel("someone/bare-GGUF"), /no tokenizer/)
 })
 
-test("GGUF files by preference: QAD Q4_0, Q4_0, Q8_0, then the fewest bits the loader takes", () => {
+test("GGUF files by preference: QAD Q4_0, Q4_0, Q4_K, Q8_0, then the fewest bits the loader takes", () => {
   const all = ["m-F16.gguf", "m-Q6_K.gguf", "m-Q5_K_M.gguf", "m-Q8_0.gguf", "m-Q4_K_M.gguf", "m-Q4_0.gguf", "m-QAD-Q4_0.gguf", "mmproj-F16.gguf"]
   assert.equal(pickGguf(all), "m-QAD-Q4_0.gguf")
   assert.equal(pickGguf(all.filter((f) => !f.includes("QAD"))), "m-Q4_0.gguf")
-  assert.equal(pickGguf(["m-Q6_K.gguf", "m-Q8_0.gguf", "m-Q4_K_M.gguf"]), "m-Q8_0.gguf")
-  assert.equal(pickGguf(["m-Q6_K.gguf", "m-Q5_K_M.gguf", "m-Q4_K_M.gguf"]), "m-Q5_K_M.gguf")
-  assert.equal(pickGguf(["model.gguf", "m-Q4_K_M.gguf"]), "model.gguf")
-  assert.equal(pickGguf(["m-Q4_K_M.gguf", "m-UD-Q4_K_XL.gguf", "m-BF16.gguf", "mmproj-F16.gguf"]), undefined)
+  assert.equal(pickGguf(all.filter((f) => !f.includes("Q4_0"))), "m-Q4_K_M.gguf")
+  assert.equal(pickGguf(["m-Q6_K.gguf", "m-Q8_0.gguf", "m-Q4_K_M.gguf", "m-Q4_K_S.gguf"]), "m-Q4_K_S.gguf")
+  assert.equal(pickGguf(["m-Q6_K.gguf", "m-Q5_K_M.gguf", "m-Q3_K_M.gguf"]), "m-Q5_K_M.gguf")
+  assert.equal(pickGguf(["model.gguf", "m-Q3_K_M.gguf"]), "model.gguf")
+  assert.equal(pickGguf(["m-Q3_K_M.gguf", "m-UD-Q4_K_XL.gguf", "m-BF16.gguf", "mmproj-F16.gguf"]), undefined)
+  // A file with a multi-token-prediction block after the one without (KRAFTON's Raon-1 nano).
+  assert.equal(pickGguf(["raon-1-nano-Q8_0.gguf", "raon-1-nano-Q4_K_M_MTP.gguf", "raon-1-nano-Q4_K_M.gguf", "raon-1-nano-F16.gguf"]), "raon-1-nano-Q4_K_M.gguf")
+  assert.equal(pickGguf(["raon-1-nano-Q8_0.gguf", "raon-1-nano-Q4_K_M_MTP.gguf"]), "raon-1-nano-Q4_K_M_MTP.gguf")
   assert.equal(pickGguf(["m-Q4_0-00001-of-00002.gguf", "m-Q4_0-00002-of-00002.gguf"]), undefined)
 })
 
