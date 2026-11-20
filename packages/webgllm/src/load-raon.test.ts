@@ -10,17 +10,25 @@ import type { QuantMatrix, WeightPiece } from "./weights.js"
  * writes it: a Raon Delta Attention layer, then a gated MLA layer; `mtp`
  * adds the multi-token-prediction block an _MTP file has.
  */
-function fixture(mtp = false) {
-  const D = 64, F = 64, hc = 4, mix = 2 * hc + (hc - 1) ** 2
+function fixture(
+  mtp = false,
+  /** Other sizes and layers: each layer's head_count_kv (0 a Raon Delta Attention layer, 1 an MLA one), and a tensor's type where not float32 (its bytes zeros). */
+  o: { D?: number; F?: number; kv?: Array<number>; type?: (name: string) => number | undefined } = {}
+) {
+  const D = o.D ?? 64, F = o.F ?? 64, hc = 4, mix = 2 * hc + (hc - 1) ** 2
+  const kv = o.kv ?? [0, 1]
   const rda = { heads: 4, dim: 8, rank: 32 }
   const mla = { heads: 4, qRank: 32, rank: 32, shared: 32, key: 64, value: 16 }
-  const ple = 32, vocab = 8, layers = 2, blocks = layers + (mtp ? 1 : 0)
+  const ple = 32, vocab = 8, layers = kv.length, blocks = layers + (mtp ? 1 : 0)
   const tensors = new Map<string, GgufTensorInfo>()
   const chunks: Array<Uint8Array> = []
   let offset = 0
   const add = (name: string, dims: Array<number>, value = 0.5) => {
-    const bytes = new Uint8Array(new Float32Array(dims.reduce((a, b) => a * b, 1)).fill(value).buffer)
-    tensors.set(name, { name, dims, type: GgmlType.F32, offset, byteLength: bytes.length })
+    const count = dims.reduce((a, b) => a * b, 1)
+    const type = o.type?.(name) ?? GgmlType.F32
+    // (A K-quant's super-blocks of 256 weights: 144 bytes each as Q4_K, 210 as Q6_K; zeros are zero weights.)
+    const bytes = type === GgmlType.Q4_K ? new Uint8Array((count / 256) * 144) : type === GgmlType.Q6_K ? new Uint8Array((count / 256) * 210) : new Uint8Array(new Float32Array(count).fill(value).buffer)
+    tensors.set(name, { name, dims, type, offset, byteLength: bytes.length })
     offset += bytes.length
     chunks.push(bytes)
   }
@@ -38,7 +46,7 @@ function fixture(mtp = false) {
       add(`${p}hc_${site}_base.weight`, [mix], 0.125)
       add(`${p}hc_${site}_chart.weight`, [mix * hc * hc + 2 * hc * hc])
     }
-    if (i === 0) {
+    if ((kv[i] ?? 1) === 0) {
       const inner = rda.heads * rda.dim
       add(`${p}attn_qkv.weight`, [D, 4 * inner])
       add(`${p}ssm_conv1d.weight`, [4, 3 * inner])
@@ -69,8 +77,8 @@ function fixture(mtp = false) {
   const a = "raon1nano"
   const metadata = new Map<string, GgufValue>([
     ["general.architecture", a], [`${a}.block_count`, blocks], [`${a}.context_length`, 262144], [`${a}.embedding_length`, D],
-    [`${a}.feed_forward_length`, F], [`${a}.attention.head_count`, [rda.heads, mla.heads, ...(mtp ? [mla.heads] : [])]],
-    [`${a}.attention.head_count_kv`, [0, 1, ...(mtp ? [1] : [])]], [`${a}.attention.layer_norm_rms_epsilon`, Math.fround(1e-6)],
+    [`${a}.feed_forward_length`, F], [`${a}.attention.head_count`, [...kv.map((k) => (k === 0 ? rda.heads : mla.heads)), ...(mtp ? [mla.heads] : [])]],
+    [`${a}.attention.head_count_kv`, [...kv, ...(mtp ? [1] : [])]], [`${a}.attention.layer_norm_rms_epsilon`, Math.fround(1e-6)],
     [`${a}.ssm.conv_kernel`, 4], [`${a}.ssm.time_step_rank`, rda.rank], [`${a}.kda.head_dim`, rda.dim], [`${a}.kda.gate_lower_bound`, -5],
     [`${a}.attention.q_lora_rank`, mla.qRank], [`${a}.attention.kv_lora_rank`, mla.rank], [`${a}.rope.dimension_count`, mla.shared],
     [`${a}.attention.key_length_mla`, mla.key], [`${a}.attention.value_length_mla`, mla.value],
@@ -192,4 +200,41 @@ test("predictSpeed's shape of a Raon-1 nano GGUF, and the probe model made from 
   assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K)], 256), { bits: 4, halves: true })
   assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K), t(GgmlType.Q6_K)], 256), { bits: 8, halves: false })
   assert.deepEqual(raonMatrixStorage([t(GgmlType.Q4_K)], 96), { bits: 8, halves: false })
+})
+
+test("predictSpeed's probe keeps a layer for each storage a type's layers have, and every layer of the model stands on the one stored as the loader stores it", async () => {
+  const { ggufHeaderSpeedShape, probePieces, layerKinds, middleStack } = await import("./speed-probe.js")
+  // As a Q4_K_M file: the MLP's down projection Q6_K (8-bit here) in some layers, Q4_K (4-bit) in the others, of either type.
+  const sixBit = new Set([0, 3, 4])
+  const f = fixture(false, {
+    D: 256, F: 256, kv: [0, 1, 0, 1, 0, 0],
+    type: (name) => {
+      const at = /^blk\.(\d+)\.(ffn_up|ffn_down)\.weight$/.exec(name)
+      if (!at) return undefined
+      return at[2] === "ffn_down" && sixBit.has(Number(at[1])) ? GgmlType.Q6_K : GgmlType.Q4_K
+    }
+  })
+  const shape = ggufHeaderSpeedShape(f.header)
+  // Raon Delta Attention with an 8-bit down, MLA with a 4-bit one, then the other two; layers 4 and 5 are kinds already there.
+  assert.deepEqual(shape.layers, [0, 1, 2, 3, 0, 2])
+  assert.deepEqual(layerKinds(shape), [0, 1, 2, 3, 0, 2])
+  assert.deepEqual(shape.kinds.map((k) => [k.type, k.matrices.down.bits, k.matrices.gateUp.bits]), [
+    ["linear_attention", 8, 4], ["full_attention", 4, 4], ["linear_attention", 4, 4], ["full_attention", 8, 4]
+  ])
+  const describe = (m: QuantMatrix) => [m.N, m.K, m.bits, !!m.zeroHalves]
+  const matrices = (pieces: Array<WeightPiece>) =>
+    pieces.flatMap((p) => (p.kind === "layer" ? [{ type: p.value.type, gateUp: describe(p.value.gateUp), down: describe(p.value.down), gate: describe(p.value.perLayer!.gate), mix: describe(p.value.mix!.ffn.fn) }] : []))
+  const real = matrices(await collect(f))
+  const probe: Array<WeightPiece> = []
+  for await (const piece of probePieces(shape)) probe.push(piece)
+  const stood = matrices(probe)
+  assert.equal(stood.length, 4)
+  assert.equal(real.length, 6)
+  layerKinds(shape).forEach((kind, layer) => assert.deepEqual(stood[kind], real[layer], `layer ${layer}`))
+  // (Both storages are there to tell apart.)
+  assert.notDeepEqual(real[0].down, real[2].down)
+  // The prompt's stack takes its middle layers (kinds 1, 2, 3, 0 here) by kind: two of them, each a kind of its own.
+  assert.deepEqual(middleStack(layerKinds(shape), 2), [1, 2])
+  // A shape remembered without its layers' kinds: the first kind of each layer's type, as before.
+  assert.deepEqual(layerKinds({ ...shape, layers: undefined }), [0, 1, 0, 1, 0, 0])
 })

@@ -37,8 +37,15 @@ export type KindStorage = Record<string, MatrixStorage>
 /** A model as the GPU sees it, without its weights. */
 export type SpeedShape = {
   config: ModelConfig
-  /** Each kind of layer the model has, in order of first appearance: its matrices' storage. */
+  /**
+   * Each kind of layer the model has, in order of first appearance: its
+   * type and its matrices' storage. Layers of one type whose matrices are
+   * stored differently are kinds apart (a Q4_K_M GGUF's: some layers'
+   * down projections are Q6_K, 8-bit here, the others' Q4_K, 4-bit).
+   */
   kinds: Array<{ type: LayerType; matrices: KindStorage }>
+  /** Each of the model's layers' kind, an index into `kinds`; left out (a shape remembered from before kinds went by storage), the first kind of its type. */
+  layers?: Array<number>
   /** The embedding, also the output head. */
   embedding: MatrixStorage
   /** Raon's per-layer token embeddings: the model's projection, and the tensor type of the table's rows in the file. */
@@ -60,15 +67,28 @@ export const PROMPT_TOKENS = 256
 /** Most middle layers the probe's prompts run (see middleStack): about one of each kind. */
 export const PROMPT_STACK = 2
 
+/** The kind (an index into `kinds`) of a layer of `type` with these matrices: one already there, or a new one. */
+function kindOf(kinds: SpeedShape["kinds"], type: LayerType, matrices: KindStorage): number {
+  const storage = JSON.stringify(matrices)
+  const found = kinds.findIndex((k) => k.type === type && JSON.stringify(k.matrices) === storage)
+  return found >= 0 ? found : kinds.push({ type, matrices }) - 1
+}
+
+/** Each of the model's layers' kind (an index into shape.kinds): the layer of the probe's model that stands in for it. */
+export function layerKinds(shape: SpeedShape): Array<number> {
+  return shape.layers ?? shape.config.layerTypes.map((type) => shape.kinds.findIndex((k) => k.type === type))
+}
+
 /**
  * Up to `slots` of a model's middle layers (all but its first and last),
  * its kinds in proportion (largest remainders), each kind's picks spread
- * evenly over its own layers, in the model's order.
+ * evenly over its own layers, in the model's order. `layerTypes`: each
+ * layer's kind, whatever tells them apart (a type, an index into kinds).
  */
-export function middleStack(layerTypes: ReadonlyArray<LayerType>, slots: number): Array<LayerType> {
+export function middleStack<T>(layerTypes: ReadonlyArray<T>, slots: number): Array<T> {
   const middle = layerTypes.slice(1, -1)
   if (middle.length <= slots) return middle
-  const at = new Map<LayerType, Array<number>>()
+  const at = new Map<T, Array<number>>()
   middle.forEach((t, i) => at.set(t, [...(at.get(t) ?? []), i]))
   const kinds = [...at.entries()].map(([type, indices]) => {
     const share = (indices.length * slots) / middle.length
@@ -116,12 +136,11 @@ const ggufEmbedding = (header: GgufHeader): MatrixStorage => {
 function raonSpeedShape(header: GgufHeader): SpeedShape {
   const config = raonConfig(header)
   const kinds: SpeedShape["kinds"] = []
-  config.layerTypes.forEach((type, i) => {
-    if (kinds.some((k) => k.type === type)) return
+  const layers = config.layerTypes.map((type, i) => {
     const matrices: KindStorage = {}
     for (const [role, m] of Object.entries(raonLayerMatrices(config, type)))
       matrices[role] = ggufMatrix(header, m.K, m.parts.map((part) => `blk.${i}.${part.tensor}.weight`), raonMatrixStorage)
-    kinds.push({ type, matrices })
+    return kindOf(kinds, type, matrices)
   })
   const table = header.tensors.get("per_layer_token_embd.weight")
   if (!table) throw new Error("GGUF: missing tensor per_layer_token_embd.weight")
@@ -130,6 +149,7 @@ function raonSpeedShape(header: GgufHeader): SpeedShape {
   return {
     config,
     kinds,
+    layers,
     embedding: { ...embedding, bits: embedding.bits === 6 ? 6 : 8 },
     perLayer: { proj: ggufMatrix(header, config.hiddenSize, ["per_layer_model_proj.weight"], raonMatrixStorage), type: table.type }
   }
@@ -156,8 +176,7 @@ export function ggufHeaderSpeedShape(header: GgufHeader, factors?: Float32Array)
   const lfm2 = header.metadata.get("general.architecture") === "lfm2"
   const D = config.hiddenSize
   const kinds: SpeedShape["kinds"] = []
-  config.layerTypes.forEach((type, i) => {
-    if (kinds.some((k) => k.type === type)) return
+  const layers = config.layerTypes.map((type, i) => {
     // Each matrix from the tensors loadGguf makes it of: its storage follows all of them.
     const m = (K: number, ...names: Array<string>) => ggufMatrix(header, K, names.map((name) => `blk.${i}.${name}.weight`))
     const matrices: KindStorage = { gateUp: m(D, "ffn_gate", "ffn_up"), down: m(config.intermediateSize, "ffn_down") }
@@ -174,9 +193,9 @@ export function ggufHeaderSpeedShape(header: GgufHeader, factors?: Float32Array)
       matrices.qkvg = m(D, "attn_q", "attn_k", "attn_v", ...(qwen || lfm2 ? [] : ["attn_gate"]))
       matrices.o = m(config.numHeads * config.headDim, "attn_output")
     }
-    kinds.push({ type, matrices })
+    return kindOf(kinds, type, matrices)
   })
-  return { config, kinds, embedding: ggufEmbedding(header) }
+  return { config, kinds, layers, embedding: ggufEmbedding(header) }
 }
 
 /** Storage of an ONNX matrix made of MatMulNBits parts, as loadOnnx stores it. */
@@ -622,8 +641,9 @@ export async function probeSpeed(
     }
     const inner = engine as unknown as Internals
     const loaded = inner.layers.slice()
-    const byKind = new Map(shape.kinds.map((k, i) => [k.type, loaded[i]]))
-    const types = shape.config.layerTypes
+    // Each of the model's layers by its kind: the probe's layer of that type and storage stands in for it.
+    const types = layerKinds(shape)
+    const byKind = new Map(shape.kinds.map((_, i) => [i, loaded[i]]))
     const first = byKind.get(types[0])!
     const last = byKind.get(types[types.length - 1])!
     const use = (layers: Array<unknown>) => {
