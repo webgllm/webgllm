@@ -43,7 +43,8 @@
         tune: params.get("tune") ?? "",
         timing: params.get("timing") ?? "",
         promptProfile: Number(params.get("promptProfile") ?? 0),
-        tuned: params.get("tuned") === "1"
+        tuned: params.get("tuned") === "1",
+        lowNorm: params.get("lownorm") === "1"
       })
     </script>
   </body>

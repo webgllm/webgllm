@@ -5,6 +5,9 @@
  */
 import { httpSource } from "../src/byte-source.js"
 import { Engine, TUNING } from "../src/engine.js"
+import { GL } from "../src/gpu/gl.js"
+import * as K from "../src/gpu/kernels.js"
+import * as R from "../src/gpu/raon-kernels.js"
 import { WebGpu } from "../src/gpu/webgpu.js"
 import { loadGguf } from "../src/load-gguf.js"
 
@@ -27,6 +30,7 @@ type Params = {
   timing: string
   promptProfile: number
   tuned: boolean
+  lowNorm: boolean
 }
 
 const relative = (got: ArrayLike<number>, want: ArrayLike<number>, g0 = 0, w0 = 0, n = want.length) => {
@@ -70,6 +74,69 @@ const kl = (want: Float32Array, got: Float32Array) => {
   return total
 }
 
+/**
+ * ?lownorm=1: Raon Delta Attention's q and k over their L2 norms where a
+ * head's are near zero, on this GPU, with no model: the batch pass
+ * (linPrep with its floor) and writing's fused pass, against x / max(|x|,
+ * 1e-6). Four heads of 128; head 0's q and k are (a, 0, 0, …), a = 0.001
+ * in row 0 (where sqrt(sum + 1e-6), Qwen3.5's form, gives 0.707 of it) and
+ * 0.5 in row 1 (where the two forms agree).
+ */
+async function lowNorm(p: Params) {
+  const gpu = p.webgpu ? await WebGpu.create() : null
+  if (p.webgpu && !gpu) throw new Error("This browser has no WebGPU.")
+  const g = new Engine(new OffscreenCanvas(1, 1), { batchSize: 8, contextLength: 64, ...(gpu && { gpu }) }).gpu
+  log(`GPU: ${g.limits.renderer} (${p.webgpu ? "WebGPU" : "WebGL 2"})`)
+  const dk = 128, heads = 4, K4 = (heads * dk) / 4, rows = 2
+  const f32 = (width: number, height: number, fill: (x: number, y: number) => [number, number, number, number]) => {
+    const pixels = new Float32Array(width * height * 4)
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) pixels.set(fill(x, y), (y * width + x) * 4)
+    return g.texture(GL.RGBA32F, width, height, { format: GL.RGBA, type: GL.FLOAT, pixels })
+  }
+  const a = [0.001, 0.5]
+  // q | k | v, a head's texels one after another: head 0's first q and k values are a, every v is 1.
+  const qkv = f32(3 * K4, rows, (x, y) => (x === 0 || x === K4 ? [a[y], 0, 0, 0] : x >= 2 * K4 ? [1, 1, 1, 1] : [0, 0, 0, 0]))
+  const want = 1 / Math.sqrt(dk)
+  let worst = 0
+  const check = (what: string, got: number, expected: number) => {
+    const error = Math.abs(got - expected) / Math.abs(expected)
+    worst = Math.max(worst, error)
+    log(`LOWNORM ${what}: ${got.toPrecision(7)} (${expected.toPrecision(7)} expected, off by ${error.toExponential(1)})`)
+  }
+  // The batch pass: q̂ (over √dk) then k̂.
+  const prep = g.texture(GL.RGBA32F, 2 * K4, rows)
+  g.run({ program: g.program(K.linPrep(dk, true)), inputs: { uQKV: qkv }, uniforms: { uK4: { int: K4 } }, output: prep, rect: { x: 0, y: 0, width: 2 * K4, height: rows } })
+  const hat = await g.read(prep, { x: 0, y: 0, width: 2 * K4, height: rows })
+  for (let y = 0; y < rows; y++) {
+    check(`batch, |q| = ${a[y]}: q̂[0]`, hat[y * 2 * K4 * 4], want)
+    check(`batch, |k| = ${a[y]}: k̂[0]`, hat[(y * 2 * K4 + K4) * 4], 1)
+  }
+  // (Qwen3.5's form on the same inputs, to show the case tells them apart: 0.7071 of the above at 0.001.)
+  g.run({ program: g.program(K.linPrep(dk)), inputs: { uQKV: qkv }, uniforms: { uK4: { int: K4 } }, output: prep, rect: { x: 0, y: 0, width: 2 * K4, height: rows } })
+  const qwen = await g.read(prep, { x: 0, y: 0, width: 2 * K4, height: rows })
+  log(`LOWNORM Qwen3.5's form, |k| = ${a[0]}: k̂[0] ${qwen[K4 * 4].toPrecision(7)} (${Math.SQRT1_2.toPrecision(7)} expected: not Raon's)`)
+  // Writing's fused pass, an empty state: beta = sigmoid(0), the write ratio 1, so the output is (q̂·k̂) · v / 2 and k̂ is written beside it.
+  const V4 = K4
+  const state = f32(V4, dk, () => [0, 0, 0, 0])
+  const gates = f32(4, rows, () => [0, 0, 0, 0])
+  const decay = f32(K4, rows, () => [1, 1, 1, 1])
+  const out = [0, 1, 2].map(() => g.texture(GL.RGBA32F, V4, rows))
+  g.run({
+    program: g.program(R.rdaDeltaFused({ keyHeadDim: dk, valueHeadDim: dk })),
+    inputs: { uS: state, uQKV: qkv, uBA: gates, uDecay: decay },
+    uniforms: { uK4: { int: K4 }, uH4: { int: heads / 4 }, uBAx: { int: 0 }, uSplitIn: { int: 1 } },
+    output: out,
+    rect: { x: 0, y: 0, width: V4, height: rows }
+  })
+  const o = await g.read(out[1], { x: 0, y: 0, width: V4, height: rows })
+  const k = await g.read(out[2], { x: 0, y: 0, width: V4, height: rows })
+  for (let y = 0; y < rows; y++) {
+    check(`fused, |q| = |k| = ${a[y]}: output[0]`, o[y * V4 * 4], want / 2)
+    check(`fused, |k| = ${a[y]}: k̂[0]`, k[y * V4 * 4], 1)
+  }
+  log(worst < 1e-4 ? "PASS: q and k are over max(|x|, 1e-6) in both passes" : `FAIL: off by ${worst.toExponential(1)}`)
+}
+
 async function run(p: Params) {
   // ?tune=knob:value,…: TUNING knobs for this run.
   for (const pair of p.tune ? p.tune.split(",") : []) {
@@ -77,6 +144,7 @@ async function run(p: Params) {
     if (!(knob in TUNING)) throw new Error(`No TUNING knob ${knob}.`)
     ;(TUNING as Record<string, number>)[knob] = Number(value)
   }
+  if (p.lowNorm) return lowNorm(p)
   const source = await httpSource(`/models/${p.model}`)
   const ref = (await fetch(`/models/${p.ref}.json`).then((r) => r.json())) as { ids: Array<number>; written: Array<number>; steps: Array<{ top: Array<[number, number]> }> }
   const wantLogits = new Float32Array(await fetch(`/models/${p.ref}.logits.bin`).then((r) => r.arrayBuffer()))

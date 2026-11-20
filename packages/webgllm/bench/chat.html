@@ -108,6 +108,43 @@
         log(`TURN ${turn + 1} prompt ${usage?.prompt_tokens} tokens, first token ${(first - t).toFixed(0)} ms, ${written} tokens at ${(((written - 1) * 1000) / Math.max(1, done - first)).toFixed(1)} tokens/s`)
         log(`REPLY ${JSON.stringify(text)}`)
         messages.push({ role: "assistant", content: text })
+        // ?pause=hidden: after each turn but the last, waits until the page has been hidden and shown again
+        // (the browser put in the background by hand and brought back: iOS suspends the page meanwhile).
+        if (params.get("pause") === "hidden" && turn + 1 < turns) {
+          log("PAUSE until the page has been hidden and is shown again")
+          status.textContent = "paused: switch to another app for 20 seconds, then come back"
+          const shown = () => new Promise((resolve) => {
+            const changed = () => {
+              if (document.visibilityState !== "visible") return
+              document.removeEventListener("visibilitychange", changed)
+              resolve()
+            }
+            document.addEventListener("visibilitychange", changed)
+          })
+          const hidden = () => new Promise((resolve) => {
+            const changed = () => {
+              if (document.visibilityState !== "hidden") return
+              document.removeEventListener("visibilitychange", changed)
+              resolve()
+            }
+            document.addEventListener("visibilitychange", changed)
+          })
+          await hidden()
+          const at = Date.now()
+          await shown()
+          log(`RESUMED after ${((Date.now() - at) / 1000).toFixed(0)} s hidden`)
+        }
+        // ?pause=s: seconds to wait after each turn but the last.
+        const pause = Number(params.get("pause") ?? 0)
+        if (pause > 0 && turn + 1 < turns) {
+          log(`PAUSE ${pause} s`)
+          const until = performance.now() + pause * 1000
+          while (performance.now() < until) {
+            status.textContent = `paused: ${Math.ceil((until - performance.now()) / 1000)} s`
+            await new Promise((resolve) => setTimeout(resolve, 500))
+          }
+          log("RESUMED")
+        }
       }
       // ?rounds=n: after the chat, n fresh prompts of about `len` tokens (each
       // begins differently, so the cache holds nothing of it) with `max`
