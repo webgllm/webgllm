@@ -560,7 +560,8 @@ async function load(
     if (signal.aborted) throw new Superseded()
     if (perLayerTable && TUNING.syncReads > 0) {
       // Through a handle kept open from here on (see keptSource), now that the load's are closed: they lock the same file.
-      const kept = await keptSource(weightFiles[0])
+      const kept = await keptSource(weightFiles[0], (error) =>
+        post({ type: "log", text: `${model}'s open file handle was closed under it (${error instanceof Error ? error.message : String(error)}); another is opened for its rows.` }))
       keptFiles.set(engine, kept.close)
       engine.perLayerSource = kept.source
     }

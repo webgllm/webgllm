@@ -176,34 +176,53 @@ export async function storedSources(blobs: ReadonlyArray<Blob>, options: { reade
  * Pixel 10 Pro's Chrome about 10 ms, an iPad Pro M4's Safari 1.3 and an M3
  * Ultra's Chrome 0.7, before every token not read lately. The handle locks
  * the file, as a load's do (see storedSources: another reader of it gets
- * the Blob). A read the handle fails (iOS closes a suspended page's
- * handles) is read from the Blob, and the handle opened again for the
- * next. `close()` releases it: call it when the model is unloaded.
+ * the Blob).
+ *
+ * iOS closes a suspended page's handles: a read the handle fails (`onLost`
+ * is told) is asked again of a handle opened anew, and failing that of the
+ * file as it's stored now. A file that's no longer stored at all (Safari
+ * deleted an iPad's site storage under a loaded model, and the read
+ * answered only "The object can not be found here") fails saying so.
+ * `close()` releases the handle: call it when the model is unloaded.
  */
-export async function keptSource(blob: Blob): Promise<{ source: ByteSource; close: () => Promise<void> }> {
-  const plain = blobSource(blob)
+export async function keptSource(blob: Blob, onLost?: (error: unknown) => void): Promise<{ source: ByteSource; close: () => Promise<void> }> {
   let stored: StoredSources | null = await storedSources([blob])
   let closed = false
+  /** The file as stored now: its handle's, or (a Blob with no handle) the Blob. */
+  const current = async (): Promise<Blob> => {
+    const handle = fileHandles.get(blob)?.handle
+    return handle ? handle.getFile().catch(() => blob) : blob
+  }
   return {
     source: {
       size: blob.size,
       recycle: (buffer) => stored?.sources[0].recycle?.(buffer),
       read: async (offset, length) => {
-        const now = stored
-        if (now) {
+        // (Twice: the handle that was open, then the one opened in its place.)
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const now = stored
+          if (!now) break
           try {
             return await now.sources[0].read(offset, length)
           } catch (error) {
             if (error instanceof RangeError) throw error
-            if (stored === now) {
+            if (stored !== now) continue
+            onLost?.(error)
+            stored = null
+            await now.close()
+            if (!closed) stored = await storedSources([blob]).catch(() => null)
+            if (closed && stored) {
+              await stored.close()
               stored = null
-              await now.close()
-              if (!closed) stored = await storedSources([blob]).catch(() => null)
-              if (closed) await stored?.close()
             }
           }
         }
-        return plain.read(offset, length)
+        try {
+          return await blobSource(await current()).read(offset, length)
+        } catch (error) {
+          if (error instanceof RangeError) throw error
+          throw new Error(`The model's stored file can no longer be read (${error instanceof Error ? error.message : String(error)}): load the model again.`, { cause: error })
+        }
       }
     },
     close: async () => {
