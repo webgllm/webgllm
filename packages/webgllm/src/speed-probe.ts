@@ -120,7 +120,7 @@ function raonSpeedShape(header: GgufHeader): SpeedShape {
     if (kinds.some((k) => k.type === type)) return
     const matrices: KindStorage = {}
     for (const [role, m] of Object.entries(raonLayerMatrices(config, type)))
-      matrices[role] = ggufMatrix(header, m.K, m.tensors.map((name) => `blk.${i}.${name}.weight`), raonMatrixStorage)
+      matrices[role] = ggufMatrix(header, m.K, m.parts.map((part) => `blk.${i}.${part.tensor}.weight`), raonMatrixStorage)
     kinds.push({ type, matrices })
   })
   const table = header.tensors.get("per_layer_token_embd.weight")

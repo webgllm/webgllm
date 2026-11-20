@@ -137,10 +137,12 @@ export function raonMatrixStorage(infos: ReadonlyArray<GgufTensorInfo>, K: numbe
 
 /**
  * A layer's matrices by role: the tensors each is made of (their names
- * after `blk.N.`) and the rows' width. What loadRaon reads them by, and
- * what predictSpeed's probe sizes and stores its random ones by.
+ * after `blk.N.`, without `.weight`) with their rows, the rows' width K,
+ * and the matrix's rows N (zero rows after the tensors' where they're
+ * fewer). What loadRaon reads them by, and what predictSpeed's probe sizes
+ * and stores its random ones by.
  */
-export function raonLayerMatrices(config: ModelConfig, type: LayerType): Record<string, { K: number; N: number; tensors: Array<string> }> {
+export function raonLayerMatrices(config: ModelConfig, type: LayerType): Record<string, { K: number; N: number; parts: Array<{ tensor: string; rows: number }> }> {
   const { hiddenSize: D, intermediateSize: F } = config
   const lin = config.linear
   const latent = config.latent
@@ -149,26 +151,32 @@ export function raonLayerMatrices(config: ModelConfig, type: LayerType): Record<
   if (!lin?.keyDecay || !latent || !streams || !perLayer) throw new Error("The model's config isn't a Raon-1 nano's.")
   const inner = lin.numKeyHeads * lin.keyHeadDim
   const mixRows = 2 * streams.count + (streams.count - 1) ** 2
-  const mix = (site: string) => ({ K: streams.count * D, N: Math.ceil(mixRows / 4) * 4, tensors: [`hc_${site}_fn`] })
+  const of = (K: number, parts: Array<{ tensor: string; rows: number }>, N = parts.reduce((n, p) => n + p.rows, 0)) => ({ K, N, parts })
+  // (A selector's rows padded to whole row groups.)
+  const mix = (site: string) => of(streams.count * D, [{ tensor: `hc_${site}_fn`, rows: mixRows }], Math.ceil(mixRows / 4) * 4)
   return {
     mixOperator: mix("attn"),
     mixFfn: mix("ffn"),
     ...(type === "linear_attention"
       ? {
-          inProj: { K: D, N: 4 * inner, tensors: ["attn_qkv"] },
-          ba: { K: D, N: lin.keyDecay.rank + 2 * lin.numKeyHeads, tensors: ["ssm_f_a"] },
-          decay: { K: lin.keyDecay.rank, N: inner, tensors: ["ssm_f_b"] },
-          outProj: { K: inner, N: D, tensors: ["attn_output"] }
+          inProj: of(D, [{ tensor: "attn_qkv", rows: 4 * inner }]),
+          ba: of(D, [{ tensor: "ssm_f_a", rows: lin.keyDecay.rank + 2 * lin.numKeyHeads }]),
+          decay: of(lin.keyDecay.rank, [{ tensor: "ssm_f_b", rows: inner }]),
+          outProj: of(inner, [{ tensor: "attn_output", rows: D }])
         }
       : {
-          latentIn: { K: D, N: latent.queryRank + latent.rank + latent.shared + latent.heads * latent.valueDim, tensors: ["attn_q_a", "attn_kv_a_mqa", "attn_gate"] },
-          qB: { K: latent.queryRank, N: latent.heads * latent.keyDim, tensors: ["attn_q_b"] },
-          o: { K: latent.heads * latent.valueDim, N: D, tensors: ["attn_output"] }
+          latentIn: of(D, [
+            { tensor: "attn_q_a", rows: latent.queryRank },
+            { tensor: "attn_kv_a_mqa", rows: latent.rank + latent.shared },
+            { tensor: "attn_gate", rows: latent.heads * latent.valueDim }
+          ]),
+          qB: of(latent.queryRank, [{ tensor: "attn_q_b", rows: latent.heads * latent.keyDim }]),
+          o: of(latent.heads * latent.valueDim, [{ tensor: "attn_output", rows: D }])
         }),
-    perLayerGate: { K: D, N: perLayer.dim, tensors: ["inp_gate"] },
-    perLayerProj: { K: perLayer.dim, N: D, tensors: ["proj"] },
-    gateUp: { K: D, N: 2 * F, tensors: ["ffn_up"] },
-    down: { K: F, N: D, tensors: ["ffn_down"] }
+    perLayerGate: of(D, [{ tensor: "inp_gate", rows: perLayer.dim }]),
+    perLayerProj: of(perLayer.dim, [{ tensor: "proj", rows: D }]),
+    gateUp: of(D, [{ tensor: "ffn_up", rows: 2 * F }]),
+    down: of(F, [{ tensor: "ffn_down", rows: D }])
   }
 }
 
@@ -181,7 +189,7 @@ export async function* loadRaon(
   if (header.metadata.get(`${ARCH}.hyper_connection.magnitude`) !== 1)
     throw new Error("GGUF: a Raon-1 nano file whose post magnitude isn't folded into its weights is not supported")
   yield { kind: "config", config }
-  const { hiddenSize: D, intermediateSize: F, numLayers } = config
+  const { hiddenSize: D, numLayers } = config
   const lin = config.linear!
   const latent = config.latent!
   const streams = config.streams!
@@ -287,8 +295,8 @@ export async function* loadRaon(
     for (let i = 0; i < values.length; i++) halves[i] = toHalf(values[i])
     return halves
   }
-  const mix = async (blk: string, site: string): Promise<StreamMixWeights> => ({
-    fn: await matrix(streams.count * D, [{ name: `${blk}hc_${site}_fn.weight`, rows: mixRows }], Math.ceil(mixRows / 4) * 4),
+  const mix = async (blk: string, site: string, fn: Promise<QuantMatrix>): Promise<StreamMixWeights> => ({
+    fn: await fn,
     base: await floats(`${blk}hc_${site}_base.weight`, mixRows),
     chart: await floats(`${blk}hc_${site}_chart.weight`, mixRows * streams.count ** 2 + 2 * streams.count ** 2)
   })
@@ -306,16 +314,23 @@ export async function* loadRaon(
   for (let i = 0; i < numLayers; i++) {
     const blk = `blk.${i}.`
     const type = config.layerTypes[i]
+    // Each matrix from the tensors raonLayerMatrices lists for its role (predictSpeed's probe sizes its own by the same list).
+    const roles = raonLayerMatrices(config, type)
+    const role = (name: string): Promise<QuantMatrix> => {
+      const m = roles[name]
+      if (!m) throw new Error(`A ${type} layer has no ${name} matrix.`)
+      return matrix(m.K, m.parts.map((p) => ({ name: `${blk}${p.tensor}.weight`, rows: p.rows })), m.N)
+    }
     const operatorNorm = await floats(`${blk}attn_norm.weight`, D)
     const ffnNorm = await floats(`${blk}ffn_norm.weight`, D)
-    const mixes = { operator: await mix(blk, "attn"), ffn: await mix(blk, "ffn") }
+    const mixes = { operator: await mix(blk, "attn", role("mixOperator")), ffn: await mix(blk, "ffn", role("mixFfn")) }
     let linear: LinearAttentionWeights | undefined
     let latentWeights: LatentAttentionWeights | undefined
     if (type === "linear_attention") {
-      const inProj = await matrix(D, [{ name: `${blk}attn_qkv.weight`, rows: 4 * inner }])
-      const ba = await matrix(D, [{ name: `${blk}ssm_f_a.weight`, rows: lin.keyDecay.rank + 2 * lin.numKeyHeads }])
-      const decay = await matrix(lin.keyDecay.rank, [{ name: `${blk}ssm_f_b.weight`, rows: inner }])
-      const outProj = await matrix(inner, [{ name: `${blk}attn_output.weight`, rows: D }])
+      const inProj = await role("inProj")
+      const ba = await role("ba")
+      const decay = await role("decay")
+      const outProj = await role("outProj")
       const convInfo = tensor(`${blk}ssm_conv1d.weight`)
       if (convInfo.dims[0] !== lin.convKernel || convInfo.dims[1] !== 3 * inner)
         throw new Error(`GGUF: ${convInfo.name} is [${convInfo.dims}]`)
@@ -330,15 +345,11 @@ export async function* loadRaon(
         norm: await floats(`${blk}ssm_norm.weight`, lin.valueHeadDim)
       }
     } else {
-      const inProj = await matrix(D, [
-        { name: `${blk}attn_q_a.weight`, rows: latent.queryRank },
-        { name: `${blk}attn_kv_a_mqa.weight`, rows: latent.rank + latent.shared },
-        { name: `${blk}attn_gate.weight`, rows: latent.heads * latent.valueDim }
-      ])
-      const qB = await matrix(latent.queryRank, [{ name: `${blk}attn_q_b.weight`, rows: latent.heads * latent.keyDim }])
+      const inProj = await role("latentIn")
+      const qB = await role("qB")
       const kB = await perHead(`${blk}attn_k_b.weight`, nope, latent.rank)
       const vB = await perHead(`${blk}attn_v_b.weight`, latent.rank, latent.valueDim)
-      const o = await matrix(latent.heads * latent.valueDim, [{ name: `${blk}attn_output.weight`, rows: D }])
+      const o = await role("o")
       latentWeights = {
         inProj,
         qB,
@@ -350,12 +361,12 @@ export async function* loadRaon(
       }
     }
     const perLayerWeights = {
-      gate: await matrix(D, [{ name: `${blk}inp_gate.weight`, rows: perLayer.dim }]),
-      proj: await matrix(perLayer.dim, [{ name: `${blk}proj.weight`, rows: D }]),
+      gate: await role("perLayerGate"),
+      proj: await role("perLayerProj"),
       norm: await floats(`${blk}post_norm.weight`, D)
     }
-    const gateUp = await matrix(D, [{ name: `${blk}ffn_up.weight`, rows: 2 * F }])
-    const down = await matrix(F, [{ name: `${blk}ffn_down.weight`, rows: D }])
+    const gateUp = await role("gateUp")
+    const down = await role("down")
     const value: LayerWeights = { type, operatorNorm, ffnNorm, gateUp, down, mix: mixes, perLayer: perLayerWeights }
     if (linear) value.linear = linear
     if (latentWeights) value.latent = latentWeights
