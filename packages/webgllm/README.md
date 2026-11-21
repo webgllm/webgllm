@@ -119,6 +119,22 @@ const reply = await webgllm.chat.completions.create({
 
 The image is resized the way the model's processor does it, and `detail` sets how much of it the model reads. Qwen3.5 and LFM3-VL read an image whole (in whole 32-pixel blocks), within a pixel budget: `"low"` 256 × 256, `"auto"` (the default) 640 × 640, `"high"` 1024 × 1024, which is 64, 400 or 1,024 prompt tokens for a square image. LFM2.5-VL reads an image of up to about 512 × 512 pixels whole, as 64 to 256 tokens; a larger one as its processor cuts it, a grid of 512-pixel tiles (up to 10, 256 tokens each) and the whole image again as a thumbnail (about 1,800 tokens for a photo), and `"low"` reads any image whole, as one view. The vision encoder (62 MB for Qwen3.5 0.8B's ONNX build, 197 MB for 2B's, 668 MB for 2B's GGUF; 103 to 583 MB for Liquid AI's) downloads the first time a request has an image, loads on the GPU for the request's new images and is freed after them, so text chats never pay for it in memory or speed. Each image's embedding rows are kept for a few recent images, and the prompt cache tells images apart by content, so a follow-up about an image in the history reads only the new turn. `timings.images_ms` says how long a request's images took (fetching, resizing and encoding, the encoder's load included), before `prompt_ms`. On a GPU whose textures are shorter than an image's count of 16-pixel patches (4,096 at `"high"`), the image is made smaller to fit.
 
+### Image generation
+
+`images.generate` draws 16 × 16 pixel-art sprites with [Tessera-small](https://huggingface.co/thejagstudio/tessera-small) (Jagrat Patel, TheJagStudio; **CC BY-NC 4.0: non-commercial use only**), in the int8 ONNX build of [`cfahlgren1/tessera-small-onnx`](https://huggingface.co/cfahlgren1/tessera-small-onnx) (with OpenAI's CLIP ViT-B/32 text encoder, MIT), on webgllm's own engines: WebGPU, else WebGL 2. It's shaped like OpenAI's Images API:
+
+```ts
+const { data, seed } = await webgllm.images.generate({
+  prompt: "rubber duck",
+  n: 4, //                  1–8, drawn together (1 by default)
+  seed: 7, //               the same seed, prompt and GPU draw the same sprites (random by default)
+  size: "128x128", //       a PNG's size: 16x16 (the default), or a multiple, each pixel repeated
+  response_format: "b64_json" // PNGs, base64 (the default); "rgba": the 16 × 16 pixels, 4 bytes each
+})
+```
+
+`steps` (16) and `guidance_scale` (3) are the sampler's: Tessera's own masked-diffusion sampler, with classifier-free guidance, confidence-ordered commits and self-conditioning. The model (115 MB) downloads the first time, with the load's `progress` events, and `loadModel("cfahlgren1/tessera-small-onnx")` loads it ahead; `unloadModel` frees it as it does a text model (webgllm's worker for it ends). A load checks the GPU against the model's self-test (`selftest.json`: at least 80% of its pixels' colors must match) and falls back from WebGPU to WebGL 2 if it doesn't pass. The weights stay int8 on the GPU (84 MB); 1 sprite's steps take 36 MB more, 4 sprites' 140 MB (`memory` in the response). On an M3 Ultra in Chrome, 1 sprite takes about 0.3 s on WebGPU and 0.6 s on WebGL 2; 4 sprites about 0.7 and 1 s.
+
 ### WebGPU or WebGL
 
 Models run on WebGPU where the browser has it, and on WebGL 2 elsewhere (no `navigator.gpu`, no adapter, or a model WebGPU fails to load). `webgpu: false` keeps them on WebGL 2 even where there's WebGPU; it takes only `"auto"` (the default) or `false`, and applies to the models the instance loads from then on.

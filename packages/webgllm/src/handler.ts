@@ -45,6 +45,8 @@ import { DEFAULT_REPEAT_LAST_N, PenaltyWindow } from "./penalty-window.js"
 import { seededUniforms } from "./seeded-random.js"
 import { CodedError, downloadError, errorCode, isFilesError } from "./worker-errors.js"
 import { createSharedDownloads } from "./shared-download.js"
+import { isImageRequest } from "./image-protocol.js"
+import { receiveImage, type ImageHost } from "./image-worker.js"
 import { imageProcessorConfig, type ImageProcessorConfig } from "./image.js"
 import { loadVision, planVision } from "./load-vision.js"
 import { loadVisionGguf, planVisionGguf } from "./load-vision-gguf.js"
@@ -95,7 +97,8 @@ export class WebGLLMWorkerHandler {
   /** A message from the page: `self.onmessage = (event) => handler.onmessage(event)`. */
   onmessage(event: { data: unknown }): void {
     // The worker's own messages come this way too: only webgllm's are taken.
-    if (isRequest(event.data)) receive(event.data)
+    if (isImageRequest(event.data)) receiveImage(event.data, imageHost)
+    else if (isRequest(event.data)) receive(event.data)
   }
 }
 
@@ -114,6 +117,16 @@ export interface LogitProcessor {
 }
 
 let logitProcessors: Map<string, LogitProcessor> | undefined
+
+/** What the image models' side (image-worker.ts) asks of the worker. */
+const imageHost: ImageHost = {
+  post: (message, transfer) => postMessage({ ...message, [WEBGLLM]: true }, { transfer: transfer ?? [] }),
+  webgpu: () => TUNING.webgpu > 0 && webgpuAllowed,
+  collect: async () => {
+    uncollected = true
+    await collectReleased()
+  }
+}
 
 const REQUESTS: ReadonlySet<string> = new Set<WorkerRequest["type"]>([
   "load", "generate", "forward", "reset", "stop", "unload", "download", "frames", "claimed", "tune", "configure"

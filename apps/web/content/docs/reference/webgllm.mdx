@@ -94,6 +94,10 @@ Downloads a model's files into storage without loading them. Takes `onProgress` 
 
 Frees a model's GPU memory, or every model's with no argument. webgllm's own worker for the model ends; a worker of your own frees the model and stays running.
 
+## `images.generate(params, options?)`
+
+Draws 16 × 16 pixel-art sprites with Tessera-small (CC BY-NC 4.0, non-commercial use only), on WebGPU or WebGL 2. Params: `prompt`, `n` (1–8), `seed`, `steps` (16), `guidance_scale` (3), `size` (`"16x16"`, or a multiple such as `"128x128"`) and `response_format` (`"b64_json"` PNGs, or `"rgba"` pixels). Options: `signal`, `onProgress` (the load's) and `onStep`. Resolves with `{ created, model, data, seed, width, height, timings, memory }`. `loadModel` and `unloadModel` take its model, `cfahlgren1/tessera-small-onnx`.
+
 ## `models`
 
 | Method | Returns |
