@@ -123,6 +123,22 @@ export class MemoryBudget {
     this.held.delete(model)
   }
 
+  /** What `model` holds: its bytes, last use and whether it's kept loaded. */
+  heldBy(model: string): Readonly<Held> | undefined {
+    const held = this.held.get(model)
+    return held && { ...held }
+  }
+
+  /**
+   * Puts back what `model` held before a claim that didn't go through (its
+   * host refused it, or its claimant went away), or forgets it if it held
+   * nothing. Never unloads anything: it holds no more than it did.
+   */
+  restore(model: string, before: Readonly<Held> | undefined) {
+    if (before) this.held.set(model, { ...before })
+    else this.held.delete(model)
+  }
+
   /** Bytes held by every model together. */
   get total(): number {
     let sum = 0

@@ -231,7 +231,8 @@ export class WebGLLM {
       },
       dispatch: (type, event) => this.dispatch(type, event),
       // Its memory shares the text models' budget and the host's onMemoryClaim.
-      claim: (model, bytes, unload, signal) => this.pool.claimExternal(model, bytes, unload, signal),
+      claim: (model, bytes, unload, keepLoaded, signal) => this.pool.claimExternal(model, bytes, unload, keepLoaded, signal),
+      setKeepLoaded: (model, keep) => this.pool.setExternalKeepLoaded(model, keep),
       touch: (model) => this.pool.touchExternal(model),
       release: (model) => this.pool.releaseExternal(model)
     })
@@ -273,7 +274,11 @@ export class WebGLLM {
   async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
     throwIfAborted(options.signal)
     if (isImageModel(model)) {
-      await this.images.load(model, { ...(options.onProgress && { onProgress: options.onProgress }), ...(options.signal && { signal: options.signal }) })
+      await this.images.load(model, {
+        ...(options.onProgress && { onProgress: options.onProgress }),
+        ...(options.signal && { signal: options.signal }),
+        ...(options.keepLoaded !== undefined && { keepLoaded: options.keepLoaded })
+      })
       return
     }
     // Before resolving: an unload asked for meanwhile stops this load.

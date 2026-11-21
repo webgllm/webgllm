@@ -86,8 +86,11 @@ function setup(own = true, refuse?: (bytes: number) => string | undefined, holdC
   /** Bytes held by model, as the budget would. */
   const held = new Map<string, number>()
   const touched: Array<string> = []
+  const kept: Array<boolean> = []
   const images = new Images({
-    claim: async (model, bytes, _unload, signal) => {
+    setKeepLoaded: (_model, keep) => void kept.push(keep),
+    claim: async (model, bytes, _unload, keepLoaded, signal) => {
+      kept.push(keepLoaded)
       // (Held: a claim waiting for room, until the claimant goes.)
       if (holdClaims) await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
       const why = refuse?.(bytes)
@@ -106,7 +109,7 @@ function setup(own = true, refuse?: (bytes: number) => string | undefined, holdC
     onProgress: (p) => progress.push(p),
     dispatch: (type, event) => events.push(`${type} ${(event as { model: string }).model}${"reason" in event ? ` ${event.reason}` : ""}`)
   })
-  return { images, made, caller, events, progress, held, touched }
+  return { images, made, caller, events, progress, held, touched, kept }
 }
 
 test("a load starts a worker, reports progress and the model's events, once for calls at once", async () => {
@@ -276,4 +279,14 @@ test("a worker that fails after loading takes its model out; the next load start
   assert.deepEqual(events.slice(-2), [`error ${TESSERA}`, `unload ${TESSERA} crashed`])
   await images.generate({ prompt: "fire" })
   assert.equal(made.length, 2)
+})
+
+test("keepLoaded goes with every claim of the model, its batches' too, and a later load can change it", async () => {
+  const { images, kept } = setup()
+  await images.load(TESSERA, { keepLoaded: true })
+  await images.generate({ prompt: "duck", n: 4 })
+  assert.deepEqual(kept, [true, true])
+  await images.load(TESSERA, { keepLoaded: false })
+  await images.generate({ prompt: "duck", n: 8 })
+  assert.deepEqual(kept, [true, true, false, false])
 })

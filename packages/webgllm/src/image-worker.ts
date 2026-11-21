@@ -16,7 +16,7 @@ import { encodePng } from "./png.js"
 import { download, storedFile } from "./storage.js"
 import { TesseraGpu, tesseraWeightBytes } from "./tessera.js"
 import { DEFAULT_SAMPLER, drawSprites, fixedLengthIds, GRID, MASK, PALETTE, PIXELS, spritePixels } from "./tessera-sampler.js"
-import { readClipWeights, readTesseraWeights } from "./tessera-weights.js"
+import { readClipWeights, readTesseraWeights, type ClipWeights, type TesseraWeights } from "./tessera-weights.js"
 
 /** Pixels of selftest.json's canvas that must match its argmax for a GPU to be used. */
 export const SELFTEST_AGREEMENT = 0.8
@@ -34,11 +34,10 @@ type Loaded = {
   /** Bytes claimed for it: weights and the work textures of the largest batch so far. */
   claimed: number
   weightBytes: number
-  gpu: Gpu | WebGpu
-  tessera: TesseraGpu
+  gpu: { dispose(): void }
+  tessera: ImageModelOnGpu
   engine: "webgpu" | "webgl"
   tokenize: (text: string) => Array<number>
-  endToken: number
   palette: Array<Array<number>>
 }
 
@@ -150,22 +149,41 @@ async function fileBytes(file: ModelFile, onBytes: (loaded: number) => void, sig
   return new Uint8Array(await blob.arrayBuffer())
 }
 
-async function load(model: string, id: number, host: ImageHost, signal: AbortSignal): Promise<Loaded> {
-  if (current?.model === model) return current
-  if (!isImageModel(model)) throw new Error(`${model} isn't an image model webgllm runs.`)
-  if (current) await release(host)
-  const meta: ImageModelMeta = IMAGE_MODEL_META[model]
+/** A model's files, read: what each GPU attempt loads. */
+export type PreparedImageModel = {
+  weights: TesseraWeights
+  clip: ClipWeights
+  /** GPU bytes of the weights. */
+  weightBytes: number
+  tokenize: (prompt: string) => Array<number>
+  palette: Array<Array<number>>
+  selftest: { ids: Array<number>; argmax: Array<number> }
+  /** Whether every file came from storage. */
+  cached: boolean
+}
+
+/** The model on a GPU (TesseraGpu's side the worker uses). */
+export type ImageModelOnGpu = Pick<TesseraGpu, "load" | "encodeText" | "setText" | "denoise" | "dispose" | "workBytesFor" | "bytes">
+
+/** What the tests swap: reading the model's files, a GPU, and the model on it. */
+export const imageDeps = {
+  prepare: prepareTessera as (meta: ImageModelMeta, onProgress: (progress: number, cached: boolean) => void, signal: AbortSignal) => Promise<PreparedImageModel>,
+  gpu: (engine: "webgpu" | "webgl"): Promise<{ dispose(): void } | null> =>
+    engine === "webgpu" ? WebGpu.create() : Promise.resolve(new Gpu(new OffscreenCanvas(1, 1))),
+  model: (gpu: { dispose(): void }): ImageModelOnGpu => new TesseraGpu(gpu as Gpu | WebGpu)
+}
+
+/** Tessera's files (from storage, else downloaded into it), read: `onProgress` gets the download's share (0–1). */
+async function prepareTessera(meta: ImageModelMeta, onProgress: (progress: number, cached: boolean) => void, signal: AbortSignal): Promise<PreparedImageModel> {
   const files = Object.values(meta.files)
   const total = files.reduce((s, f) => s + f.bytes, 0)
   const cached = (await Promise.all(files.map((f) => storedFile(f)))).every(Boolean)
   const got = new Map<ModelFile, number>()
-  const report = (phase: "download" | "load", progress: number) =>
-    host.post({ type: "image-progress", id, model, phase, progress, cached })
   const onBytes = (file: ModelFile) => (loaded: number) => {
     got.set(file, loaded)
     let sum = 0
     for (const n of got.values()) sum += n
-    report("download", Math.min(sum / total, 1) * (cached ? 0.5 : 0.9))
+    onProgress(Math.min(sum / total, 1), cached)
   }
   const [denoiser, textEncoder, tokenizerJson, paletteJson, selftestJson] = await Promise.all(
     [meta.files.denoiser, meta.files.textEncoder, meta.files.tokenizer, meta.files.palette, meta.files.selftest].map((f) => fileBytes(f, onBytes(f), signal))
@@ -180,33 +198,54 @@ async function load(model: string, id: number, host: ImageHost, signal: AbortSig
   const selftest = JSON.parse(text.decode(selftestJson)) as { ids: Array<number>; argmax: Array<number> }
   const weights = readTesseraWeights(denoiser)
   const clip = readClipWeights(textEncoder)
+  const sizes = tesseraWeightBytes(weights, clip)
+  return {
+    weights,
+    clip,
+    weightBytes: sizes.denoiser + sizes.text,
+    tokenize: (prompt) => fixedLengthIds(prompt === "" ? [] : tokenizer.encode(prompt, { add_special_tokens: true }).ids, endToken),
+    palette,
+    selftest,
+    cached
+  }
+}
+
+async function load(model: string, id: number, host: ImageHost, signal: AbortSignal): Promise<Loaded> {
+  if (current?.model === model) return current
+  if (!isImageModel(model)) throw new Error(`${model} isn't an image model webgllm runs.`)
+  if (current) await release(host)
+  let cached = false
+  const report = (phase: "download" | "load", progress: number) => host.post({ type: "image-progress", id, model, phase, progress, cached })
+  const prepared = await imageDeps.prepare(IMAGE_MODEL_META[model], (share, fromStorage) => {
+    cached = fromStorage
+    report("download", share * (cached ? 0.5 : 0.9))
+  }, signal)
+  signal.throwIfAborted()
+  cached = prepared.cached
   report("load", cached ? 0.6 : 0.92)
 
   // WebGPU first, where it's allowed and passes the self-test; else WebGL 2.
   const failures: Array<string> = []
   for (const engine of host.webgpu() ? (["webgpu", "webgl"] as const) : (["webgl"] as const)) {
     signal.throwIfAborted()
-    let gpu: Gpu | WebGpu | null = null
-    let tessera: TesseraGpu | null = null
+    let gpu: { dispose(): void } | null = null
+    let tessera: ImageModelOnGpu | null = null
     try {
-      gpu = engine === "webgpu" ? await WebGpu.create() : new Gpu(new OffscreenCanvas(1, 1))
+      gpu = await imageDeps.gpu(engine)
       if (!gpu) {
         failures.push("WebGPU: no adapter")
         continue
       }
       // Room for the weights and a one-canvas pass (the self-test's), before any of it is allocated.
-      const sizes = tesseraWeightBytes(weights, clip)
-      const weightBytes = sizes.denoiser + sizes.text
-      tessera = new TesseraGpu(gpu)
-      const claimed = weightBytes + tessera.workBytesFor(1)
+      tessera = imageDeps.model(gpu)
+      const claimed = prepared.weightBytes + tessera.workBytesFor(1)
       await claim(host, id, model, claimed, signal)
-      await tessera.load(weights, clip, signal)
+      await tessera.load(prepared.weights, prepared.clip, signal)
       report("load", cached ? 0.8 : 0.96)
-      const agreement = await selftestAgreement(tessera, selftest, signal)
+      const agreement = await selftestAgreement(tessera, prepared.selftest, signal)
       if (agreement < SELFTEST_AGREEMENT) throw new Error(`its self-test matched ${(agreement * 100).toFixed(1)}% of pixels (at least ${SELFTEST_AGREEMENT * 100}% needed)`)
       lastSelftest = agreement
-      const tokenize = (prompt: string) => fixedLengthIds(prompt === "" ? [] : tokenizer.encode(prompt, { add_special_tokens: true }).ids, endToken)
-      current = { model, claimed, weightBytes, gpu, tessera, engine, tokenize, endToken, palette }
+      current = { model, claimed, weightBytes: prepared.weightBytes, gpu, tessera, engine, tokenize: prepared.tokenize, palette: prepared.palette }
       report("load", 1)
       return current
     } catch (error) {
@@ -220,7 +259,7 @@ async function load(model: string, id: number, host: ImageHost, signal: AbortSig
 }
 
 /** The share of selftest.json's pixels whose argmax the GPU matches. */
-async function selftestAgreement(tessera: TesseraGpu, selftest: { ids: Array<number>; argmax: Array<number> }, signal: AbortSignal) {
+async function selftestAgreement(tessera: ImageModelOnGpu, selftest: { ids: Array<number>; argmax: Array<number> }, signal: AbortSignal) {
   const text = await tessera.encodeText(selftest.ids, signal)
   await tessera.setText(text.states, text.pooled, signal)
   const logits = await tessera.denoise(new Int32Array(PIXELS).fill(MASK), new Float32Array([1]), null, 1, 1, signal)

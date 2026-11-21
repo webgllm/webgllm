@@ -205,13 +205,25 @@ export class ModelPool {
    * onMemoryClaim. `unload` frees it when another claim needs its room.
    * Rejects, holding nothing new, if the host refuses or `signal` aborts.
    */
-  async claimExternal(model: string, bytes: number, unload: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+  async claimExternal(model: string, bytes: number, unload: () => Promise<void>, keepLoaded: boolean, signal?: AbortSignal): Promise<void> {
     this.external.set(model, unload)
-    await this.budget.claim(model, bytes, false, signal)
-    const hook = this.options.onMemoryClaim
-    if (!hook) return
-    const gone = signal ?? new AbortController().signal
-    await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: gone })), signal)
+    const before = this.budget.heldBy(model)
+    try {
+      await this.budget.claim(model, bytes, keepLoaded, signal)
+      const hook = this.options.onMemoryClaim
+      if (!hook) return
+      const gone = signal ?? new AbortController().signal
+      await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: gone })), signal)
+    } catch (error) {
+      // Refused or given up: it holds what it held before (the model stays as it was), unless it was unloaded meanwhile.
+      if (this.external.get(model) === unload) this.budget.restore(model, before)
+      throw error
+    }
+  }
+
+  /** Whether a model outside the pool may be unloaded to make room. */
+  setExternalKeepLoaded(model: string, keep: boolean) {
+    this.budget.setKeepLoaded(model, keep)
   }
 
   /** Marks a model outside the pool as just used (least recently used order). */

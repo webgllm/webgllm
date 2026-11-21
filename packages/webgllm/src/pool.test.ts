@@ -1050,7 +1050,7 @@ test("an image model's claim shares the budget: it unloads the least recently us
   await p.claimExternal("image", 84, async () => {
     imageUnloads++
     p.releaseExternal("image")
-  })
+  }, false)
   assert.equal(p.isLoaded(A), false, "the text model stayed past the budget")
   assert.equal(p.memoryUsed, 84)
   await p.load(B)
@@ -1068,9 +1068,42 @@ test("the host's onMemoryClaim is asked for an image model's claims, and its ref
     }
   })
   await p.load(A)
-  await assert.rejects(p.claimExternal("image", 84, async () => undefined), /no room for images/)
+  await assert.rejects(p.claimExternal("image", 84, async () => undefined, false), /no room for images/)
   assert.deepEqual(asked, [`${A} 60`, "image 84"])
   // The refused model releases what it claimed (images.ts does, when its load fails).
   p.releaseExternal("image")
   assert.equal(p.memoryUsed, 60)
+})
+
+test("a refused claim to grow an image model's memory leaves it holding what it held: no text model unloads for room it doesn't take", async () => {
+  const { pool: p } = pool({
+    budget: 220,
+    onMemoryClaim: ({ model, bytes }) => {
+      if (model === "image" && bytes > 90) throw new Error("no room to grow")
+    }
+  })
+  await p.load(A)
+  await p.claimExternal("image", 90, async () => p.releaseExternal("image"), false)
+  assert.equal(p.memoryUsed, 150)
+  await assert.rejects(p.claimExternal("image", 130, async () => p.releaseExternal("image"), false), /no room to grow/)
+  assert.equal(p.memoryUsed, 150, "the refused growth is still counted")
+  await p.load(B)
+  assert.equal(p.isLoaded(A), true, "a text model unloaded for the refused growth's room")
+  assert.equal(p.memoryUsed, 210)
+})
+
+test("an image model loaded with keepLoaded isn't unloaded to make room for a text model", async () => {
+  const { pool: p } = pool({ budget: 100 })
+  let imageUnloads = 0
+  await p.claimExternal("image", 84, async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }, true)
+  await p.load(A)
+  assert.equal(imageUnloads, 0)
+  assert.equal(p.isLoaded(A), true)
+  // Allowed again, it goes for the next text model's room.
+  p.setExternalKeepLoaded("image", false)
+  await p.load(B)
+  assert.equal(imageUnloads, 1)
 })
