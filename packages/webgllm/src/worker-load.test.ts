@@ -9,6 +9,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
+import { setFlagsFromString } from "node:v8"
+import { runInNewContext } from "node:vm"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 
 const require = createRequire(join(process.cwd(), "package.json"))
@@ -32,6 +34,8 @@ await build({ stdin: { loader: "ts", resolveDir: join(process.cwd(), "src"), con
     const post = (m) => state.messages.push(m)
     const load = (model, signal, contextLength) => state.load(model, signal, contextLength, claimMemory)
     const release = (engine) => { engine.released = true }
+    // The collection after a release (see collectReleased), held by a test that sets state.collect.
+    const collectReleased = () => state.collect?.() ?? Promise.resolve()
     class Superseded extends Error { constructor() { super("Switched to another model.") } }
     const errorMessage = (e) => e instanceof Error ? e.message : String(e)
     const errorCode = () => undefined
@@ -72,9 +76,15 @@ function worker() {
   const loads: Array<{ contextLength: number | undefined; signal: AbortSignal; finish: () => void; engine: Engine }> = []
   const generations: Array<{ engine: Engine; finish: () => void; fail: (error: Error) => void; releasedMidway?: boolean }> = []
   let active = 0, most = 0
+  let collect: { promise: Promise<void>; release: () => void } | null = null
+  let collections = 0
   const state = {
     messages,
     warmups: 0,
+    collect: () => {
+      collections++
+      return collect?.promise ?? Promise.resolve()
+    },
     onmessage: null as unknown as (event: { data: WorkerRequest }) => void,
     async load(model: string, signal: AbortSignal, contextLength: number | undefined): Promise<Loaded> {
       active++
@@ -101,7 +111,12 @@ function worker() {
   }
   makeWorker(state)
   const send = (data: WorkerRequest) => state.onmessage({ data: mark(data) as WorkerRequest })
-  return { send, messages, loads, generations, most: () => most, warmups: () => state.warmups }
+  return {
+    send, messages, loads, generations, most: () => most, warmups: () => state.warmups,
+    /** Holds the next collections until the gate's release. */
+    holdCollection: () => (collect = gate()),
+    collections: () => collections
+  }
 }
 
 const MODEL = "LiquidAI/LFM3-1.7B-GGUF"
@@ -187,6 +202,57 @@ test("unload frees the loaded model after the generation running, and the worker
   await settle()
   assert.deepEqual(readies(w.messages).map((m) => m.type === "ready" && m.loadId), [1, 2])
   assert.equal(w.loads[1].engine.released, false)
+})
+
+test("unload answers once the worker's collector has run after the model was freed (Safari keeps its memory until then)", async () => {
+  const w = worker()
+  w.send({ type: "load", model: MODEL, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  const collection = w.holdCollection()
+  w.send({ type: "unload", model: MODEL, id: 9 })
+  await settle()
+  assert.equal(w.loads[0].engine.released, true)
+  assert.equal(w.collections(), 1)
+  assert.equal(w.messages.some((m) => m.type === "unloaded"), false, "said it was freed before the collection")
+  collection.release()
+  await settle()
+  assert.deepEqual(w.messages.filter((m) => m.type === "unloaded"), [{ type: "unloaded", id: 9 }])
+})
+
+test("a load for another context leaves nothing holding the engine it replaces while it loads, so the collection before it can take it", async () => {
+  setFlagsFromString("--expose-gc")
+  const gc = runInNewContext("gc") as () => void
+  const w = worker()
+  w.send({ type: "load", model: MODEL, contextLength: 64, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  const replaced = new WeakRef(w.loads[0].engine)
+  ;(w.loads[0] as { engine: unknown }).engine = null
+  w.send({ type: "load", model: MODEL, contextLength: 128, loadId: 2 })
+  await settle()
+  assert.equal(w.loads.length, 2, "the new context's load hasn't started")
+  assert.equal(replaced.deref()?.released, true)
+  // (Collected in a task of its own: deref keeps its target to the end of the task it's called in.)
+  let held = true
+  for (let i = 0; i < 3 && held; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    gc()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    held = replaced.deref() !== undefined
+  }
+  assert.equal(held, false, "the replaced engine is still held while the new one loads")
+  w.loads[1].finish()
+  await settle()
+  // Its answer still says it's a new load (with its timings); one for the same context, that it's the same.
+  assert.deepEqual(readies(w.messages).map((m) => m.type === "ready" && m.loadId), [1, 2])
+  assert.equal("timings" in readies(w.messages)[1]!, true)
+  w.send({ type: "load", model: MODEL, contextLength: 128, loadId: 3 })
+  await settle()
+  assert.equal(w.loads.length, 2)
+  assert.equal("timings" in readies(w.messages)[2]!, false)
 })
 
 test("unload stops a load in progress, without an answer; the next load waits for it to end", async () => {

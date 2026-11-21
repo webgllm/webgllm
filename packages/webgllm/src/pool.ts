@@ -61,8 +61,6 @@ type Entry = {
   watched: Promise<void> | null
   /** Aborted when it's dropped: its claims for memory stop. */
   gone: AbortController
-  /** The worker webgllm started (or reused) for it: kept for the next load once the model is freed (see park). */
-  own: Worker | null
   /** Once dropped: settles when its memory is free and "unload" says so (see drop). */
   dropped?: Promise<void>
 }
@@ -106,8 +104,8 @@ const unloaded = (model: string) =>
 
 let nextId = 0
 
-/** How long a worker of webgllm's whose model was unloaded is kept for the next load (see ModelPool.parked). */
-export const PARKED_MS = 30_000
+/** How long a spare worker of webgllm's waits for the next load (see ModelPool.spare). */
+export const SPARE_MS = 30_000
 
 export class ModelPool {
   private readonly entries = new Map<string, Entry>()
@@ -127,17 +125,16 @@ export class ModelPool {
   /** Downloads stopped in the caller's worker whose files aren't closed yet, by model. */
   private readonly closing = new Map<string, Promise<void>>()
   /**
-   * A worker of webgllm's whose model was unloaded, kept for the next load
-   * (see park): one ended after each model left a little of its memory
-   * behind in Safari on an iPhone (2 MB a load, kept by the page), and
-   * reused, nothing. Ended once idle for PARKED_MS: it holds what the last
-   * load left for the collector (about 350 MB after Qwen3.5 2B), which an
-   * idle worker never collects.
+   * A worker of webgllm's started when a model was unloaded, for the next
+   * load (see startSpare): the unloaded model's own worker is ended, as only
+   * that frees its memory in Safari on an iPhone at once (a worker that
+   * frees a model keeps its memory until its collector runs, which an idle
+   * one never does), and a worker started ahead loads as soon as one that's
+   * reused (LFM3 1.7B: 1.0 s; 1.3 to 1.5 s in one started for the load).
+   * Ended once idle for SPARE_MS.
    */
-  private parked: Worker | null = null
-  private parkedTimer: ReturnType<typeof setTimeout> | undefined
-  /** Workers of webgllm's the pool ended: never taken back (see unpark). */
-  private readonly ended = new WeakSet<Worker>()
+  private spare: Worker | null = null
+  private spareTimer: ReturnType<typeof setTimeout> | undefined
   /** Models dropped whose memory isn't free yet, by model: settles once it is (see drop, evict). */
   private readonly releasing = new Map<string, Promise<void>>()
   /** The caller's worker's completions, one at a time from load to last token (see turn). */
@@ -395,9 +392,10 @@ export class ModelPool {
 
   /**
    * Unloads `model`, or every model; their running generations fail with
-   * "model-not-loaded" at once. Resolves once their GPU memory is free: at
+   * "model-not-loaded" at once. Resolves once their memory is free: at
    * once for webgllm's own workers (they're ended), and for the caller's
-   * worker when it says it has freed the model.
+   * worker when it says it has freed the model (see collectReleased in
+   * handler.ts).
    */
   async unload(model?: string): Promise<void> {
     // Loads still waiting (for a download or an eviction of it) have no
@@ -597,53 +595,46 @@ export class ModelPool {
   }
 
   /**
-   * `model`'s side of a worker: the caller's, or `own`, one of webgllm's
-   * the pool ends or keeps (see park), both left running when the model
-   * goes; else one started for it alone and ended with it (a download's).
+   * `model`'s side of a worker: the caller's, left running when the model
+   * goes; else one of webgllm's (`own`, or one started now), ended with it.
    */
   private modelWorker(model: string, own: Worker | null, events: WorkerEvents): ModelWorker {
-    const kept = this.options.worker ?? own
-    return new ModelWorker(model, kept ?? this.options.createWorker(), !kept, events, this.options.webgpu ?? "auto")
+    const worker = this.options.worker ?? own ?? this.options.createWorker()
+    return new ModelWorker(model, worker, !this.options.worker, events, this.options.webgpu ?? "auto")
   }
 
-  /** The kept worker, taken for a new model (see park). */
-  private unpark(): Worker | null {
-    const worker = this.parked
-    this.parked = null
-    clearTimeout(this.parkedTimer)
-    if (worker) worker.removeEventListener("error", this.parkedError)
-    return worker && !this.ended.has(worker) ? worker : null
-  }
-
-  /** Ends a worker of webgllm's for good. */
-  private end(worker: Worker) {
-    this.ended.add(worker)
-    worker.terminate()
+  /** The spare worker, taken for a new model (see spare). */
+  private takeSpare(): Worker | null {
+    const worker = this.spare
+    this.spare = null
+    clearTimeout(this.spareTimer)
+    worker?.removeEventListener("error", this.spareError)
+    return worker
   }
 
   /**
-   * Keeps a worker of webgllm's whose model was freed for the next load, or
-   * ends it: one that failed or crashed, or one more than the one kept.
+   * Starts a spare worker for the next load, unless there's one (see spare).
+   * Never throws: a worker that can't be started now is logged, and the
+   * next load starts its own.
    */
-  private park(worker: Worker, reusable: boolean) {
-    if (!reusable || this.parked || this.ended.has(worker)) return void this.end(worker)
-    this.parked = worker
-    worker.addEventListener("error", this.parkedError)
-    this.parkedTimer = setTimeout(() => {
-      const idle = this.unpark()
-      if (idle) this.end(idle)
-    }, PARKED_MS)
+  private startSpare() {
+    if (this.spare || this.options.worker) return
+    let worker: Worker
+    try {
+      worker = this.options.createWorker()
+    } catch (error) {
+      this.options.log("warn", `A spare worker didn't start: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    this.spare = worker
+    worker.addEventListener("error", this.spareError)
+    this.spareTimer = setTimeout(() => this.takeSpare()?.terminate(), SPARE_MS)
     // (Node: a pending timer doesn't keep the process alive.)
-    ;(this.parkedTimer as { unref?: () => void }).unref?.()
+    ;(this.spareTimer as { unref?: () => void }).unref?.()
   }
 
-  /** A kept worker that fails is ended, not reused. */
-  private readonly parkedError = (event: Event) => {
-    const worker = event.target as Worker | null
-    if (!worker || worker !== this.parked) return
-    this.unpark()
-    this.end(worker)
-  }
+  /** A spare worker that fails is ended, not used (it listens only while it's the spare). */
+  private readonly spareError = () => this.takeSpare()?.terminate()
 
   /**
    * WebLLM's forwardTokensAndSample on `model` (loaded first if it isn't):
@@ -678,10 +669,9 @@ export class ModelPool {
   }
 
   private spawn(model: string): Entry {
-    // A worker of webgllm's own: the one kept from an earlier model, else a new one.
-    const own = this.options.worker ? null : this.unpark() ?? this.options.createWorker()
+    // A worker of webgllm's own: the spare, else a new one.
+    const own = this.options.worker ? null : this.takeSpare()
     const entry: Entry = {
-      own,
       model,
       keepLoaded: false,
       waiters: 0,
@@ -736,7 +726,6 @@ export class ModelPool {
     }
   }
 
-  /** Frees `entry`'s model and memory (ending its worker, unless it's the caller's); what waits on it fails with `reason`. */
   /**
    * Drops `entry`: its model's worker stops and frees it. Once only (a load
    * failing after an unload asked for it drops it again): the first
@@ -744,15 +733,9 @@ export class ModelPool {
    */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason): Promise<void> {
     if (entry.dropped) return entry.dropped
+    // A worker of webgllm's is ended (its memory is free at once); the
+    // caller's worker frees the model (see collectReleased in handler.ts).
     const freed = entry.worker.terminate(reason)
-    // A worker of webgllm's: kept for the next load once it has freed the
-    // model (see park), unless it failed, even while it was freeing it.
-    const own = entry.own
-    if (own) {
-      const park = () => this.park(own, why !== "failed" && why !== "crashed" && !entry.worker.failed)
-      if (freed) void freed.then(park)
-      else park()
-    }
     entry.gone.abort(reason)
     if (this.entries.get(entry.model) !== entry) return (entry.dropped = freed ?? Promise.resolve())
     this.entries.delete(entry.model)
@@ -778,6 +761,8 @@ export class ModelPool {
       this.stopFrames?.()
       this.stopFrames = undefined
     }
+    // A spare for the next load, if the caller unloaded it: once all the above is done.
+    if (why === "unloaded") this.startSpare()
     return done
   }
 

@@ -5,7 +5,7 @@ import { FakeWorker, fakeStorage, fakeWorkers, settle } from "./fake-worker.test
 import type { FakeOptions } from "./fake-worker.test.js"
 import { MemoryBudget } from "./model-memory.js"
 import type { LoadProgress } from "./openai.js"
-import { downloadProgress, loadProgress, ModelPool, PARKED_MS, TaskQueue } from "./pool.js"
+import { downloadProgress, loadProgress, ModelPool, SPARE_MS, TaskQueue } from "./pool.js"
 import type { ModelEvent, PoolOptions } from "./pool.js"
 
 const A = "LiquidAI/LFM2.5-350M-GGUF"
@@ -63,10 +63,9 @@ test("loading past the budget unloads the least recently used model", async () =
   await p.load(B)
   assert.equal(p.isLoaded(A), false)
   assert.equal(p.isLoaded(B), true)
-  // B's worker, started before it claimed A's room, has B; A's freed A and is kept for the next load.
+  // A's worker is ended, which frees its memory at once; B's has B.
   assert.equal(workers.workers.length, 2)
-  assert.deepEqual(workers.workers[0]?.unloaded, [A])
-  assert.equal(workers.workers[0]?.terminated, false)
+  assert.equal(workers.workers[0]?.terminated, true)
   assert.equal(p.memoryUsed, 60)
 })
 
@@ -120,9 +119,7 @@ test("a model being unloaded for room finishes its running generation first", as
   a.finish(a.generations()[0]!.id, ["done"])
   await running
   await loadB
-  // A freed in its worker, which is kept for the next load.
-  assert.deepEqual(a.unloaded, [A])
-  assert.equal(a.terminated, false)
+  assert.equal(a.terminated, true)
   assert.equal(p.isLoaded(B), true)
 })
 
@@ -135,12 +132,13 @@ test("a generation for an unloaded model loads it again", async () => {
   await p.generate(A, fields, { onToken: (t) => tokens.push(t) })
   assert.deepEqual(tokens, ["ok"])
   assert.equal(p.isLoaded(A), true)
-  // A again in the worker it left, kept since (B's, started to claim A's room, has B).
-  assert.equal(workers.workers.length, 2)
-  assert.equal(workers.workers[0]!.sent.filter((m) => m.type === "load" && m.model === A).length, 2)
+  // A again in a worker of its own: the one it left was ended (and no spare started: it made room, it wasn't unloaded).
+  assert.equal(workers.workers.length, 3)
+  assert.equal(workers.workers[0]!.terminated, true)
+  assert.equal(workers.workers[2]!.sent.filter((m) => m.type === "load" && m.model === A).length, 1)
 })
 
-test("a worker that crashed or failed to load isn't kept for the next model", async () => {
+test("a worker that crashed or failed to load is ended, and the next model has a new one", async () => {
   const failing = pool({ loadError: (model) => (model === A ? { message: "boom" } : undefined) })
   await assert.rejects(failing.pool.load(A))
   await settle()
@@ -156,12 +154,12 @@ test("a worker that crashed or failed to load isn't kept for the next model", as
   assert.equal(crashing.workers.workers[0]!.terminated, true)
 })
 
-test("a worker kept after its model was unloaded is reused until it has been idle PARKED_MS, then ended", async (t) => {
+test("unloading a model ends its worker and starts a spare for the next load, ended once idle SPARE_MS", async (t) => {
   // The pool's idle timer, fired by hand; every other timer runs as usual.
   const idle: Array<() => void> = []
   const real = globalThis.setTimeout
   t.mock.method(globalThis, "setTimeout", ((fn: () => void, ms?: number, ...rest: Array<unknown>) => {
-    if (ms === PARKED_MS) {
+    if (ms === SPARE_MS) {
       idle.push(fn)
       return { unref: () => undefined }
     }
@@ -171,23 +169,73 @@ test("a worker kept after its model was unloaded is reused until it has been idl
   await p.load(A)
   await p.unload(A)
   await settle()
+  // Ended, not asked to free the model: only ending it frees its memory at once in Safari.
+  assert.equal(workers.workers[0]!.terminated, true)
+  assert.deepEqual(workers.workers[0]!.unloaded, [])
+  assert.equal(workers.workers.length, 2, "no spare started")
   assert.equal(idle.length, 1)
   await p.load(B)
-  assert.equal(workers.workers.length, 1, "reused before the idle time ran out")
+  assert.equal(workers.workers.length, 2, "the spare wasn't used")
+  assert.equal(workers.workers[1]!.model, B)
   await p.unload(B)
   await settle()
+  assert.equal(workers.workers.length, 3)
   idle.at(-1)!()
-  assert.equal(workers.workers[0]!.terminated, true, "ended once idle")
+  assert.equal(workers.workers[2]!.terminated, true, "the spare ended once idle")
   await p.load(A)
-  assert.equal(workers.workers.length, 2)
+  assert.equal(workers.workers.length, 4)
   t.mock.restoreAll()
+})
+
+test("a spare worker that can't be started leaves the unload whole: every model unloaded, its memory free, the next load starting its own", async () => {
+  const workers = fakeWorkers({ bytes: () => 60 })
+  let refuse = false
+  const events: Array<ModelEvent> = []
+  const logs: Array<string> = []
+  const p = new ModelPool({
+    createWorker: () => {
+      if (refuse) throw new Error("no more workers")
+      return workers.create()
+    },
+    memoryBudget: () => 1000,
+    storage: fakeStorage(),
+    onProgress: () => undefined,
+    onModelEvent: (event) => events.push(event),
+    log: (_, text) => logs.push(text)
+  })
+  await p.load(A)
+  await p.load(B)
+  refuse = true
+  await p.unload()
+  assert.deepEqual(p.loadedModels(), [])
+  assert.equal(p.memoryUsed, 0)
+  assert.deepEqual(events.filter((e) => e.type === "unload").map((e) => e.model).sort(), [A, B].sort())
+  assert.ok(workers.workers.every((w) => w.terminated))
+  assert.ok(logs.some((text) => text.includes("no more workers")), "the failure isn't logged")
+  refuse = false
+  await p.load(A)
+  assert.equal(workers.workers.length, 3)
+  assert.equal(workers.workers[2]!.model, A)
+})
+
+test("a spare worker that fails is ended, and the next load starts another", async () => {
+  const { pool: p, workers } = pool()
+  await p.load(A)
+  await p.unload(A)
+  const spare = workers.workers[1]!
+  spare.failToLoad()
+  await settle()
+  assert.equal(spare.terminated, true)
+  await p.load(B)
+  assert.equal(workers.workers.length, 3)
+  assert.equal(workers.workers[2]!.model, B)
 })
 
 /** Settles with "pending" if `promise` hasn't after `ms`. */
 const within = <T>(promise: Promise<T>, ms = 300) =>
   Promise.race([promise.then(() => "settled", () => "settled"), new Promise<string>((resolve) => setTimeout(() => resolve("pending"), ms))])
 
-test("unloading a model during its load keeps its worker usable: the next model loads there", async () => {
+test("unloading a model during its load: the next model loads (in the spare, never in the ended worker)", async () => {
   let release!: () => void
   const held = new Promise<void>((resolve) => (release = resolve))
   const { pool: p, workers } = pool({ hold: (model) => (model === A ? held : Promise.resolve()) })
@@ -200,64 +248,6 @@ test("unloading a model during its load keeps its worker usable: the next model 
   assert.equal(await within(p.load(B)), "settled", "B never loaded")
   assert.equal(p.isLoaded(B), true)
   assert.ok(workers.workers.every((w) => !w.terminated || !w.sent.some((m) => m.type === "load" && m.model === B)), "B was sent to an ended worker")
-})
-
-test("an eviction for room completes once the evicted model is freed, not before", async () => {
-  let release!: () => void
-  const held = new Promise<void>((resolve) => (release = resolve))
-  const { pool: p } = pool({ holdUnload: (model) => (model === A ? held : Promise.resolve()) })
-  await p.load(A)
-  const loadingB = p.load(B)
-  assert.equal(await within(loadingB), "pending", "B loaded while A was still in memory")
-  assert.equal(p.isLoaded(B), false)
-  release()
-  await loadingB
-  assert.equal(p.isLoaded(B), true)
-  assert.equal(p.memoryUsed, 60)
-})
-
-test("a claim arriving after an explicit unload removed the model waits for its memory to be freed", async () => {
-  let release!: () => void, start!: () => void
-  const held = new Promise<void>((resolve) => (release = resolve))
-  const starting = new Promise<void>((resolve) => (start = resolve))
-  // B's worker is running its load before A is unloaded; its claim comes after.
-  const { pool: p } = pool({ hold: (model) => (model === B ? starting : Promise.resolve()), holdUnload: (model) => (model === A ? held : Promise.resolve()) })
-  await p.load(A)
-  const loadingB = p.load(B)
-  await settle()
-  const unloading = p.unload(A)
-  await settle()
-  start()
-  assert.equal(await within(loadingB), "pending", "B was admitted while A's memory was still held")
-  release()
-  await unloading
-  await loadingB
-  assert.equal(p.isLoaded(B), true)
-  assert.equal(p.memoryUsed, 60)
-})
-
-test("an eviction waiting for the model's reply, which an explicit unload then removes, waits for its memory to be freed", async () => {
-  let release!: () => void
-  const held = new Promise<void>((resolve) => (release = resolve))
-  const { pool: p, workers } = pool({ holdUnload: (model) => (model === A ? held : Promise.resolve()) })
-  await p.load(A)
-  const running = p.generate(A, fields, { onToken: () => undefined })
-  running.catch(() => undefined)
-  await settle()
-  const a = workers.of(A)!
-  // B needs A's room: it waits for A's reply to end.
-  const loadingB = p.load(B)
-  await settle()
-  const unloading = p.unload(A)
-  await settle()
-  const generation = a.generations()[0]
-  if (generation) a.finish(generation.id, ["done"])
-  assert.equal(await within(loadingB), "pending", "B was admitted while A's memory was still held")
-  release()
-  await unloading
-  await loadingB
-  assert.equal(p.isLoaded(B), true)
-  assert.equal(p.memoryUsed, 60)
 })
 
 test("a worker whose script fails after its load was canceled isn't kept for the next model", async () => {
@@ -442,12 +432,11 @@ test("aborting the only wait for a load stops it", async () => {
   abort.abort()
   await assert.rejects(load, { name: "AbortError" })
   await settle()
-  // Its worker is asked to stop and free it, and kept for the next load.
-  assert.ok(workers.workers[0]?.sent.some((m) => m.type === "unload" && m.model === A))
-  assert.equal(workers.workers[0]?.terminated, false)
+  // Its worker is ended.
+  assert.equal(workers.workers[0]?.terminated, true)
   assert.equal(p.isLoaded(A), false)
   await p.load(A)
-  assert.equal(workers.workers.length, 1)
+  assert.equal(workers.workers.length, 2)
 })
 
 test("a load for another context loads again, and generations carry the loaded context", async () => {
@@ -829,7 +818,7 @@ test("a running generation's claim (its vision encoder) isn't stuck behind a loa
   a.finish(a.generations()[0]!.id, ["done"])
   await running
   await loadB
-  assert.deepEqual(a.unloaded, [A])
+  assert.equal(a.terminated, true)
   assert.equal(p.isLoaded(B), true)
   assert.equal(p.memoryUsed, 60, "only B's bytes are held once A is unloaded")
 })
@@ -1030,14 +1019,18 @@ test("a worker of the caller's: completions take turns, so a second model's does
   assert.deepEqual(worker.sent.filter((m) => m.type === "load").map((m) => m.model), [A, B])
 })
 
-test("the webgpu setting is sent to each worker before its load, auto too (a worker is kept for the next model)", async () => {
-  for (const webgpu of [false, "auto"] as const) {
-    const { pool: p, workers } = pool({ webgpu })
-    await p.load(A)
-    assert.deepEqual(workers.workers[0]?.sent.slice(0, 2).map(({ type, webgpu }: { type: string; webgpu?: unknown }) => ({ type, webgpu })), [{ type: "configure", webgpu }, { type: "load", webgpu: undefined }])
-  }
+test("webgpu false is sent to each worker of webgllm's before its load, the spare too (auto is a new worker's default)", async () => {
+  const types = (worker: FakeWorker | undefined) => worker?.sent.slice(0, 2).map(({ type, webgpu }: { type: string; webgpu?: unknown }) => ({ type, webgpu }))
+  const off = pool({ webgpu: false })
+  await off.pool.load(A)
+  await off.pool.unload(A)
+  await off.pool.load(A)
+  assert.equal(off.workers.workers.length, 2)
+  for (const worker of off.workers.workers) assert.deepEqual(types(worker), [{ type: "configure", webgpu: false }, { type: "load", webgpu: undefined }])
+  const auto = pool({ webgpu: "auto" })
+  await auto.pool.load(A)
+  assert.equal(types(auto.workers.workers[0])?.[0]?.type, "load")
 })
-
 test("a worker of the caller's is told the webgpu setting on every attachment, auto too", async () => {
   // One worker, used by a client with webgpu false and then by one with "auto".
   const worker = new FakeWorker({ bytes: () => 60 })

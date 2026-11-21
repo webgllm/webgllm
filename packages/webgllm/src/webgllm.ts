@@ -268,11 +268,14 @@ export class WebGLLM {
   }
 
   /**
-   * Unloads `model`, or every model, freeing its GPU memory; its running
-   * generation fails. webgllm's own worker frees the model and is kept for
-   * the next load for 30 s, then ends; a worker of your own (`worker`)
-   * frees the model and stays running. Resolves, after the model's
-   * "unload" event, once the memory is free.
+   * Unloads `model`, or every model, freeing its memory; its running
+   * generation fails. webgllm's own worker for the model is ended, which
+   * frees it all at once, and a new one waits 30 s for the next load. A
+   * worker of your own (`worker`) frees the model and stays running: Safari
+   * keeps a freed model's memory until the worker's garbage collector runs,
+   * so it makes garbage first (about 0.5 s on an iPhone), which frees it in
+   * most runs but not all (end your worker for certain). Resolves, after
+   * the model's "unload" event, once the worker has freed it.
    */
   async unloadModel(model?: WebGlModelId): Promise<void> {
     await this.pool.unload(model)
