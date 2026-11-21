@@ -612,10 +612,21 @@ export class ModelPool {
     return worker
   }
 
-  /** Starts a spare worker for the next load, unless there's one (see spare). */
+  /**
+   * Starts a spare worker for the next load, unless there's one (see spare).
+   * Never throws: a worker that can't be started now is logged, and the
+   * next load starts its own.
+   */
   private startSpare() {
     if (this.spare || this.options.worker) return
-    const worker = (this.spare = this.options.createWorker())
+    let worker: Worker
+    try {
+      worker = this.options.createWorker()
+    } catch (error) {
+      this.options.log("warn", `A spare worker didn't start: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    this.spare = worker
     worker.addEventListener("error", this.spareError)
     this.spareTimer = setTimeout(() => this.takeSpare()?.terminate(), SPARE_MS)
     // (Node: a pending timer doesn't keep the process alive.)
@@ -722,11 +733,9 @@ export class ModelPool {
    */
   private drop(entry: Entry, reason: Error, why: ModelUnloadReason): Promise<void> {
     if (entry.dropped) return entry.dropped
-    // A worker of webgllm's is ended (its memory is free at once), and a
-    // spare started for the next load, if the caller unloaded it; the
+    // A worker of webgllm's is ended (its memory is free at once); the
     // caller's worker frees the model (see collectReleased in handler.ts).
     const freed = entry.worker.terminate(reason)
-    if (why === "unloaded") this.startSpare()
     entry.gone.abort(reason)
     if (this.entries.get(entry.model) !== entry) return (entry.dropped = freed ?? Promise.resolve())
     this.entries.delete(entry.model)
@@ -752,6 +761,8 @@ export class ModelPool {
       this.stopFrames?.()
       this.stopFrames = undefined
     }
+    // A spare for the next load, if the caller unloaded it: once all the above is done.
+    if (why === "unloaded") this.startSpare()
     return done
   }
 

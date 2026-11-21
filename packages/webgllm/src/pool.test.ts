@@ -187,6 +187,37 @@ test("unloading a model ends its worker and starts a spare for the next load, en
   t.mock.restoreAll()
 })
 
+test("a spare worker that can't be started leaves the unload whole: every model unloaded, its memory free, the next load starting its own", async () => {
+  const workers = fakeWorkers({ bytes: () => 60 })
+  let refuse = false
+  const events: Array<ModelEvent> = []
+  const logs: Array<string> = []
+  const p = new ModelPool({
+    createWorker: () => {
+      if (refuse) throw new Error("no more workers")
+      return workers.create()
+    },
+    memoryBudget: () => 1000,
+    storage: fakeStorage(),
+    onProgress: () => undefined,
+    onModelEvent: (event) => events.push(event),
+    log: (_, text) => logs.push(text)
+  })
+  await p.load(A)
+  await p.load(B)
+  refuse = true
+  await p.unload()
+  assert.deepEqual(p.loadedModels(), [])
+  assert.equal(p.memoryUsed, 0)
+  assert.deepEqual(events.filter((e) => e.type === "unload").map((e) => e.model).sort(), [A, B].sort())
+  assert.ok(workers.workers.every((w) => w.terminated))
+  assert.ok(logs.some((text) => text.includes("no more workers")), "the failure isn't logged")
+  refuse = false
+  await p.load(A)
+  assert.equal(workers.workers.length, 3)
+  assert.equal(workers.workers[2]!.model, A)
+})
+
 test("a spare worker that fails is ended, and the next load starts another", async () => {
   const { pool: p, workers } = pool()
   await p.load(A)

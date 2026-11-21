@@ -317,6 +317,17 @@ function garbage(round: number) {
   return new ArrayBuffer(16 << 20).byteLength + objects.length
 }
 
+/** A load's closeStored with nothing to close: made here, so it holds nothing of the load. */
+const closeNothing = async (): Promise<void> => {}
+
+/** `loading`, after which `close` runs if it fails. */
+function closingOnFailure<T>(loading: Promise<T>, close: () => Promise<unknown>): Promise<T> {
+  return loading.catch((error: unknown) => {
+    void close()
+    throw error
+  })
+}
+
 /** What closes the stored file an engine reads while its model is loaded (Raon's per-layer table: see keptSource). */
 const keptFiles = new Map<Engine, () => Promise<void>>()
 
@@ -473,7 +484,7 @@ async function load(
   lap("context")
   let reusedTuning = false
   // Closes the weights' synchronous access handles, which lock their files (see storedSources).
-  let closeStored = async () => {}
+  let closeStored = closeNothing
   try {
     // Before a gigabyte downloads: the weight textures' width.
     const { maxTextureSize } = engine.gpu.limits
@@ -502,7 +513,7 @@ async function load(
     // claimed (a claim of the whole file had the page unload models that
     // fit beside this one, and a smaller claim after it brings none back).
     // The weights read through synchronous access handles where they can be (see storedSources).
-    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: async () => undefined }
+    const stored = TUNING.syncReads > 0 ? await storedSources(weightFiles, { reader: TUNING.readerWorker > 0 }) : { sources: weightFiles.map(blobSource), close: closeNothing }
     closeStored = stored.close
     timings.readerWorker = "reader" in stored && stored.reader ? 1 : 0
     const weightSources = stored.sources
@@ -702,7 +713,10 @@ async function load(
         )
       }
       release(engine)
-      return await load(model, signal, contextLength, true, true, webgl)
+      // Not awaited: this attempt ends here, and with it what holds its
+      // engine, so the collection before the retry can take it (see
+      // collectReleased). The retry failing closes this attempt's files.
+      return closingOnFailure(load(model, signal, contextLength, true, true, webgl), closeStored)
     }
     engine.gpu.resetPacing(true)
     engine.gpu.setPhase("load")
@@ -2017,7 +2031,9 @@ function receive(data: WorkerRequest) {
     const { model, contextLength, loadId } = data
     if (data.meta) rememberModel(data.meta)
     queue = queue.then(() => {
-      const before = current
+      // Weakly: a load that replaces it releases its engine, which the
+      // collection before that load must be able to take (see collectReleased).
+      const before = current && new WeakRef(current)
       startLoad(model, contextLength).then(
         (loaded) => {
           post({
@@ -2025,7 +2041,7 @@ function receive(data: WorkerRequest) {
             model,
             loadId,
             contextLength: loaded.engine.contextLength,
-            ...(loaded !== before && { timings: loaded.timings })
+            ...(loaded !== before?.deref() && { timings: loaded.timings })
           })
         },
         (error: unknown) => {

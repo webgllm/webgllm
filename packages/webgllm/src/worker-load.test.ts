@@ -9,6 +9,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createRequire } from "node:module"
+import { setFlagsFromString } from "node:v8"
+import { runInNewContext } from "node:vm"
 import type { WorkerRequest, WorkerResponse } from "./protocol.js"
 
 const require = createRequire(join(process.cwd(), "package.json"))
@@ -217,6 +219,40 @@ test("unload answers once the worker's collector has run after the model was fre
   collection.release()
   await settle()
   assert.deepEqual(w.messages.filter((m) => m.type === "unloaded"), [{ type: "unloaded", id: 9 }])
+})
+
+test("a load for another context leaves nothing holding the engine it replaces while it loads, so the collection before it can take it", async () => {
+  setFlagsFromString("--expose-gc")
+  const gc = runInNewContext("gc") as () => void
+  const w = worker()
+  w.send({ type: "load", model: MODEL, contextLength: 64, loadId: 1 })
+  await settle()
+  w.loads[0].finish()
+  await settle()
+  const replaced = new WeakRef(w.loads[0].engine)
+  ;(w.loads[0] as { engine: unknown }).engine = null
+  w.send({ type: "load", model: MODEL, contextLength: 128, loadId: 2 })
+  await settle()
+  assert.equal(w.loads.length, 2, "the new context's load hasn't started")
+  assert.equal(replaced.deref()?.released, true)
+  // (Collected in a task of its own: deref keeps its target to the end of the task it's called in.)
+  let held = true
+  for (let i = 0; i < 3 && held; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    gc()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    held = replaced.deref() !== undefined
+  }
+  assert.equal(held, false, "the replaced engine is still held while the new one loads")
+  w.loads[1].finish()
+  await settle()
+  // Its answer still says it's a new load (with its timings); one for the same context, that it's the same.
+  assert.deepEqual(readies(w.messages).map((m) => m.type === "ready" && m.loadId), [1, 2])
+  assert.equal("timings" in readies(w.messages)[1]!, true)
+  w.send({ type: "load", model: MODEL, contextLength: 128, loadId: 3 })
+  await settle()
+  assert.equal(w.loads.length, 2)
+  assert.equal("timings" in readies(w.messages)[2]!, false)
 })
 
 test("unload stops a load in progress, without an answer; the next load waits for it to end", async () => {

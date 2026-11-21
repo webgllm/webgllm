@@ -16,10 +16,11 @@ const end = source.indexOf("/** What closes the stored file")
 assert.ok(start >= 0 && end > start)
 const { code: js } = await transform(source.slice(start, end), { loader: "ts" })
 const make = new Function(`${js}
-  return { collectReleased, release: () => { uncollected = true }, rounds: GARBAGE_ROUNDS }`) as () => {
+  return { collectReleased, release: () => { uncollected = true }, rounds: GARBAGE_ROUNDS, closingOnFailure }`) as () => {
   collectReleased: () => Promise<void>
   release: () => void
   rounds: number
+  closingOnFailure: <T>(loading: Promise<T>, close: () => Promise<unknown>) => Promise<T>
 }
 
 /** Counts the timers a collection waits on: one a round. */
@@ -61,4 +62,15 @@ test("a second caller waits for the collection running, and one released meanwhi
   await Promise.all([first, second, third])
   assert.equal(order[0], "first")
   assert.deepEqual(order.slice(1).sort(), ["second", "third"])
+})
+
+test("a retried load (the self-check's) closes the first attempt's files only if it fails, and fails with its own error", async () => {
+  const { closingOnFailure } = make()
+  let closed = 0
+  const close = async () => void closed++
+  assert.equal(await closingOnFailure(Promise.resolve("loaded"), close), "loaded")
+  assert.equal(closed, 0)
+  const error = new Error("retry failed")
+  await assert.rejects(closingOnFailure(Promise.reject(error), close), (e) => e === error)
+  assert.equal(closed, 1)
 })
