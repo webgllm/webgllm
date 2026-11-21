@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tessera headroom</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 13px ui-monospace, monospace; margin: 16px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Headroom beside Tessera</h1>
+  <p>
+    Loads Tessera through <code>webgllm.images</code> (in webgllm's own worker), draws sprites, then fills the page's
+    memory <code>&amp;block=</code> MB at a time (64; touched, so it counts) until the browser kills the tab: the largest
+    <code>BALLAST</code> line is the headroom left. <code>?stage=</code> <code>none</code> (no model),
+    <code>loaded</code>, <code>n1</code> or <code>n4</code> (after 1 or 4 sprites), <code>unloaded</code> (after 4
+    sprites and an unload). <code>&amp;webgpu=0</code> for WebGL 2. <code>&amp;once=&lt;name&gt;</code> runs only while
+    <code>/models/&lt;name&gt;</code> exists (see <code>unload-headroom.html</code>).
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const stage = params.get("stage") ?? "n1"
+    const tag = params.get("tag") ?? stage
+    const out = document.getElementById("out")
+    const log = (line) => {
+      out.textContent += line + "\n"
+      return fetch("/log", { method: "POST", body: `TESSERA-HEAD ${tag} ${line}` }).catch(() => {})
+    }
+    const once = params.get("once")
+    if (once && !(await fetch(`/models/${once}`, { method: "HEAD", cache: "no-store" })).ok) {
+      await log("skipped: already ran")
+      throw new Error("already ran")
+    }
+    try {
+      await log(`start ${navigator.userAgent.slice(0, 80)}`)
+      if (stage !== "none") {
+        const { WebGLLM } = await import("/bundle/src/index.js")
+        const webgllm = new WebGLLM({ ...(params.get("webgpu") === "0" && { webgpu: false }) })
+        const model = "cfahlgren1/tessera-small-onnx"
+        let t = performance.now()
+        await webgllm.loadModel(model)
+        await log(`loaded ${Math.round(performance.now() - t)} ms on ${webgllm.images.engineOf(model)}`)
+        if (stage !== "loaded") {
+          const n = stage === "n1" ? 1 : 4
+          t = performance.now()
+          const res = await webgllm.images.generate({ prompt: "rubber duck", n, seed: 7 })
+          await log(`drew ${n} in ${Math.round(performance.now() - t)} ms (draw ${Math.round(res.timings.draw_ms)}), GPU weights ${(res.memory.weights_bytes / 2 ** 20).toFixed(0)} MB, work ${(res.memory.work_bytes / 2 ** 20).toFixed(0)} MB`)
+        }
+        if (stage === "unloaded") {
+          await webgllm.unloadModel(model)
+          await log("unloaded")
+        }
+      }
+      const block = Number(params.get("block") ?? 64)
+      await log(`FILL start block=${block}`)
+      const kept = []
+      for (;;) {
+        const b = new Uint8Array(block << 20)
+        for (let i = 0; i < b.length; i += 4096) b[i] = 1
+        kept.push(b)
+        void log(`BALLAST ${kept.length * block} MB`)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        if (kept.length * block > 16000) break
+      }
+      await log("ALL DONE (never killed)")
+    } catch (error) {
+      await log(`ERROR ${error?.stack ?? error}`)
+    }
+  </script>
+</html>

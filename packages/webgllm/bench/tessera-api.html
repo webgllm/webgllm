@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tessera through the API</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 13px ui-monospace, monospace; margin: 16px; }
+    pre { white-space: pre-wrap; }
+    img { width: 96px; height: 96px; image-rendering: pixelated; background: repeating-conic-gradient(#2a2f36 0 25%, #1d2127 0 50%) 0 0 / 12px 12px; margin: 4px; }
+    figure { display: inline-block; margin: 6px; text-align: center; }
+  </style>
+  <h1>Tessera through webgllm's API</h1>
+  <p>
+    <code>webgllm.images.generate</code> in webgllm's own worker: a load (with progress), then each prompt as 1 and 4
+    sprites (seed 7), timed, then an unload. <code>?webgpu=0</code> runs on WebGL 2; <code>&amp;prompts=a,b</code>;
+    <code>&amp;hold=1</code> waits after each generation for a memory reading (see <code>bench/README.md</code>).
+    Lines go to the server as <code>TESSERA-API …</code>; it ends with <code>ALL DONE</code> or <code>ERROR</code>.
+  </p>
+  <pre id="out"></pre>
+  <div id="sprites"></div>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const tag = params.get("tag") ?? "api"
+    const out = document.getElementById("out")
+    const log = (line) => {
+      out.textContent += line + "\n"
+      return fetch("/log", { method: "POST", body: `TESSERA-API ${tag} ${line}` }).catch(() => {})
+    }
+    const hold = async (what) => {
+      if (params.get("hold") !== "1") return
+      await log(`HOLD ${what}`)
+      await new Promise((resolve) => setTimeout(resolve, Number(params.get("holdMs") ?? 8000)))
+    }
+    const MB = (n) => `${(n / 2 ** 20).toFixed(1)} MB`
+    try {
+      const { WebGLLM } = await import("/bundle/src/index.js")
+      const webgllm = new WebGLLM({ ...(params.get("webgpu") === "0" && { webgpu: false }), logLevel: "info" })
+      const model = "cfahlgren1/tessera-small-onnx"
+      let last = -1
+      webgllm.addEventListener("progress", (p) => {
+        const pct = Math.floor(p.progress * 10) * 10
+        if (pct > last) {
+          last = pct
+          void log(`progress ${p.phase} ${pct}% cached=${p.cached}`)
+        }
+      })
+      let t = performance.now()
+      await webgllm.loadModel(model)
+      await log(`loaded ${Math.round(performance.now() - t)} ms on ${webgllm.images.engineOf(model)}`)
+      await hold("loaded")
+      const prompts = (params.get("prompts") ?? "cat wearing sunglasses,rubber duck,fire,red apple").split(",")
+      const sprites = document.getElementById("sprites")
+      for (const n of [1, 4]) {
+        for (const prompt of prompts) {
+          t = performance.now()
+          const res = await webgllm.images.generate({ prompt, n, seed: 7, size: "128x128" })
+          const ms = Math.round(performance.now() - t)
+          await log(`SPRITES n=${n} "${prompt}": ${ms} ms (text ${Math.round(res.timings.text_ms)}, draw ${Math.round(res.timings.draw_ms)}), weights ${MB(res.memory.weights_bytes)}, work ${MB(res.memory.work_bytes)}`)
+          for (const [i, d] of res.data.entries()) {
+            const fig = document.createElement("figure")
+            fig.innerHTML = `<img src="data:image/png;base64,${d.b64_json}" alt=""><figcaption>${prompt} ${n}.${i}</figcaption>`
+            sprites.append(fig)
+          }
+        }
+        await hold(`after n=${n}`)
+      }
+      t = performance.now()
+      await webgllm.unloadModel(model)
+      await log(`unloaded ${Math.round(performance.now() - t)} ms`)
+      await hold("unloaded")
+      await log("ALL DONE")
+    } catch (error) {
+      await log(`ERROR ${error?.stack ?? error}`)
+    }
+  </script>
+</html>

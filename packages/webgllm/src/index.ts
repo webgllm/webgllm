@@ -64,6 +64,11 @@ export type {
   ResponseFormat
 } from "./openai.js"
 
+// Image generation.
+export type { ImageData, ImageGenerateParams, ImageRequestOptions, ImagesResponse } from "./images.js"
+export { IMAGE_MODEL_META, WEBGL_IMAGE_MODELS } from "./image-models.js"
+export type { ImageModelMeta, WebGlImageModel } from "./image-models.js"
+
 // The model catalog.
 export { WEBGL_MODEL_META, WEBGL_TEXT_MODELS } from "./model-meta.js"
 export type { WebGlModelId, WebGlModelMeta, WebGlModelReasoning, WebGlTextModel } from "./model-meta.js"

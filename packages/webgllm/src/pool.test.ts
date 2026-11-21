@@ -1042,3 +1042,157 @@ test("a worker of the caller's is told the webgpu setting on every attachment, a
   const told = worker.sent.filter((m) => m.type === "configure" || m.type === "load").map(({ type, webgpu }: { type: string; webgpu?: unknown }) => (type === "load" ? type : webgpu))
   assert.deepEqual(told, [false, "load", "auto", "load"])
 })
+
+test("an image model's claim shares the budget: it unloads the least recently used text model, and a text load unloads it in turn", async () => {
+  const { pool: p } = pool()
+  await p.load(A)
+  let imageUnloads = 0
+  await p.claimExternal("image", 84, async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }, false)
+  assert.equal(p.isLoaded(A), false, "the text model stayed past the budget")
+  assert.equal(p.memoryUsed, 84)
+  await p.load(B)
+  assert.equal(imageUnloads, 1)
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("the host's onMemoryClaim is asked for an image model's claims, and its refusal rejects the claim", async () => {
+  const asked: Array<string> = []
+  const { pool: p } = pool({
+    budget: 1000,
+    onMemoryClaim: ({ model, bytes }) => {
+      asked.push(`${model} ${bytes}`)
+      if (model === "image") throw new Error("no room for images")
+    }
+  })
+  await p.load(A)
+  await assert.rejects(p.claimExternal("image", 84, async () => undefined, false), /no room for images/)
+  assert.deepEqual(asked, [`${A} 60`, "image 84"])
+  // The refused model releases what it claimed (images.ts does, when its load fails).
+  p.releaseExternal("image")
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("a refused claim to grow an image model's memory leaves it holding what it held: no text model unloads for room it doesn't take", async () => {
+  const { pool: p } = pool({
+    budget: 220,
+    onMemoryClaim: ({ model, bytes }) => {
+      if (model === "image" && bytes > 90) throw new Error("no room to grow")
+    }
+  })
+  await p.load(A)
+  await p.claimExternal("image", 90, async () => p.releaseExternal("image"), false)
+  assert.equal(p.memoryUsed, 150)
+  await assert.rejects(p.claimExternal("image", 130, async () => p.releaseExternal("image"), false), /no room to grow/)
+  assert.equal(p.memoryUsed, 150, "the refused growth is still counted")
+  await p.load(B)
+  assert.equal(p.isLoaded(A), true, "a text model unloaded for the refused growth's room")
+  assert.equal(p.memoryUsed, 210)
+})
+
+test("an image model loaded with keepLoaded isn't unloaded to make room for a text model", async () => {
+  const { pool: p } = pool({ budget: 100 })
+  let imageUnloads = 0
+  await p.claimExternal("image", 84, async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }, true)
+  await p.load(A)
+  assert.equal(imageUnloads, 0)
+  assert.equal(p.isLoaded(A), true)
+  // Allowed again, it goes for the next text model's room.
+  p.setExternalKeepLoaded("image", false)
+  await p.load(B)
+  assert.equal(imageUnloads, 1)
+})
+
+/** A host hook that waits, for image claims, until the test answers or the claim is given up. */
+function heldHook() {
+  const waiting: Array<{ bytes: number; refuse: (why: string) => void; grant: () => void }> = []
+  const hook = ({ model, bytes, signal }: { model: string; bytes: number; signal: AbortSignal }) =>
+    model !== "image"
+      ? undefined
+      : new Promise<void>((grant, reject) => {
+          const entry = { bytes, grant, refuse: (why: string) => reject(new Error(why)) }
+          // (Given up: no longer waiting.)
+          signal.addEventListener("abort", () => (waiting.splice(waiting.indexOf(entry), 1), reject(signal.reason)), { once: true })
+          waiting.push(entry)
+        })
+  return { hook, waiting }
+}
+
+test("a refused claim puts back only the bytes: keepLoaded set while it waited stays", async () => {
+  const { hook, waiting } = heldHook()
+  const { pool: p } = pool({ budget: 140, onMemoryClaim: hook })
+  let imageUnloads = 0
+  const unload = async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }
+  const first = p.claimExternal("image", 90, unload, false)
+  while (!waiting.length) await settle()
+  waiting.shift()!.grant()
+  await first
+  const growth = p.claimExternal("image", 130, unload, false)
+  while (!waiting.length) await settle()
+  // Kept loaded while its growth waits for the host, which then refuses it.
+  p.setExternalKeepLoaded("image", true)
+  waiting.shift()!.refuse("no room to grow")
+  await assert.rejects(growth, /no room to grow/)
+  assert.equal(p.memoryUsed, 90)
+  await p.load(A)
+  assert.equal(imageUnloads, 0, "a model kept loaded was unloaded")
+})
+
+test("claims overlapping, both refused (the later one first), leave what the last admitted claim held", async () => {
+  const { hook, waiting } = heldHook()
+  const { pool: p } = pool({ budget: 1000, onMemoryClaim: hook })
+  // (A new unload for each claim, as images.ts gives.)
+  const unload = () => async () => p.releaseExternal("image")
+  await p.load(A)
+  const first = p.claimExternal("image", 90, unload(), false)
+  while (!waiting.length) await settle()
+  waiting.shift()!.grant()
+  await first
+  assert.equal(p.memoryUsed, 150)
+  // A growth to 130 waits for the host (its drawing gone); a second, to 110, comes; the host refuses each, the later one first where both wait.
+  const grow = p.claimExternal("image", 130, unload(), false)
+  // (The second comes once the first waits for the host, its room counted.)
+  while (!waiting.length) await settle()
+  const again = p.claimExternal("image", 110, unload(), false)
+  grow.catch(() => undefined)
+  again.catch(() => undefined)
+  for (let left = 2; left > 0; left--) {
+    for (let i = 0; i < 10; i++) await settle()
+    const later = waiting.findIndex((w) => w.bytes === 110)
+    waiting.splice(later >= 0 ? later : 0, 1)[0]!.refuse("no")
+  }
+  await assert.rejects(grow, /no/)
+  await assert.rejects(again, /no/)
+  assert.equal(p.memoryUsed, 150)
+})
+
+test("keepLoaded set while an image model's claim waits for room stays once the claim goes through", async () => {
+  const { pool: p, workers } = pool({ budget: 100 })
+  await p.load(A)
+  // A generates, so making room for the image waits for it.
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  let imageUnloads = 0
+  const unload = () => async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }
+  const claiming = p.claimExternal("image", 90, unload(), false)
+  await settle()
+  p.setExternalKeepLoaded("image", true)
+  const a = workers.of(A)!
+  a.finish(a.generations()[0]!.id, ["done"])
+  await running
+  await claiming
+  assert.equal(p.isLoaded(A), false)
+  await p.load(B)
+  assert.equal(imageUnloads, 0, "the image model, kept loaded, was unloaded")
+})

@@ -123,6 +123,18 @@ export class MemoryBudget {
     this.held.delete(model)
   }
 
+  /**
+   * Sets what `model` holds back to `bytes` after a claim that didn't go
+   * through (refused, or given up), keeping its last use and whether it's
+   * kept loaded as they are now; recorded anew (with `keepLoaded`) if the
+   * claim had taken it out. Never unloads anything.
+   */
+  setBytes(model: string, bytes: number, keepLoaded: boolean) {
+    const held = this.held.get(model)
+    if (held) held.bytes = bytes
+    else this.held.set(model, { model, bytes, lastUsed: ++this.clock, keepLoaded })
+  }
+
   /** Bytes held by every model together. */
   get total(): number {
     let sum = 0

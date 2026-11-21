@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tessera check</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 13px ui-monospace, monospace; margin: 16px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Tessera on the GPU against ONNX Runtime</h1>
+  <p>
+    CLIP's states and the denoiser's logits against ONNX Runtime's (made by <code>tessera-reference.ts</code>), the
+    selftest's argmax, then the speed of 1 and 4 sprites' steps. <code>?engine=webgpu|webgl</code>,
+    <code>&amp;models=</code> (the ONNX files, <code>/models/tessera</code>), <code>&amp;refs=</code> (the reference
+    tensors, <code>/models/tessera-refs-noopt</code>). Lines go to the server as <code>TESSERA …</code>; it ends with
+    <code>ALL DONE</code> or <code>ERROR</code>.
+  </p>
+  <pre id="out"></pre>
+  <script type="module" src="/bundle/bench/tessera-check.js"></script>
+</html>

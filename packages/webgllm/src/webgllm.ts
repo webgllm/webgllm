@@ -2,6 +2,8 @@
  * WebGLLM: the public API. OpenAI's Chat Completions and Models on models
  * running in the page, each in a Web Worker on WebGL 2.
  */
+import { Images } from "./images.js"
+import { isImageModel } from "./image-models.js"
 import {
   buildCompletion,
   createChunkWriter,
@@ -169,6 +171,8 @@ export class WebGLLM {
   /** OpenAI's Completions: a raw prompt, with no chat template. */
   readonly completions: TextCompletions
   readonly models: Models
+  /** Image generation: `images.generate({ prompt })` (Tessera-small: 16 × 16 pixel art). */
+  readonly images: Images
   private readonly pool: ModelPool
   /** Listeners by event type (typed at addEventListener and dispatch). */
   private readonly listeners = new Map<keyof WebGLLMEventMap, Set<(event: unknown) => void>>()
@@ -216,6 +220,22 @@ export class WebGLLM {
     }
     this.completions = new TextCompletions({ checkSupport: () => this.checkSupport(), contextLength: options.contextLength }, this.pool)
     this.models = new Models(this, this.pool, this.storage)
+    this.images = new Images({
+      createWorker: internals.createWorker,
+      ...(options.worker && { worker: options.worker }),
+      ...(options.webgpu !== undefined && { webgpu: options.webgpu }),
+      checkSupport: () => this.checkSupport(),
+      onProgress: (progress) => {
+        options.onProgress?.(progress)
+        this.dispatch("progress", progress)
+      },
+      dispatch: (type, event) => this.dispatch(type, event),
+      // Its memory shares the text models' budget and the host's onMemoryClaim.
+      claim: (model, bytes, unload, keepLoaded, signal) => this.pool.claimExternal(model, bytes, unload, keepLoaded, signal),
+      setKeepLoaded: (model, keep) => this.pool.setExternalKeepLoaded(model, keep),
+      touch: (model) => this.pool.touchExternal(model),
+      release: (model) => this.pool.releaseExternal(model)
+    })
   }
 
   /**
@@ -253,6 +273,14 @@ export class WebGLLM {
    */
   async loadModel(model: WebGlModelId, options: LoadModelOptions = {}): Promise<void> {
     throwIfAborted(options.signal)
+    if (isImageModel(model)) {
+      await this.images.load(model, {
+        ...(options.onProgress && { onProgress: options.onProgress }),
+        ...(options.signal && { signal: options.signal }),
+        ...(options.keepLoaded !== undefined && { keepLoaded: options.keepLoaded })
+      })
+      return
+    }
     // Before resolving: an unload asked for meanwhile stops this load.
     const since = typeof model === "string" ? this.pool.unloadMark(model) : 0
     // (Without a wait for a known model: its load starts in this call.)
@@ -278,7 +306,9 @@ export class WebGLLM {
    * the model's "unload" event, once the worker has freed it.
    */
   async unloadModel(model?: WebGlModelId): Promise<void> {
-    await this.pool.unload(model)
+    if (model === undefined) await Promise.all([this.pool.unload(), this.images.unload()])
+    else if (isImageModel(model)) await this.images.unload(model)
+    else await this.pool.unload(model)
   }
 
   /**
