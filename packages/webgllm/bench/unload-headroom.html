@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Headroom after an unload</title>
+  <style>
+    body { background: #13171c; color: #eef3f8; font: 13px ui-monospace, monospace; margin: 16px; }
+    pre { white-space: pre-wrap; }
+  </style>
+  <h1>Headroom after an unload</h1>
+  <p>
+    Loads a model, unloads it one way or another, then fills the page's memory 16 MB at a time (touched, so it counts)
+    until the browser kills the tab: the last <code>BALLAST</code> line is the headroom left (an iPhone's tab dies near
+    2 GB; with <code>pace=0</code> the lines arrive out of order, so take the largest). <code>?arm=</code>
+    <code>none</code> (no model), <code>none-spare</code> (no model, an idle worker), <code>loaded</code> (filled with
+    the model loaded), <code>loaded-churn</code> (that, after its worker made and dropped 512 MB of garbage),
+    <code>pool</code> (webgllm's own worker, <code>unloadModel()</code>), <code>own</code> (a worker of the page's,
+    <code>unloadModel()</code>), <code>own-end</code> (that, then the page ends its worker), <code>own-churn</code>
+    (that, then the worker makes and drops 512 MB of garbage), <code>own-spare</code> (like <code>own-end</code>,
+    with a worker started at the beginning for the reload), <code>probe</code> (no model: whether the worker's
+    FinalizationRegistry and WeakRef report what its collector took; <code>&amp;mode=promote&amp;keep=&lt;n&gt;</code>
+    keeps each round's garbage for n rounds). <code>&amp;wait=&lt;s&gt;</code> waits after the unload.
+    <code>&amp;reload=1</code> loads the model again after the unload and times it, instead of filling (in a new
+    worker for <code>own-end</code>). <code>&amp;ballast=0</code> stops before filling. <code>&amp;pace=&lt;ms&gt;</code>
+    between blocks (100; 0 fills at once, as a model loading next does). <code>&amp;worker=&lt;url&gt;</code> runs the
+    page's workers from a prebuilt script (by default <code>unload-worker.ts</code>, bundled on each request).
+    <code>&amp;model=</code>, <code>&amp;ctx=</code> (8192).
+    <code>&amp;once=&lt;name&gt;</code> runs only while <code>/models/&lt;name&gt;</code> exists (a driver can delete it
+    once the fill starts, so a tab Safari reloads after the kill doesn't run again).
+  </p>
+  <pre id="out"></pre>
+  <script type="module">
+    const params = new URLSearchParams(location.search)
+    const out = document.getElementById("out")
+    const arm = params.get("arm") ?? "pool"
+    const tag = params.get("tag") ?? arm
+    const log = (...parts) => {
+      const line = `UNLOAD ${tag} ` + parts.join(" ")
+      out.textContent += line + "\n"
+      return fetch("/log", { method: "POST", body: line }).catch(() => {})
+    }
+    const once = params.get("once")
+    if (once && !(await fetch(`/models/${once}`, { method: "HEAD", cache: "no-store" })).ok) {
+      await log("skipped: already ran")
+      throw new Error("already ran")
+    }
+    try {
+      const { WebGLLM } = await import("/bundle/src/index.js")
+      const model = params.get("model") ?? "LiquidAI/LFM3-1.7B-GGUF"
+      const contextLength = Number(params.get("ctx") ?? 8192)
+      await log(`start ${navigator.userAgent.slice(0, 70)} model=${model} ctx=${contextLength}`)
+      // &worker=<url>: the page's workers from a prebuilt script (as an app serves webgllm's) instead of bundling on request.
+      const workerUrl = params.get("worker") ?? "/bundle/bench/unload-worker.js"
+      const own = arm.startsWith("own") || arm === "probe" || arm === "loaded-churn"
+      // own-spare: the worker for the reload started now, idle until then (a spare started at the unload).
+      const spare = arm === "own-spare" || arm === "none-spare" ? new Worker(workerUrl, { type: "module", name: "spare" }) : undefined
+      const worker = own ? new Worker(workerUrl, { type: "module", name: "unload" }) : undefined
+      // The worker's info lines about collecting an unloaded model's memory, sent to the server too.
+      const info = console.info.bind(console)
+      console.info = (...parts) => {
+        info(...parts)
+        if (String(parts[0]).includes("collected")) void log(`worker: ${parts.join(" ")}`)
+      }
+      // (A worker of the page's: its own lines too, as the page stops listening for its model's lines once it's unloaded.)
+      worker?.addEventListener("message", ({ data }) => {
+        if (data?.type === "log" && String(data.text).includes("collected")) void log(`worker: ${data.text}`)
+      })
+      const webgllm = new WebGLLM({ ...(own && { worker }), logLevel: "info" })
+      // arm=probe: whether this worker's FinalizationRegistry reports what its collector took (no model).
+      if (arm === "probe") {
+        const t = performance.now()
+        const rounds = await new Promise((resolve) => {
+          worker.addEventListener("message", ({ data }) => data?.type === "probed" && resolve(data.rounds))
+          worker.postMessage({ type: "probe", mode: params.get("mode"), keep: params.get("keep") })
+        })
+        await log(`PROBE ${JSON.stringify(rounds)} in ${Math.round(performance.now() - t)} ms`)
+        await log("ALL DONE")
+        throw null
+      }
+      // none-spare: no model, an idle worker (what a spare holds), given 2 s to start.
+      if (arm === "none-spare") await new Promise((resolve) => setTimeout(resolve, 2000))
+      if (arm !== "none" && arm !== "none-spare") {
+        let t = performance.now()
+        await webgllm.loadModel(model, { contextLength })
+        await log(`loaded ${Math.round(performance.now() - t)} ms`)
+        const reply = await webgllm.chat.completions.create({
+          model, temperature: 0, reasoning_effort: "none", max_tokens: 8, messages: [{ role: "user", content: "Hi" }]
+        })
+        await log(`reply ${JSON.stringify(reply.choices[0].message.content)}`)
+        // loaded-churn: the model stays loaded, and its worker makes and drops 512 MB of garbage.
+        if (arm === "loaded-churn") {
+          const t = performance.now()
+          await new Promise((resolve) => {
+            worker.addEventListener("message", ({ data }) => data?.type === "churned" && resolve())
+            worker.postMessage({ type: "churn" })
+          })
+          await log(`churned (loaded) ${Math.round(performance.now() - t)} ms`)
+        }
+        if (arm !== "loaded" && arm !== "loaded-churn") {
+          t = performance.now()
+          await webgllm.unloadModel()
+          await log(`unloaded ${Math.round(performance.now() - t)} ms`)
+          if (arm === "own-end" || arm === "own-spare") {
+            worker.terminate()
+            await log("worker ended")
+          }
+          if (arm === "own-churn") {
+            t = performance.now()
+            await new Promise((resolve) => {
+              worker.addEventListener("message", ({ data }) => data?.type === "churned" && resolve())
+              worker.postMessage({ type: "churn" })
+            })
+            await log(`churned ${Math.round(performance.now() - t)} ms`)
+          }
+          const wait = Number(params.get("wait") ?? 0)
+          if (wait > 0) {
+            await log(`waiting ${wait} s`)
+            await new Promise((resolve) => setTimeout(resolve, wait * 1000))
+          }
+          if (params.get("reload") === "1") {
+            // own-end: in a new worker, as a worker ended at the unload leaves the next load.
+            const next = spare ? new WebGLLM({ worker: spare }) : arm === "own-end" ? new WebGLLM({ worker: new Worker(workerUrl, { type: "module", name: "unload-2" }) }) : webgllm
+            t = performance.now()
+            await next.loadModel(model, { contextLength })
+            await log(`RELOAD ${Math.round(performance.now() - t)} ms`)
+            const again = await next.chat.completions.create({
+              model, temperature: 0, reasoning_effort: "none", max_tokens: 8, messages: [{ role: "user", content: "Hi" }]
+            })
+            await log(`reply ${JSON.stringify(again.choices[0].message.content)}`)
+            t = performance.now()
+            await next.unloadModel()
+            await log(`unloaded again ${Math.round(performance.now() - t)} ms`)
+            await log("ALL DONE")
+            throw null
+          }
+        }
+      }
+      if (params.get("ballast") === "0") {
+        await log("ALL DONE")
+        throw null
+      }
+      // &pace=<ms> between blocks (100 by default); 0 fills as fast as it can, as a model loading next does, without
+      // waiting for each line to reach the server (the last line may then be a block or two short).
+      const pace = Number(params.get("pace") ?? 100)
+      await log(`FILL start pace=${pace}`)
+      const kept = []
+      for (;;) {
+        const block = new Uint8Array(16 << 20)
+        for (let i = 0; i < block.length; i += 4096) block[i] = 1
+        kept.push(block)
+        const line = log(`BALLAST ${kept.length * 16} MB`)
+        if (pace > 0) await line
+        await new Promise((resolve) => setTimeout(resolve, pace))
+        if (kept.length * 16 > 6000) break
+      }
+      await log("ALL DONE (never killed)")
+    } catch (error) {
+      if (error !== null) await log("ERROR:", String(error?.stack ?? error))
+    }
+  </script>
+</html>

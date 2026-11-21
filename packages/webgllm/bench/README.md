@@ -69,6 +69,18 @@ On an iPhone: start the server on the Mac (`node packages/webgllm/bench/server.m
 
 For example, an 8k chat on Qwen3.5's GGUF, with live memory and speed: `mem.html?model=qwen-gguf&len=2048&follow=1024&reply=128&target=8192&ctx=8192` (`&batch=128` for the smallest batch's memory). The timings a phone's defaults would need: `mem.html?model=qwen-gguf&mode=ab&len=535&reply=64&rounds=3&variants=default|f16Matmul:2|packZeros:0|batch:512|batch:256|batch:128|batch:128,quadMinBatch:128` (`packZeros` only matters for the ONNX builds; run it on each build). A tab that reloads by itself ran out of memory.
 
+## unload-headroom.html: what an unload gives back
+
+Loads a model, unloads it one way or another, then fills the page's memory 16 MB at a time until the tab is killed: the largest `BALLAST` line is the headroom left (an iPhone 16 Pro Max's Safari tab dies at 2,097 MB). Watch for the kill with `idevicesyslog -u <udid> --no-colors | grep -aE "killing_specific_process.*WebContent"`. With `&once=<file in MODELS_DIR>` the page runs only while that file exists, so a driver deletes it once the fill starts and the tab Safari reloads after the kill doesn't run again. Every arm and parameter is on the page.
+
+What it found (iPhone 16 Pro Max, iOS 27.2, LFM3 1.7B GGUF on WebGPU, 8,192-token context, `pace=0`, the largest block before the kill):
+
+- No model: 1,840 to 1,904 MB. The model loaded: 416 to 496 (garbage made in its worker meanwhile frees nothing).
+- After `unloadModel()` in a worker that stays (webgllm's parked one before this change, or the page's own): 432 to 480, every time. The engine had destroyed every buffer, texture and its device; Safari keeps their memory until the worker's collector runs, which an idle worker never does. At a slow fill (`pace=100`) it came back in 4 runs of 6, from iOS's memory warnings making the worker collect near the limit, so a slow test hides it.
+- Ending the worker: 1,808 to 2,048, every time. webgllm now ends its own worker at an unload.
+- Garbage made in the worker after the unload (16 MB buffers, not written, and small objects): frees it by chance. 8 or 16 rounds: 8 of 10. 32 or more: 9 of 10 (64: 5 of 6, in 0.4 to 0.6 s). FinalizationRegistry and WeakRef in a Safari worker never reported anything collected, even a plain object over 256 rounds (`arm=probe`), so there's nothing to wait on.
+- Reloading after an unload: about 1.0 s in the same worker, 1.3 to 1.5 s in one started for the reload from a prebuilt script, 1.0 s in one started earlier and left idle (a spare, about 50 MB).
+
 ## own-worker.html: webgllm's worker and a worker of the page's own
 
 The public API in both kinds of worker: a chat, an unload and a chat again in the worker webgllm starts, then the same in a worker the page starts (`own-worker.ts`, three lines around `WebGLLMWorkerHandler`) and gives to `new WebGLLM({ worker })`, which must still run after its model is unloaded, and must leave the page's own messages to that worker alone. It ends with a worker whose script doesn't exist: requests to it must reject with `worker-failed`, not wait. `?model=<id>` (LFM2.5 350M GGUF by default); `&second=<id>` also loads a second model in the page's worker, which replaces the first. Ends with `ALL DONE`, or `ERROR` if a check failed.

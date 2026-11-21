@@ -259,13 +259,62 @@ function hash(text: string) {
   return (h >>> 0).toString(16)
 }
 
-/** Frees an engine's GPU memory now (see Gpu.dispose). */
+/** Frees an engine's GPU memory now (see Gpu.dispose); the rest of it goes at the next collectReleased. */
 const release = (engine: Engine) => {
   if (pacingEngine === engine) pacingEngine = null
   // (Its file's lock too: see keptSource.)
   void keptFiles.get(engine)?.()
   keptFiles.delete(engine)
   engine.gpu.dispose()
+  uncollected = true
+}
+
+/** Whether an engine was released since the last collectReleased. */
+let uncollected = false
+
+/** Rounds of garbage collectReleased makes (a 16 MB buffer and 50,000 objects each). */
+const GARBAGE_ROUNDS = 64
+
+/**
+ * Makes garbage after an engine was released, so the worker's collector
+ * runs: until it does, Safari on an iPhone keeps the released model's
+ * memory (its buffers, textures and device are destroyed, but not yet
+ * collected), and an idle worker never collects. An unloaded LFM3 1.7B
+ * kept 1.3 GB that way, and the next model, loaded at once, crossed the
+ * tab's 2 GB. What the page asks of a worker of its own (webgllm ends its
+ * own workers instead, which frees it all at once). Nothing in a worker
+ * there says when something is collected (FinalizationRegistry and WeakRef
+ * said nothing in 256 rounds), so the rounds are counted, not watched, and
+ * it's chance: 32 rounds or more freed LFM3 in 9 runs of 10 (64: 5 of 6,
+ * in 0.4 to 0.6 s), 8 or 16 in 8 of 10; nothing, in none at once. The
+ * buffers aren't written, so they take no memory of their own.
+ */
+async function collectReleased() {
+  // (One at a time: a caller waits for the one making garbage, then makes its own if more was released since.)
+  while (collecting) await collecting
+  if (!uncollected) return
+  uncollected = false
+  collecting = (async () => {
+    for (let round = 0; round < GARBAGE_ROUNDS; round++) {
+      garbage(round)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+  })()
+  try {
+    await collecting
+  } finally {
+    collecting = undefined
+  }
+}
+
+/** collectReleased's garbage being made. */
+let collecting: Promise<void> | undefined
+
+/** One round of collectReleased's garbage, dropped as soon as it's made. */
+function garbage(round: number) {
+  const objects: Array<{ round: number }> = []
+  for (let i = 0; i < 50_000; i++) objects.push({ round })
+  return new ArrayBuffer(16 << 20).byteLength + objects.length
 }
 
 /** What closes the stored file an engine reads while its model is loaded (Raon's per-layer table: see keptSource). */
@@ -394,6 +443,8 @@ async function load(
   /** A second try after the model's files failed to download (see the catch below). */
   again = false
 ): Promise<Loaded> {
+  // What a model loaded before left (replaced, or this load's own first try) is free before this one claims its own.
+  await collectReleased()
   const meta = await resolveModel(model)
   // The GPU first: a browser or GPU that can't run the model says so before
   // a gigabyte downloads. (The page's hasWebGl2 checks the page; this is
@@ -827,6 +878,8 @@ function unload(model: string, id: number) {
     }
     // A load of it that was stopped has freed its textures once it ends.
     await stopped
+    // Its memory is free once the worker's collector has run (see collectReleased).
+    await collectReleased()
     leaving.delete(model)
     post({ type: "unloaded", id })
   })

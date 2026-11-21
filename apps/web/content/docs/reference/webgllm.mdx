@@ -38,7 +38,7 @@ const webgllm = new WebGLLM({ worker })
 ```
 
 - The worker holds one model. Loading another replaces the one there once its running generation ends, whatever `keepLoaded` says; the replaced model's `unload` event has the reason `"evicted"`.
-- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory.
+- `unloadModel` stops the model's generation and frees its GPU memory, and leaves the worker running. webgllm never ends a worker it didn't start. It resolves, after the model's `unload` event, once the worker has freed the memory. Safari keeps a freed model's memory until the worker's garbage collector runs, which an idle worker never does, so the worker makes garbage before it answers (about half a second on an iPhone), which frees it in most runs but not all. Ending your worker frees everything at once, every time: do that before loading something big in another runtime.
 - Completions take turns, each from its load to its last token, so two for different models don't replace each other midway.
 - Every message webgllm sends or takes carries its own mark (`webgllm: true`), so your own messages can share the worker whatever their `type`.
 - For several models loaded at once, make a `WebGLLM` for each worker (and share memory between them with `onMemoryClaim`), or leave `worker` out.
