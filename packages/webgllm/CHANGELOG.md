@@ -1,3 +1,20 @@
+## 0.3.11 (2026-11-21)
+
+### 🚀 Features
+
+- **images:** Tessera-small draws 16 × 16 pixel-art sprites on webgllm's own WebGPU and WebGL 2 engines, through webgllm.images.generate ([19de36e](https://github.com/webgllm/webgllm/commit/19de36e))
+
+### 🩹 Fixes
+
+- **images:** a claim of a stopped request is refused even if it arrives after the stop, and keepLoaded set while a claim waits for room stays when it goes through ([26cdb27](https://github.com/webgllm/webgllm/commit/26cdb27))
+- **images:** a load waiting for a teardown can be aborted and is stopped by a later unload, and an image model's claims run in order, a refused one putting back only the bytes last admitted ([9d01c7d](https://github.com/webgllm/webgllm/commit/9d01c7d))
+- **images:** one teardown per image model, a refused claim keeps what the model held, and keepLoaded keeps image models ([2b78cd3](https://github.com/webgllm/webgllm/commit/2b78cd3))
+- **images:** image models share the memory budget and onMemoryClaim, a load stops when its last caller aborts, and failures and unloads leave no stale state ([2ec2a56](https://github.com/webgllm/webgllm/commit/2ec2a56))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.10 (2026-11-21)
 
 ### 🩹 Fixes
