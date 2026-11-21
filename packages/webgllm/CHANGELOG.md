@@ -1,3 +1,14 @@
+## 0.3.10 (2026-11-21)
+
+### 🩹 Fixes
+
+- **pool, worker:** a spare worker that can't start leaves the unload whole, and nothing holds a replaced engine during the collection before its replacement ([473ac25](https://github.com/webgllm/webgllm/commit/473ac25))
+- **pool:** unloading a model frees its memory at once: webgllm's own worker is ended (a spare started for the next load), and a worker of the caller's makes garbage before it answers ([eb2ce43](https://github.com/webgllm/webgllm/commit/eb2ce43))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.9 (2026-11-20)
 
 ### 🚀 Features
