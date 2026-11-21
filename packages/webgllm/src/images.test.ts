@@ -78,7 +78,7 @@ class FakeImageWorker {
   }
 }
 
-function setup(own = true, refuse?: (bytes: number) => string | undefined, holdClaims = false) {
+function setup(own = true, refuse?: (bytes: number) => string | undefined, holdClaims: boolean | ((bytes: number) => boolean) = false) {
   const made: Array<FakeImageWorker> = []
   const caller = new FakeImageWorker()
   const events: Array<string> = []
@@ -87,12 +87,14 @@ function setup(own = true, refuse?: (bytes: number) => string | undefined, holdC
   const held = new Map<string, number>()
   const touched: Array<string> = []
   const kept: Array<boolean> = []
+  const claimSignals: Array<AbortSignal> = []
   const images = new Images({
     setKeepLoaded: (_model, keep) => void kept.push(keep),
     claim: async (model, bytes, _unload, keepLoaded, signal) => {
       kept.push(keepLoaded)
+      claimSignals.push(signal)
       // (Held: a claim waiting for room, until the claimant goes.)
-      if (holdClaims) await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
+      if (holdClaims === true || (typeof holdClaims === "function" && holdClaims(bytes))) await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
       const why = refuse?.(bytes)
       if (why) throw new Error(why)
       held.set(model, bytes)
@@ -109,7 +111,7 @@ function setup(own = true, refuse?: (bytes: number) => string | undefined, holdC
     onProgress: (p) => progress.push(p),
     dispatch: (type, event) => events.push(`${type} ${(event as { model: string }).model}${"reason" in event ? ` ${event.reason}` : ""}`)
   })
-  return { images, made, caller, events, progress, held, touched, kept }
+  return { images, made, caller, events, progress, held, touched, kept, claimSignals }
 }
 
 test("a load starts a worker, reports progress and the model's events, once for calls at once", async () => {
@@ -289,4 +291,18 @@ test("keepLoaded goes with every claim of the model, its batches' too, and a lat
   await images.load(TESSERA, { keepLoaded: false })
   await images.generate({ prompt: "duck", n: 8 })
   assert.deepEqual(kept, [true, true, false, false])
+})
+
+test("stopping a drawing gives up its claim still waiting for room", async () => {
+  // Claims past the load's (a batch's work textures) wait, as for a host making room.
+  const { images, claimSignals } = setup(true, undefined, (bytes) => bytes > 90)
+  await images.load(TESSERA)
+  const abort = new AbortController()
+  const drawing = images.generate({ prompt: "duck", n: 4 }, { signal: abort.signal })
+  while (claimSignals.length < 2) await new Promise((r) => setTimeout(r, 0))
+  assert.equal(claimSignals[1]!.aborted, false)
+  abort.abort()
+  assert.equal(claimSignals[1]!.aborted, true, "the stopped drawing's claim still waits")
+  await assert.rejects(drawing)
+  assert.equal(images.isLoaded(TESSERA), true)
 })

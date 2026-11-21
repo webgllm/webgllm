@@ -179,6 +179,8 @@ type Entry = {
   keepLoaded: boolean
   /** Its teardown, once it began (see teardown). */
   closing: Promise<void> | null
+  /** Each request's claims still waiting for room: stopping the request stops them. */
+  claims: Map<number, Set<AbortController>>
   /** GPU bytes of its weights, once loaded. */
   weightBytes: number
   engine: "webgpu" | "webgl" | null
@@ -195,6 +197,20 @@ export class Images {
   private readonly entries = new Map<WebGlImageModel, Entry>()
   /** Models being torn down: a new load waits for its model's to finish (see teardown). */
   private readonly tearing = new Map<string, Promise<void>>()
+  /** Unloads asked for, by model and of every model: a load asked for before one stops (see unloadMark). */
+  private readonly unloads = new Map<string, number>()
+  private unloadsOfAll = 0
+
+  /** Counts the unloads of `model` asked for so far: a load compares it before and after it waits. */
+  private unloadMark(model: string) {
+    return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
+  }
+
+  /** Stops request `id`'s claims still waiting for room (it was stopped). */
+  private stopClaims(entry: Entry, id: number) {
+    for (const c of entry.claims.get(id) ?? []) c.abort(abortError())
+    entry.claims.delete(id)
+  }
 
   constructor(private readonly host: Host) {}
 
@@ -262,12 +278,25 @@ export class Images {
       if (!entry.worker.closed) entry.worker.post({ type: "image-claimed", id: m.claim, ...(refused !== undefined && { refused }) })
     }
     if (entry.closing) return answer(`${entry.model} was unloaded`)
-    this.host
-      .claim(entry.model, m.bytes, () => this.unload(entry.model, "evicted"), entry.keepLoaded, entry.gone.signal)
-      .then(
-        () => answer(),
-        (error: unknown) => answer(error instanceof Error ? error.message : String(error))
-      )
+    // Given up when the request is stopped, or the model goes.
+    const stop = new AbortController()
+    const claims = entry.claims.get(m.id) ?? new Set<AbortController>()
+    claims.add(stop)
+    entry.claims.set(m.id, claims)
+    const gone = entry.gone.signal
+    const onGone = () => stop.abort(gone.reason)
+    if (gone.aborted) onGone()
+    else gone.addEventListener("abort", onGone, { once: true })
+    const signal = stop.signal
+    const settled = () => {
+      gone.removeEventListener("abort", onGone)
+      claims.delete(stop)
+      if (!claims.size && entry.claims.get(m.id) === claims) entry.claims.delete(m.id)
+    }
+    this.host.claim(entry.model, m.bytes, () => this.unload(entry.model, "evicted"), entry.keepLoaded, signal).then(
+      () => (settled(), answer()),
+      (error: unknown) => (settled(), answer(error instanceof Error ? error.message : String(error)))
+    )
   }
 
   /**
@@ -283,13 +312,16 @@ export class Images {
     throwIfAborted(signal)
     if (!isImageModel(model)) throw new WebGLLMError("model-not-supported", `${String(model)} isn't an image model webgllm runs.`)
     this.host.checkSupport()
+    // An unload asked for while this waits stops it.
+    const since = this.unloadMark(model)
     let entry = this.entries.get(model)
     while (!entry) {
-      // A teardown of this model, or of another in the caller's worker (which holds one), finishes first.
+      // A teardown of this model, or of another in the caller's worker (which holds one), finishes first; the teardown goes on if this stops waiting.
       const waits = [this.tearing.get(model), ...(this.host.worker ? [...this.tearing.values(), ...[...this.entries.keys()].map((other) => this.unload(other))] : [])]
       if (waits.some(Boolean)) {
-        await Promise.all(waits)
-        throwIfAborted(signal)
+        const all = Promise.all(waits)
+        await (signal ? abortableWait(all, signal) : all)
+        if (this.unloadMark(model) !== since) throw new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
         entry = this.entries.get(model)
         continue
       }
@@ -340,6 +372,7 @@ export class Images {
       gone: new AbortController(),
       keepLoaded,
       closing: null,
+      claims: new Map(),
       weightBytes: 0,
       engine: null,
       ready: Promise.resolve()
@@ -382,6 +415,11 @@ export class Images {
    * the "unload" event.
    */
   async unload(model?: string, why: ModelUnloadReason = "unloaded"): Promise<void> {
+    // Loads waiting (for a teardown) see an unload asked for and stop (not an eviction: that's room made, not a request).
+    if (why === "unloaded") {
+      if (model === undefined) this.unloadsOfAll++
+      else this.unloads.set(model, (this.unloads.get(model) ?? 0) + 1)
+    }
     const reason = (m: string) => new WebGLLMError("model-not-loaded", `${m} was unloaded.`)
     const entries = [...this.entries.values()].filter((e) => model === undefined || e.model === model)
     // (Teardowns in progress too: it resolves once the model is freed.)
@@ -414,7 +452,10 @@ export class Images {
     if (!entry || entry.closing) throw new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
     this.host.touch(model)
     const id = ++ids
-    const stop = () => entry.worker.post({ type: "image-stop", id })
+    const stop = () => {
+      entry.worker.post({ type: "image-stop", id })
+      this.stopClaims(entry, id)
+    }
     signal?.addEventListener("abort", stop, { once: true })
     entry.drawing.add(id)
     try {

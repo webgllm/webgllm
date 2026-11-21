@@ -148,8 +148,8 @@ export class ModelPool {
 
   constructor(private readonly options: PoolOptions) {
     this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => {
-      const unload = this.external.get(model)
-      return unload ? unload().then(() => true) : this.evict(model, signal)
+      const ext = this.external.get(model)
+      return ext ? ext.unload().then(() => true) : this.evict(model, signal)
     })
     // The caller's worker may fail before anything is asked of it: heard from
     // now on, as nothing says later that it had. (A worker that failed before
@@ -195,34 +195,53 @@ export class ModelPool {
     return this.budget.total
   }
 
-  /** Models outside the pool sharing its budget (image models: images.ts), each with what unloads it to make room. */
-  private readonly external = new Map<string, () => Promise<void>>()
+  /**
+   * Models outside the pool sharing its budget (image models: images.ts):
+   * what unloads each to make room, the bytes its last claim to go through
+   * admitted, whether it's kept loaded, and its claims, one at a time.
+   */
+  private readonly external = new Map<string, { unload: () => Promise<void>; admitted: number | undefined; keepLoaded: boolean; claims: Promise<void> }>()
 
   /**
    * Claims `bytes` for a model outside the pool (all it will hold, in
-   * place of its last claim): room in the budget first, unloading the
-   * least recently used models (text or image), then the host's
-   * onMemoryClaim. `unload` frees it when another claim needs its room.
-   * Rejects, holding nothing new, if the host refuses or `signal` aborts.
+   * place of its last claim), after its claims before: room in the budget
+   * first, unloading the least recently used models (text or image), then
+   * the host's onMemoryClaim. `unload` frees it when another claim needs
+   * its room. Rejects if the host refuses or `signal` aborts, and the model
+   * then holds what its last claim admitted (its retention and last use as
+   * they are).
    */
   async claimExternal(model: string, bytes: number, unload: () => Promise<void>, keepLoaded: boolean, signal?: AbortSignal): Promise<void> {
-    this.external.set(model, unload)
-    const before = this.budget.heldBy(model)
-    try {
-      await this.budget.claim(model, bytes, keepLoaded, signal)
-      const hook = this.options.onMemoryClaim
-      if (!hook) return
-      const gone = signal ?? new AbortController().signal
-      await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: gone })), signal)
-    } catch (error) {
-      // Refused or given up: it holds what it held before (the model stays as it was), unless it was unloaded meanwhile.
-      if (this.external.get(model) === unload) this.budget.restore(model, before)
-      throw error
-    }
+    let ext = this.external.get(model)
+    if (!ext) this.external.set(model, (ext = { unload, admitted: undefined, keepLoaded, claims: Promise.resolve() }))
+    const own = ext
+    own.unload = unload
+    own.keepLoaded = keepLoaded
+    const run = own.claims.then(async () => {
+      throwIfAborted(signal)
+      // (Unloaded while it waited: it holds nothing to claim for.)
+      if (this.external.get(model) !== own) throw new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
+      try {
+        await this.budget.claim(model, bytes, own.keepLoaded, signal)
+        const hook = this.options.onMemoryClaim
+        if (hook) await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: signal ?? new AbortController().signal })), signal)
+        own.admitted = bytes
+      } catch (error) {
+        if (this.external.get(model) === own) {
+          if (own.admitted === undefined) this.budget.release(model)
+          else this.budget.setBytes(model, own.admitted, own.keepLoaded)
+        }
+        throw error
+      }
+    })
+    own.claims = run.catch(() => undefined)
+    return run
   }
 
   /** Whether a model outside the pool may be unloaded to make room. */
   setExternalKeepLoaded(model: string, keep: boolean) {
+    const ext = this.external.get(model)
+    if (ext) ext.keepLoaded = keep
     this.budget.setKeepLoaded(model, keep)
   }
 

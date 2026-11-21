@@ -182,3 +182,37 @@ test("the last load waiter aborting as the model becomes ready still frees it in
   assert.equal(held.has(TESSERA), false)
   assert.equal(images.isLoaded(TESSERA), false)
 })
+
+test("a load waiting behind a teardown stops at once when aborted; the teardown goes on", { timeout: 5000 }, async () => {
+  const { images, worker, events } = setup()
+  await images.load(TESSERA)
+  // The worker's answer to the unload is held: the teardown waits for it.
+  worker.holdReplies = true
+  const unloading = images.unload(TESSERA)
+  const abort = new AbortController()
+  const reload = images.load(TESSERA, { signal: abort.signal })
+  await tick()
+  abort.abort()
+  await assert.rejects(reload, { name: "AbortError" })
+  assert.equal(events.includes("unload unloaded"), false, "the teardown ended before its worker answered")
+  worker.flush()
+  await unloading
+  assert.equal(images.isLoaded(TESSERA), false)
+})
+
+test("an unload of every model stops a reload still waiting behind an earlier teardown", { timeout: 5000 }, async () => {
+  const { images, worker } = setup()
+  await images.load(TESSERA)
+  worker.holdReplies = true
+  const unloading = images.unload(TESSERA)
+  const reload = images.load(TESSERA)
+  reload.catch(() => undefined)
+  await tick()
+  const all = images.unload()
+  worker.flush()
+  await Promise.all([unloading, all])
+  await assert.rejects(reload, { code: "model-not-loaded" })
+  for (let i = 0; i < 5; i++) await tick()
+  assert.equal(images.isLoaded(TESSERA), false)
+  assert.equal(worker.toWorker.filter((t) => t === "image-load").length, 1, "the reload started after the unload")
+})
