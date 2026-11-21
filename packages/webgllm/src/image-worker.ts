@@ -14,7 +14,7 @@ import type { ImageRequest, ImageResponse } from "./image-protocol.js"
 import type { ModelFile } from "./model-meta.js"
 import { encodePng } from "./png.js"
 import { download, storedFile } from "./storage.js"
-import { TesseraGpu } from "./tessera.js"
+import { TesseraGpu, tesseraWeightBytes } from "./tessera.js"
 import { DEFAULT_SAMPLER, drawSprites, fixedLengthIds, GRID, MASK, PALETTE, PIXELS, spritePixels } from "./tessera-sampler.js"
 import { readClipWeights, readTesseraWeights } from "./tessera-weights.js"
 
@@ -31,6 +31,9 @@ export type ImageHost = {
 
 type Loaded = {
   model: string
+  /** Bytes claimed for it: weights and the work textures of the largest batch so far. */
+  claimed: number
+  weightBytes: number
   gpu: Gpu | WebGpu
   tessera: TesseraGpu
   engine: "webgpu" | "webgl"
@@ -44,10 +47,43 @@ let current: Loaded | null = null
 let queue: Promise<void> = Promise.resolve()
 const aborts = new Map<number, AbortController>()
 
+/** Claims waiting for the page's answer, by claim id. */
+const claims = new Map<number, { resolve: () => void; reject: (error: unknown) => void }>()
+let claimIds = 0
+
+/**
+ * Asks the page for room for `bytes` (all the model will hold), before
+ * allocating them: it makes room within the instance's memory budget
+ * (unloading other models) and asks the host's onMemoryClaim. Rejects if
+ * either refuses, or `signal` aborts.
+ */
+function claim(host: ImageHost, id: number, model: string, bytes: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  const c = ++claimIds
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      if (claims.delete(c)) reject(signal.reason)
+    }
+    claims.set(c, {
+      resolve: () => (signal.removeEventListener("abort", onAbort), resolve()),
+      reject: (error) => (signal.removeEventListener("abort", onAbort), reject(error))
+    })
+    signal.addEventListener("abort", onAbort, { once: true })
+    host.post({ type: "image-claim", id, claim: c, model, bytes })
+  })
+}
+
 /** An image request from the page. */
 export function receiveImage(data: ImageRequest, host: ImageHost) {
   if (data.type === "image-stop") {
     aborts.get(data.id)?.abort()
+    return
+  }
+  if (data.type === "image-claimed") {
+    const waiting = claims.get(data.id)
+    claims.delete(data.id)
+    if (data.refused === undefined) waiting?.resolve()
+    else waiting?.reject(new Error(`Tessera's memory claim was refused: ${data.refused}`))
     return
   }
   const abort = new AbortController()
@@ -73,13 +109,37 @@ export function receiveImage(data: ImageRequest, host: ImageHost) {
 
 let lastSelftest = 0
 
-async function release(host: ImageHost) {
-  const was = current
-  current = null
-  if (!was) return
-  was.tessera.dispose()
-  was.gpu.dispose()
-  await host.collect()
+/**
+ * Frees the loaded model, then runs the collector (see disposeThenCollect):
+ * nothing of the model is held while it runs, so the collection can take it.
+ */
+function release(host: ImageHost): Promise<void> {
+  return disposeThenCollect(
+    () => {
+      const was = current
+      current = null
+      return was
+    },
+    (was) => {
+      was.tessera.dispose()
+      was.gpu.dispose()
+    },
+    host.collect
+  )
+}
+
+/**
+ * Takes a thing out (`take`), frees it (`dispose`) and drops it, all in
+ * this synchronous call, then starts `collect`: no suspended function holds
+ * the thing while the collector runs, as an async function awaiting the
+ * collection would.
+ */
+export function disposeThenCollect<T>(take: () => T | null, dispose: (thing: T) => void, collect: () => Promise<void>): Promise<void> {
+  let thing = take()
+  if (thing === null) return Promise.resolve()
+  dispose(thing)
+  thing = null
+  return collect()
 }
 
 /** A file's bytes: from storage, else downloaded into it, reporting its bytes as they come. */
@@ -134,14 +194,19 @@ async function load(model: string, id: number, host: ImageHost, signal: AbortSig
         failures.push("WebGPU: no adapter")
         continue
       }
+      // Room for the weights and a one-canvas pass (the self-test's), before any of it is allocated.
+      const sizes = tesseraWeightBytes(weights, clip)
+      const weightBytes = sizes.denoiser + sizes.text
       tessera = new TesseraGpu(gpu)
+      const claimed = weightBytes + tessera.workBytesFor(1)
+      await claim(host, id, model, claimed, signal)
       await tessera.load(weights, clip, signal)
       report("load", cached ? 0.8 : 0.96)
       const agreement = await selftestAgreement(tessera, selftest, signal)
       if (agreement < SELFTEST_AGREEMENT) throw new Error(`its self-test matched ${(agreement * 100).toFixed(1)}% of pixels (at least ${SELFTEST_AGREEMENT * 100}% needed)`)
       lastSelftest = agreement
       const tokenize = (prompt: string) => fixedLengthIds(prompt === "" ? [] : tokenizer.encode(prompt, { add_special_tokens: true }).ids, endToken)
-      current = { model, gpu, tessera, engine, tokenize, endToken, palette }
+      current = { model, claimed, weightBytes, gpu, tessera, engine, tokenize, endToken, palette }
       report("load", 1)
       return current
     } catch (error) {
@@ -171,6 +236,12 @@ async function selftestAgreement(tessera: TesseraGpu, selftest: { ids: Array<num
 async function generate(data: Extract<ImageRequest, { type: "image-generate" }>, host: ImageHost, signal: AbortSignal) {
   const model = current?.model === data.model ? current : await load(data.model, data.id, host, signal)
   const { tessera } = model
+  // Room for this batch's work textures, before they're made (two rows a sprite: with the prompt and without).
+  const needed = model.weightBytes + tessera.workBytesFor(2 * data.n)
+  if (needed > model.claimed) {
+    await claim(host, data.id, model.model, needed, signal)
+    model.claimed = needed
+  }
   const started = performance.now()
   const text = await tessera.encodeText(model.tokenize(data.prompt), signal)
   await tessera.setText(text.states, text.pooled, signal)

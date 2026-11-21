@@ -2,12 +2,14 @@
  * Image generation (webgllm.images): an image model loaded in a worker,
  * one of webgllm's for each model (ended when it's unloaded, which frees
  * its memory at once), or the caller's worker (which frees the model and
- * stays running). Requests take turns in the worker.
+ * stays running). Requests take turns in the worker. The model's memory is
+ * claimed, before the worker allocates it, within the instance's memory
+ * budget (with the text models) and through the host's onMemoryClaim.
  */
 import { abortError, failedToLoad, throwIfAborted, WebGLLMError, workerFailure } from "./errors.js"
 import { isImageModel, TESSERA, type WebGlImageModel } from "./image-models.js"
 import { isImageResponse, type ImageRequest, type ImageResponse } from "./image-protocol.js"
-import type { LoadProgress, WebGLLMEventMap } from "./openai.js"
+import type { LoadProgress, ModelUnloadReason, WebGLLMEventMap } from "./openai.js"
 import { WEBGLLM } from "./protocol.js"
 
 export type ImageGenerateParams = {
@@ -66,6 +68,16 @@ type Host = {
   checkSupport: () => void
   onProgress: (progress: LoadProgress) => void
   dispatch: <K extends keyof WebGLLMEventMap>(type: K, event: WebGLLMEventMap[K]) => void
+  /**
+   * Room for `bytes` (all the model will hold): in the shared memory budget
+   * (`unload` frees the model when another claim needs its room), then
+   * the host's onMemoryClaim. Rejects if refused or `signal` aborts.
+   */
+  claim: (model: string, bytes: number, unload: () => Promise<void>, signal: AbortSignal) => Promise<void>
+  /** The model was just used (least recently used order). */
+  touch: (model: string) => void
+  /** The model holds nothing any more. */
+  release: (model: string) => void
 }
 
 type Waiter = { onMessage: (message: ImageResponse) => boolean; reject: (error: unknown) => void }
@@ -80,16 +92,25 @@ class ImageWorker {
   constructor(
     readonly worker: Worker,
     readonly owned: boolean,
-    webgpu: "auto" | false
+    webgpu: "auto" | false,
+    /** A claim the worker makes before allocating. */
+    private readonly onClaim: (message: Extract<ImageResponse, { type: "image-claim" }>) => void,
+    /** The worker failed: every request fails with `error`. */
+    private readonly onFail: (error: Error) => void
   ) {
     worker.addEventListener("message", this.onMessage)
     worker.addEventListener("error", this.onError)
     // A new worker loads on WebGPU unless told otherwise; the caller's is told every time (another client may have told it otherwise).
-    if (webgpu === false || !owned) worker.postMessage({ type: "configure", webgpu, [WEBGLLM]: true })
+    if (webgpu === false || !owned) this.post({ type: "configure", webgpu })
+  }
+
+  post(message: Record<string, unknown>) {
+    this.worker.postMessage({ ...message, [WEBGLLM]: true })
   }
 
   private readonly onMessage = ({ data }: MessageEvent) => {
     if (!isImageResponse(data)) return
+    if (data.type === "image-claim") return void this.onClaim(data)
     const waiter = this.waiters.get(data.id)
     if (waiter?.onMessage(data)) this.waiters.delete(data.id)
   }
@@ -97,7 +118,9 @@ class ImageWorker {
   private readonly onError = (event: ErrorEvent) => {
     // A worker of the caller's that only threw in its own code keeps running; one whose script failed never does.
     if (!this.owned && !failedToLoad(event)) return
-    this.fail(workerFailure(event))
+    const error = workerFailure(event)
+    this.fail(error)
+    this.onFail(error)
   }
 
   /** Fails every request waiting, and any later one, with `error`. */
@@ -107,12 +130,20 @@ class ImageWorker {
     this.waiters.clear()
   }
 
+  /** Fails request `id` here, and stops it in the worker. */
+  cancel(id: number, error: unknown) {
+    const waiter = this.waiters.get(id)
+    this.waiters.delete(id)
+    waiter?.reject(error)
+    if (!this.gone) this.post({ type: "image-stop", id })
+  }
+
   /** Sends `request`; `onMessage` gets its answers until it returns true (the last one). */
   send(request: ImageRequest, onMessage: (message: ImageResponse, resolve: (value: ImageResponse) => void, reject: (error: unknown) => void) => boolean) {
     return new Promise<ImageResponse>((resolve, reject) => {
       if (this.gone) return reject(this.gone)
       this.waiters.set(request.id, { onMessage: (m) => onMessage(m, resolve, reject), reject })
-      this.worker.postMessage({ ...request, [WEBGLLM]: true })
+      this.post(request)
     })
   }
 
@@ -128,9 +159,17 @@ class ImageWorker {
 type Entry = {
   model: WebGlImageModel
   worker: ImageWorker
+  /** The load's request id. */
+  loadId: number
   ready: Promise<void>
   loaded: boolean
+  /** Calls waiting for the load: the last to abort stops it. */
+  waiters: number
   listeners: Set<(progress: LoadProgress) => void>
+  /** Drawings in progress, by request id. */
+  drawing: Set<number>
+  /** Aborted once it's gone: its claims stop waiting. */
+  gone: AbortController
   /** GPU bytes of its weights, once loaded. */
   weightBytes: number
   engine: "webgpu" | "webgl" | null
@@ -163,86 +202,142 @@ export class Images {
   }
 
   /**
+   * Takes `entry` out: its worker is ended (webgllm's) or stops listening,
+   * its claims stop, its memory is released from the budget, and its
+   * events say why. Only if it's still the model's entry.
+   */
+  private drop(entry: Entry, error: Error, why: ModelUnloadReason) {
+    if (this.entries.get(entry.model) !== entry) return
+    this.entries.delete(entry.model)
+    entry.gone.abort(error)
+    entry.worker.close(error)
+    entry.ready.catch(() => undefined)
+    this.host.release(entry.model)
+    if (why === "failed" || why === "crashed") this.host.dispatch("error", { model: entry.model, error })
+    this.host.dispatch("unload", { model: entry.model, reason: why })
+  }
+
+  /** Answers a claim of `entry`'s worker: granted, or refused (its request then fails). */
+  private claim(entry: Entry, m: Extract<ImageResponse, { type: "image-claim" }>) {
+    const answer = (refused?: string) => {
+      if (this.entries.get(entry.model) === entry) entry.worker.post({ type: "image-claimed", id: m.claim, ...(refused !== undefined && { refused }) })
+    }
+    this.host
+      .claim(entry.model, m.bytes, () => this.unload(entry.model, "evicted"), entry.gone.signal)
+      .then(
+        () => answer(),
+        (error: unknown) => answer(error instanceof Error ? error.message : String(error))
+      )
+  }
+
+  /**
    * Loads `model` (downloading it the first time): on WebGPU where the
    * browser has it and the GPU passes the model's self-test, else on WebGL 2.
+   * Aborting stops the load, unless another call is waiting for it too.
    */
   async load(model: WebGlImageModel, options: { onProgress?: (progress: LoadProgress) => void; signal?: AbortSignal } = {}): Promise<void> {
-    throwIfAborted(options.signal)
+    const { signal } = options
+    throwIfAborted(signal)
     if (!isImageModel(model)) throw new WebGLLMError("model-not-supported", `${String(model)} isn't an image model webgllm runs.`)
     this.host.checkSupport()
     let entry = this.entries.get(model)
     if (!entry) {
       // The caller's worker holds one image model: another is unloaded first.
       if (this.host.worker) for (const other of [...this.entries.keys()]) await this.unload(other)
-      const worker = new ImageWorker(this.host.worker ?? this.host.createWorker(), !this.host.worker, this.host.webgpu ?? "auto")
-      const listeners = new Set<(progress: LoadProgress) => void>()
-      const id = ++ids
-      this.host.dispatch("loadstart", { model })
-      const made: Entry = {
-        model,
-        worker,
-        loaded: false,
-        listeners,
-        weightBytes: 0,
-        engine: null,
-        ready: worker
-          .send({ type: "image-load", id, model }, (m, resolve, reject) => {
-            if (m.type === "image-progress") {
-              const progress: LoadProgress = { model, phase: m.phase, progress: m.progress, cached: m.cached }
-              this.host.onProgress(progress)
-              for (const listener of listeners) listener(progress)
-              return false
-            }
-            if (m.type === "image-ready") {
-              made.weightBytes = m.weightBytes
-              made.engine = m.engine
-              resolve(m)
-            } else if (m.type === "image-error") reject(new Error(m.message))
-            else return false
-            return true
-          })
-          .then(
-            () => {
-              made.loaded = true
-              this.host.dispatch("load", { model, contextLength: 0 })
-            },
-            (error: unknown) => {
-              if (this.entries.get(model) === made) {
-                this.entries.delete(model)
-                worker.close(error as Error)
-                this.host.dispatch("error", { model, error: error as Error })
-                this.host.dispatch("unload", { model, reason: "failed" })
-              }
-              throw error
-            }
-          )
-      }
-      entry = made
-      this.entries.set(model, entry)
+      entry = this.entries.get(model) ?? this.start(model)
     }
-    const { listeners, ready } = entry
+    const made = entry
     const listener = options.onProgress
-    if (listener) listeners.add(listener)
+    if (listener) made.listeners.add(listener)
+    made.waiters++
     try {
-      await (options.signal ? abortableWait(ready, options.signal) : ready)
+      await (signal ? abortableWait(made.ready, signal) : made.ready)
+    } catch (error) {
+      // The last call waiting gave up: the load stops.
+      if (signal?.aborted && made.waiters === 1 && !made.loaded) {
+        made.worker.cancel(made.loadId, abortError(signal))
+        this.drop(made, abortError(signal) as Error, "aborted")
+      }
+      throw error
     } finally {
-      if (listener) listeners.delete(listener)
+      made.waiters--
+      if (listener) made.listeners.delete(listener)
     }
+  }
+
+  /** Starts loading `model` in a worker. */
+  private start(model: WebGlImageModel): Entry {
+    const loadId = ++ids
+    // (The entry's callbacks reach it once it's made, below.)
+    let entry!: Entry
+    const worker = new ImageWorker(
+      this.host.worker ?? this.host.createWorker(),
+      !this.host.worker,
+      this.host.webgpu ?? "auto",
+      (m) => this.claim(entry, m),
+      (error) => this.drop(entry, error, "crashed")
+    )
+    const listeners = new Set<(progress: LoadProgress) => void>()
+    this.host.dispatch("loadstart", { model })
+    entry = {
+      model,
+      worker,
+      loadId,
+      loaded: false,
+      waiters: 0,
+      listeners,
+      drawing: new Set(),
+      gone: new AbortController(),
+      weightBytes: 0,
+      engine: null,
+      ready: Promise.resolve()
+    }
+    this.entries.set(model, entry)
+    entry.ready = worker
+      .send({ type: "image-load", id: loadId, model }, (m, resolve, reject) => {
+        if (m.type === "image-progress") {
+          const progress: LoadProgress = { model, phase: m.phase, progress: m.progress, cached: m.cached }
+          this.host.onProgress(progress)
+          for (const l of listeners) l(progress)
+          return false
+        }
+        if (m.type === "image-ready") {
+          entry.weightBytes = m.weightBytes
+          entry.engine = m.engine
+          resolve(m)
+        } else if (m.type === "image-error") reject(new Error(m.message))
+        else return false
+        return true
+      })
+      .then(
+        () => {
+          entry.loaded = true
+          this.host.dispatch("load", { model, contextLength: 0 })
+        },
+        (error: unknown) => {
+          this.drop(entry, error as Error, "failed")
+          throw error
+        }
+      )
+    return entry
   }
 
   /**
    * Unloads `model`, or every image model: webgllm's own worker is ended,
-   * which frees the memory at once; the caller's frees the model. Resolves
-   * after its "unload" event.
+   * which frees the memory at once; the caller's stops the drawings in
+   * progress, then frees the model. Their drawings fail. Resolves after
+   * the "unload" event.
    */
-  async unload(model?: string): Promise<void> {
+  async unload(model?: string, why: ModelUnloadReason = "unloaded"): Promise<void> {
     const entries = [...this.entries.values()].filter((e) => model === undefined || e.model === model)
     await Promise.all(
       entries.map(async (entry) => {
-        this.entries.delete(entry.model)
         const reason = new WebGLLMError("model-not-loaded", `${entry.model} was unloaded.`)
-        if (!entry.worker.owned) {
-          // The caller's worker frees it after the request running there.
+        if (!entry.worker.owned && !entry.worker.gone) {
+          // The caller's worker: its drawings (and a load) stop first, else the unload waits behind them; then it frees the model.
+          for (const id of entry.drawing) entry.worker.cancel(id, reason)
+          if (!entry.loaded) entry.worker.cancel(entry.loadId, reason)
+          entry.gone.abort(reason)
           await entry.worker
             .send({ type: "image-unload", id: ++ids, model: entry.model }, (m, resolve) => {
               if (m.type !== "image-unloaded" && m.type !== "image-error") return false
@@ -251,9 +346,7 @@ export class Images {
             })
             .catch(() => undefined)
         }
-        entry.worker.close(reason)
-        entry.ready.catch(() => undefined)
-        this.host.dispatch("unload", { model: entry.model, reason: "unloaded" })
+        this.drop(entry, reason, why)
       })
     )
   }
@@ -280,9 +373,11 @@ export class Images {
     await this.load(model, { ...(options.onProgress && { onProgress: options.onProgress }), ...(signal && { signal }) })
     const entry = this.entries.get(model)
     if (!entry) throw new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
+    this.host.touch(model)
     const id = ++ids
-    const stop = () => entry.worker.worker.postMessage({ type: "image-stop", id, [WEBGLLM]: true })
+    const stop = () => entry.worker.post({ type: "image-stop", id })
     signal?.addEventListener("abort", stop, { once: true })
+    entry.drawing.add(id)
     try {
       const done = await entry.worker.send(
         { type: "image-generate", id, model, prompt: params.prompt, n, seed, steps, guidanceScale, png: format === "b64_json", scale: side / 16 },
@@ -309,6 +404,7 @@ export class Images {
         memory: { weights_bytes: entry.weightBytes, work_bytes: done.workBytes }
       }
     } finally {
+      entry.drawing.delete(id)
       signal?.removeEventListener("abort", stop)
     }
   }

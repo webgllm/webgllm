@@ -147,7 +147,10 @@ export class ModelPool {
   private dead: WebGLLMError | null = null
 
   constructor(private readonly options: PoolOptions) {
-    this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => this.evict(model, signal))
+    this.budget = new MemoryBudget(options.memoryBudget, (model, signal) => {
+      const unload = this.external.get(model)
+      return unload ? unload().then(() => true) : this.evict(model, signal)
+    })
     // The caller's worker may fail before anything is asked of it: heard from
     // now on, as nothing says later that it had. (A worker that failed before
     // this can't be told from one that's slow to answer.) Its models' own
@@ -190,6 +193,36 @@ export class ModelPool {
   /** Bytes the loaded models claim together. */
   get memoryUsed(): number {
     return this.budget.total
+  }
+
+  /** Models outside the pool sharing its budget (image models: images.ts), each with what unloads it to make room. */
+  private readonly external = new Map<string, () => Promise<void>>()
+
+  /**
+   * Claims `bytes` for a model outside the pool (all it will hold, in
+   * place of its last claim): room in the budget first, unloading the
+   * least recently used models (text or image), then the host's
+   * onMemoryClaim. `unload` frees it when another claim needs its room.
+   * Rejects, holding nothing new, if the host refuses or `signal` aborts.
+   */
+  async claimExternal(model: string, bytes: number, unload: () => Promise<void>, signal?: AbortSignal): Promise<void> {
+    this.external.set(model, unload)
+    await this.budget.claim(model, bytes, false, signal)
+    const hook = this.options.onMemoryClaim
+    if (!hook) return
+    const gone = signal ?? new AbortController().signal
+    await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: gone })), signal)
+  }
+
+  /** Marks a model outside the pool as just used (least recently used order). */
+  touchExternal(model: string) {
+    this.budget.touch(model)
+  }
+
+  /** Forgets a model outside the pool: it's unloaded, or failed to load. */
+  releaseExternal(model: string) {
+    this.external.delete(model)
+    this.budget.release(model)
   }
 
   /**

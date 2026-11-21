@@ -22,8 +22,12 @@ export type ImageRequest =
     }
   | { type: "image-stop"; id: number }
   | { type: "image-unload"; id: number; model: string }
+  /** The page's answer to claim `id` (an image-claim's `claim`): granted, or refused with why. */
+  | { type: "image-claimed"; id: number; refused?: string }
 
 export type ImageResponse =
+  /** Before allocating: the bytes the model will hold in all (replacing its last claim), for request `id`. */
+  | { type: "image-claim"; id: number; claim: number; model: string; bytes: number }
   | { type: "image-progress"; id: number; model: string; phase: "download" | "load"; progress: number; cached: boolean }
   | { type: "image-ready"; id: number; model: string; engine: "webgpu" | "webgl"; weightBytes: number; selftest: number }
   | { type: "image-step"; id: number; step: number; steps: number }
@@ -31,7 +35,7 @@ export type ImageResponse =
   | { type: "image-error"; id: number; message: string }
   | { type: "image-unloaded"; id: number }
 
-const TYPES: ReadonlySet<string> = new Set<ImageRequest["type"]>(["image-load", "image-generate", "image-stop", "image-unload"])
+const TYPES: ReadonlySet<string> = new Set<ImageRequest["type"]>(["image-load", "image-generate", "image-stop", "image-unload", "image-claimed"])
 
 /** Whether a message is one of the page's image requests (marked as webgllm's, with an id). */
 export function isImageRequest(data: unknown): data is ImageRequest {

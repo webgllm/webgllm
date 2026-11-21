@@ -229,7 +229,11 @@ export class WebGLLM {
         options.onProgress?.(progress)
         this.dispatch("progress", progress)
       },
-      dispatch: (type, event) => this.dispatch(type, event)
+      dispatch: (type, event) => this.dispatch(type, event),
+      // Its memory shares the text models' budget and the host's onMemoryClaim.
+      claim: (model, bytes, unload, signal) => this.pool.claimExternal(model, bytes, unload, signal),
+      touch: (model) => this.pool.touchExternal(model),
+      release: (model) => this.pool.releaseExternal(model)
     })
   }
 

@@ -31,21 +31,46 @@ class FakeImageWorker {
   failToLoad() {
     for (const l of [...this.listeners.error]) l({ type: "error" })
   }
+  /** Claims waiting for the page's answer: what each request does once granted. */
+  private claims = new Map<number, { request: number; then: () => void }>()
+  private claimIds = 0
+  /** The bytes each claim asked for. */
+  readonly claimed: Array<number> = []
   postMessage(data: Record<string, unknown>) {
     if (this.terminated) return
     this.sent.push(data)
-    if (!this.auto || !isImageRequest(data)) return
+    if (!isImageRequest(data)) return
     const r = data as ImageRequest
+    if (r.type === "image-claimed") {
+      const waiting = this.claims.get(r.id)
+      this.claims.delete(r.id)
+      if (!waiting) return
+      if (r.refused === undefined) waiting.then()
+      else this.emit({ type: "image-error", id: waiting.request, message: `Tessera's memory claim was refused: ${r.refused}` })
+      return
+    }
+    if (!this.auto) return
     queueMicrotask(() => this.answer(r))
+  }
+  /** Claims `bytes` for request `id`, as the worker does before allocating; `then` runs once it's granted. */
+  claim(id: number, model: string, bytes: number, then: () => void) {
+    const c = ++this.claimIds
+    this.claims.set(c, { request: id, then })
+    this.claimed.push(bytes)
+    this.emit({ type: "image-claim", id, claim: c, model, bytes })
   }
   answer(r: ImageRequest) {
     if (r.type === "image-load") {
       this.emit({ type: "image-progress", id: r.id, model: r.model, phase: "download", progress: 0.5, cached: false })
-      this.emit({ type: "image-ready", id: r.id, model: r.model, engine: "webgpu", weightBytes: 84 << 20, selftest: 0.965 })
+      this.claim(r.id, r.model, 90, () =>
+        this.emit({ type: "image-ready", id: r.id, model: r.model, engine: "webgpu", weightBytes: 84 << 20, selftest: 0.965 })
+      )
     } else if (r.type === "image-generate") {
-      this.emit({ type: "image-step", id: r.id, step: 1, steps: r.steps })
-      const images = Array.from({ length: r.n }, (_, i) => ({ rgba: new Uint8Array(1024).fill(i), ...(r.png && { png: new Uint8Array([137, 80, 78, 71]) }) }))
-      this.emit({ type: "image-done", id: r.id, images, timings: { textMs: 1, drawMs: 2 }, workBytes: 36 << 20 })
+      this.claim(r.id, r.model, 90 + 10 * r.n, () => {
+        this.emit({ type: "image-step", id: r.id, step: 1, steps: r.steps })
+        const images = Array.from({ length: r.n }, (_, i) => ({ rgba: new Uint8Array(1024).fill(i), ...(r.png && { png: new Uint8Array([137, 80, 78, 71]) }) }))
+        this.emit({ type: "image-done", id: r.id, images, timings: { textMs: 1, drawMs: 2 }, workBytes: 36 << 20 })
+      })
     } else if (r.type === "image-unload") this.emit({ type: "image-unloaded", id: r.id })
   }
   requests(type: string) {
@@ -53,12 +78,24 @@ class FakeImageWorker {
   }
 }
 
-function setup(own = true) {
+function setup(own = true, refuse?: (bytes: number) => string | undefined, holdClaims = false) {
   const made: Array<FakeImageWorker> = []
   const caller = new FakeImageWorker()
   const events: Array<string> = []
   const progress: Array<LoadProgress> = []
+  /** Bytes held by model, as the budget would. */
+  const held = new Map<string, number>()
+  const touched: Array<string> = []
   const images = new Images({
+    claim: async (model, bytes, _unload, signal) => {
+      // (Held: a claim waiting for room, until the claimant goes.)
+      if (holdClaims) await new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
+      const why = refuse?.(bytes)
+      if (why) throw new Error(why)
+      held.set(model, bytes)
+    },
+    touch: (model) => touched.push(model),
+    release: (model) => held.delete(model),
     createWorker: () => {
       const w = new FakeImageWorker()
       made.push(w)
@@ -69,7 +106,7 @@ function setup(own = true) {
     onProgress: (p) => progress.push(p),
     dispatch: (type, event) => events.push(`${type} ${(event as { model: string }).model}${"reason" in event ? ` ${event.reason}` : ""}`)
   })
-  return { images, made, caller, events, progress }
+  return { images, made, caller, events, progress, held, touched }
 }
 
 test("a load starts a worker, reports progress and the model's events, once for calls at once", async () => {
@@ -163,4 +200,80 @@ test("a load that fails reports it and leaves nothing loaded; a worker that fail
   made[1]!.auto = false
   made[1]!.failToLoad()
   await assert.rejects(again, { code: "worker-failed" })
+})
+
+test("the worker's claims go to the shared budget before it allocates, and an unload releases them", async () => {
+  const { images, made, held, touched } = setup()
+  await images.load(TESSERA)
+  assert.deepEqual(made[0]!.claimed, [90])
+  assert.equal(held.get(TESSERA), 90)
+  await images.generate({ prompt: "duck", n: 4 })
+  assert.deepEqual(made[0]!.claimed, [90, 130])
+  assert.equal(held.get(TESSERA), 130)
+  assert.deepEqual(touched, [TESSERA])
+  await images.unload(TESSERA)
+  assert.equal(held.has(TESSERA), false)
+})
+
+test("a refused claim fails the load (or the drawing) and holds nothing", async () => {
+  const refusing = setup(true, () => "the host has no room")
+  await assert.rejects(refusing.images.load(TESSERA), /no room/)
+  assert.equal(refusing.images.isLoaded(TESSERA), false)
+  assert.equal(refusing.held.size, 0)
+  assert.equal(refusing.made[0]!.terminated, true)
+  // A drawing whose batch needs more than the host allows fails; the model stays loaded.
+  const big = setup(true, (bytes) => (bytes > 100 ? "too big" : undefined))
+  await big.images.load(TESSERA)
+  await assert.rejects(big.images.generate({ prompt: "duck", n: 4 }), /too big/)
+  assert.equal(big.images.isLoaded(TESSERA), true)
+})
+
+test("the last call waiting for a load aborting stops it; one of two leaves it loading", async () => {
+  const { images, made, events } = setup(true, undefined, true)
+  const a = new AbortController()
+  const b = new AbortController()
+  const first = images.load(TESSERA, { signal: a.signal })
+  const second = images.load(TESSERA, { signal: b.signal })
+  await new Promise((r) => setTimeout(r, 0))
+  a.abort()
+  await assert.rejects(first, { name: "AbortError" })
+  assert.equal(made[0]!.requests("image-stop").length, 0, "stopped while another call waits")
+  b.abort()
+  await assert.rejects(second, { name: "AbortError" })
+  assert.equal(made[0]!.terminated, true)
+  assert.equal(images.isLoaded(TESSERA), false)
+  assert.deepEqual(events.slice(-1), [`unload ${TESSERA} aborted`])
+  // The next load starts afresh.
+  const next = images.load(TESSERA)
+  await new Promise((r) => setTimeout(r, 0))
+  assert.equal(made.length, 2)
+  void images.unload()
+  await assert.rejects(next)
+})
+
+test("unloading the caller's worker stops its drawing first, which fails", async () => {
+  const { images, caller } = setup(false)
+  await images.load(TESSERA)
+  caller.auto = false
+  const drawing = images.generate({ prompt: "cat" })
+  await new Promise((r) => setTimeout(r, 0))
+  const gen = caller.requests("image-generate")[0]!
+  const unloading = images.unload(TESSERA)
+  const order = caller.sent.map((m) => m.type)
+  assert.ok(order.indexOf("image-stop") >= 0 && order.indexOf("image-stop") < order.indexOf("image-unload"), "the unload went before the stop")
+  assert.equal(caller.requests("image-stop")[0]!.id, gen.id)
+  await assert.rejects(drawing, { code: "model-not-loaded" })
+  caller.answer(caller.requests("image-unload")[0] as unknown as ImageRequest)
+  await unloading
+})
+
+test("a worker that fails after loading takes its model out; the next load starts a new worker", async () => {
+  const { images, made, events, held } = setup()
+  await images.load(TESSERA)
+  made[0]!.failToLoad()
+  assert.equal(images.isLoaded(TESSERA), false)
+  assert.equal(held.has(TESSERA), false)
+  assert.deepEqual(events.slice(-2), [`error ${TESSERA}`, `unload ${TESSERA} crashed`])
+  await images.generate({ prompt: "fire" })
+  assert.equal(made.length, 2)
 })

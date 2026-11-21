@@ -67,6 +67,37 @@ export function ratioFeatures(maskRatio: number): Float32Array {
   return out
 }
 
+/**
+ * GPU bytes of TesseraGpu's work textures once it has run CLIP and a
+ * denoiser pass of `batch` canvases (RGBA32F, as `tex` makes them: each
+ * name as wide and as tall as it has been asked for).
+ */
+export function tesseraWorkBytes(batch: number, maxTextureSize: number, clipHidden = 4 * D): number {
+  const rows = batch * SEQ
+  const coreRows = batch * CORE_SEQ
+  const coreTokens = batch * CORE_GRID * CORE_GRID
+  const pixels = batch * P
+  const L = C.textLen
+  const wide = (C.patch * C.patch * D) / 4
+  const shapes: Array<[number, number]> = [
+    // Blocks (pixel and core rows), and the denoiser's own.
+    [DT, rows], [DT, rows], [DT, coreRows], [3 * DT, rows], [2 * DT, rows], [DT, rows], [(2 * C.hidden) / 4, rows], [C.hidden / 4, rows],
+    [4, batch], [DT, batch], [DT, batch], [DT, batch], [(6 * D) / 4, batch], [(2 * D) / 4, batch],
+    [DT, pixels], [DT, pixels], [P / 4, batch], [DT, rows],
+    [wide, coreTokens], [wide, coreTokens], [DT, coreTokens], [DT, coreRows], [DT, coreTokens], [wide, coreTokens], [DT, rows],
+    [DT, pixels], [DT, pixels], [C.vocab / 4, pixels],
+    // CLIP's, and the prompt's text rows and condition.
+    [DT, L], [DT, L], [DT, L], [3 * DT, L], [DT, L], [clipHidden / 4, L],
+    [DT, L], [DT, L], [DT, L], [DT, 1], [DT, 1], [DT, 1], [DT, 1]
+  ]
+  // Attention's scores and their statistics: as wide as the widest row of keys, as tall as the tallest chunk of queries.
+  const heads = C.heads
+  const chunk = (n: number) => Math.min(n, Math.floor(maxTextureSize / heads)) * heads
+  const scoreRows = Math.max(chunk(rows), chunk(coreRows), chunk(L))
+  shapes.push([Math.ceil(Math.max(SEQ, CORE_SEQ, L) / 4), scoreRows], [1, scoreRows])
+  return shapes.reduce((sum, [w, h]) => sum + w * h * 16, 0)
+}
+
 /** GPU bytes of the weights tessera.ts uploads, by part. */
 export function tesseraWeightBytes(w: TesseraWeights, clip: ClipWeights) {
   const linear = (l: QLinear) => l.N * l.K + (l.axis === "out" ? l.N : l.K) * 4 + (l.bias ? l.N * 4 : 0)
@@ -236,14 +267,28 @@ export class TesseraGpu {
 
   // ------------------------------------------------------------ passes
 
-  /** A work texture by name, made again if it's too small. */
+  /**
+   * A work texture by name, made again (as large as both) if it's too
+   * small: the new one first, so a texture the GPU can't make leaves the
+   * old one in place.
+   */
   private tex(name: string, width: number, height: number) {
     const t = this.work.get(name)
     if (t && t.width >= width && t.height >= height) return t
-    if (t) this.gpu.delete(t)
     const made = this.gpu.texture(GL.RGBA32F, Math.max(width, t?.width ?? 0), Math.max(height, t?.height ?? 0))
+    if (t) this.gpu.delete(t)
     this.work.set(name, made)
     return made
+  }
+
+  /** The most canvases one pass of the denoiser takes: its token rows must fit a texture's height. */
+  get maxBatch() {
+    return Math.floor(this.gpu.limits.maxTextureSize / SEQ)
+  }
+
+  /** GPU bytes of the work textures a batch of `batch` canvases takes (in passes of maxBatch at most), with CLIP's. */
+  workBytesFor(batch: number) {
+    return tesseraWorkBytes(Math.min(batch, this.maxBatch), this.gpu.limits.maxTextureSize, this.clip?.layers[0]?.fc1.N ?? 4 * D)
   }
 
   private upload(name: string, values: Float32Array, rows: number) {
@@ -468,6 +513,35 @@ export class TesseraGpu {
     signal?: AbortSignal
   ): Promise<Float32Array> {
     if (!this.text) throw new Error("Tessera: no prompt was set (setText).")
+    const most = this.maxBatch
+    if (most < 1) throw new Error(`Tessera: this GPU's textures (${this.gpu.limits.maxTextureSize} rows) can't hold one canvas's ${SEQ} token rows.`)
+    if (batch <= most) return this.denoiseBatch(tokens, maskRatio, scProbs, batch, count, signal)
+    // In passes of `most` canvases: the prompt's rows stay first in each (rows below `count` overall).
+    const logits = new Float32Array(batch * P * C.vocab)
+    for (let s = 0; s < batch; s += most) {
+      const e = Math.min(batch, s + most)
+      const part = await this.denoiseBatch(
+        tokens.subarray(s * P, e * P),
+        maskRatio.subarray(s, e),
+        scProbs && scProbs.subarray(s * P * C.vocab, e * P * C.vocab),
+        e - s,
+        Math.max(0, Math.min(e, count) - s),
+        signal
+      )
+      logits.set(part, s * P * C.vocab)
+    }
+    return logits
+  }
+
+  private async denoiseBatch(
+    tokens: Int32Array,
+    maskRatio: Float32Array,
+    scProbs: Float32Array | null,
+    batch: number,
+    count: number,
+    signal?: AbortSignal
+  ): Promise<Float32Array> {
+    const text = this.text!
     this.signal = signal
     const d = this.den
     // The conditioning: g = c + ratio MLP(mask ratio's features); then adaLN's modulations.
@@ -475,7 +549,7 @@ export class TesseraGpu {
     const cMix = new Float32Array(batch * D)
     for (let b = 0; b < batch; b++) {
       feats.set(ratioFeatures(maskRatio[b]!), b * 16)
-      cMix.set(b < count ? this.text.cond : d.nullCond, b * D)
+      cMix.set(b < count ? text.cond : d.nullCond, b * D)
     }
     const ratioIn = this.upload("ratio-in", feats, batch)
     const ratioH = this.tex("ratio-h", DT, batch)
@@ -500,7 +574,7 @@ export class TesseraGpu {
     let xs = this.tex("xs", DT, rows)
     await this.run("tessera-assemble", {
       program: this.gpu.program(K.TESSERA_ASSEMBLE),
-      inputs: { uReg: d.registers, uText: this.text.rows, uNullText: d.nullText, uEmbed: d.embed, uPos: d.pos, uSc: sc, uTok: tok },
+      inputs: { uReg: d.registers, uText: text.rows, uNullText: d.nullText, uEmbed: d.embed, uPos: d.pos, uSc: sc, uTok: tok },
       uniforms: {
         uSeq: { int: SEQ },
         uRegisters: { int: C.registers },

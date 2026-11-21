@@ -1042,3 +1042,35 @@ test("a worker of the caller's is told the webgpu setting on every attachment, a
   const told = worker.sent.filter((m) => m.type === "configure" || m.type === "load").map(({ type, webgpu }: { type: string; webgpu?: unknown }) => (type === "load" ? type : webgpu))
   assert.deepEqual(told, [false, "load", "auto", "load"])
 })
+
+test("an image model's claim shares the budget: it unloads the least recently used text model, and a text load unloads it in turn", async () => {
+  const { pool: p } = pool()
+  await p.load(A)
+  let imageUnloads = 0
+  await p.claimExternal("image", 84, async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  })
+  assert.equal(p.isLoaded(A), false, "the text model stayed past the budget")
+  assert.equal(p.memoryUsed, 84)
+  await p.load(B)
+  assert.equal(imageUnloads, 1)
+  assert.equal(p.memoryUsed, 60)
+})
+
+test("the host's onMemoryClaim is asked for an image model's claims, and its refusal rejects the claim", async () => {
+  const asked: Array<string> = []
+  const { pool: p } = pool({
+    budget: 1000,
+    onMemoryClaim: ({ model, bytes }) => {
+      asked.push(`${model} ${bytes}`)
+      if (model === "image") throw new Error("no room for images")
+    }
+  })
+  await p.load(A)
+  await assert.rejects(p.claimExternal("image", 84, async () => undefined), /no room for images/)
+  assert.deepEqual(asked, [`${A} 60`, "image 84"])
+  // The refused model releases what it claimed (images.ts does, when its load fails).
+  p.releaseExternal("image")
+  assert.equal(p.memoryUsed, 60)
+})
