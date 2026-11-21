@@ -306,3 +306,26 @@ test("stopping a drawing gives up its claim still waiting for room", async () =>
   await assert.rejects(drawing)
   assert.equal(images.isLoaded(TESSERA), true)
 })
+
+test("a claim that arrives after its drawing was stopped is refused at once, and later drawings don't wait behind it", async () => {
+  const { images, made, claimSignals } = setup()
+  await images.load(TESSERA)
+  const worker = made[0]!
+  worker.auto = false
+  const abort = new AbortController()
+  const drawing = images.generate({ prompt: "duck", n: 4 }, { signal: abort.signal })
+  await new Promise((r) => setTimeout(r, 0))
+  const gen = worker.requests("image-generate")[0]!
+  // Stopped while the worker's claim is still on its way: the claim comes, then the worker's error.
+  abort.abort()
+  const asked = claimSignals.length
+  worker.emit({ type: "image-claim", id: gen.id, claim: 99, model: TESSERA, bytes: 130 })
+  assert.equal(claimSignals.length, asked, "the stopped drawing's claim went to the budget")
+  assert.deepEqual(worker.requests("image-claimed").at(-1), { type: "image-claimed", id: 99, refused: "its request was stopped", [WEBGLLM]: true })
+  worker.emit({ type: "image-error", id: gen.id, message: "aborted" })
+  await assert.rejects(drawing, { name: "AbortError" })
+  // The next drawing runs.
+  worker.auto = true
+  const res = await images.generate({ prompt: "duck" })
+  assert.equal(res.data.length, 1)
+})

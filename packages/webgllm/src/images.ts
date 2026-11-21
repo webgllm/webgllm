@@ -100,7 +100,9 @@ class ImageWorker {
     /** A claim the worker makes before allocating. */
     private readonly onClaim: (message: Extract<ImageResponse, { type: "image-claim" }>) => void,
     /** The worker failed: every request fails with `error`. */
-    private readonly onFail: (error: Error) => void
+    private readonly onFail: (error: Error) => void,
+    /** The worker's last answer to request `id` (done or failed): no more of its claims come. */
+    private readonly onEnd: (id: number) => void
   ) {
     worker.addEventListener("message", this.onMessage)
     worker.addEventListener("error", this.onError)
@@ -117,6 +119,7 @@ class ImageWorker {
     if (data.type === "image-claim") return void this.onClaim(data)
     const waiter = this.waiters.get(data.id)
     if (waiter?.onMessage(data)) this.waiters.delete(data.id)
+    if (data.type === "image-done" || data.type === "image-error" || data.type === "image-ready" || data.type === "image-unloaded") this.onEnd(data.id)
   }
 
   private readonly onError = (event: ErrorEvent) => {
@@ -181,6 +184,8 @@ type Entry = {
   closing: Promise<void> | null
   /** Each request's claims still waiting for room: stopping the request stops them. */
   claims: Map<number, Set<AbortController>>
+  /** Requests stopped whose worker hasn't given its last answer: a claim of theirs, even one still on its way, is refused. */
+  stopped: Set<number>
   /** GPU bytes of its weights, once loaded. */
   weightBytes: number
   engine: "webgpu" | "webgl" | null
@@ -206,8 +211,9 @@ export class Images {
     return this.unloadsOfAll + (this.unloads.get(model) ?? 0)
   }
 
-  /** Stops request `id`'s claims still waiting for room (it was stopped). */
+  /** Stops request `id`'s claims: those waiting for room, and any still on their way (it was stopped). */
   private stopClaims(entry: Entry, id: number) {
+    entry.stopped.add(id)
     for (const c of entry.claims.get(id) ?? []) c.abort(abortError())
     entry.claims.delete(id)
   }
@@ -278,6 +284,7 @@ export class Images {
       if (!entry.worker.closed) entry.worker.post({ type: "image-claimed", id: m.claim, ...(refused !== undefined && { refused }) })
     }
     if (entry.closing) return answer(`${entry.model} was unloaded`)
+    if (entry.stopped.has(m.id)) return answer("its request was stopped")
     // Given up when the request is stopped, or the model goes.
     const stop = new AbortController()
     const claims = entry.claims.get(m.id) ?? new Set<AbortController>()
@@ -357,7 +364,8 @@ export class Images {
       !this.host.worker,
       this.host.webgpu ?? "auto",
       (m) => this.claim(entry, m),
-      (error) => void this.teardown(entry, error, "crashed")
+      (error) => void this.teardown(entry, error, "crashed"),
+      (id) => void entry.stopped.delete(id)
     )
     const listeners = new Set<(progress: LoadProgress) => void>()
     this.host.dispatch("loadstart", { model })
@@ -373,6 +381,7 @@ export class Images {
       keepLoaded,
       closing: null,
       claims: new Map(),
+      stopped: new Set(),
       weightBytes: 0,
       engine: null,
       ready: Promise.resolve()

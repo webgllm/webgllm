@@ -1173,3 +1173,26 @@ test("claims overlapping, both refused (the later one first), leave what the las
   await assert.rejects(again, /no/)
   assert.equal(p.memoryUsed, 150)
 })
+
+test("keepLoaded set while an image model's claim waits for room stays once the claim goes through", async () => {
+  const { pool: p, workers } = pool({ budget: 100 })
+  await p.load(A)
+  // A generates, so making room for the image waits for it.
+  const running = p.generate(A, fields, { onToken: () => undefined })
+  await settle()
+  let imageUnloads = 0
+  const unload = () => async () => {
+    imageUnloads++
+    p.releaseExternal("image")
+  }
+  const claiming = p.claimExternal("image", 90, unload(), false)
+  await settle()
+  p.setExternalKeepLoaded("image", true)
+  const a = workers.of(A)!
+  a.finish(a.generations()[0]!.id, ["done"])
+  await running
+  await claiming
+  assert.equal(p.isLoaded(A), false)
+  await p.load(B)
+  assert.equal(imageUnloads, 0, "the image model, kept loaded, was unloaded")
+})

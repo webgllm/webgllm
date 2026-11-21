@@ -223,13 +223,18 @@ export class ModelPool {
       if (this.external.get(model) !== own) throw new WebGLLMError("model-not-loaded", `${model} was unloaded.`)
       try {
         await this.budget.claim(model, bytes, own.keepLoaded, signal)
+        // (Set while it waited for room, when the budget held no entry to set it on.)
+        this.budget.setKeepLoaded(model, own.keepLoaded)
         const hook = this.options.onMemoryClaim
         if (hook) await abortable(Promise.resolve().then(() => hook({ model, bytes, signal: signal ?? new AbortController().signal })), signal)
         own.admitted = bytes
       } catch (error) {
         if (this.external.get(model) === own) {
           if (own.admitted === undefined) this.budget.release(model)
-          else this.budget.setBytes(model, own.admitted, own.keepLoaded)
+          else {
+            this.budget.setBytes(model, own.admitted, own.keepLoaded)
+            this.budget.setKeepLoaded(model, own.keepLoaded)
+          }
         }
         throw error
       }
