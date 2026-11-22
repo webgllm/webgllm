@@ -2,7 +2,7 @@
 
 pnpm + Nx monorepo.
 
-- `packages/webgllm`: the engine, LLM inference on WebGL 2 (npm `webgllm`). Its bench pages are in `packages/webgllm/bench`.
+- `packages/webgllm`: the engine, LLM inference on WebGPU and WebGL 2 (npm `webgllm`). Its bench pages are in `packages/webgllm/bench`.
 - `apps/web`: the docs site (Fumadocs on TanStack Start), prerendered static, deployed to Cloudflare.
 
 Commands:

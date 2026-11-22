@@ -44,5 +44,8 @@ Sampling defaults come from each model card. See [Thinking](/docs/guides/thinkin
 - **Qwen3.5 2B** answers directly unless asked to think. Both builds read [images](/docs/guides/chat-and-streaming#images).
 - **LFM3-VL 2B** and **LFM2.5-VL** (3B, 1.6B, 450M) are Liquid AI's vision-language models: both builds of each read [images](/docs/guides/chat-and-streaming#images). LFM2.5-VL 450M is the smallest that does.
 - **LFM2.5 350M** is the smallest, for weak devices.
+- **Raon-1 nano** (`KRAFTON/Raon-1-nano-gguf`) isn't in the catalog but loads by name, from its Q4_K_M GGUF.
+
+For image generation, see [Image generation](/docs/guides/image-generation).
 
 Every model takes [tools](/docs/guides/tool-calling), except `LiquidAI/LFM2.5-VL-1.6B-ONNX`, whose chat template has none.

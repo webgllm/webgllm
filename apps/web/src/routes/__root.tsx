@@ -19,7 +19,7 @@ export const Route = createRootRoute({
       },
       {
         name: 'description',
-        content: 'LLM inference in the browser on WebGL 2, for devices without WebGPU.',
+        content: 'LLM inference in the browser: WebGPU where the browser has it, WebGL 2 everywhere else.',
       },
     ],
     links: [

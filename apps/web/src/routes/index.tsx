@@ -12,9 +12,12 @@ import {
   Cpu,
   Gauge,
   HardDriveDownload,
+  Layers,
   MessageSquare,
   Plug,
   ShieldCheck,
+  Sparkles,
+  Timer,
   Wrench,
 } from 'lucide-react';
 import { baseOptions } from '@/lib/layout.shared';
@@ -73,12 +76,12 @@ function Hero() {
           <h1 className="text-4xl font-semibold tracking-tight text-balance sm:text-5xl lg:text-6xl">
             LLMs in the browser,
             <br />
-            <span className="text-fd-muted-foreground">on WebGL 2.</span>
+            <span className="text-fd-muted-foreground">on WebGPU and WebGL&nbsp;2.</span>
           </h1>
           <p className="mt-6 max-w-xl text-lg text-fd-muted-foreground text-pretty">
-            WebGLLM runs LFM3, LFM2.5 and Qwen3.5 on its own WebGL 2 engine, with an
-            OpenAI-compatible API. It works where WebGPU doesn't: Firefox on Android,
-            older iPhones, and everywhere else.
+            WebGLLM runs LFM3, Qwen3.5, LFM2.5 and Raon-1 nano on its own engine, with an
+            OpenAI-compatible API. It uses WebGPU where the browser has it and WebGL 2
+            everywhere else, so it also works on Firefox for Android and older iPhones.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
@@ -201,7 +204,7 @@ function Platforms() {
     <section className="border-b bg-fd-card/40">
       <div className="mx-auto flex w-full max-w-(--fd-layout-width) flex-col items-center gap-4 px-4 py-8 md:flex-row md:justify-between md:px-6">
         <p className="text-sm text-fd-muted-foreground">
-          Needs only WebGL 2, no WebGPU and no cross-origin isolation.
+          WebGPU where the browser has it, WebGL 2 everywhere else. No cross-origin isolation.
         </p>
         <ul className="flex flex-wrap justify-center gap-2">
           {platforms.map((name) => (
@@ -226,10 +229,16 @@ const features = [
       'chat.completions.create with streaming, images, logprobs, stop sequences, seeds, usage and timings. Unsupported fields throw instead of being ignored.',
   },
   {
+    icon: <Layers />,
+    title: 'WebGPU, with WebGL 2 behind it',
+    description:
+      'Models run on WebGPU where the browser has it, and on the same kernels on WebGL 2 where it doesn\'t. webgpu: false keeps them on WebGL 2.',
+  },
+  {
     icon: <Gauge />,
     title: 'Keeps the page smooth',
     description:
-      'Each model runs in its own Web Worker on an OffscreenCanvas, with big passes split into bands, so the page keeps painting while it reads and writes.',
+      'Each model runs in its own Web Worker, with big passes split into bands, so the page keeps painting while it reads and writes.',
   },
   {
     icon: <HardDriveDownload />,
@@ -265,7 +274,19 @@ const features = [
     icon: <Cpu />,
     title: 'GGUF and ONNX',
     description:
-      'Reads regular GGUF and ONNX builds from Hugging Face into the same 4-bit weights. No special web builds needed.',
+      'Reads regular GGUF and ONNX builds from Hugging Face into the same quantized weights. No special web builds needed.',
+  },
+  {
+    icon: <Timer />,
+    title: 'Speed before download',
+    description:
+      'predictSpeed times a model\'s layers on this GPU with random weights, so you can choose local or cloud before anything downloads.',
+  },
+  {
+    icon: <Sparkles />,
+    title: 'Pixel-art sprites',
+    description:
+      'images.generate draws 16 × 16 sprites from a prompt with Tessera-small, shaped like OpenAI\'s Images API.',
   },
   {
     icon: <ShieldCheck />,
@@ -281,7 +302,7 @@ function Features() {
       <SectionHeading
         eyebrow="Features"
         title="Everything you need to ship a local model"
-        description="A familiar API on top of an engine written for WebGL 2 from the ground up."
+        description="A familiar API on top of an engine written for the browser's GPU from the ground up."
       />
       <Cards className="mt-12 lg:grid-cols-3">
         {features.map((feature) => (
@@ -323,6 +344,29 @@ const models = [
       'LiquidAI/LFM2.5-350M-GGUF',
     ],
   },
+  {
+    name: 'LFM3-VL and LFM2.5-VL',
+    vendor: 'Liquid AI',
+    note: '450M to 3B',
+    description: 'Vision-language models. Both builds of each read images.',
+    ids: ['LiquidAI/LFM3-VL-2B-GGUF', 'LiquidAI/LFM2.5-VL-1.6B-GGUF', 'LiquidAI/LFM2.5-VL-450M-GGUF'],
+  },
+  {
+    name: 'Raon-1 nano',
+    vendor: 'KRAFTON',
+    note: 'GGUF',
+    description:
+      'Delta attention and latent attention over several residual streams, with per-layer embeddings read from storage.',
+    ids: ['KRAFTON/Raon-1-nano-gguf'],
+  },
+  {
+    name: 'Tessera-small',
+    vendor: 'TheJagStudio',
+    note: 'Images',
+    description:
+      '16 × 16 pixel-art sprites from a prompt, through images.generate. CC BY-NC 4.0: non-commercial use only.',
+    ids: ['cfahlgren1/tessera-small-onnx'],
+  },
 ];
 
 function Models() {
@@ -332,7 +376,7 @@ function Models() {
         <SectionHeading
           eyebrow="Models"
           title="Small models, loaded straight from Hugging Face"
-          description="Pass a repository name as the model. 4-bit weights, quantization-aware trained where the vendor ships them."
+          description="Pass a repository name as the model. Regular GGUF and ONNX builds, quantization-aware trained where the vendor ships them."
         />
         <div className="mt-12 grid gap-4 md:grid-cols-3">
           {models.map((model) => (

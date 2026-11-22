@@ -10,7 +10,7 @@ webgllm needs:
 - WebGL 2 with float render targets (`EXT_color_buffer_float`)
 - OffscreenCanvas in workers
 
-Current Chrome, Firefox and Safari have both, on desktop and mobile. WebGPU isn't needed.
+Current Chrome, Firefox and Safari have both, on desktop and mobile. WebGPU isn't needed, but models run on it where the browser has it (see [WebGPU or WebGL 2](/docs/guides/webgpu-and-speed)).
 
 ```ts
 if (!WebGLLM.isSupported()) {
@@ -36,7 +36,7 @@ Phones have the least room. iOS Safari ends a tab that uses about 2 GB, so load 
 
 ## Limitations
 
-- Images only on models with a vision encoder (Qwen3.5's ONNX builds; `supports.images` in `models.list()`). Images for other models, and audio, throw `unsupported-parameter`.
+- Images only on models with a vision encoder (Qwen3.5, LFM3-VL and LFM2.5-VL, in their GGUF and ONNX builds; `supports.images` in `models.list()`). Images for other models, and audio, throw `unsupported-parameter`.
 - One completion per request (`n` is 1).
 - Generations run one at a time, across all models.
 - Only the architectures webgllm runs load: LFM2, LFM2.5, LFM3 and Qwen3.5, as a GGUF or an ONNX export, and Raon-1 nano as a GGUF. See [Models](/docs/models).

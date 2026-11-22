@@ -5,6 +5,8 @@
     "thinking",
     "tool-calling",
     "structured-output",
+    "image-generation",
+    "webgpu-and-speed",
     "events-and-errors",
     "sharing-memory"
   ]

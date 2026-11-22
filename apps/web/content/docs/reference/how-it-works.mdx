@@ -5,17 +5,19 @@ description: Workers, weights, kernels and caching.
 
 ## Workers
 
-Each loaded model runs in its own Web Worker on an OffscreenCanvas, and each `chat.completions.create` call is one generation there. The page's main thread stays free. webgllm starts the workers, and ends one to free its model; given a [worker of your own](/docs/reference/webgllm#a-worker-of-your-own), it runs one model in that worker and never ends it.
+Each loaded model runs in its own Web Worker, and each `chat.completions.create` call is one generation there. The page's main thread stays free. webgllm starts the workers, and ends one to free its model at once when it's unloaded; given a [worker of your own](/docs/reference/webgllm#a-worker-of-your-own), it runs one model in that worker and never ends it.
 
 The worker downloads the files to the Origin Private File System, resuming a dropped download. It then streams the weights from there into textures one layer at a time, so a model is never all in JavaScript memory.
 
 ## Weights
 
-The GGUF and ONNX loaders read either format into the same weights: 4-bit blocks of 32, in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. The GGUF's Q6_K embedding (also the output head) is read natively in the shader, so its weights are exactly llama.cpp's. Only tensors are read from the ONNX graph; its ops aren't run.
+The GGUF and ONNX loaders read either format into the same weights: 4-bit blocks of 32, in llama.cpp's Q4_0 order, with zero points where the ONNX build has them. A GGUF's Q4_K matrices keep their 4 bits and its Q8_0 ones their 8. The GGUF's Q6_K embedding (also the output head) is read natively in the shader, so its weights are exactly llama.cpp's. Only tensors are read from the ONNX graph; its ops aren't run.
 
 ## Kernels
 
-Every op is a fragment-shader pass, one output texel per fragment: RMSNorm, the short convolutions, attention over a half-precision cache, SwiGLU, and Qwen3.5's Gated DeltaNet recurrence. Matmuls read weights from byte textures and activations as packed halves.
+Every op is a fragment-shader pass, one output texel per fragment: RMSNorm, the short convolutions, attention over a half-precision cache, SwiGLU, Qwen3.5's Gated DeltaNet recurrence, and Raon-1 nano's delta and latent attention. Matmuls read weights from byte textures and activations as packed halves.
+
+On WebGPU, the same kernels are translated into compute shaders, so one set runs on both backends. Where a chain of passes costs more as separate dispatches, kernels written for WebGPU take its place, among them matmuls that read weights from storage buffers. Which ones run is chosen by timing them on the device at load, not by GPU name.
 
 Prompts are read 512 tokens at a time, and big passes are split into bands of rows to stay under mobile GPUs' watchdogs.
 
@@ -27,11 +29,13 @@ With top-k, the GPU applies the repetition penalty and narrows the logits down t
 
 A follow-up reads only what's new. The attention cache rewinds to any position, and the models' recurrent and convolution states are saved at points a follow-up can resume from.
 
+Each model also keeps the system prompts (with their tools) it has read, in GPU memory and on disk, so a request that starts with one it read before reads only the rest, even after a page reload (`promptCacheBytes`, `promptCacheDiskBytes`).
+
 The cache starts small and grows as a chat does, up to the loaded context length. Long contexts are read in segments.
 
 ## Images
 
-A model with a vision encoder (Qwen3.5's ONNX builds) reads an image in passes of its own, once per image. The encoder downloads with the first request that has an image, is loaded on the GPU only while a request's new images are encoded, and is freed after them, so text chats never pay for it.
+A model with a vision encoder (Qwen3.5, LFM3-VL and LFM2.5-VL, in their GGUF and ONNX builds) reads an image in passes of its own, once per image. The encoder downloads with the first request that has an image, is loaded on the GPU only while a request's new images are encoded, and is freed after them, so text chats never pay for it.
 
 The encoder's output rows take the place of the image tokens' embeddings in the prompt. They are kept for a few recent images, and the prompt cache tells images apart by their content, so a follow-up about an image already in the chat reads only the new turn. The repository's [vision notes](https://github.com/webgllm/webgllm/blob/main/packages/webgllm/docs/vision.md) have the details.
 

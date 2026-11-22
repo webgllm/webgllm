@@ -43,6 +43,8 @@ await webgllm.models.delete(id)  // remove a model's files from storage
 await webgllm.unloadModel(id)    // free its GPU memory (no argument: all)
 ```
 
+Unloading frees the model's memory at once: webgllm ends the model's worker (and starts a spare for the next load).
+
 ## Cancelling a load
 
 ```ts

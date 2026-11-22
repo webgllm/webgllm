@@ -1,0 +1,43 @@
+---
+title: Image generation
+description: Draw 16 × 16 pixel-art sprites with Tessera-small.
+---
+
+`images.generate` draws 16 × 16 pixel-art sprites from a prompt with [Tessera-small](https://huggingface.co/thejagstudio/tessera-small), by Jagrat Patel (TheJagStudio). It's shaped like OpenAI's Images API.
+
+<Callout type="warn">
+  Tessera-small is licensed CC BY-NC 4.0: non-commercial use only. Its text encoder, OpenAI's CLIP ViT-B/32, is MIT.
+</Callout>
+
+```ts
+const { data, seed } = await webgllm.images.generate({
+  prompt: "rubber duck",
+  n: 4, //                     1 to 8, drawn together (1 by default)
+  seed: 7, //                  the same seed, prompt and GPU draw the same sprites (random by default)
+  size: "128x128", //          a PNG's size: 16x16 (the default), or a multiple, each pixel repeated
+  response_format: "b64_json" // base64 PNGs (the default); "rgba": the 16 × 16 pixels, 4 bytes each
+})
+```
+
+`steps` (16 by default) and `guidance_scale` (3) tune Tessera's own sampler: masked diffusion with classifier-free guidance.
+
+## Loading
+
+The model is the int8 ONNX build in [`cfahlgren1/tessera-small-onnx`](https://huggingface.co/cfahlgren1/tessera-small-onnx). It downloads the first time (115 MB), with the usual `progress` events. Load it ahead of time, or free it, as you would a text model:
+
+```ts
+await webgllm.loadModel("cfahlgren1/tessera-small-onnx")
+await webgllm.unloadModel("cfahlgren1/tessera-small-onnx")
+```
+
+It runs on webgllm's own engine: WebGPU where the browser has it, else WebGL 2. A load checks the GPU against the model's self-test and falls back from WebGPU to WebGL 2 if it doesn't pass.
+
+## Memory
+
+The weights stay int8 on the GPU (84 MB). Drawing 1 sprite takes 36 MB more, 4 sprites 140 MB; the response's `memory` says how much.
+
+Tessera shares the [memory budget](/docs/guides/loading-models#several-models) with text models: loading it can unload the least recently used text model, and a text model can unload Tessera unless it was loaded with `keepLoaded: true`. [`onMemoryClaim`](/docs/guides/sharing-memory) is asked before each allocation, and a refusal fails the load or the drawing.
+
+## Speed
+
+On an M3 Ultra in Chrome, 1 sprite takes about 0.3 s on WebGPU and 0.6 s on WebGL 2; 4 sprites about 0.7 s and 1 s.

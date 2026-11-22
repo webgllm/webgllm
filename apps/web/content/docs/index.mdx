@@ -1,10 +1,10 @@
 ---
 title: Introduction
-description: LLM inference in the browser on WebGL 2, with an OpenAI-compatible API.
+description: LLM inference in the browser on WebGPU and WebGL 2, with an OpenAI-compatible API.
 icon: Rocket
 ---
 
-WebGLLM runs language models in the browser on its own WebGL 2 engine, in a Web Worker. It works where WebGPU doesn't: Firefox on Android, older iPhones, and everywhere else. Its API follows OpenAI's Chat Completions.
+WebGLLM runs language models in the browser on its own engine, in a Web Worker. It uses WebGPU where the browser has it and WebGL 2 everywhere else, so it also works where WebGPU doesn't: Firefox on Android and older iPhones. Its API follows OpenAI's Chat Completions, and it can also draw [pixel-art sprites](/docs/guides/image-generation).
 
 ```ts
 import { WebGLLM } from "webgllm"
@@ -24,6 +24,6 @@ The package is in early development (0.x); the API may change.
 <Cards>
   <Card title="Quickstart" href="/docs/quickstart" description="Install it and run your first chat." />
   <Card title="Requirements" href="/docs/requirements" description="Browsers, devices and memory." />
-  <Card title="Models" href="/docs/models" description="LFM3, LFM2.5 and Qwen3.5, as GGUF or ONNX." />
+  <Card title="Models" href="/docs/models" description="LFM3, Qwen3.5, LFM2.5, Raon-1 nano and the VL models, as GGUF or ONNX." />
   <Card title="API reference" href="/docs/reference/webgllm" description="WebGLLM, its options and methods." />
 </Cards>

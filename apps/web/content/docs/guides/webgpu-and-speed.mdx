@@ -1,0 +1,37 @@
+---
+title: WebGPU, WebGL 2 and speed
+description: Which GPU API models run on, and how fast a model would run here before it downloads.
+---
+
+## WebGPU or WebGL 2
+
+Models run on WebGPU where the browser has it, and on WebGL 2 elsewhere: no `navigator.gpu`, no adapter, or a model WebGPU fails to load. Both run the same kernels, written once and translated into compute shaders for WebGPU.
+
+`webgpu: false` keeps models on WebGL 2 even where there's WebGPU. It takes only `"auto"` (the default) or `false`, and applies to the models the instance loads from then on.
+
+```ts
+const webgllm = new WebGLLM({ webgpu: false })
+```
+
+## Predicting speed
+
+`predictSpeed` says how fast a model would read prompts and write on this device before its weights download, so an app can choose to run it here or in the cloud.
+
+```ts
+import { predictSpeed } from "webgllm"
+
+// Prompt speed only, sooner: enough to decide whether to download the model.
+const { prompt } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF", { decode: false })
+const downloadLocal = prompt >= 300
+
+// Prompt and writing speed.
+const { prompt: p, decode } = await predictSpeed("LiquidAI/LFM3-1.7B-GGUF")
+```
+
+`prompt` is tokens read per second. `decode` is tokens written per second, one at a time, and is absent with `decode: false`.
+
+It reads the model's shapes (a GGUF's header, or an ONNX model's graph and config), runs one layer of each kind the model has with random weights through the engine's own passes on this GPU, and scales that to the whole model. It measures on the backend a model would run on: WebGPU where the browser has it, else WebGL 2, or WebGL 2 with `webgpu: false`.
+
+It's a quick guess, not a benchmark. The answer is remembered per GPU, browser, backend, model and webgllm version, so later calls return at once; `force: true` measures again, and `signal` aborts. Call it while no model is loading or answering, since they share the GPU.
+
+The first call for LFM3 1.7B, prompt only, takes about 0.2 s on an M3 Ultra (Chrome), 0.3 to 0.9 s on an iPad Pro M4 (Safari), and 1.3 to 1.9 s on a Pixel 10 Pro.

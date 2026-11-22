@@ -1,6 +1,6 @@
 # WebGLLM
 
-LLM inference in the browser on WebGL 2, for devices without WebGPU.
+LLM inference in the browser, with an OpenAI-compatible API: WebGPU where the browser has it, WebGL 2 everywhere else.
 
 - [`packages/webgllm`](packages/webgllm): the engine, published to npm as [`webgllm`](https://www.npmjs.com/package/webgllm).
 - [`apps/web`](apps/web): the docs site, [webgllm.dev](https://webgllm.dev). Fumadocs on TanStack Start, prerendered to static HTML.
