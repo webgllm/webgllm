@@ -1,6 +1,41 @@
 import assert from "node:assert/strict"
 import { describe, test } from "node:test"
-import { DraftPolicy, draftTimes, lookupDraft } from "./draft.js"
+import { DraftPolicy, draftTimes, longestDraft, lookupDraft } from "./draft.js"
+
+describe("longestDraft", () => {
+  test("follows the longest match, where lookupDraft follows the latest", () => {
+    // 1 2 3 4 5 [6 7] ... 9 2 3 4 5 [8] ... 1 2 3 4 5
+    const tokens = [1, 2, 3, 4, 5, 6, 7, 9, 2, 3, 4, 5, 8, 1, 2, 3, 4, 5]
+    assert.deepEqual(lookupDraft(tokens, 2, 2), [8, 1])
+    assert.deepEqual(longestDraft(tokens, 2, 2), [6, 7])
+  })
+
+  test("the latest of equally long matches wins", () => {
+    assert.deepEqual(longestDraft([1, 2, 7, 1, 2, 8, 1, 2], 1, 2), [8])
+  })
+
+  test("an n-token match drafts at most 2^(n-1) tokens, and at most max", () => {
+    assert.deepEqual(longestDraft([3, 4, 5, 6, 7, 1, 3, 4], 8), [5, 6])
+    assert.deepEqual(longestDraft([9, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4], 3), [5, 6, 7])
+  })
+
+  test("nothing below minMatch, nothing with max 0, nothing without a match", () => {
+    assert.deepEqual(longestDraft([2, 5, 3, 2], 4, 2), [])
+    assert.deepEqual(longestDraft([2, 5, 3, 2], 4, 1), [5])
+    assert.deepEqual(longestDraft([1, 2, 3, 1, 2, 3], 0), [])
+    assert.deepEqual(longestDraft([1, 2, 3], 4), [])
+    assert.deepEqual(longestDraft([1], 4), [])
+  })
+
+  test("an overlapping match drafts up to the end of the text", () => {
+    assert.deepEqual(longestDraft([1, 2, 1, 2], 8, 2), [1, 2])
+  })
+
+  test("a match stops growing at `longest`", () => {
+    const run = [1, 2, 3, 4, 5, 6]
+    assert.deepEqual(longestDraft([...run, 7, 0, ...run], 1, 1, 3), [7])
+  })
+})
 
 describe("DraftPolicy.watch", () => {
   const remembered = () => {

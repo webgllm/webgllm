@@ -11,6 +11,7 @@
  */
 import { blobSource, httpSource } from "../src/byte-source.js"
 import { Engine, TUNING } from "../src/engine.js"
+import { WebGpu } from "../src/gpu/webgpu.js"
 import { names } from "./memory-names.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
@@ -26,7 +27,7 @@ import type { ByteSource } from "../src/weights.js"
 type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
-  mode: "chat" | "ab" | "prefix"
+  mode: "chat" | "ab" | "prefix" | "draft" | "kv8"
   /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
@@ -48,6 +49,8 @@ type Params = {
   cdp: boolean
   /** chat: print every texture group at each checkpoint, not just the totals. */
   detail: boolean
+  /** Run on WebGPU (?webgpu=1); WebGL 2 otherwise. */
+  webgpu: boolean
 }
 
 const MiB = 2 ** 20
@@ -229,6 +232,7 @@ function applyTune(spec: string) {
 
 async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>, batch: number) {
   const engine = new Engine(new OffscreenCanvas(1, 1), {
+    ...(params.webgpu && { gpu: await WebGpu.create() }),
     batchSize: batch || params.batch || (TUNING.promptBatch > 0 ? TUNING.promptBatch : 512),
     ...(params.contextLength && { contextLength: params.contextLength })
   })
@@ -451,6 +455,194 @@ async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>
   }
 }
 
+/**
+ * ?mode=draft: draft batches cut back to every prefix against the same
+ * tokens read one at a time: the batch's kept rows, then six tokens read
+ * after `accept`, which only match if the state went back correctly; and
+ * two draft batches in a row, each cut short.
+ */
+async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    if (!engine.canDraft) throw new Error("This model reads no draft batches (tune=linearDrafts:1 for Gated DeltaNet).")
+    const { tokenizer } = got
+    const content = padded(tokenizer, [], "Tell me a short story about the mill, in a few paragraphs.", params.length + 32, false)
+    const all = Array.from(tokenizer.encodeChat([{ role: "user", content }], { addGenerationPrompt: true, enableThinking: false }))
+    const prompt = all.slice(0, -32)
+    const rest = all.slice(-32)
+    const distribution = (logits: Float32Array) => {
+      let max = -Infinity
+      for (const l of logits) if (l > max) max = l
+      const p = new Float64Array(logits.length)
+      let sum = 0
+      for (let i = 0; i < p.length; i++) sum += p[i] = Math.exp(logits[i] - max)
+      for (let i = 0; i < p.length; i++) p[i] /= sum
+      return p
+    }
+    const argmax = (x: ArrayLike<number>) => {
+      let at = 0
+      for (let i = 1; i < x.length; i++) if (x[i] > x[at]) at = i
+      return at
+    }
+    engine.reset()
+    await engine.forwardHidden(prompt)
+    const want: Array<Float64Array> = []
+    const wantTop: Array<number> = []
+    for (const token of rest) {
+      const logits = await engine.logits(await engine.forwardHidden([token]))
+      want.push(distribution(logits))
+      wantTop.push(argmax(logits))
+    }
+    let worst = 0
+    let compared = 0
+    let same = 0
+    const check = async (row: number, at: number) => {
+      const logits = await engine.logits(row)
+      const p = want[at]
+      const q = distribution(logits)
+      let kl = 0
+      for (let i = 0; i < p.length; i++) if (p[i] > 1e-12) kl += p[i] * Math.log(p[i] / Math.max(q[i], 1e-30))
+      if (!(kl <= worst)) worst = kl
+      compared++
+      if (argmax(logits) === wantTop[at]) same++
+    }
+    const before = engine.gpu.bytes
+    let cases = 0
+    for (const n of [2, 3, 4, 5, 8]) {
+      for (let keep = 1; keep < n; keep++) {
+        engine.reset()
+        await engine.forwardHidden(prompt)
+        const last = await engine.forwardHidden(rest.slice(0, n), { draft: true })
+        for (let r = 0; r < keep; r++) await check(last - n + 1 + r, r)
+        engine.accept(keep)
+        for (let at = keep; at < keep + 6; at++) await check(await engine.forwardHidden([rest[at]]), at)
+        cases++
+      }
+    }
+    engine.reset()
+    await engine.forwardHidden(prompt)
+    await engine.forwardHidden(rest.slice(0, 5), { draft: true })
+    engine.accept(2)
+    const last = await engine.forwardHidden(rest.slice(2, 7), { draft: true })
+    for (let r = 0; r < 3; r++) await check(last - 4 + r, 2 + r)
+    engine.accept(3)
+    for (let at = 5; at < 11; at++) await check(await engine.forwardHidden([rest[at]]), at)
+    cases++
+    log(
+      `DRAFT CHECK ${params.model} (${prompt.length}-token prompt, ${cases} cut-short batches, ${compared} rows): worst KL ${worst.toExponential(2)}, same top token ${same}/${compared}, draft rows ${mib(engine.gpu.bytes - before)} MiB`
+    )
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
+/**
+ * ?mode=kv8: what an 8-bit KV cache would cost in quality, before building
+ * one. A real document is read in batches of 256 and then 32 tokens one at
+ * a time, the cache's keys and values rounded after each to int8 with a
+ * scale per 32 values (llama.cpp's Q8_0), against the same run at f16. The
+ * cache stays f16 here: no memory is saved and a token's own batch reads
+ * its keys unrounded, so this is a lower bound on the error.
+ */
+async function kv8Check(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    const layers = (engine as unknown as { layers: Array<{ attention?: { kv: Texture } }> }).layers
+    const { tokenizer } = got
+    const doc = await (await fetch("/README.md")).text()
+    const ids = Array.from(tokenizer.encodeChat(
+      [{ role: "user", content: doc.slice(0, (params.length + 64) * 8) }],
+      { addGenerationPrompt: false, enableThinking: false }
+    ))
+    if (ids.length < params.length + 32) throw new Error(`The document is only ${ids.length} tokens.`)
+    const prompt = ids.slice(0, params.length)
+    const steps = Math.max(32, params.reply)
+    const rest = ids.slice(params.length, params.length + steps)
+    // Halves per cache row: the keys, then the values.
+    const rowHalves = (engine as unknown as { kvWidth(): number }).kvWidth() * 8
+    const round = async (part: string) => {
+      for (const layer of layers) {
+        const kv = layer.attention?.kv
+        if (!kv) continue
+        const bytes = (await engine.gpu.readBytes(kv)).slice()
+        const halves = new (globalThis as unknown as { Float16Array: new (b: ArrayBuffer) => Float32Array }).Float16Array(bytes.buffer as ArrayBuffer)
+        for (let b = 0; b + 32 <= halves.length; b += 32) {
+          const isKey = b % rowHalves < rowHalves / 2
+          if ((part === "keys" && !isKey) || (part === "values" && isKey)) continue
+          let most = 0
+          for (let i = b; i < b + 32; i++) {
+            const a = Math.abs(halves[i])
+            if (Number.isFinite(a) && a > most) most = a
+          }
+          if (most === 0) continue
+          const step = most / 127
+          for (let i = b; i < b + 32; i++) if (Number.isFinite(halves[i])) halves[i] = Math.round(halves[i] / step) * step
+        }
+        engine.gpu.write(kv, { x: 0, y: 0, width: kv.width, height: kv.height }, {
+          format: 0x8d99, // RGBA_INTEGER
+          type: 0x1405, // UNSIGNED_INT
+          pixels: new Uint32Array(bytes.buffer as ArrayBuffer)
+        })
+      }
+    }
+    const read = async (part: string | null) => {
+      engine.reset()
+      const out: Array<Float32Array> = []
+      let row = 0
+      for (let at = 0; at < prompt.length; at += 256) {
+        row = await engine.forwardHidden(prompt.slice(at, at + 256), { fullRows: true })
+        if (part) await round(part)
+      }
+      out.push((await engine.logits(row)).slice())
+      for (const token of rest) {
+        out.push((await engine.logits(await engine.forwardHidden([token]))).slice())
+        if (part) await round(part)
+      }
+      return out
+    }
+    const compare = (a: Array<Float32Array>, b: Array<Float32Array>) => {
+      const dist = (l: Float32Array) => {
+        let max = -Infinity
+        for (const v of l) if (v > max) max = v
+        const p = new Float64Array(l.length)
+        let sum = 0
+        for (let i = 0; i < p.length; i++) sum += p[i] = Math.exp(l[i] - max)
+        for (let i = 0; i < p.length; i++) p[i] /= sum
+        return p
+      }
+      const top = (l: Float32Array) => {
+        let at = 0
+        for (let i = 1; i < l.length; i++) if (l[i] > l[at]) at = i
+        return at
+      }
+      let worst = 0
+      let total = 0
+      let same = 0
+      for (let r = 0; r < a.length; r++) {
+        const p = dist(a[r])
+        const q = dist(b[r])
+        let kl = 0
+        for (let i = 0; i < p.length; i++) if (p[i] > 1e-12) kl += p[i] * Math.log(p[i] / Math.max(q[i], 1e-30))
+        total += kl
+        worst = Math.max(worst, kl)
+        if (top(a[r]) === top(b[r])) same++
+      }
+      return `mean KL ${(total / a.length).toExponential(2)}, worst ${worst.toExponential(2)}, same top token ${same}/${a.length}`
+    }
+    const plain = await read(null)
+    const again = await read(null)
+    log(`KV8 CHECK ${params.model} (${prompt.length} tokens + ${rest.length} steps): f16 against itself ${compare(plain, again)}`)
+    for (const part of ["keys", "values", "both"])
+      log(`KV8 CHECK ${params.model} (${prompt.length} tokens + ${rest.length} steps): int8 ${part} against f16 ${compare(plain, await read(part))}`)
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
 async function run(params: Params) {
   if (params.cdp) {
     // The GPU process before any of this page's textures: what the
@@ -464,5 +656,7 @@ async function run(params: Params) {
   const got = await files(params.model)
   if (params.mode === "ab") await ab(params, got)
   else if (params.mode === "prefix") await prefixCheck(params, got)
+  else if (params.mode === "draft") await draftCheck(params, got)
+  else if (params.mode === "kv8") await kv8Check(params, got)
   else await chat(params, got)
 }

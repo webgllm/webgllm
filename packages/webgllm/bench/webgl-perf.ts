@@ -509,6 +509,28 @@ async function run() {
     length = Number(params.get("len") ?? 512)
   const filler =
     "The river runs past the old mill, where the miller's daughter counts sacks of grain each morning before the market opens in the square. "
+  // ?ask=copy's passage: long enough that a 160-token reply is all copying.
+  const COPY_PASSAGE =
+    "Marta, the north sluice sticks again, so open it by hand before six and grease the iron pin twice. " +
+    "Tomas owes us for eleven sacks of rye and four of barley; take his payment in coin, not in eggs. " +
+    "The cooper will bring two new barrels on Thursday, and the old one with the split stave goes to the smith for its hoops. " +
+    "If the water rises past the third mark on the post, stop the wheel, lift the gate, and send the boy to warn the Hallers downstream. " +
+    "Keep the good flour on the top shelf, away from the damp wall, and count the mousetraps when you sweep. " +
+    "Your aunt arrives on the Saturday cart with the seed potatoes; give her the room over the kitchen and do not let her pay for anything. " +
+    "I will be back from the fair by the new moon, with the millstone dresser if he will come, and with ribbon for you if he will not."
+  // ?ask=edit's file: similar blocks, so a rewrite repeats most of it and the
+  // latest match of a few tokens is often another block's.
+  const EDIT_SOURCE = ["rye", "barley", "oats", "wheat", "millet", "spelt"].map((grain, i) => `export function ${grain}Report(sacks: Array<Sack>, prices: PriceTable) {
+  let amount = 0
+  const seen = new Set<string>()
+  for (const sack of sacks) {
+    if (sack.grain !== "${grain}" || seen.has(sack.id)) continue
+    seen.add(sack.id)
+    amount += sack.weight * prices.${grain} * ${(1 + i / 10).toFixed(1)}
+  }
+  if (amount > ${(i + 2) * 100}) log("${grain}: a large order", amount)
+  return { grain: "${grain}", amount, sacks: seen.size }
+}`).join("\n\n")
   const settle = Number(params.get("afterLoadMs") ?? 0)
   if (settle > 0) {
     begin("settle")
@@ -538,7 +560,9 @@ async function run() {
           {
             role: "user",
             // TEMP: ?ask=copy has the reply repeat a passage from the prompt (a quoting / summarizing style reply).
-            content: params.get("ask") === "copy"
+            content: params.get("ask") === "edit"
+              ? `Trial ${params.get("same") === "1" ? 0 : i}.\n\n\`\`\`ts\n${EDIT_SOURCE}\n\`\`\`\n\nRewrite this whole file with every \`amount\` renamed to \`total\`. Change nothing else. Output only the code.`
+              : params.get("ask") === "copy"
               ? `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nHere is a note from the miller:\n"${COPY_PASSAGE}"\nRepeat the miller's note exactly, word for word.`
               : `Trial ${params.get("same") === "1" ? 0 : i}.\n${filler.repeat(Math.ceil(length / 29))}\nDescribe the river scene in a detailed paragraph.`
           }
@@ -548,7 +572,7 @@ async function run() {
         sampling: {
           temperature: Number(params.get("temperature") ?? 0),
           top_k: Number(params.get("topk") ?? 1),
-          repetition_penalty: params.get("rp") ? Number(params.get("rp")) : params.get("ask") === "copy" ? 1 : 1.1
+          repetition_penalty: params.get("rp") ? Number(params.get("rp")) : params.get("ask") ? 1 : 1.1
         },
         maxTokens: Number(params.get("tokens") ?? 64),
         pipeline: params.get("pipeline") !== "0",

@@ -40,6 +40,40 @@ export function lookupDraft(
 }
 
 /**
+ * lookupDraft from the earlier occurrence that matches the most last tokens
+ * (up to `longest`; the latest of equally long ones), not the latest one
+ * that matches 4: in repeated code, the latest few matching tokens are
+ * often another copy's boilerplate.
+ */
+export function longestDraft(
+  tokens: ArrayLike<number>,
+  max: number,
+  minMatch = 1,
+  longest = 32
+): Array<number> {
+  const end = tokens.length
+  if (max <= 0 || end < 2) return []
+  const last = tokens[end - 1]
+  let best = 0
+  let from = -1
+  for (let next = end - 1; next >= 1; next--) {
+    if (tokens[next - 1] !== last) continue
+    let n = 1
+    while (n < longest && next - 1 - n >= 0 && tokens[next - 1 - n] === tokens[end - 1 - n]) n++
+    if (n > best) {
+      best = n
+      from = next
+      if (n === longest) break
+    }
+  }
+  if (best < Math.max(1, minMatch)) return []
+  const most = Math.min(max, 2 ** Math.min(best - 1, 30))
+  const out: Array<number> = []
+  for (let i = from; i < end && out.length < most; i++) out.push(tokens[i])
+  return out
+}
+
+/**
  * How many drafts to check with each written token, from what they've
  * cost and earned so far in this reply: the count that writes the most
  * tokens per millisecond, expected tokens 1 + a₁ + a₁a₂ + … over the

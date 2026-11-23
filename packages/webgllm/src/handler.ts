@@ -23,7 +23,7 @@ import { repackTime } from "./repack.js"
 import type { ModelFile } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { DraftPolicy, draftTimes, lookupDraft, type DraftTimes } from "./draft.js"
+import { DraftPolicy, draftTimes, longestDraft, lookupDraft, type DraftTimes } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
 import { download, incumbentGpuTuning, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
@@ -1541,10 +1541,12 @@ async function generate(request: GenerateRequest) {
   const policy = new DraftPolicy(DRAFTS, undefined, undefined, undefined, undefined, costs)
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
+  const lookup = (max: number) =>
+    untilCallEnd((TUNING.draftLongest > 0 ? longestDraft : lookupDraft)(history, max, TUNING.draftMatch))
   const draftsFor = (max: number) => {
-    // (Gated DeltaNet models read one token at a time: see Engine.canDraft.)
+    // (Not every model reads draft batches: see Engine.canDraft.)
     if (request.speculative === false || max <= 0 || !engine.canDraft) return []
-    const found = untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
+    const found = lookup(max)
     return found.slice(0, policy.choose(found))
   }
   // Whether a draft batch would follow. If not, the drafts found are still
@@ -1552,7 +1554,7 @@ async function generate(request: GenerateRequest) {
   // guesses all hit would otherwise never learn that its drafts are right.
   const draftsNext = () => {
     if (request.speculative === false || !engine.canDraft) return false
-    const found = untilCallEnd(lookupDraft(history, DRAFTS, TUNING.draftMatch))
+    const found = lookup(DRAFTS)
     const next = found.length > 0 && policy.peek(found) > 0
     if (!next) policy.watch(found)
     return next
