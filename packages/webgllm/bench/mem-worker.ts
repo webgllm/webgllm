@@ -459,8 +459,24 @@ async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>
  * ?mode=draft: draft batches cut back to every prefix against the same
  * tokens read one at a time: the batch's kept rows, then six tokens read
  * after `accept`, which only match if the state went back correctly; and
- * two draft batches in a row, each cut short.
+ * two draft batches in a row, each cut short. Fails (an ERROR line) on a
+ * row whose KL is past DRAFT_KL_MAX or isn't a number, and on a shader
+ * compiled in a draft batch after its passes were prepared.
  */
+/**
+ * The most a row of a cut-short batch may differ from reading its tokens one
+ * at a time (KL): batches round differently, up to 1e-3 on the GPUs measured
+ * (an M3 Ultra, a Pixel 10 Pro); a state that went back wrong measured 1.1.
+ */
+const DRAFT_KL_MAX = 1e-2
+
+/** A compiled shader's source in a few words: its variant key, if it has one, and the textures it reads. */
+function shaderLabel(source: string) {
+  const lines = source.split("\n")
+  const key = lines[0].includes("|") || lines[0].startsWith("native") || lines[0].startsWith("merged") ? `${lines[0].slice(0, 60)} ` : ""
+  const samplers = lines.filter((l) => /^uniform \S*sampler/.test(l)).map((l) => l.replace(/^uniform \S+ (\w+);.*/, "$1"))
+  return `${key}[${samplers.join(",")}] ${source.length}`
+}
 async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>) {
   applyTune(params.tune)
   const { engine } = await loadEngine(params, got, 0)
@@ -509,7 +525,8 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
       if (argmax(logits) === wantTop[at]) same++
     }
     // Compiling the draft passes between tokens leaves the cache and state as they were.
-    if (!engine.draftsReady) {
+    const prepared = !engine.draftsReady
+    if (prepared) {
       engine.reset()
       await engine.forwardHidden(prompt)
       for (let at = 0; at < 3; at++) await check(await engine.forwardHidden([rest[at]]), at)
@@ -518,6 +535,17 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
       while (engine.draftsCompiling) await new Promise((r) => setTimeout(r, 10))
     }
     const before = engine.gpu.bytes
+    // Once prepared, a batch compiles nothing more, whichever way its rows are picked:
+    // with rows seeing a token otherwise than the mask too (as drafts' rows do).
+    const compiled = engine.gpu.compiled
+    const known = new Set(compiled.times.keys())
+    const picks = async (row0: number, rows: number) => {
+      if (!prepared) return
+      for (const seen of [[], [[0, 0, 0, rows]]] as Array<Array<[number, 0, number, number]>>) {
+        await engine.pick(row0, rows, 20, 1.1, seen)
+        await engine.argmax(row0, rows, 1.1, seen)
+      }
+    }
     let cases = 0
     for (const n of [2, 3, 4, 5, 8]) {
       for (let keep = 1; keep < n; keep++) {
@@ -525,6 +553,7 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
         await engine.forwardHidden(prompt)
         const last = await engine.forwardHidden(rest.slice(0, n), { draft: true })
         for (let r = 0; r < keep; r++) await check(last - n + 1 + r, r)
+        await picks(last - n + 1, n)
         engine.accept(keep)
         for (let at = keep; at < keep + 6; at++) await check(await engine.forwardHidden([rest[at]]), at)
         cases++
@@ -542,6 +571,10 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
     log(
       `DRAFT CHECK ${params.model} (${prompt.length}-token prompt, ${cases} cut-short batches, ${compared} rows): worst KL ${worst.toExponential(2)}, same top token ${same}/${compared}, draft rows ${mib(engine.gpu.bytes - before)} MiB`
     )
+    if (!(worst <= DRAFT_KL_MAX)) throw new Error(`A draft batch's rows differ from reading its tokens one at a time: worst KL ${worst} (at most ${DRAFT_KL_MAX}).`)
+    const late = [...compiled.times.keys()].filter((source) => !known.has(source))
+    if (prepared && late.length)
+      throw new Error(`${late.length} shaders compiled in draft batches after their passes were prepared: ${late.slice(0, 8).map(shaderLabel).join(" | ")}`)
   } finally {
     engine.gpu.dispose()
   }

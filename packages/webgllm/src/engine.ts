@@ -4363,8 +4363,12 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       for (const rows of [2, SPLIT_ROWS]) {
         this.position = at
         await this.forwardDraft(new Array<number>(rows).fill(0))
-        await this.pick(0, rows, 1, 1, [])
-        await this.argmax(0, rows, 1, [])
+        // With a row seeing a token otherwise than the mask too, as drafts'
+        // rows do: the pick's GLSL passes then (see nativePicks).
+        for (const seen of [[], [[0, 0, 0, rows]]] as Array<Array<SeenRow>>) {
+          await this.pick(0, rows, 1, 1, seen)
+          await this.argmax(0, rows, 1, seen)
+        }
         this.accept(1)
       }
     } finally {
