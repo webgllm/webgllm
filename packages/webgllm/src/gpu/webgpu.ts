@@ -320,6 +320,25 @@ export class WebGpu extends PacedGpu<Fence> {
   deferPipelines = false
   private pendingPipelines: Array<Promise<unknown>> = []
 
+  /** While set, no pass runs at all, even one whose pipeline is ready (see startDryRun). */
+  private dryRun = false
+
+  /**
+   * Until endDryRun, passes only start compiling the pipelines they'd need:
+   * nothing reaches the GPU, so no texture changes.
+   */
+  startDryRun() {
+    this.flushQueue()
+    this.dryRun = true
+    this.deferPipelines = true
+  }
+
+  endDryRun() {
+    this.flushQueue()
+    this.dryRun = false
+    this.deferPipelines = false
+  }
+
   /** Whether pipelines deferPipelines asked for are still compiling. */
   get compiling() {
     return this.pendingPipelines.length > 0
@@ -752,7 +771,7 @@ export class WebGpu extends PacedGpu<Fence> {
   /** The open compute pass, with this pipeline set. */
   private computePassFor(pipeline: GPUComputePipeline | undefined) {
     // (A pipeline still compiling while pipelines are deferred: nothing runs.)
-    if (!pipeline) return WebGpu.noPass
+    if (!pipeline || this.dryRun) return WebGpu.noPass
     if (!this.computePass && this.profile && WebGpu.coarse && this.device.features.has("timestamp-query")) this.timed("busy")
     const cpass = (this.computePass ??= this.commands().beginComputePass())
     if (this.boundPipeline !== pipeline) {

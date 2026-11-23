@@ -517,11 +517,13 @@ export const TUNING = {
   qInCache: 1,
   /**
    * The worker's speculative decoding (see handler.ts): drafts follow an
-   * earlier occurrence of at least draftMatch last tokens, as many as
-   * pay by measured cost (see DraftPolicy); with
-   * guessDrafts, a draft batch also guesses the token after its last row.
+   * earlier occurrence of at least draftMatch last tokens (draftStart
+   * unless the last batch kept some), as many as pay by measured cost
+   * (see DraftPolicy); with guessDrafts, a draft batch also guesses the
+   * token after its last row.
    */
   draftMatch: 2,
+  draftStart: 4,
   guessDrafts: 0,
   /**
    * 1: Gated DeltaNet models read draft batches too: a batch keeps what
@@ -4320,6 +4322,67 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       !l.keyDecay &&
       !this.config.streams
     )
+  }
+
+  /** A Gated DeltaNet model's draft passes on WebGPU: compiled when a reply first wants them (see prepareDraftBatches). */
+  private draftPipelines: "none" | "compiling" | "ready" = "none"
+
+  /** Whether a draft batch can run with no shader compiling in the middle of a reply. */
+  get draftsReady() {
+    return !this.config?.linear || !("deferPipelines" in this.gpu) || TUNING.deferWarmUp <= 0 || this.draftPipelines === "ready"
+  }
+
+  /** Whether those shaders are compiling: tokens go on one at a time meanwhile. */
+  get draftsCompiling() {
+    return this.draftPipelines === "compiling"
+  }
+
+  /**
+   * Starts compiling a Gated DeltaNet model's draft passes in the background
+   * (a Pixel 10 Pro took over a second, in the middle of a reply), by going
+   * through a draft batch as a dry run: no pass reaches the GPU, so the
+   * cache and the state stay as they are, and what the walk moved is put
+   * back. Between tokens, with no guess pending.
+   */
+  async prepareDraftBatches() {
+    if (this.draftsReady || this.draftPipelines !== "none" || this.guessAt !== null) return
+    const gpu = this.gpu as WebGpu
+    this.draftPipelines = "compiling"
+    const { position, draft, lastRowOnly, headScaled, guessedToken } = this
+    const states = this.layers.map(({ linear }) => linear && { state: [...linear.state], conv: [...linear.convState] })
+    // (At a position like the real one, for its attention passes, in the room the cache has: nothing grows.)
+    const room = this.kvPositions - SPLIT_ROWS * (1 + this.querySlots())
+    const at = Math.max(0, Math.min(position, room))
+    // (Image rows there would be read as a batch's: those compile when first used.)
+    if (this.imageRuns(at, SPLIT_ROWS).length) {
+      this.draftPipelines = "ready"
+      return
+    }
+    gpu.startDryRun()
+    try {
+      for (const rows of [2, SPLIT_ROWS]) {
+        this.position = at
+        await this.forwardDraft(new Array<number>(rows).fill(0))
+        await this.pick(0, rows, 1, 1, [])
+        await this.argmax(0, rows, 1, [])
+        this.accept(1)
+      }
+    } finally {
+      gpu.endDryRun()
+      Object.assign(this, { position, draft, lastRowOnly, headScaled, guessedToken })
+      this.layers.forEach(({ linear }, i) => {
+        const saved = states[i]
+        if (!linear || !saved) return
+        linear.state[0] = saved.state[0]
+        linear.state[1] = saved.state[1]
+        linear.convState[0] = saved.conv[0]
+        linear.convState[1] = saved.conv[1]
+      })
+    }
+    const ready = () => {
+      this.draftPipelines = "ready"
+    }
+    void gpu.settlePipelines().then(ready, ready)
   }
 
   /** Rows the head's buffers are made for: a Gated DeltaNet model's grow at its first draft batch. */

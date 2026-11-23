@@ -508,6 +508,15 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
       compared++
       if (argmax(logits) === wantTop[at]) same++
     }
+    // Compiling the draft passes between tokens leaves the cache and state as they were.
+    if (!engine.draftsReady) {
+      engine.reset()
+      await engine.forwardHidden(prompt)
+      for (let at = 0; at < 3; at++) await check(await engine.forwardHidden([rest[at]]), at)
+      await engine.prepareDraftBatches()
+      for (let at = 3; at < 12; at++) await check(await engine.forwardHidden([rest[at]]), at)
+      while (engine.draftsCompiling) await new Promise((r) => setTimeout(r, 10))
+    }
     const before = engine.gpu.bytes
     let cases = 0
     for (const n of [2, 3, 4, 5, 8]) {
@@ -602,7 +611,7 @@ async function draftCost(params: Params, got: Awaited<ReturnType<typeof files>>)
         await gpu.profiled()
         const rows = [...(gpu.profile?.entries() ?? [])].sort((a, b) => b[1].ms - a[1].ms)
         const total = rows.reduce((sum, [, v]) => sum + v.ms, 0)
-        log(`DRAFT PROFILE ${params.model} ${n} rows, GPU ms a batch ${(total / 6).toFixed(1)}: ${rows.slice(0, 12).map(([k, v]) => `${k} ${(v.ms / 6).toFixed(1)} (${Math.round(v.n / 6)})`).join(", ")}`)
+        log(`DRAFT PROFILE ${params.model} ${n} rows, GPU ms a batch ${(total / 6).toFixed(1)}: ${rows.slice(0, 40).map(([k, v]) => `${k} ${(v.ms / 6).toFixed(1)} (${Math.round(v.n / 6)})`).join(", ")}`)
         gpu.profile = null
       }
     }

@@ -117,18 +117,20 @@ export class DraftPolicy {
   private batchMs(d: number): number {
     const own = this.times.batch[d]
     if (own !== null) return own
-    // Unmeasured: the nearest measured count's time, and for each draft
-    // further what a draft cost there over a token alone (at least 3%: on a
-    // GPU where rows cost time, a bigger batch isn't nearly free). With none
-    // measured, a token alone's (so drafts get tried).
-    for (let k = 1; k <= this.max; k++) {
-      for (const j of [d - k, d + k]) {
-        const t = j >= 1 && j <= this.max ? this.times.batch[j] : null
-        if (t === null) continue
-        const perDraft = Math.max(0.03 * t, (t - (this.times.single ?? t)) / j)
-        return t + perDraft * (d - j)
-      }
-    }
+    // Unmeasured: between two measured counts, on the line through them
+    // (a batch has a fixed cost, so one count's time per row overprices a
+    // bigger one); past them, the nearest's time and 3% more per draft, so
+    // a bigger batch gets tried and timed. With none measured, a token
+    // alone's (so drafts get tried).
+    let below = d - 1
+    while (below >= 1 && this.times.batch[below] === null) below--
+    let above = d + 1
+    while (above <= this.max && this.times.batch[above] === null) above++
+    const low = below >= 1 ? this.times.batch[below] : null
+    const high = above <= this.max ? this.times.batch[above] : null
+    if (low !== null && high !== null) return low + ((high - low) * (d - below)) / (above - below)
+    if (low !== null) return low * (1 + 0.03 * (d - below))
+    if (high !== null) return high * (1 + 0.03 * (d - above))
     return this.times.single ?? 0
   }
 
@@ -157,8 +159,11 @@ export class DraftPolicy {
     // Until two batches are timed: none before two drafts have come true (a
     // reply that repeats nothing never pays for one), then one draft each, to
     // find out what batches cost here for less than a full one would where
-    // they don't pay. Two, so that one stall doesn't end drafting.
-    if ((this.times.samples ?? 0) < 2) return this.kept[1] < 1.5 ? 0 : 1
+    // they don't pay. Two if the first looks slow, so that one stall doesn't
+    // end drafting.
+    const samples = this.times.samples ?? 0
+    const cheap = samples === 1 && (this.times.batch[1] ?? Infinity) <= 1.5 * this.times.single
+    if (samples < 2 && !cheap) return this.kept[1] < 1.5 ? 0 : 1
     let best = 0
     let bestRate = 1 / this.times.single
     let expect = 1

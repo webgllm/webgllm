@@ -145,10 +145,18 @@ describe("DraftPolicy", () => {
     twoRight(p)
     p.checkedBatch(1, 1, 1000, 1, true)
     assert.equal(p.peek([1, 2, 3, 4]), 1, "still no time: one draft again")
-    p.checkedBatch(1, 1, 11)
-    assert.equal(p.peek([1, 2, 3, 4]), 1, "one time isn't enough to go by")
+    p.checkedBatch(1, 1, 20)
+    assert.equal(p.peek([1, 2, 3, 4]), 1, "one slow time isn't enough to go by")
     p.checkedBatch(1, 1, 11)
     assert.ok(p.peek([1, 2, 3, 4]) > 1, "timed twice, and cheap: more drafts")
+  })
+
+  test("a first batch that's cheap is enough to go by", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    twoRight(p)
+    p.checkedBatch(1, 1, 11)
+    assert.ok(p.peek([1, 2, 3, 4]) > 1)
   })
 
   test("of the first two batches timed, a stall doesn't count", () => {
@@ -160,18 +168,32 @@ describe("DraftPolicy", () => {
     assert.ok(p.peek([1, 2, 3, 4]) > 1, "drafting goes on")
   })
 
-  test("what one draft cost over a token alone prices the bigger batches", () => {
-    // A row costs a token's time again: 8 tokens in 80 + 70 ms never pay, all right or not.
+  test("a size between two timed ones is priced on the line through them", () => {
+    // 2 tokens in 140 ms, 8 in 420, a token alone in 100: a big batch pays, a small one doesn't.
     const p = new DraftPolicy(7)
-    p.alone(10)
+    p.alone(100)
     twoRight(p)
-    p.checkedBatch(1, 1, 25)
-    p.checkedBatch(1, 1, 25)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(7, 7, 420)
     for (let i = 0; i < 20; i++) {
       p.watch([1, 2, 3, 4, 5, 6, 7])
       for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
     }
-    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 0)
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 7)
+  })
+
+  test("past the sizes timed, a bigger batch is cheap enough to try", () => {
+    const p = new DraftPolicy(7)
+    p.alone(100)
+    twoRight(p)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(1, 1, 140)
+    for (let i = 0; i < 20; i++) {
+      p.watch([1, 2, 3, 4, 5, 6, 7])
+      for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
+    }
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 7)
   })
 
   test("a policy sharing another's times doesn't pay for a slow batch again", () => {

@@ -1541,13 +1541,24 @@ async function generate(request: GenerateRequest) {
   const policy = new DraftPolicy(DRAFTS, undefined, undefined, undefined, undefined, costs)
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
+  // (A long match starts drafting: prose repeats two or three tokens by
+  // chance, and each batch that finds so costs it speed. While a batch's
+  // drafts keep being right, shorter ones carry on.)
+  let rolling = false
   const lookup = (max: number) =>
-    untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
+    untilCallEnd(lookupDraft(history, max, rolling ? TUNING.draftMatch : TUNING.draftStart))
   // (Not every model reads draft batches: see Engine.canDraft.)
   const drafting = () => request.speculative !== false && engine.canDraft
-  const draftsFor = (max: number) => {
+  const draftsFor = async (max: number) => {
     if (max <= 0 || !drafting()) return []
     const found = lookup(max)
+    // The first batch's shaders compile in the background (no guess is
+    // pending here); tokens go on one at a time until they're done.
+    if (!engine.draftsReady && policy.peek(found) > 0) {
+      await engine.prepareDraftBatches()
+      policy.watch(found)
+      return []
+    }
     return found.slice(0, policy.choose(found))
   }
   // Whether a draft batch would follow. If not, the drafts found are still
@@ -1556,7 +1567,7 @@ async function generate(request: GenerateRequest) {
   const draftsNext = () => {
     if (!drafting()) return false
     const found = lookup(DRAFTS)
-    const next = found.length > 0 && policy.peek(found) > 0
+    const next = found.length > 0 && !engine.draftsCompiling && policy.peek(found) > 0
     if (!next) policy.watch(found)
     return next
   }
@@ -1816,7 +1827,7 @@ async function generate(request: GenerateRequest) {
     }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
-    const proposed = draftsFor(
+    const proposed = await draftsFor(
       Math.min(
         DRAFTS,
         maxTokens - stats.outputTokens - 1,
@@ -1882,6 +1893,7 @@ async function generate(request: GenerateRequest) {
         going ? drafts.length : kept - 1,
         engine.gpu.compiled.count !== compiledBefore
       )
+      rolling = kept > 1
       stats.draftBatches = (stats.draftBatches ?? 0) + 1
       stats.draftsChecked =
         (stats.draftsChecked ?? 0) + (going ? drafts.length : kept - 1)
