@@ -523,13 +523,11 @@ export const TUNING = {
    */
   draftMatch: 2,
   guessDrafts: 0,
-  /** 1: drafts follow the longest earlier match (longestDraft); 0: the latest (lookupDraft). */
-  draftLongest: 0,
   /**
    * 1: Gated DeltaNet models read draft batches too: a batch keeps what
    * replays its recurrence up to any prefix (see linearDraftRows, accept).
    */
-  linearDrafts: 0,
+  linearDrafts: 1,
   /** Queries per scores slice (0: from the batch size; see scoreRows). */
   scoreRows: 0,
   /** 1: few-row conv blocks draw their output and new state in one pass. */
@@ -1403,9 +1401,9 @@ export class Engine {
     const hasConv = c.layerTypes.includes("conv")
     const conv = (make: () => Texture) =>
       hasConv ? make() : this.gpu.texture(GL.RGBA32UI, 1, 1)
-    // Logits for one row at a time where no draft batch is read (see
-    // canDraft: Gated DeltaNet models, unless linearDrafts).
-    const headRows = c.layerTypes.includes("linear_attention") && !this.linearDraftsOn ? 1 : SPLIT_ROWS
+    // Logits for one row at a time on a Gated DeltaNet model, until its
+    // first draft batch (see growHeadForDrafts).
+    const headRows = c.layerTypes.includes("linear_attention") ? 1 : SPLIT_ROWS
     const residualWidth = D / 4 + K.RMS_PARTS + D / 8
     const residualLarge = [0, 1].map(() =>
       this.gpu.texture(GL.RGBA32F, residualWidth, M)
@@ -2748,13 +2746,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         0,
         headScratchBytes(
           nextSplit,
-          this.canDraft ? SPLIT_ROWS : 1,
+          this.headRowsAtLoad,
           this.logitRows,
           OUT_WIDTH
         ) -
           headScratchBytes(
             baseSplit,
-            this.canDraft ? SPLIT_ROWS : 1,
+            this.headRowsAtLoad,
             this.logitRows,
             OUT_WIDTH
           )
@@ -3053,13 +3051,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       0,
       headScratchBytes(
         nextSplit,
-        this.canDraft ? SPLIT_ROWS : 1,
+        this.headRowsAtLoad,
         this.logitRows,
         OUT_WIDTH
       ) -
         headScratchBytes(
           baselineSplit,
-          this.canDraft ? SPLIT_ROWS : 1,
+          this.headRowsAtLoad,
           this.logitRows,
           OUT_WIDTH
         )
@@ -4324,6 +4322,21 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     )
   }
 
+  /** Rows the head's buffers are made for: a Gated DeltaNet model's grow at its first draft batch. */
+  private get headRowsAtLoad() {
+    return this.config?.linear ? 1 : SPLIT_ROWS
+  }
+
+  /** The logits of a whole draft batch, the first time a Gated DeltaNet model reads one. */
+  private growHeadForDrafts() {
+    const b = this.buffers
+    const height = this.logitRows * SPLIT_ROWS
+    if (b.logits.height >= height) return
+    const old = b.logits
+    b.logits = this.gpu.texture(GL.RGBA32F, OUT_WIDTH, height)
+    this.gpu.delete(old)
+  }
+
   /** A draft batch's recurrence output (SPLIT_ROWS rows, every layer's in turn). */
   private linearDraftO: Texture | null = null
   private linearDraftOutput() {
@@ -4395,7 +4408,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         // next forward waits for any still compiling): awaited here they
         // cost a Pixel 10 Pro 330 ms more load; left to its first draft
         // batch, 9 programs compiled mid-reply.
-        if (!options.shortOnly && this.canDraft) {
+        // (Not a Gated DeltaNet model's: they'd make the draft rows every load needs none of.)
+        if (!options.shortOnly && this.canDraft && !this.config?.linear) {
           this.reset()
           this.gpu.deferPipelines = true
           try {
@@ -4472,7 +4486,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       await this.forwardHidden(fit(f16Rows))
       step("batchF16")
     }
-    // (A Gated DeltaNet model's draft passes compile after the load: see warmDraftBatches.)
+    // (A Gated DeltaNet model's draft passes compile at its first draft batch.)
     if (this.canDraft && !this.config?.linear) {
       await this.forwardHidden(fit(2), { draft: true })
       this.accept(1)
@@ -8125,6 +8139,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
     }
+    if (this.config.linear) this.growHeadForDrafts()
     const pos0 = this.position
     this.keepPrefixes = true
     try {
@@ -8664,7 +8679,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // (Room for a draft batch's rows where the model reads them.)
       this.headScratch = this.f32(
         OUT_WIDTH * 4,
-        Math.max(height, split * (this.canDraft ? SPLIT_ROWS : 1) * sliceRows)
+        Math.max(height, split * (this.headRowsAtLoad) * sliceRows)
       )
     }
     return this.headScratch

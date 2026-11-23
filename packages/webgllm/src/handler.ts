@@ -23,7 +23,7 @@ import { repackTime } from "./repack.js"
 import type { ModelFile } from "./model-meta.js"
 import { WEBGLLM } from "./protocol.js"
 import type { FinishReason, RunTimings, TokenLogprob, WorkerRequest, WorkerResponse } from "./protocol.js"
-import { DraftPolicy, draftTimes, longestDraft, lookupDraft, type DraftTimes } from "./draft.js"
+import { DraftPolicy, draftTimes, lookupDraft, type DraftTimes } from "./draft.js"
 import { createSampler, draw, drawAt, logprobsOf, verify, verifyAt } from "./sampler.js"
 import { download, incumbentGpuTuning, previousGpuTuning, readGpuNotes, saveManifest, sharedGpuTuning, storedFile, writeGpuNote } from "./storage.js"
 import { loadTokenizer } from "./tokenizer.js"
@@ -1542,7 +1542,7 @@ async function generate(request: GenerateRequest) {
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
   const lookup = (max: number) =>
-    untilCallEnd((TUNING.draftLongest > 0 ? longestDraft : lookupDraft)(history, max, TUNING.draftMatch))
+    untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
   const draftsFor = (max: number) => {
     // (Not every model reads draft batches: see Engine.canDraft.)
     if (request.speculative === false || max <= 0 || !engine.canDraft) return []
