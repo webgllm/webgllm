@@ -159,6 +159,16 @@ export class DraftPolicy {
     return best
   }
 
+  /**
+   * Drafts found while no batch would be read: scored against the next
+   * tokens like the ones `choose` leaves unchecked, so a reply whose guesses
+   * keep hitting (and so never reaches `choose`) can still learn to draft.
+   */
+  watch(available: Array<number>) {
+    if (!this.shadow && available.length)
+      this.shadow = { drafts: available.slice(0, this.max), at: 0, from: 0 }
+  }
+
   /** A token was written (any way): scores remembered unchecked drafts. */
   drawn(token: number) {
     const s = this.shadow

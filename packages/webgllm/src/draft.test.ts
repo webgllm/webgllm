@@ -2,6 +2,35 @@ import assert from "node:assert/strict"
 import { describe, test } from "node:test"
 import { DraftPolicy, draftTimes, lookupDraft } from "./draft.js"
 
+describe("DraftPolicy.watch", () => {
+  const remembered = () => {
+    const times = draftTimes(4)
+    times.single = 10
+    times.batch = [null, 30, 30, 30, 30]
+    return new DraftPolicy(4, undefined, undefined, undefined, undefined, times)
+  }
+
+  test("drafts it watched come true: a policy that wouldn't draft starts to", () => {
+    const policy = remembered()
+    const drafts = [1, 2, 3, 4]
+    assert.equal(policy.peek(drafts), 0)
+    for (let round = 0; round < 8; round++) {
+      policy.watch(drafts)
+      for (const token of drafts) policy.drawn(token)
+    }
+    assert.ok(policy.peek(drafts) > 0)
+  })
+
+  test("drafts that don't come true keep it from drafting", () => {
+    const policy = remembered()
+    for (let round = 0; round < 8; round++) {
+      policy.watch([1, 2, 3, 4])
+      policy.drawn(9)
+    }
+    assert.equal(policy.peek([1, 2, 3, 4]), 0)
+  })
+})
+
 describe("lookupDraft", () => {
   test("drafts what followed the latest earlier occurrence of the last 4 tokens", () => {
     // ... 1 2 3 4 [5 6 7 8 9] ... 1 2 3 4

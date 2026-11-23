@@ -1547,12 +1547,15 @@ async function generate(request: GenerateRequest) {
     const found = untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
     return found.slice(0, policy.choose(found))
   }
-  // Whether a draft batch would follow (without changing what the policy
-  // remembers).
+  // Whether a draft batch would follow. If not, the drafts found are still
+  // scored: with batch times remembered from an earlier reply, a reply whose
+  // guesses all hit would otherwise never learn that its drafts are right.
   const draftsNext = () => {
     if (request.speculative === false || !engine.canDraft) return false
     const found = untilCallEnd(lookupDraft(history, DRAFTS, TUNING.draftMatch))
-    return found.length > 0 && policy.peek(found) > 0
+    const next = found.length > 0 && policy.peek(found) > 0
+    if (!next) policy.watch(found)
+    return next
   }
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
