@@ -1551,6 +1551,7 @@ async function generate(request: GenerateRequest) {
   const drafting = () => request.speculative !== false && engine.canDraft
   const draftsFor = async (max: number) => {
     if (max <= 0 || !drafting()) return []
+    policy.startAfter = engine.draftsReady ? 1 : 2
     const found = lookup(max)
     // The first batch's shaders compile in the background (no guess is
     // pending here); tokens go on one at a time until they're done.
@@ -1566,6 +1567,7 @@ async function generate(request: GenerateRequest) {
   // guesses all hit would otherwise never learn that its drafts are right.
   const draftsNext = () => {
     if (!drafting()) return false
+    policy.startAfter = engine.draftsReady ? 1 : 2
     const found = lookup(DRAFTS)
     const next = found.length > 0 && !engine.draftsCompiling && policy.peek(found) > 0
     if (!next) policy.watch(found)

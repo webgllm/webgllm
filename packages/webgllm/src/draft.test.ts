@@ -183,7 +183,7 @@ describe("DraftPolicy", () => {
     assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 7)
   })
 
-  test("past the sizes timed, a bigger batch is cheap enough to try", () => {
+  test("with one size timed, the next tried is at most 3 drafts", () => {
     const p = new DraftPolicy(7)
     p.alone(100)
     twoRight(p)
@@ -193,7 +193,32 @@ describe("DraftPolicy", () => {
       p.watch([1, 2, 3, 4, 5, 6, 7])
       for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
     }
-    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 7)
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 3)
+  })
+
+  test("two sizes timed price the bigger ones, which needn't be tried to know they don't pay", () => {
+    // 2 tokens in 150 ms, 4 in 390: 120 ms a draft, 8 tokens in 870, a token alone in 100.
+    const p = new DraftPolicy(7)
+    p.alone(100)
+    twoRight(p)
+    p.checkedBatch(1, 1, 150)
+    p.checkedBatch(1, 1, 150)
+    p.checkedBatch(3, 3, 390)
+    for (let i = 0; i < 20; i++) {
+      p.watch([1, 2, 3, 4, 5, 6, 7])
+      for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
+    }
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 1)
+  })
+
+  test("one draft come true is enough where a batch has nothing to compile", () => {
+    const p = new DraftPolicy(7)
+    p.startAfter = 1
+    p.alone(10)
+    assert.equal(p.peek([1, 2, 3]), 0)
+    p.watch([1])
+    p.drawn(1)
+    assert.equal(p.peek([1, 2, 3]), 1)
   })
 
   test("a policy sharing another's times doesn't pay for a slow batch again", () => {

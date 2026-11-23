@@ -78,6 +78,11 @@ export class DraftPolicy {
    * ones not checked; those before it a batch checks itself).
    */
   private shadow: { drafts: Array<number>; at: number; from: number } | null = null
+  /**
+   * Drafts that must come true before the first batch is timed: one where a
+   * batch is ready to run, two where it would first have shaders to compile.
+   */
+  startAfter = 2
 
   constructor(
     readonly max: number,
@@ -117,11 +122,11 @@ export class DraftPolicy {
   private batchMs(d: number): number {
     const own = this.times.batch[d]
     if (own !== null) return own
-    // Unmeasured: between two measured counts, on the line through them
-    // (a batch has a fixed cost, so one count's time per row overprices a
-    // bigger one); past them, the nearest's time and 3% more per draft, so
-    // a bigger batch gets tried and timed. With none measured, a token
-    // alone's (so drafts get tried).
+    // Unmeasured: on the line through the two measured counts around it or
+    // just below it (a batch has a fixed cost, so one count's time per row
+    // overprices a bigger one), at least 3% more per draft. With one count
+    // measured, 3% more per draft, so the next size gets tried and timed;
+    // with none, a token alone's (so drafts get tried).
     let below = d - 1
     while (below >= 1 && this.times.batch[below] === null) below--
     let above = d + 1
@@ -129,7 +134,13 @@ export class DraftPolicy {
     const low = below >= 1 ? this.times.batch[below] : null
     const high = above <= this.max ? this.times.batch[above] : null
     if (low !== null && high !== null) return low + ((high - low) * (d - below)) / (above - below)
-    if (low !== null) return low * (1 + 0.03 * (d - below))
+    if (low !== null) {
+      let previous = below - 1
+      while (previous >= 1 && this.times.batch[previous] === null) previous--
+      const before = previous >= 1 ? this.times.batch[previous] : null
+      const slope = before !== null ? (low - before) / (below - previous) : 0
+      return low + Math.max(0.03 * low, slope) * (d - below)
+    }
     if (high !== null) return high * (1 + 0.03 * (d - above))
     return this.times.single ?? 0
   }
@@ -156,19 +167,22 @@ export class DraftPolicy {
     if (n === 0) return 0
     // A token alone first, to have its time to beat.
     if (this.times.single === null) return 0
-    // Until two batches are timed: none before two drafts have come true (a
-    // reply that repeats nothing never pays for one), then one draft each, to
+    // Until a batch is timed: none before `startAfter` drafts have come true
+    // (a reply that repeats nothing never pays for one), then one draft, to
     // find out what batches cost here for less than a full one would where
-    // they don't pay. Two if the first looks slow, so that one stall doesn't
-    // end drafting.
+    // they don't pay. Twice if the first looks slow, so that one stall
+    // doesn't end drafting.
     const samples = this.times.samples ?? 0
     const cheap = samples === 1 && (this.times.batch[1] ?? Infinity) <= 1.5 * this.times.single
-    if (samples < 2 && !cheap) return this.kept[1] < 1.5 ? 0 : 1
+    if (samples < 2 && !cheap) return this.kept[1] < this.startAfter - 0.5 ? 0 : 1
+    // A second size next, at most 3 drafts: two sizes price the bigger ones.
+    const sizes = this.times.batch.filter((t) => t !== null).length
+    const most = sizes < 2 ? Math.min(n, 3) : n
     let best = 0
     let bestRate = 1 / this.times.single
     let expect = 1
     let run = 1
-    for (let d = 1; d <= n; d++) {
+    for (let d = 1; d <= most; d++) {
       run *= this.rate(d)
       expect += run
       const ms = this.batchMs(d)
