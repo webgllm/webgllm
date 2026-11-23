@@ -460,8 +460,9 @@ async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>
  * tokens read one at a time: the batch's kept rows, then six tokens read
  * after `accept`, which only match if the state went back correctly; and
  * two draft batches in a row, each cut short. Fails (an ERROR line) on a
- * row whose KL is past DRAFT_KL_MAX or isn't a number, and on a shader
- * compiled in a draft batch after its passes were prepared.
+ * logit or a KL that isn't a number, on either side and at the row it's
+ * found; on a row whose KL is past DRAFT_KL_MAX; and on a shader compiled
+ * in a draft batch after its passes were prepared.
  */
 /**
  * The most a row of a cut-short batch may differ from reading its tokens one
@@ -488,9 +489,16 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
     const all = Array.from(tokenizer.encodeChat([{ role: "user", content }], { addGenerationPrompt: true, enableThinking: false }))
     const prompt = all.slice(0, -32)
     const rest = all.slice(-32)
-    const distribution = (logits: Float32Array) => {
+    // `what`'s logits as probabilities. Throws on a logit that isn't a number (or is
+    // +Infinity): a NaN would otherwise drop out of the comparisons below unnoticed.
+    const distribution = (logits: Float32Array, what: string) => {
       let max = -Infinity
-      for (const l of logits) if (l > max) max = l
+      for (let i = 0; i < logits.length; i++) {
+        const l = logits[i]
+        if (Number.isNaN(l) || l === Infinity) throw new Error(`${what}: logit ${i} is ${l}.`)
+        if (l > max) max = l
+      }
+      if (!Number.isFinite(max)) throw new Error(`${what}: no finite logit.`)
       const p = new Float64Array(logits.length)
       let sum = 0
       for (let i = 0; i < p.length; i++) sum += p[i] = Math.exp(logits[i] - max)
@@ -508,7 +516,7 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
     const wantTop: Array<number> = []
     for (const token of rest) {
       const logits = await engine.logits(await engine.forwardHidden([token]))
-      want.push(distribution(logits))
+      want.push(distribution(logits, `Token ${want.length} read alone`))
       wantTop.push(argmax(logits))
     }
     let worst = 0
@@ -517,10 +525,12 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
     const check = async (row: number, at: number) => {
       const logits = await engine.logits(row)
       const p = want[at]
-      const q = distribution(logits)
+      const q = distribution(logits, `Comparison ${compared} (token ${at})`)
       let kl = 0
       for (let i = 0; i < p.length; i++) if (p[i] > 1e-12) kl += p[i] * Math.log(p[i] / Math.max(q[i], 1e-30))
-      if (!(kl <= worst)) worst = kl
+      // (At once: a later row must not be able to hide it.)
+      if (!Number.isFinite(kl)) throw new Error(`Comparison ${compared} (token ${at}): KL is ${kl}.`)
+      worst = Math.max(worst, kl)
       compared++
       if (argmax(logits) === wantTop[at]) same++
     }
