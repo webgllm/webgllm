@@ -7422,7 +7422,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const groupEnd = i > 0 && decodeLayers > 0 && this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
       if (paced) await this.charge(0)
       else {
-        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        if (groupEnd) await this.gpu.pace(2, true, 0, decodeLayers)
         if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
           TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
           this.gpu.flush()
@@ -9244,7 +9244,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
       if (paced) await this.charge(0)
       else {
-        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        if (groupEnd) await this.gpu.pace(2, true, 0, decodeLayers)
         // Grouped decode's fence flushes its own layers.
         if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
           TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)

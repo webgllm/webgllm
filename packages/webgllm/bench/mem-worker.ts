@@ -27,7 +27,7 @@ import type { ByteSource } from "../src/weights.js"
 type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
-  mode: "chat" | "ab" | "prefix" | "draft"
+  mode: "chat" | "ab" | "prefix" | "draft" | "draftcost"
   /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
@@ -538,6 +538,79 @@ async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>
   }
 }
 
+/**
+ * ?mode=draftcost: what a draft batch costs on this GPU, by its size: a warm
+ * batch and its greedy picks read back, sizes alternating, then (WebGPU)
+ * where the GPU's time goes by kind of pass.
+ */
+async function draftCost(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    if (!engine.canDraft) throw new Error("This model reads no draft batches.")
+    const { tokenizer } = got
+    const content = padded(tokenizer, [], "Tell me a short story about the mill, in a few paragraphs.", params.length + 64, false)
+    const all = Array.from(tokenizer.encodeChat([{ role: "user", content }], { addGenerationPrompt: true, enableThinking: false }))
+    const prompt = all.slice(0, -64)
+    const rest = all.slice(-64)
+    const sizes = [1, 2, 3, 4, 6, 8]
+    const gpu = engine.gpu as unknown as {
+      passes: number
+      profile?: Map<string, { ms: number; n: number }> | null
+      profiled?: () => Promise<unknown>
+    }
+    let at = 0
+    const step = async (n: number) => {
+      const batch = Array.from({ length: n }, (_, i) => rest[(at + i) % rest.length])
+      at++
+      const row = await engine.forwardHidden(batch, { draft: n > 1 })
+      await engine.argmax(row - n + 1, n, 1, [])
+      if (n > 1) engine.accept(1)
+    }
+    const start = async () => {
+      engine.reset()
+      at = 0
+      await engine.forwardHidden(prompt)
+      for (const n of sizes) await step(n) // (Compiles what each size needs.)
+    }
+    await start()
+    const times = new Map<number, Array<number>>(sizes.map((n) => [n, []]))
+    const passes = new Map<number, number>()
+    const rounds = Math.max(10, params.rounds)
+    for (let round = 0; round < rounds; round++) {
+      for (const n of round % 2 ? [...sizes].reverse() : sizes) {
+        const before = gpu.passes
+        const t = performance.now()
+        await step(n)
+        times.get(n)!.push(performance.now() - t)
+        passes.set(n, gpu.passes - before)
+      }
+      log(`draft cost: round ${round + 1} of ${rounds}`)
+    }
+    const median = (x: Array<number>) => [...x].sort((a, b) => a - b)[Math.floor(x.length / 2)]
+    const one = median(times.get(1)!)
+    for (const n of sizes) {
+      const ms = median(times.get(n)!)
+      log(`DRAFT COST ${params.model} ${n} rows: ${ms.toFixed(1)} ms (${(ms / n).toFixed(1)} a token, ${(ms / one).toFixed(2)}x one token), ${passes.get(n)} passes`)
+    }
+    if (gpu.profiled) {
+      for (const n of [1, 8]) {
+        await start()
+        gpu.profile = new Map()
+        for (let i = 0; i < 6; i++) await step(n)
+        await gpu.profiled()
+        const rows = [...(gpu.profile?.entries() ?? [])].sort((a, b) => b[1].ms - a[1].ms)
+        const total = rows.reduce((sum, [, v]) => sum + v.ms, 0)
+        log(`DRAFT PROFILE ${params.model} ${n} rows, GPU ms a batch ${(total / 6).toFixed(1)}: ${rows.slice(0, 12).map(([k, v]) => `${k} ${(v.ms / 6).toFixed(1)} (${Math.round(v.n / 6)})`).join(", ")}`)
+        gpu.profile = null
+      }
+    }
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
 async function run(params: Params) {
   if (params.cdp) {
     // The GPU process before any of this page's textures: what the
@@ -552,5 +625,6 @@ async function run(params: Params) {
   if (params.mode === "ab") await ab(params, got)
   else if (params.mode === "prefix") await prefixCheck(params, got)
   else if (params.mode === "draft") await draftCheck(params, got)
+  else if (params.mode === "draftcost") await draftCost(params, got)
   else await chat(params, got)
 }

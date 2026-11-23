@@ -1543,9 +1543,10 @@ async function generate(request: GenerateRequest) {
   // the policy expects to pay.
   const lookup = (max: number) =>
     untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
+  // (Not every model reads draft batches: see Engine.canDraft.)
+  const drafting = () => request.speculative !== false && engine.canDraft
   const draftsFor = (max: number) => {
-    // (Not every model reads draft batches: see Engine.canDraft.)
-    if (request.speculative === false || max <= 0 || !engine.canDraft) return []
+    if (max <= 0 || !drafting()) return []
     const found = lookup(max)
     return found.slice(0, policy.choose(found))
   }
@@ -1553,7 +1554,7 @@ async function generate(request: GenerateRequest) {
   // scored: with batch times remembered from an earlier reply, a reply whose
   // guesses all hit would otherwise never learn that its drafts are right.
   const draftsNext = () => {
-    if (request.speculative === false || !engine.canDraft) return false
+    if (!drafting()) return false
     const found = lookup(DRAFTS)
     const next = found.length > 0 && policy.peek(found) > 0
     if (!next) policy.watch(found)
@@ -1826,6 +1827,7 @@ async function generate(request: GenerateRequest) {
     const preview = structured?.answering ? structured.previewAnswerDrafts(proposed) : undefined
     const drafts = preview?.drafts ?? proposed
     const batch = [token, ...drafts]
+    const compiledBefore = engine.gpu.compiled.count
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
     // Row i's distribution checks draft i + 1; the first draft it rejects
     // is replaced by a token drawn from what's left, and the rest dropped.
@@ -1877,7 +1879,8 @@ async function generate(request: GenerateRequest) {
         drafts.length,
         kept - 1,
         stepMs,
-        going ? drafts.length : kept - 1
+        going ? drafts.length : kept - 1,
+        engine.gpu.compiled.count !== compiledBefore
       )
       stats.draftBatches = (stats.draftBatches ?? 0) + 1
       stats.draftsChecked =

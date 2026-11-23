@@ -57,7 +57,12 @@ export function lookupDraft(
  * drafts cost on this device, which a policy can share with the next
  * reply's (see DraftPolicy's `times`).
  */
-export type DraftTimes = { single: number | null; batch: Array<number | null> }
+export type DraftTimes = {
+  single: number | null
+  batch: Array<number | null>
+  /** Batches timed so far. */
+  samples?: number
+}
 
 /** No times measured yet, for drafts up to `max`. */
 export function draftTimes(max: number): DraftTimes {
@@ -112,12 +117,16 @@ export class DraftPolicy {
   private batchMs(d: number): number {
     const own = this.times.batch[d]
     if (own !== null) return own
-    // Unmeasured: the nearest measured count's time, 3% more per draft
-    // further; with none measured, a token alone's (so drafts get tried).
+    // Unmeasured: the nearest measured count's time, and for each draft
+    // further what a draft cost there over a token alone (at least 3%: on a
+    // GPU where rows cost time, a bigger batch isn't nearly free). With none
+    // measured, a token alone's (so drafts get tried).
     for (let k = 1; k <= this.max; k++) {
       for (const j of [d - k, d + k]) {
         const t = j >= 1 && j <= this.max ? this.times.batch[j] : null
-        if (t !== null) return t * (1 + 0.03 * (d - j))
+        if (t === null) continue
+        const perDraft = Math.max(0.03 * t, (t - (this.times.single ?? t)) / j)
+        return t + perDraft * (d - j)
       }
     }
     return this.times.single ?? 0
@@ -145,6 +154,11 @@ export class DraftPolicy {
     if (n === 0) return 0
     // A token alone first, to have its time to beat.
     if (this.times.single === null) return 0
+    // Until two batches are timed: none before two drafts have come true (a
+    // reply that repeats nothing never pays for one), then one draft each, to
+    // find out what batches cost here for less than a full one would where
+    // they don't pay. Two, so that one stall doesn't end drafting.
+    if ((this.times.samples ?? 0) < 2) return this.kept[1] < 1.5 ? 0 : 1
     let best = 0
     let bestRate = 1 / this.times.single
     let expect = 1
@@ -187,17 +201,23 @@ export class DraftPolicy {
   /**
    * A batch of a token and `drafts` drafts took `ms`, and its first
    * `kept` drafts were kept, of the first `judged` checked (fewer than
-   * `drafts` if the reply ended first).
+   * `drafts` if the reply ended first). `compiled`: shaders compiled during
+   * it, so its time says nothing about what the next one will cost.
    */
-  checkedBatch(drafts: number, kept: number, ms: number, judged = drafts) {
+  checkedBatch(drafts: number, kept: number, ms: number, judged = drafts, compiled = false) {
     // (The shadow, if any, goes on: the batch's kept drafts were drawn
     // already, and the token drawn after them scores the next draft.)
     for (let i = 1; i <= Math.min(judged, kept + 1); i++) this.outcome(i, i <= kept)
+    if (compiled) return
+    const samples = this.times.samples ?? 0
+    this.times.samples = samples + 1
     const old = this.times.batch[drafts]
     this.times.batch[drafts] =
       old === null
         ? Math.min(ms, 3 * this.batchMs(drafts) || ms)
-        : this.timeDecay * old + (1 - this.timeDecay) * Math.min(ms, 3 * old)
+        : samples === 1
+          ? Math.min(old, ms) // (The first two: the lesser, in case one stalled.)
+          : this.timeDecay * old + (1 - this.timeDecay) * Math.min(ms, 3 * old)
   }
 
   /** A token alone (no drafts) took `ms`, waits it overlapped included. */
