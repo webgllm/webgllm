@@ -29,6 +29,7 @@ const chat = chatModel();
 
 const suggestions = [
   { title: 'Search the web', label: 'for the latest WebGL news', prompt: 'Search the web for the latest WebGL news and summarize it.' },
+  { title: 'Draw', label: 'a pixel-art rubber duck', prompt: 'Draw a pixel-art rubber duck.' },
   { title: 'Explain', label: 'how attention works in transformers', prompt: 'Explain how attention works in transformers, briefly.' },
   { title: 'Write code', label: 'a debounce function in TypeScript', prompt: 'Write a debounce function in TypeScript.' },
   { title: 'Plan', label: 'a weekend in Lisbon', prompt: 'Plan a weekend in Lisbon for someone who likes food and walking.' },
