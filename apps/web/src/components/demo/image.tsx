@@ -14,7 +14,6 @@ import { Loader2Icon } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
 import type { LoadProgress } from 'webgllm';
 import { type ShownToolResult, webgllm, whileUnloaded } from './model';
-import { oneAtATime } from './one-at-a-time';
 
 export const IMAGE_TOOL = 'generate_image';
 
@@ -43,15 +42,6 @@ const subscribeDownload = (listener: () => void) => {
 const onProgress = ({ phase, progress, cached }: LoadProgress) =>
   setDownload(phase === 'download' && !cached ? Math.min(1, progress / 0.9) : undefined);
 
-/**
- * Runs one image call's whole swap (unload the chat model, draw, unload the
- * image model, load the chat model again) after the one before has ended. A
- * reply's tool calls run together, and two image calls share the image
- * model: without this, the first to finish would unload it under the other
- * and load the chat model while the other still drew.
- */
-const swap = oneAtATime();
-
 /** The result's line for the model, which it reads in later turns. */
 const resultLine = (prompt: string) =>
   `The image of "${prompt}" is already shown to the person. Don't add an image or link to it.`;
@@ -59,21 +49,19 @@ const resultLine = (prompt: string) =>
 async function draw(args: Record<string, unknown>, { abortSignal }: { abortSignal: AbortSignal }): Promise<ImageResult> {
   const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
   if (!prompt) throw new Error('A prompt is needed.');
-  const response = await swap(
-    () =>
-      whileUnloaded(async () => {
-        try {
-          return await webgllm().images.generate(
-            { model: IMAGE_MODEL, prompt, n: IMAGES_PER_CALL },
-            { signal: abortSignal, onProgress },
-          );
-        } finally {
-          setDownload(undefined);
-          await webgllm().unloadModel(IMAGE_MODEL);
-        }
-      }, abortSignal),
-    abortSignal,
-  );
+  // The whole swap (unload the chat models, draw, unload the image model, load this
+  // reply's chat model again) is one turn alone at the models: see `whileUnloaded`.
+  const response = await whileUnloaded(async () => {
+    try {
+      return await webgllm().images.generate(
+        { model: IMAGE_MODEL, prompt, n: IMAGES_PER_CALL },
+        { signal: abortSignal, onProgress },
+      );
+    } finally {
+      setDownload(undefined);
+      await webgllm().unloadModel(IMAGE_MODEL);
+    }
+  }, abortSignal);
   return {
     text: resultLine(prompt),
     endsReply: true,

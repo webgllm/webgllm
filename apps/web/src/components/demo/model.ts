@@ -11,6 +11,7 @@ import type {
 } from 'webgllm';
 import { WEBGL_IMAGE_MODELS, WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
+import { turns } from './turns';
 
 /**
  * The models the demo offers: GGUF builds, each with tools. Those with a
@@ -171,33 +172,48 @@ export function webgllm(): WebGLLM {
   return client;
 }
 
-/** The model the last reply ran on: what `whileUnloaded` loads again. */
-let lastModel: ModelId | undefined;
+/**
+ * Turns at the models, across every chat (a chat in the background keeps
+ * replying): replies share one, and `whileUnloaded` takes one alone.
+ */
+const turn = turns();
+
+/** The model each reply runs on, by the reply's abort signal, which its tools are given too. */
+const replyModels = new WeakMap<AbortSignal, ModelId>();
 
 /**
- * Runs `run` with no chat model loaded, then loads the chat's model again,
+ * Runs `run` with no chat model loaded, then loads the reply's model again,
  * so a chat model and the image model never sit in memory together: the
  * image tool draws in the chat model's place (image.tsx). A phone's tab
- * holds LFM3 or the image model, not both. A reply that was stopped leaves
+ * holds LFM3 or the image model, not both. `signal` is the reply's, as its
+ * tool was given it: it names the model to load again, the one that reply
+ * ran on, whatever other chats have run since. It waits for the replies
+ * running in other chats to end, and none starts until the model is loaded
+ * again; two of these never overlap either. A reply that was stopped leaves
  * the load to the next message.
  */
-export async function whileUnloaded<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const model = lastModel;
-  await webgllm().unloadModel();
-  setStatus({ state: 'idle' });
+export async function whileUnloaded<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  const model = replyModels.get(signal);
+  const end = await turn('alone', signal);
   try {
-    return await run();
-  } finally {
-    if (model && !signal?.aborted) {
-      try {
-        await webgllm().loadModel(model, { ...(signal && { signal }) });
-        setStatus({ state: 'ready' });
-      } catch (error) {
-        // (The next message loads it, and shows what went wrong if it can't.)
-        setStatus({ state: 'idle' });
-        if (!signal?.aborted) console.error(error);
+    await webgllm().unloadModel();
+    setStatus({ state: 'idle' });
+    try {
+      return await run();
+    } finally {
+      if (model && !signal.aborted) {
+        try {
+          await webgllm().loadModel(model, { signal });
+          setStatus({ state: 'ready' });
+        } catch (error) {
+          // (The next message loads it, and shows what went wrong if it can't.)
+          setStatus({ state: 'idle' });
+          if (!signal.aborted) console.error(error);
+        }
       }
     }
+  } finally {
+    end();
   }
 }
 
@@ -358,44 +374,53 @@ export function chatModel(): ChatModelAdapter {
       try {
         // Set by assistant-ui's model selector through the model context.
         const model = context.config?.modelName ?? MODELS[0]!.id;
-        lastModel = model as ModelId;
-        const stream = await webgllm().chat.completions.create(
-          {
-            model,
-            ...(context.config?.reasoningEffort && {
-              reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
-            }),
-            messages: [
-              ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
-              ...toOpenAI(thread, mediaInputs(model).includes('image')),
-            ],
-            ...(tools.length > 0 && { tools }),
-            stream: true,
-            stream_options: { include_usage: true },
-          },
-          { signal: abortSignal },
-        );
-        setStatus({ state: 'ready' });
-        // Timed from here, once the model is loaded, so a download doesn't count.
-        const streamStartTime = Date.now();
+        replyModels.set(abortSignal, model as ModelId);
+        let streamStartTime = 0;
         let totalChunks = 0;
         let usage: CompletionUsage | undefined;
         let timings: CompletionTimings | undefined;
-        for await (const chunk of stream) {
-          totalChunks++;
-          usage = chunk.usage ?? usage;
-          timings = chunk.timings ?? timings;
-          const delta = chunk.choices[0]?.delta;
-          if (!delta) continue;
-          if (delta.reasoning_content) reasoning += delta.reasoning_content;
-          if (delta.content) answer += delta.content;
-          for (const call of delta.tool_calls ?? []) {
-            const entry = (calls[call.index] ??= { id: '', name: '', args: '' });
-            if (call.id) entry.id = call.id;
-            if (call.function.name) entry.name += call.function.name;
-            if (call.function.arguments) entry.args += call.function.arguments;
+        // The model's part of the reply takes a shared turn: it waits out a
+        // drawing in another chat, and a drawing waits for it. The turn ends
+        // before the tools run, so this reply's own drawing can take its own.
+        const end = await turn('shared', abortSignal);
+        try {
+          const stream = await webgllm().chat.completions.create(
+            {
+              model,
+              ...(context.config?.reasoningEffort && {
+                reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
+              }),
+              messages: [
+                ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
+                ...toOpenAI(thread, mediaInputs(model).includes('image')),
+              ],
+              ...(tools.length > 0 && { tools }),
+              stream: true,
+              stream_options: { include_usage: true },
+            },
+            { signal: abortSignal },
+          );
+          setStatus({ state: 'ready' });
+          // Timed from here, once the model is loaded, so a download doesn't count.
+          streamStartTime = Date.now();
+          for await (const chunk of stream) {
+            totalChunks++;
+            usage = chunk.usage ?? usage;
+            timings = chunk.timings ?? timings;
+            const delta = chunk.choices[0]?.delta;
+            if (!delta) continue;
+            if (delta.reasoning_content) reasoning += delta.reasoning_content;
+            if (delta.content) answer += delta.content;
+            for (const call of delta.tool_calls ?? []) {
+              const entry = (calls[call.index] ??= { id: '', name: '', args: '' });
+              if (call.id) entry.id = call.id;
+              if (call.function.name) entry.name += call.function.name;
+              if (call.function.arguments) entry.args += call.function.arguments;
+            }
+            yield { content: content() };
           }
-          yield { content: content() };
+        } finally {
+          end();
         }
         // assistant-ui's message timing, from what webgllm measured.
         const timing = {
