@@ -1,3 +1,23 @@
+## 0.3.12 (2026-11-24)
+
+### 🩹 Fixes
+
+- **bench:** the draft check stops at the first NaN ([6fcb9f4](https://github.com/webgllm/webgllm/commit/6fcb9f4))
+- **drafts:** preparation compiles the pick's penalty-row shaders; the draft check can fail ([d522c0f](https://github.com/webgllm/webgllm/commit/d522c0f))
+- **drafts:** later replies keep drafting while their guesses hit ([f001e3e](https://github.com/webgllm/webgllm/commit/f001e3e))
+
+### 🔥 Performance
+
+- **drafts:** find a batch's cost in fewer, cheaper batches ([3bdfa0b](https://github.com/webgllm/webgllm/commit/3bdfa0b))
+- **drafts:** no first-reply cost for finding out drafts pay ([853fbca](https://github.com/webgllm/webgllm/commit/853fbca))
+- **drafts:** draft batches pay on slow-fence GPUs ([c61c888](https://github.com/webgllm/webgllm/commit/c61c888))
+- **drafts:** Qwen3.5 drafts by default, from the longest match ([3fbe4b6](https://github.com/webgllm/webgllm/commit/3fbe4b6))
+- **drafts:** prompt-lookup drafts for Gated DeltaNet, longest-match lookup ([695a786](https://github.com/webgllm/webgllm/commit/695a786))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.11 (2026-11-21)
 
 ### 🚀 Features
