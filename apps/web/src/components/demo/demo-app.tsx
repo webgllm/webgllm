@@ -18,6 +18,7 @@ import { useSidebar } from 'fumadocs-ui/layouts/docs/slots/sidebar';
 import { useMemo, useSyncExternalStore, type FC } from 'react';
 import { baseOptions } from '@/lib/layout.shared';
 import { useExaToolkit } from './exa';
+import { imageToolkit } from './image';
 import { chatModel, MediaAttachmentAdapter, MODELS, selectedModel } from './model';
 import { ModelProgress } from './model-progress';
 import { ModelSelector } from './model-selector';
@@ -145,7 +146,11 @@ export function DemoApp({
 }) {
   const runtime = useDemoRuntime(chatId, onChatChange);
   const { toolkit } = useExaToolkit();
-  const config = useMemo(() => AuiConfig({ tools: Tools({ toolkit }), suggestions: Suggestions(suggestions) }), [toolkit]);
+  // The web tools once Exa answers; the image tool from the start.
+  const config = useMemo(
+    () => AuiConfig({ tools: Tools({ toolkit: { ...toolkit, ...imageToolkit } }), suggestions: Suggestions(suggestions) }),
+    [toolkit],
+  );
 
   return (
     <AssistantRuntimeProvider runtime={runtime} config={config}>
