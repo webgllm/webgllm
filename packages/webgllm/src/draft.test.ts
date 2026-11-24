@@ -2,6 +2,35 @@ import assert from "node:assert/strict"
 import { describe, test } from "node:test"
 import { DraftPolicy, draftTimes, lookupDraft } from "./draft.js"
 
+describe("DraftPolicy.watch", () => {
+  const remembered = () => {
+    const times = draftTimes(4)
+    times.single = 10
+    times.batch = [null, 30, 30, 30, 30]
+    return new DraftPolicy(4, undefined, undefined, undefined, undefined, times)
+  }
+
+  test("drafts it watched come true: a policy that wouldn't draft starts to", () => {
+    const policy = remembered()
+    const drafts = [1, 2, 3, 4]
+    assert.equal(policy.peek(drafts), 0)
+    for (let round = 0; round < 8; round++) {
+      policy.watch(drafts)
+      for (const token of drafts) policy.drawn(token)
+    }
+    assert.ok(policy.peek(drafts) > 0)
+  })
+
+  test("drafts that don't come true keep it from drafting", () => {
+    const policy = remembered()
+    for (let round = 0; round < 8; round++) {
+      policy.watch([1, 2, 3, 4])
+      policy.drawn(9)
+    }
+    assert.equal(policy.peek([1, 2, 3, 4]), 0)
+  })
+})
+
 describe("lookupDraft", () => {
   test("drafts what followed the latest earlier occurrence of the last 4 tokens", () => {
     // ... 1 2 3 4 [5 6 7 8 9] ... 1 2 3 4
@@ -15,7 +44,17 @@ describe("lookupDraft", () => {
     assert.deepEqual(lookupDraft([9, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4], 3), [5, 6, 7])
   })
 
-  test("the latest occurrence wins", () => {
+  test("the longest match wins over a later, shorter one", () => {
+    // 1 2 3 4 5 [6 7] ... 9 2 3 4 5 [8] ... 1 2 3 4 5
+    assert.deepEqual(lookupDraft([1, 2, 3, 4, 5, 6, 7, 9, 2, 3, 4, 5, 8, 1, 2, 3, 4, 5], 2, 2), [6, 7])
+  })
+
+  test("a match stops growing at `longest`", () => {
+    const run = [1, 2, 3, 4, 5, 6]
+    assert.deepEqual(lookupDraft([...run, 7, 0, ...run], 1, 1, 3), [7])
+  })
+
+  test("the latest of equally long matches wins", () => {
     assert.deepEqual(lookupDraft([1, 2, 7, 1, 2, 8, 1, 2], 1, 2), [8])
   })
 
@@ -78,11 +117,115 @@ function simulate(
   return { rate: tokens / ms, meanDrafts: tail.reduce((a, b) => a + b, 0) / tail.length }
 }
 
+/** Two drafts that came true: what a policy waits for before its first batch. */
+function twoRight(policy: DraftPolicy) {
+  policy.drawn(-1) // (Ends what an earlier `choose` left being scored.)
+  for (let i = 0; i < 2; i++) {
+    policy.watch([1])
+    policy.drawn(1)
+  }
+}
+
 describe("DraftPolicy", () => {
+  test("no first batch until two drafts have come true, then a single draft", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    assert.equal(p.peek([1, 2, 3, 4]), 0)
+    p.watch([1])
+    p.drawn(1)
+    assert.equal(p.peek([1, 2, 3, 4]), 0, "one isn't enough")
+    p.watch([1])
+    p.drawn(1)
+    assert.equal(p.peek([1, 2, 3, 4]), 1)
+  })
+
+  test("a batch that compiled shaders scores its drafts but not its time", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    twoRight(p)
+    p.checkedBatch(1, 1, 1000, 1, true)
+    assert.equal(p.peek([1, 2, 3, 4]), 1, "still no time: one draft again")
+    p.checkedBatch(1, 1, 20)
+    assert.equal(p.peek([1, 2, 3, 4]), 1, "one slow time isn't enough to go by")
+    p.checkedBatch(1, 1, 11)
+    assert.ok(p.peek([1, 2, 3, 4]) > 1, "timed twice, and cheap: more drafts")
+  })
+
+  test("a first batch that's cheap is enough to go by", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    twoRight(p)
+    p.checkedBatch(1, 1, 11)
+    assert.ok(p.peek([1, 2, 3, 4]) > 1)
+  })
+
+  test("of the first two batches timed, a stall doesn't count", () => {
+    const p = new DraftPolicy(7)
+    p.alone(10)
+    twoRight(p)
+    p.checkedBatch(1, 1, 500)
+    p.checkedBatch(1, 1, 11)
+    assert.ok(p.peek([1, 2, 3, 4]) > 1, "drafting goes on")
+  })
+
+  test("a size between two timed ones is priced on the line through them", () => {
+    // 2 tokens in 140 ms, 8 in 420, a token alone in 100: a big batch pays, a small one doesn't.
+    const p = new DraftPolicy(7)
+    p.alone(100)
+    twoRight(p)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(7, 7, 420)
+    for (let i = 0; i < 20; i++) {
+      p.watch([1, 2, 3, 4, 5, 6, 7])
+      for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
+    }
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 7)
+  })
+
+  test("with one size timed, the next tried is at most 3 drafts", () => {
+    const p = new DraftPolicy(7)
+    p.alone(100)
+    twoRight(p)
+    p.checkedBatch(1, 1, 140)
+    p.checkedBatch(1, 1, 140)
+    for (let i = 0; i < 20; i++) {
+      p.watch([1, 2, 3, 4, 5, 6, 7])
+      for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
+    }
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 3)
+  })
+
+  test("two sizes timed price the bigger ones, which needn't be tried to know they don't pay", () => {
+    // 2 tokens in 150 ms, 4 in 390: 120 ms a draft, 8 tokens in 870, a token alone in 100.
+    const p = new DraftPolicy(7)
+    p.alone(100)
+    twoRight(p)
+    p.checkedBatch(1, 1, 150)
+    p.checkedBatch(1, 1, 150)
+    p.checkedBatch(3, 3, 390)
+    for (let i = 0; i < 20; i++) {
+      p.watch([1, 2, 3, 4, 5, 6, 7])
+      for (const t of [1, 2, 3, 4, 5, 6, 7]) p.drawn(t)
+    }
+    assert.equal(p.peek([1, 2, 3, 4, 5, 6, 7]), 1)
+  })
+
+  test("one draft come true is enough where a batch has nothing to compile", () => {
+    const p = new DraftPolicy(7)
+    p.startAfter = 1
+    p.alone(10)
+    assert.equal(p.peek([1, 2, 3]), 0)
+    p.watch([1])
+    p.drawn(1)
+    assert.equal(p.peek([1, 2, 3]), 1)
+  })
+
   test("a policy sharing another's times doesn't pay for a slow batch again", () => {
     const times = draftTimes(7)
     const first = new DraftPolicy(7, undefined, undefined, undefined, undefined, times)
     first.alone(50)
+    twoRight(first)
     const drafts = first.choose([1, 2, 3, 4])
     assert.ok(drafts > 0, "the first reply tries drafts")
     // A batch 5.6× a token, nothing kept (a Pixel 10 Pro's).
@@ -96,6 +239,7 @@ describe("DraftPolicy", () => {
     const p = new DraftPolicy(7)
     assert.equal(p.choose([1, 2, 3]), 0)
     p.alone(10)
+    twoRight(p)
     assert.ok(p.choose([1, 2, 3]) > 0, "drafts get tried once a single token is timed")
   })
 
@@ -174,6 +318,7 @@ describe("DraftPolicy", () => {
   test("one stalled batch doesn't stop drafting for the rest of the reply", () => {
     const p = new DraftPolicy(7)
     p.alone(15)
+    twoRight(p)
     // The first draft batch stalls (a compile, say): 200 ms against 15.
     const d = p.choose([1, 2, 3, 4, 5, 6, 7])
     assert.ok(d > 0)

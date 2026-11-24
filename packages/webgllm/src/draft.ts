@@ -7,36 +7,39 @@
  */
 
 /**
- * Tokens that may follow `tokens`: those that followed the latest earlier
- * occurrence of its last 4 tokens (else 3, ... down to `minMatch`), or
- * none. A longer match is likelier to go on, so it drafts more: up to
- * 2^(n−1) tokens after an n-token match, and at most `max`.
+ * Tokens that may follow `tokens`: those that followed the earlier
+ * occurrence matching the most last tokens (up to `longest`; the latest of
+ * equally long ones), or none below `minMatch`. In repeated code, the latest
+ * few matching tokens are often another copy's boilerplate. A longer match
+ * is likelier to go on, so it drafts more: up to 2^(n−1) tokens after an
+ * n-token match, and at most `max`.
  */
 export function lookupDraft(
   tokens: ArrayLike<number>,
   max: number,
-  minMatch = 1
+  minMatch = 1,
+  longest = 32
 ): Array<number> {
-  if (max <= 0) return []
   const end = tokens.length
-  for (let n = 4; n >= minMatch; n--) {
-    if (end <= n) continue
-    for (let start = end - n - 1; start >= 0; start--) {
-      let match = true
-      for (let j = 0; j < n; j++) {
-        if (tokens[start + j] !== tokens[end - n + j]) {
-          match = false
-          break
-        }
-      }
-      if (!match) continue
-      const most = Math.min(max, 2 ** (n - 1))
-      const out: Array<number> = []
-      for (let i = start + n; i < end && out.length < most; i++) out.push(tokens[i])
-      return out
+  if (max <= 0 || end < 2) return []
+  const last = tokens[end - 1]
+  let best = 0
+  let from = -1
+  for (let next = end - 1; next >= 1; next--) {
+    if (tokens[next - 1] !== last) continue
+    let n = 1
+    while (n < longest && next - 1 - n >= 0 && tokens[next - 1 - n] === tokens[end - 1 - n]) n++
+    if (n > best) {
+      best = n
+      from = next
+      if (n === longest) break
     }
   }
-  return []
+  if (best < Math.max(1, minMatch)) return []
+  const most = Math.min(max, 2 ** Math.min(best - 1, 30))
+  const out: Array<number> = []
+  for (let i = from; i < end && out.length < most; i++) out.push(tokens[i])
+  return out
 }
 
 /**
@@ -54,7 +57,12 @@ export function lookupDraft(
  * drafts cost on this device, which a policy can share with the next
  * reply's (see DraftPolicy's `times`).
  */
-export type DraftTimes = { single: number | null; batch: Array<number | null> }
+export type DraftTimes = {
+  single: number | null
+  batch: Array<number | null>
+  /** Batches timed so far. */
+  samples?: number
+}
 
 /** No times measured yet, for drafts up to `max`. */
 export function draftTimes(max: number): DraftTimes {
@@ -70,6 +78,11 @@ export class DraftPolicy {
    * ones not checked; those before it a batch checks itself).
    */
   private shadow: { drafts: Array<number>; at: number; from: number } | null = null
+  /**
+   * Drafts that must come true before the first batch is timed: one where a
+   * batch is ready to run, two where it would first have shaders to compile.
+   */
+  startAfter = 2
 
   constructor(
     readonly max: number,
@@ -109,14 +122,26 @@ export class DraftPolicy {
   private batchMs(d: number): number {
     const own = this.times.batch[d]
     if (own !== null) return own
-    // Unmeasured: the nearest measured count's time, 3% more per draft
-    // further; with none measured, a token alone's (so drafts get tried).
-    for (let k = 1; k <= this.max; k++) {
-      for (const j of [d - k, d + k]) {
-        const t = j >= 1 && j <= this.max ? this.times.batch[j] : null
-        if (t !== null) return t * (1 + 0.03 * (d - j))
-      }
+    // Unmeasured: on the line through the two measured counts around it or
+    // just below it (a batch has a fixed cost, so one count's time per row
+    // overprices a bigger one), at least 3% more per draft. With one count
+    // measured, 3% more per draft, so the next size gets tried and timed;
+    // with none, a token alone's (so drafts get tried).
+    let below = d - 1
+    while (below >= 1 && this.times.batch[below] === null) below--
+    let above = d + 1
+    while (above <= this.max && this.times.batch[above] === null) above++
+    const low = below >= 1 ? this.times.batch[below] : null
+    const high = above <= this.max ? this.times.batch[above] : null
+    if (low !== null && high !== null) return low + ((high - low) * (d - below)) / (above - below)
+    if (low !== null) {
+      let previous = below - 1
+      while (previous >= 1 && this.times.batch[previous] === null) previous--
+      const before = previous >= 1 ? this.times.batch[previous] : null
+      const slope = before !== null ? (low - before) / (below - previous) : 0
+      return low + Math.max(0.03 * low, slope) * (d - below)
     }
+    if (high !== null) return high * (1 + 0.03 * (d - above))
     return this.times.single ?? 0
   }
 
@@ -142,11 +167,22 @@ export class DraftPolicy {
     if (n === 0) return 0
     // A token alone first, to have its time to beat.
     if (this.times.single === null) return 0
+    // Until a batch is timed: none before `startAfter` drafts have come true
+    // (a reply that repeats nothing never pays for one), then one draft, to
+    // find out what batches cost here for less than a full one would where
+    // they don't pay. Twice if the first looks slow, so that one stall
+    // doesn't end drafting.
+    const samples = this.times.samples ?? 0
+    const cheap = samples === 1 && (this.times.batch[1] ?? Infinity) <= 1.5 * this.times.single
+    if (samples < 2 && !cheap) return this.kept[1] < this.startAfter - 0.5 ? 0 : 1
+    // A second size next, at most 3 drafts: two sizes price the bigger ones.
+    const sizes = this.times.batch.filter((t) => t !== null).length
+    const most = sizes < 2 ? Math.min(n, 3) : n
     let best = 0
     let bestRate = 1 / this.times.single
     let expect = 1
     let run = 1
-    for (let d = 1; d <= n; d++) {
+    for (let d = 1; d <= most; d++) {
       run *= this.rate(d)
       expect += run
       const ms = this.batchMs(d)
@@ -157,6 +193,16 @@ export class DraftPolicy {
       }
     }
     return best
+  }
+
+  /**
+   * Drafts found while no batch would be read: scored against the next
+   * tokens like the ones `choose` leaves unchecked, so a reply whose guesses
+   * keep hitting (and so never reaches `choose`) can still learn to draft.
+   */
+  watch(available: Array<number>) {
+    if (!this.shadow && available.length)
+      this.shadow = { drafts: available.slice(0, this.max), at: 0, from: 0 }
   }
 
   /** A token was written (any way): scores remembered unchecked drafts. */
@@ -174,17 +220,23 @@ export class DraftPolicy {
   /**
    * A batch of a token and `drafts` drafts took `ms`, and its first
    * `kept` drafts were kept, of the first `judged` checked (fewer than
-   * `drafts` if the reply ended first).
+   * `drafts` if the reply ended first). `compiled`: shaders compiled during
+   * it, so its time says nothing about what the next one will cost.
    */
-  checkedBatch(drafts: number, kept: number, ms: number, judged = drafts) {
+  checkedBatch(drafts: number, kept: number, ms: number, judged = drafts, compiled = false) {
     // (The shadow, if any, goes on: the batch's kept drafts were drawn
     // already, and the token drawn after them scores the next draft.)
     for (let i = 1; i <= Math.min(judged, kept + 1); i++) this.outcome(i, i <= kept)
+    if (compiled) return
+    const samples = this.times.samples ?? 0
+    this.times.samples = samples + 1
     const old = this.times.batch[drafts]
     this.times.batch[drafts] =
       old === null
         ? Math.min(ms, 3 * this.batchMs(drafts) || ms)
-        : this.timeDecay * old + (1 - this.timeDecay) * Math.min(ms, 3 * old)
+        : samples === 1
+          ? Math.min(old, ms) // (The first two: the lesser, in case one stalled.)
+          : this.timeDecay * old + (1 - this.timeDecay) * Math.min(ms, 3 * old)
   }
 
   /** A token alone (no drafts) took `ms`, waits it overlapped included. */

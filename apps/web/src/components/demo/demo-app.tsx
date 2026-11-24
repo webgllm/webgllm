@@ -18,6 +18,7 @@ import { useSidebar } from 'fumadocs-ui/layouts/docs/slots/sidebar';
 import { useMemo, useSyncExternalStore, type FC } from 'react';
 import { baseOptions } from '@/lib/layout.shared';
 import { useExaToolkit } from './exa';
+import { imageToolkit } from './image';
 import { chatModel, MediaAttachmentAdapter, MODELS, selectedModel } from './model';
 import { ModelProgress } from './model-progress';
 import { ModelSelector } from './model-selector';
@@ -28,6 +29,7 @@ const chat = chatModel();
 
 const suggestions = [
   { title: 'Search the web', label: 'for the latest WebGL news', prompt: 'Search the web for the latest WebGL news and summarize it.' },
+  { title: 'Draw', label: 'a pixel-art rubber duck', prompt: 'Draw a pixel-art rubber duck.' },
   { title: 'Explain', label: 'how attention works in transformers', prompt: 'Explain how attention works in transformers, briefly.' },
   { title: 'Write code', label: 'a debounce function in TypeScript', prompt: 'Write a debounce function in TypeScript.' },
   { title: 'Plan', label: 'a weekend in Lisbon', prompt: 'Plan a weekend in Lisbon for someone who likes food and walking.' },
@@ -145,7 +147,11 @@ export function DemoApp({
 }) {
   const runtime = useDemoRuntime(chatId, onChatChange);
   const { toolkit } = useExaToolkit();
-  const config = useMemo(() => AuiConfig({ tools: Tools({ toolkit }), suggestions: Suggestions(suggestions) }), [toolkit]);
+  // The web tools once Exa answers; the image tool from the start.
+  const config = useMemo(
+    () => AuiConfig({ tools: Tools({ toolkit: { ...toolkit, ...imageToolkit } }), suggestions: Suggestions(suggestions) }),
+    [toolkit],
+  );
 
   return (
     <AssistantRuntimeProvider runtime={runtime} config={config}>

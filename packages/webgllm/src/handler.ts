@@ -1541,18 +1541,37 @@ async function generate(request: GenerateRequest) {
   const policy = new DraftPolicy(DRAFTS, undefined, undefined, undefined, undefined, costs)
   // Drafts for the reply so far, at most `max`: as many of those found as
   // the policy expects to pay.
-  const draftsFor = (max: number) => {
-    // (Gated DeltaNet models read one token at a time: see Engine.canDraft.)
-    if (request.speculative === false || max <= 0 || !engine.canDraft) return []
-    const found = untilCallEnd(lookupDraft(history, max, TUNING.draftMatch))
+  // (A long match starts drafting: prose repeats two or three tokens by
+  // chance, and each batch that finds so costs it speed. While a batch's
+  // drafts keep being right, shorter ones carry on.)
+  let rolling = false
+  const lookup = (max: number) =>
+    untilCallEnd(lookupDraft(history, max, rolling ? TUNING.draftMatch : TUNING.draftStart))
+  // (Not every model reads draft batches: see Engine.canDraft.)
+  const drafting = () => request.speculative !== false && engine.canDraft
+  const draftsFor = async (max: number) => {
+    if (max <= 0 || !drafting()) return []
+    policy.startAfter = engine.draftsReady ? 1 : 2
+    const found = lookup(max)
+    // The first batch's shaders compile in the background (no guess is
+    // pending here); tokens go on one at a time until they're done.
+    if (!engine.draftsReady && policy.peek(found) > 0) {
+      await engine.prepareDraftBatches()
+      policy.watch(found)
+      return []
+    }
     return found.slice(0, policy.choose(found))
   }
-  // Whether a draft batch would follow (without changing what the policy
-  // remembers).
+  // Whether a draft batch would follow. If not, the drafts found are still
+  // scored: with batch times remembered from an earlier reply, a reply whose
+  // guesses all hit would otherwise never learn that its drafts are right.
   const draftsNext = () => {
-    if (request.speculative === false || !engine.canDraft) return false
-    const found = untilCallEnd(lookupDraft(history, DRAFTS, TUNING.draftMatch))
-    return found.length > 0 && policy.peek(found) > 0
+    if (!drafting()) return false
+    policy.startAfter = engine.draftsReady ? 1 : 2
+    const found = lookup(DRAFTS)
+    const next = found.length > 0 && !engine.draftsCompiling && policy.peek(found) > 0
+    if (!next) policy.watch(found)
+    return next
   }
   // The distribution of the token after `r`, a row of the last batch, as
   // token ids and probabilities; with `guess`, the likeliest token is read
@@ -1810,7 +1829,7 @@ async function generate(request: GenerateRequest) {
     }
     // The token and its drafts in one batch: drafts the reply can still
     // hold (one more token is drawn after them) and the cache too.
-    const proposed = draftsFor(
+    const proposed = await draftsFor(
       Math.min(
         DRAFTS,
         maxTokens - stats.outputTokens - 1,
@@ -1821,6 +1840,7 @@ async function generate(request: GenerateRequest) {
     const preview = structured?.answering ? structured.previewAnswerDrafts(proposed) : undefined
     const drafts = preview?.drafts ?? proposed
     const batch = [token, ...drafts]
+    const compiledBefore = engine.gpu.compiled.count
     row = await engine.forwardHidden(batch, { draft: drafts.length > 0 })
     // Row i's distribution checks draft i + 1; the first draft it rejects
     // is replaced by a token drawn from what's left, and the rest dropped.
@@ -1872,8 +1892,10 @@ async function generate(request: GenerateRequest) {
         drafts.length,
         kept - 1,
         stepMs,
-        going ? drafts.length : kept - 1
+        going ? drafts.length : kept - 1,
+        engine.gpu.compiled.count !== compiledBefore
       )
+      rolling = kept > 1
       stats.draftBatches = (stats.draftBatches ?? 0) + 1
       stats.draftsChecked =
         (stats.draftsChecked ?? 0) + (going ? drafts.length : kept - 1)

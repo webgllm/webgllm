@@ -11,6 +11,7 @@
  */
 import { blobSource, httpSource } from "../src/byte-source.js"
 import { Engine, TUNING } from "../src/engine.js"
+import { WebGpu } from "../src/gpu/webgpu.js"
 import { names } from "./memory-names.js"
 import type { Texture } from "../src/gpu/gl.js"
 import { loadGguf } from "../src/load-gguf.js"
@@ -26,7 +27,7 @@ import type { ByteSource } from "../src/weights.js"
 type Params = {
   model: WebGlTextModel
   /** chat: a chat with checkpoints; ab: a load per variant, timed. */
-  mode: "chat" | "ab" | "prefix"
+  mode: "chat" | "ab" | "prefix" | "draft" | "draftcost"
   /** Prompt batch (0: the worker's, 512). */
   batch: number
   /** The first message's length in tokens. */
@@ -48,6 +49,8 @@ type Params = {
   cdp: boolean
   /** chat: print every texture group at each checkpoint, not just the totals. */
   detail: boolean
+  /** Run on WebGPU (?webgpu=1); WebGL 2 otherwise. */
+  webgpu: boolean
 }
 
 const MiB = 2 ** 20
@@ -229,6 +232,7 @@ function applyTune(spec: string) {
 
 async function loadEngine(params: Params, got: Awaited<ReturnType<typeof files>>, batch: number) {
   const engine = new Engine(new OffscreenCanvas(1, 1), {
+    ...(params.webgpu && { gpu: await WebGpu.create() }),
     batchSize: batch || params.batch || (TUNING.promptBatch > 0 ? TUNING.promptBatch : 512),
     ...(params.contextLength && { contextLength: params.contextLength })
   })
@@ -451,6 +455,214 @@ async function prefixCheck(params: Params, got: Awaited<ReturnType<typeof files>
   }
 }
 
+/**
+ * ?mode=draft: draft batches cut back to every prefix against the same
+ * tokens read one at a time: the batch's kept rows, then six tokens read
+ * after `accept`, which only match if the state went back correctly; and
+ * two draft batches in a row, each cut short. Fails (an ERROR line) on a
+ * logit or a KL that isn't a number, on either side and at the row it's
+ * found; on a row whose KL is past DRAFT_KL_MAX; and on a shader compiled
+ * in a draft batch after its passes were prepared.
+ */
+/**
+ * The most a row of a cut-short batch may differ from reading its tokens one
+ * at a time (KL): batches round differently, up to 1e-3 on the GPUs measured
+ * (an M3 Ultra, a Pixel 10 Pro); a state that went back wrong measured 1.1.
+ */
+const DRAFT_KL_MAX = 1e-2
+
+/** A compiled shader's source in a few words: its variant key, if it has one, and the textures it reads. */
+function shaderLabel(source: string) {
+  const lines = source.split("\n")
+  const key = lines[0].includes("|") || lines[0].startsWith("native") || lines[0].startsWith("merged") ? `${lines[0].slice(0, 60)} ` : ""
+  const samplers = lines.filter((l) => /^uniform \S*sampler/.test(l)).map((l) => l.replace(/^uniform \S+ (\w+);.*/, "$1"))
+  return `${key}[${samplers.join(",")}] ${source.length}`
+}
+async function draftCheck(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    if (!engine.canDraft) throw new Error("This model reads no draft batches (tune=linearDrafts:1 for Gated DeltaNet).")
+    const { tokenizer } = got
+    const content = padded(tokenizer, [], "Tell me a short story about the mill, in a few paragraphs.", params.length + 32, false)
+    const all = Array.from(tokenizer.encodeChat([{ role: "user", content }], { addGenerationPrompt: true, enableThinking: false }))
+    const prompt = all.slice(0, -32)
+    const rest = all.slice(-32)
+    // `what`'s logits as probabilities. Throws on a logit that isn't a number (or is
+    // +Infinity): a NaN would otherwise drop out of the comparisons below unnoticed.
+    const distribution = (logits: Float32Array, what: string) => {
+      let max = -Infinity
+      for (let i = 0; i < logits.length; i++) {
+        const l = logits[i]
+        if (Number.isNaN(l) || l === Infinity) throw new Error(`${what}: logit ${i} is ${l}.`)
+        if (l > max) max = l
+      }
+      if (!Number.isFinite(max)) throw new Error(`${what}: no finite logit.`)
+      const p = new Float64Array(logits.length)
+      let sum = 0
+      for (let i = 0; i < p.length; i++) sum += p[i] = Math.exp(logits[i] - max)
+      for (let i = 0; i < p.length; i++) p[i] /= sum
+      return p
+    }
+    const argmax = (x: ArrayLike<number>) => {
+      let at = 0
+      for (let i = 1; i < x.length; i++) if (x[i] > x[at]) at = i
+      return at
+    }
+    engine.reset()
+    await engine.forwardHidden(prompt)
+    const want: Array<Float64Array> = []
+    const wantTop: Array<number> = []
+    for (const token of rest) {
+      const logits = await engine.logits(await engine.forwardHidden([token]))
+      want.push(distribution(logits, `Token ${want.length} read alone`))
+      wantTop.push(argmax(logits))
+    }
+    let worst = 0
+    let compared = 0
+    let same = 0
+    const check = async (row: number, at: number) => {
+      const logits = await engine.logits(row)
+      const p = want[at]
+      const q = distribution(logits, `Comparison ${compared} (token ${at})`)
+      let kl = 0
+      for (let i = 0; i < p.length; i++) if (p[i] > 1e-12) kl += p[i] * Math.log(p[i] / Math.max(q[i], 1e-30))
+      // (At once: a later row must not be able to hide it.)
+      if (!Number.isFinite(kl)) throw new Error(`Comparison ${compared} (token ${at}): KL is ${kl}.`)
+      worst = Math.max(worst, kl)
+      compared++
+      if (argmax(logits) === wantTop[at]) same++
+    }
+    // Compiling the draft passes between tokens leaves the cache and state as they were.
+    const prepared = !engine.draftsReady
+    if (prepared) {
+      engine.reset()
+      await engine.forwardHidden(prompt)
+      for (let at = 0; at < 3; at++) await check(await engine.forwardHidden([rest[at]]), at)
+      await engine.prepareDraftBatches()
+      for (let at = 3; at < 12; at++) await check(await engine.forwardHidden([rest[at]]), at)
+      while (engine.draftsCompiling) await new Promise((r) => setTimeout(r, 10))
+    }
+    const before = engine.gpu.bytes
+    // Once prepared, a batch compiles nothing more, whichever way its rows are picked:
+    // with rows seeing a token otherwise than the mask too (as drafts' rows do).
+    const compiled = engine.gpu.compiled
+    const known = new Set(compiled.times.keys())
+    const picks = async (row0: number, rows: number) => {
+      if (!prepared) return
+      for (const seen of [[], [[0, 0, 0, rows]]] as Array<Array<[number, 0, number, number]>>) {
+        await engine.pick(row0, rows, 20, 1.1, seen)
+        await engine.argmax(row0, rows, 1.1, seen)
+      }
+    }
+    let cases = 0
+    for (const n of [2, 3, 4, 5, 8]) {
+      for (let keep = 1; keep < n; keep++) {
+        engine.reset()
+        await engine.forwardHidden(prompt)
+        const last = await engine.forwardHidden(rest.slice(0, n), { draft: true })
+        for (let r = 0; r < keep; r++) await check(last - n + 1 + r, r)
+        await picks(last - n + 1, n)
+        engine.accept(keep)
+        for (let at = keep; at < keep + 6; at++) await check(await engine.forwardHidden([rest[at]]), at)
+        cases++
+      }
+    }
+    engine.reset()
+    await engine.forwardHidden(prompt)
+    await engine.forwardHidden(rest.slice(0, 5), { draft: true })
+    engine.accept(2)
+    const last = await engine.forwardHidden(rest.slice(2, 7), { draft: true })
+    for (let r = 0; r < 3; r++) await check(last - 4 + r, 2 + r)
+    engine.accept(3)
+    for (let at = 5; at < 11; at++) await check(await engine.forwardHidden([rest[at]]), at)
+    cases++
+    log(
+      `DRAFT CHECK ${params.model} (${prompt.length}-token prompt, ${cases} cut-short batches, ${compared} rows): worst KL ${worst.toExponential(2)}, same top token ${same}/${compared}, draft rows ${mib(engine.gpu.bytes - before)} MiB`
+    )
+    if (!(worst <= DRAFT_KL_MAX)) throw new Error(`A draft batch's rows differ from reading its tokens one at a time: worst KL ${worst} (at most ${DRAFT_KL_MAX}).`)
+    const late = [...compiled.times.keys()].filter((source) => !known.has(source))
+    if (prepared && late.length)
+      throw new Error(`${late.length} shaders compiled in draft batches after their passes were prepared: ${late.slice(0, 8).map(shaderLabel).join(" | ")}`)
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
+/**
+ * ?mode=draftcost: what a draft batch costs on this GPU, by its size: a warm
+ * batch and its greedy picks read back, sizes alternating, then (WebGPU)
+ * where the GPU's time goes by kind of pass.
+ */
+async function draftCost(params: Params, got: Awaited<ReturnType<typeof files>>) {
+  applyTune(params.tune)
+  const { engine } = await loadEngine(params, got, 0)
+  try {
+    await engine.warmUp()
+    if (!engine.canDraft) throw new Error("This model reads no draft batches.")
+    const { tokenizer } = got
+    const content = padded(tokenizer, [], "Tell me a short story about the mill, in a few paragraphs.", params.length + 64, false)
+    const all = Array.from(tokenizer.encodeChat([{ role: "user", content }], { addGenerationPrompt: true, enableThinking: false }))
+    const prompt = all.slice(0, -64)
+    const rest = all.slice(-64)
+    const sizes = [1, 2, 3, 4, 6, 8]
+    const gpu = engine.gpu as unknown as {
+      passes: number
+      profile?: Map<string, { ms: number; n: number }> | null
+      profiled?: () => Promise<unknown>
+    }
+    let at = 0
+    const step = async (n: number) => {
+      const batch = Array.from({ length: n }, (_, i) => rest[(at + i) % rest.length])
+      at++
+      const row = await engine.forwardHidden(batch, { draft: n > 1 })
+      await engine.argmax(row - n + 1, n, 1, [])
+      if (n > 1) engine.accept(1)
+    }
+    const start = async () => {
+      engine.reset()
+      at = 0
+      await engine.forwardHidden(prompt)
+      for (const n of sizes) await step(n) // (Compiles what each size needs.)
+    }
+    await start()
+    const times = new Map<number, Array<number>>(sizes.map((n) => [n, []]))
+    const passes = new Map<number, number>()
+    const rounds = Math.max(10, params.rounds)
+    for (let round = 0; round < rounds; round++) {
+      for (const n of round % 2 ? [...sizes].reverse() : sizes) {
+        const before = gpu.passes
+        const t = performance.now()
+        await step(n)
+        times.get(n)!.push(performance.now() - t)
+        passes.set(n, gpu.passes - before)
+      }
+      log(`draft cost: round ${round + 1} of ${rounds}`)
+    }
+    const median = (x: Array<number>) => [...x].sort((a, b) => a - b)[Math.floor(x.length / 2)]
+    const one = median(times.get(1)!)
+    for (const n of sizes) {
+      const ms = median(times.get(n)!)
+      log(`DRAFT COST ${params.model} ${n} rows: ${ms.toFixed(1)} ms (${(ms / n).toFixed(1)} a token, ${(ms / one).toFixed(2)}x one token), ${passes.get(n)} passes`)
+    }
+    if (gpu.profiled) {
+      for (const n of [1, 8]) {
+        await start()
+        gpu.profile = new Map()
+        for (let i = 0; i < 6; i++) await step(n)
+        await gpu.profiled()
+        const rows = [...(gpu.profile?.entries() ?? [])].sort((a, b) => b[1].ms - a[1].ms)
+        const total = rows.reduce((sum, [, v]) => sum + v.ms, 0)
+        log(`DRAFT PROFILE ${params.model} ${n} rows, GPU ms a batch ${(total / 6).toFixed(1)}: ${rows.slice(0, 40).map(([k, v]) => `${k} ${(v.ms / 6).toFixed(1)} (${Math.round(v.n / 6)})`).join(", ")}`)
+        gpu.profile = null
+      }
+    }
+  } finally {
+    engine.gpu.dispose()
+  }
+}
+
 async function run(params: Params) {
   if (params.cdp) {
     // The GPU process before any of this page's textures: what the
@@ -464,5 +676,7 @@ async function run(params: Params) {
   const got = await files(params.model)
   if (params.mode === "ab") await ab(params, got)
   else if (params.mode === "prefix") await prefixCheck(params, got)
+  else if (params.mode === "draft") await draftCheck(params, got)
+  else if (params.mode === "draftcost") await draftCost(params, got)
   else await chat(params, got)
 }

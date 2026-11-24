@@ -9,8 +9,9 @@ import type {
   CompletionUsage,
   ReasoningEffort,
 } from 'webgllm';
-import { WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
+import { WEBGL_IMAGE_MODELS, WEBGL_MODEL_META, WebGLLM, type WebGlModelMeta } from 'webgllm';
 import type { ModelOption, ModelSelectorEffortOption } from './model-selection';
+import { turns } from './turns';
 
 /**
  * The models the demo offers: GGUF builds, each with tools. Those with a
@@ -162,11 +163,76 @@ let client: WebGLLM | undefined;
 export function webgllm(): WebGLLM {
   client ??= new WebGLLM({
     contextLength: 8192,
-    onProgress: ({ model, phase, progress, cached }) =>
-      setStatus({ state: phase === 'download' ? 'downloading' : 'loading', model, progress, cached }),
+    onProgress: ({ model, phase, progress, cached }) => {
+      // (The image model's shows in its tool's widget: see image.tsx.)
+      if ((WEBGL_IMAGE_MODELS as readonly string[]).includes(model)) return;
+      setStatus({ state: phase === 'download' ? 'downloading' : 'loading', model, progress, cached });
+    },
   });
   return client;
 }
+
+/**
+ * Turns at the models, across every chat (a chat in the background keeps
+ * replying): replies share one, and `whileUnloaded` takes one alone.
+ */
+const turn = turns();
+
+/** The model each reply runs on, by the reply's abort signal, which its tools are given too. */
+const replyModels = new WeakMap<AbortSignal, ModelId>();
+
+/**
+ * Runs `run` with no chat model loaded, then loads the reply's model again,
+ * so a chat model and the image model never sit in memory together: the
+ * image tool draws in the chat model's place (image.tsx). A phone's tab
+ * holds LFM3 or the image model, not both. `signal` is the reply's, as its
+ * tool was given it: it names the model to load again, the one that reply
+ * ran on, whatever other chats have run since. It waits for the replies
+ * running in other chats to end, and none starts until the model is loaded
+ * again; two of these never overlap either. A reply that was stopped leaves
+ * the load to the next message.
+ */
+export async function whileUnloaded<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  const model = replyModels.get(signal);
+  const end = await turn('alone', signal);
+  try {
+    await webgllm().unloadModel();
+    setStatus({ state: 'idle' });
+    try {
+      return await run();
+    } finally {
+      if (model && !signal.aborted) {
+        try {
+          await webgllm().loadModel(model, { signal });
+          setStatus({ state: 'ready' });
+        } catch (error) {
+          // (The next message loads it, and shows what went wrong if it can't.)
+          setStatus({ state: 'idle' });
+          if (!signal.aborted) console.error(error);
+        }
+      }
+    }
+  } finally {
+    end();
+  }
+}
+
+/**
+ * A tool result whose widget shows more than the model reads: `text` is
+ * what goes to the model. With `endsReply`, a model turn that called only
+ * such tools ends the reply with their results, and the model isn't called
+ * again for them.
+ */
+export type ShownToolResult = { text: string; endsReply?: boolean };
+
+const shownResult = (result: unknown): ShownToolResult | undefined =>
+  result !== null && typeof result === 'object' && typeof (result as { text?: unknown }).text === 'string'
+    ? (result as ShownToolResult)
+    : undefined;
+
+/** What the model reads of a tool's result. */
+const resultForModel = (result: unknown) =>
+  shownResult(result)?.text ?? (typeof result === 'string' ? result : JSON.stringify(result));
 
 type ReadonlyJSONObject = ToolCallMessagePart['args'];
 
@@ -220,7 +286,7 @@ function toOpenAI(messages: readonly ThreadMessage[], readsImages: boolean): Cha
       out.push({
         role: 'tool',
         tool_call_id: call.toolCallId,
-        content: typeof call.result === 'string' ? call.result : JSON.stringify(call.result),
+        content: resultForModel(call.result),
       });
     }
   }
@@ -308,43 +374,53 @@ export function chatModel(): ChatModelAdapter {
       try {
         // Set by assistant-ui's model selector through the model context.
         const model = context.config?.modelName ?? MODELS[0]!.id;
-        const stream = await webgllm().chat.completions.create(
-          {
-            model,
-            ...(context.config?.reasoningEffort && {
-              reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
-            }),
-            messages: [
-              ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
-              ...toOpenAI(thread, mediaInputs(model).includes('image')),
-            ],
-            ...(tools.length > 0 && { tools }),
-            stream: true,
-            stream_options: { include_usage: true },
-          },
-          { signal: abortSignal },
-        );
-        setStatus({ state: 'ready' });
-        // Timed from here, once the model is loaded, so a download doesn't count.
-        const streamStartTime = Date.now();
+        replyModels.set(abortSignal, model as ModelId);
+        let streamStartTime = 0;
         let totalChunks = 0;
         let usage: CompletionUsage | undefined;
         let timings: CompletionTimings | undefined;
-        for await (const chunk of stream) {
-          totalChunks++;
-          usage = chunk.usage ?? usage;
-          timings = chunk.timings ?? timings;
-          const delta = chunk.choices[0]?.delta;
-          if (!delta) continue;
-          if (delta.reasoning_content) reasoning += delta.reasoning_content;
-          if (delta.content) answer += delta.content;
-          for (const call of delta.tool_calls ?? []) {
-            const entry = (calls[call.index] ??= { id: '', name: '', args: '' });
-            if (call.id) entry.id = call.id;
-            if (call.function.name) entry.name += call.function.name;
-            if (call.function.arguments) entry.args += call.function.arguments;
+        // The model's part of the reply takes a shared turn: it waits out a
+        // drawing in another chat, and a drawing waits for it. The turn ends
+        // before the tools run, so this reply's own drawing can take its own.
+        const end = await turn('shared', abortSignal);
+        try {
+          const stream = await webgllm().chat.completions.create(
+            {
+              model,
+              ...(context.config?.reasoningEffort && {
+                reasoning_effort: context.config.reasoningEffort as ReasoningEffort,
+              }),
+              messages: [
+                ...(context.system ? [{ role: 'system' as const, content: context.system }] : []),
+                ...toOpenAI(thread, mediaInputs(model).includes('image')),
+              ],
+              ...(tools.length > 0 && { tools }),
+              stream: true,
+              stream_options: { include_usage: true },
+            },
+            { signal: abortSignal },
+          );
+          setStatus({ state: 'ready' });
+          // Timed from here, once the model is loaded, so a download doesn't count.
+          streamStartTime = Date.now();
+          for await (const chunk of stream) {
+            totalChunks++;
+            usage = chunk.usage ?? usage;
+            timings = chunk.timings ?? timings;
+            const delta = chunk.choices[0]?.delta;
+            if (!delta) continue;
+            if (delta.reasoning_content) reasoning += delta.reasoning_content;
+            if (delta.content) answer += delta.content;
+            for (const call of delta.tool_calls ?? []) {
+              const entry = (calls[call.index] ??= { id: '', name: '', args: '' });
+              if (call.id) entry.id = call.id;
+              if (call.function.name) entry.name += call.function.name;
+              if (call.function.arguments) entry.args += call.function.arguments;
+            }
+            yield { content: content() };
           }
-          yield { content: content() };
+        } finally {
+          end();
         }
         // assistant-ui's message timing, from what webgllm measured.
         const timing = {
@@ -393,12 +469,18 @@ export function chatModel(): ChatModelAdapter {
             }
           }),
         );
+        const answered = content().map((part) => {
+          if (part.type !== 'tool-call') return part;
+          const index = calls.findIndex((call) => call.id === part.toolCallId);
+          return { ...part, ...results[index] };
+        });
+        // A turn whose tools all end the reply (a drawing): their results are the answer.
+        if (results.every(({ result, isError }) => !isError && shownResult(result)?.endsReply)) {
+          yield { content: answered, metadata: { timing, custom: { stats } } };
+          return;
+        }
         yield {
-          content: content().map((part) => {
-            if (part.type !== 'tool-call') return part;
-            const index = calls.findIndex((call) => call.id === part.toolCallId);
-            return { ...part, ...results[index] };
-          }),
+          content: answered,
           status: { type: 'requires-action', reason: 'tool-calls' },
           metadata: { steps: [{}], timing, custom: { stats } },
         };

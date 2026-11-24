@@ -120,6 +120,8 @@ type GpuLayer = {
     norm: Texture
     /** Raon Delta Attention: the decay's rank to every key's logit (see LinearAttentionWeights.decay). */
     decay?: GpuMatrix
+    /** The last draft batch's recurrence inputs, made at the first one (see linearDraftRows). */
+    draftRows?: LinearDraftRows
   }
   /** Raon's gated MLA beside `attention` (whose qkvg is its first projection): q_b and the per-head matrices. */
   latent?: {
@@ -515,12 +517,19 @@ export const TUNING = {
   qInCache: 1,
   /**
    * The worker's speculative decoding (see handler.ts): drafts follow an
-   * earlier occurrence of at least draftMatch last tokens, as many as
-   * pay by measured cost (see DraftPolicy); with
-   * guessDrafts, a draft batch also guesses the token after its last row.
+   * earlier occurrence of at least draftMatch last tokens (draftStart
+   * unless the last batch kept some), as many as pay by measured cost
+   * (see DraftPolicy); with guessDrafts, a draft batch also guesses the
+   * token after its last row.
    */
   draftMatch: 2,
+  draftStart: 4,
   guessDrafts: 0,
+  /**
+   * 1: Gated DeltaNet models read draft batches too: a batch keeps what
+   * replays its recurrence up to any prefix (see linearDraftRows, accept).
+   */
+  linearDrafts: 1,
   /** Queries per scores slice (0: from the batch size; see scoreRows). */
   scoreRows: 0,
   /** 1: few-row conv blocks draw their output and new state in one pass. */
@@ -779,6 +788,15 @@ export function retimedTuning(previous: Tuned, now: Tuned): Tuned {
     submissionRetime: 0
   }
 }
+
+/**
+ * What a Gated DeltaNet layer's draft batch keeps to go back to a prefix of
+ * it (see Engine.accept), for up to SPLIT_ROWS rows: q̂|k̂, delta and the
+ * decays' running sums, which the batch's recurrence draws here in place
+ * of the scratch every layer shares, and `conv`, the conv state before the
+ * batch followed by its raw q|k|v rows.
+ */
+type LinearDraftRows = { qk: Texture; delta: Texture; cum: Texture; conv: Texture }
 
 /** What resuming at a cache position needs (see Engine.snapshots). */
 type Snapshot = {
@@ -1385,8 +1403,8 @@ export class Engine {
     const hasConv = c.layerTypes.includes("conv")
     const conv = (make: () => Texture) =>
       hasConv ? make() : this.gpu.texture(GL.RGBA32UI, 1, 1)
-    // Logits for one row at a time where no draft batch is read (see
-    // canDraft: Gated DeltaNet models).
+    // Logits for one row at a time on a Gated DeltaNet model, until its
+    // first draft batch (see growHeadForDrafts).
     const headRows = c.layerTypes.includes("linear_attention") ? 1 : SPLIT_ROWS
     const residualWidth = D / 4 + K.RMS_PARTS + D / 8
     const residualLarge = [0, 1].map(() =>
@@ -2730,13 +2748,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         0,
         headScratchBytes(
           nextSplit,
-          this.canDraft ? SPLIT_ROWS : 1,
+          this.headRowsAtLoad,
           this.logitRows,
           OUT_WIDTH
         ) -
           headScratchBytes(
             baseSplit,
-            this.canDraft ? SPLIT_ROWS : 1,
+            this.headRowsAtLoad,
             this.logitRows,
             OUT_WIDTH
           )
@@ -3035,13 +3053,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       0,
       headScratchBytes(
         nextSplit,
-        this.canDraft ? SPLIT_ROWS : 1,
+        this.headRowsAtLoad,
         this.logitRows,
         OUT_WIDTH
       ) -
         headScratchBytes(
           baselineSplit,
-          this.canDraft ? SPLIT_ROWS : 1,
+          this.headRowsAtLoad,
           this.logitRows,
           OUT_WIDTH
         )
@@ -3784,7 +3802,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
 
   /** Most snapshots kept: MAX_SNAPSHOTS, or TUNING.linearSnapshots for Gated DeltaNet models. */
   get snapshotLimit() {
-    return this.canDraft ? MAX_SNAPSHOTS : Math.max(1, TUNING.linearSnapshots)
+    return this.layers.some((l) => l.linear) ? Math.max(1, TUNING.linearSnapshots) : MAX_SNAPSHOTS
   }
 
   /** Retains the reusable prefix and conversational anchor within the existing limit. */
@@ -4277,13 +4295,133 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
   }
 
   /**
-   * Whether draft batches (speculative decoding) can be read: a Gated
-   * DeltaNet layer would need its recurrent state after each prefix of the
-   * batch to keep only some of it, so models with them read one token at
-   * a time (the one-token guess still works: see dropGuess).
+   * Whether draft batches (speculative decoding) can be read. A Gated
+   * DeltaNet layer needs its recurrent state after whichever prefix of the
+   * batch is kept: with linearDrafts, accept replays the recurrence up to
+   * it. Otherwise such models read one token at a time (the one-token
+   * guess still works: see dropGuess).
    */
   get canDraft() {
-    return !this.layers.some((l) => l.linear)
+    return !this.layers.some((l) => l.linear) || this.linearDraftsOn
+  }
+
+  /**
+   * Whether this model's Gated DeltaNet layers read draft batches: one
+   * chunk holds a whole batch, so the state before it stays in the other
+   * state texture for accept to replay from.
+   */
+  private get linearDraftsOn() {
+    const l = this.config.linear
+    return (
+      !!l &&
+      TUNING.linearDrafts > 0 &&
+      this.chunkedRecurrence &&
+      TUNING.linChunk >= SPLIT_ROWS &&
+      TUNING.linChunk % 4 === 0 &&
+      l.numKeyHeads === l.numValueHeads &&
+      !l.keyDecay &&
+      !this.config.streams
+    )
+  }
+
+  /** A Gated DeltaNet model's draft passes on WebGPU: compiled when a reply first wants them (see prepareDraftBatches). */
+  private draftPipelines: "none" | "compiling" | "ready" = "none"
+
+  /** Whether a draft batch can run with no shader compiling in the middle of a reply. */
+  get draftsReady() {
+    return !this.config?.linear || !("deferPipelines" in this.gpu) || TUNING.deferWarmUp <= 0 || this.draftPipelines === "ready"
+  }
+
+  /** Whether those shaders are compiling: tokens go on one at a time meanwhile. */
+  get draftsCompiling() {
+    return this.draftPipelines === "compiling"
+  }
+
+  /**
+   * Starts compiling a Gated DeltaNet model's draft passes in the background
+   * (a Pixel 10 Pro took over a second, in the middle of a reply), by going
+   * through a draft batch as a dry run: no pass reaches the GPU, so the
+   * cache and the state stay as they are, and what the walk moved is put
+   * back. Between tokens, with no guess pending.
+   */
+  async prepareDraftBatches() {
+    if (this.draftsReady || this.draftPipelines !== "none" || this.guessAt !== null) return
+    const gpu = this.gpu as WebGpu
+    this.draftPipelines = "compiling"
+    const { position, draft, lastRowOnly, headScaled, guessedToken } = this
+    const states = this.layers.map(({ linear }) => linear && { state: [...linear.state], conv: [...linear.convState] })
+    // (At a position like the real one, for its attention passes, in the room the cache has: nothing grows.)
+    const room = this.kvPositions - SPLIT_ROWS * (1 + this.querySlots())
+    const at = Math.max(0, Math.min(position, room))
+    // (Image rows there would be read as a batch's: those compile when first used.)
+    if (this.imageRuns(at, SPLIT_ROWS).length) {
+      this.draftPipelines = "ready"
+      return
+    }
+    gpu.startDryRun()
+    try {
+      for (const rows of [2, SPLIT_ROWS]) {
+        this.position = at
+        await this.forwardDraft(new Array<number>(rows).fill(0))
+        // With a row seeing a token otherwise than the mask too, as drafts'
+        // rows do: the pick's GLSL passes then (see nativePicks).
+        for (const seen of [[], [[0, 0, 0, rows]]] as Array<Array<SeenRow>>) {
+          await this.pick(0, rows, 1, 1, seen)
+          await this.argmax(0, rows, 1, seen)
+        }
+        this.accept(1)
+      }
+    } finally {
+      gpu.endDryRun()
+      Object.assign(this, { position, draft, lastRowOnly, headScaled, guessedToken })
+      this.layers.forEach(({ linear }, i) => {
+        const saved = states[i]
+        if (!linear || !saved) return
+        linear.state[0] = saved.state[0]
+        linear.state[1] = saved.state[1]
+        linear.convState[0] = saved.conv[0]
+        linear.convState[1] = saved.conv[1]
+      })
+    }
+    const ready = () => {
+      this.draftPipelines = "ready"
+    }
+    void gpu.settlePipelines().then(ready, ready)
+  }
+
+  /** Rows the head's buffers are made for: a Gated DeltaNet model's grow at its first draft batch. */
+  private get headRowsAtLoad() {
+    return this.config?.linear ? 1 : SPLIT_ROWS
+  }
+
+  /** The logits of a whole draft batch, the first time a Gated DeltaNet model reads one. */
+  private growHeadForDrafts() {
+    const b = this.buffers
+    const height = this.logitRows * SPLIT_ROWS
+    if (b.logits.height >= height) return
+    const old = b.logits
+    b.logits = this.gpu.texture(GL.RGBA32F, OUT_WIDTH, height)
+    this.gpu.delete(old)
+  }
+
+  /** A draft batch's recurrence output (SPLIT_ROWS rows, every layer's in turn). */
+  private linearDraftO: Texture | null = null
+  private linearDraftOutput() {
+    const lin = this.linDims()
+    if (!lin) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    return (this.linearDraftO ??= this.f32(lin.V, SPLIT_ROWS))
+  }
+
+  /** A Gated DeltaNet layer's rows for going back to a prefix of a draft batch, made at its first. */
+  private linearDraftRows(layer: NonNullable<GpuLayer["linear"]>) {
+    const lin = this.linDims()
+    if (!lin) throw new Error("The model's config has no Gated DeltaNet shapes.")
+    return (layer.draftRows ??= {
+      qk: this.f32(2 * lin.K, SPLIT_ROWS),
+      delta: this.f32(lin.V, SPLIT_ROWS),
+      cum: this.f32(lin.H, SPLIT_ROWS),
+      conv: this.f32(lin.C, lin.l.convKernel - 1 + SPLIT_ROWS)
+    })
   }
 
   /**
@@ -4337,7 +4475,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         // next forward waits for any still compiling): awaited here they
         // cost a Pixel 10 Pro 330 ms more load; left to its first draft
         // batch, 9 programs compiled mid-reply.
-        if (!options.shortOnly && this.canDraft) {
+        // (Not a Gated DeltaNet model's: they'd make the draft rows every load needs none of.)
+        if (!options.shortOnly && this.canDraft && !this.config?.linear) {
           this.reset()
           this.gpu.deferPipelines = true
           try {
@@ -4414,7 +4553,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       await this.forwardHidden(fit(f16Rows))
       step("batchF16")
     }
-    if (this.canDraft) {
+    // (A Gated DeltaNet model's draft passes compile at its first draft batch.)
+    if (this.canDraft && !this.config?.linear) {
       await this.forwardHidden(fit(2), { draft: true })
       this.accept(1)
       step("draft")
@@ -6677,11 +6817,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     })
     // Prompt batches run the recurrence in chunks (see recurrenceChunks).
     const chunk = TUNING.linChunk
+    // A draft batch is one chunk whatever its size, its inputs in the
+    // layer's own rows (see linearDraftRows).
+    const draftRows = this.keepPrefixes && rows > 1 ? this.linearDraftRows(layer) : null
     const chunked =
       this.chunkedRecurrence &&
       chunk > 0 &&
       chunk % 4 === 0 &&
-      rows >= Math.max(2, TUNING.linChunkMin) &&
+      (rows >= Math.max(2, TUNING.linChunkMin) || !!draftRows) &&
       lin.l.numKeyHeads === lin.l.numValueHeads
     // beta and decay (its log, for chunks).
     // (An 8-bit `ba` that goes through the scratch buffer writes a 4-token
@@ -6733,6 +6876,18 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       output: t.qkv,
       rect: { x: 0, y: 0, width: C4, height: rows }
     })
+    // The state before the batch, then the batch's raw rows: rows
+    // [p, p + width - 1) are the conv state after p tokens.
+    if (draftRows) {
+      this.gpu.run({
+        name: "linear",
+        program: read(K.linConvState(width)),
+        inputs: { ...inInputs, uState: layer.convState[0] },
+        uniforms: { ...inUniforms, uM: { int: 0 } },
+        output: draftRows.conv,
+        rect: { x: 0, y: 0, width: C4, height: width - 1 + rows }
+      })
+    }
     for (const m of [rows, ...(saveAt !== undefined ? [saveAt] : [])]) {
       // Own the anchor copy before compiling or drawing it. Do not allocate it
       // ahead of the full-batch state pass, which can itself be interrupted.
@@ -6753,13 +6908,13 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       program: this.gpu.program(K.linPrep(dk)),
       inputs: { uQKV: t.qkv },
       uniforms: { uK4: { int: K4 } },
-      output: t.qk,
+      output: draftRows?.qk ?? t.qk,
       rect: { x: 0, y: 0, width: 2 * K4, height: rows }
     })
     // The recurrence: in chunks, or a token at a time.
     const shape = { keyHeadDim: dk, valueHeadDim: dv }
     const common = { uK4: { int: K4 }, uH4: { int: H4 } }
-    if (chunked) await this.recurrenceChunks(layer, rows, chunk, paced, saveAt)
+    if (chunked) await this.recurrenceChunks(layer, rows, chunk, paced, saveAt, draftRows)
     else for (let r = 0; r < rows; r++) {
       const deltaIn = { uS: layer.state[0], uQK: t.qk, uQKV: t.qkv, uG: t.gates }
       const rect = { x: 0, y: r, width: V4, height: 1 }
@@ -6801,7 +6956,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     this.gpu.run({
       name: "linear",
       program: read(K.linNorm(dv)),
-      inputs: { ...inInputs, uO: t.o, uNorm: layer.norm },
+      inputs: { ...inInputs, uO: draftRows ? this.linearDraftOutput() : t.o, uNorm: layer.norm },
       uniforms: { ...inUniforms, uZ: { int: C4 }, uEps: this.config.normEps },
       output: t.out,
       rect: { x: 0, y: 0, width: V4 / 2, height: rows }
@@ -6937,12 +7092,19 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     chunk: number,
     paced: boolean,
     /** A row where a chunk ends, the state after it copied into `saving` (see forwardBatch). */
-    saveAt?: number
+    saveAt?: number,
+    /** A draft batch's own rows for q̂|k̂, delta and the decays' sums (see linearDraftRows). */
+    draftRows?: LinearDraftRows | null
   ) {
     const lin = this.linDims()
     const t = this.buffers.lin
     if (!lin || !t) throw new Error("The model's config has no Gated DeltaNet shapes.")
-    const c = this.linChunkBuffers(chunk)
+    const buffers = this.linChunkBuffers(chunk)
+    const c = draftRows ? { ...buffers, cum: draftRows.cum } : buffers
+    const qk = draftRows?.qk ?? t.qk
+    const deltaOut = draftRows?.delta ?? t.delta
+    // (Render targets of one size: the output beside the layer's delta rows.)
+    const oOut = draftRows ? this.linearDraftOutput() : t.o
     const dk = lin.l.keyHeadDim
     const dv = lin.l.valueHeadDim
     const H4 = lin.H / 4
@@ -6971,15 +7133,15 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         work
       })
     run(K.linCum(chunk), { uG: t.gates }, c.cum, H4)
-    const gram = { uQK: t.qk, uG: t.gates, uCum: c.cum }
+    const gram = { uQK: qk, uG: t.gates, uCum: c.cum }
     if (both) run(K.linGram({ keyHeadDim: dk, chunk, out: "both" }), gram, [c.a, c.p], wide)
     else
       for (const [out, tex] of [["a", c.a], ["p", c.p]] as const)
         run(K.linGram({ keyHeadDim: dk, chunk, out }), gram, tex, wide)
     run(K.linSolve(chunk), { uA: c.a }, c.t, wide, {}, undefined, chunk)
     const shape = { keyHeadDim: dk, valueHeadDim: dv, chunk }
-    const uw = { uT: c.t, uQK: t.qk, uQKV: t.qkv, uG: t.gates, uCum: c.cum }
-    const qo = { uP: c.p, uU: c.u, uW: c.w, uQK: t.qk, uCum: c.cum }
+    const uw = { uT: c.t, uQK: qk, uQKV: t.qkv, uG: t.gates, uCum: c.cum }
+    const qo = { uP: c.p, uU: c.u, uW: c.w, uQK: qk, uCum: c.cum }
     if (both && dk === dv) {
       run(K.linUW({ ...shape, out: "both" }), uw, [c.u, c.w], V4, {}, undefined, chunk)
       run(K.linQO({ ...shape, out: "both" }), qo, [c.oi, c.qp], V4, {}, undefined, chunk)
@@ -6995,7 +7157,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     // gpu/native.ts's linChunkLoop), up to a row whose state is saved; a
     // chunk a saved prefix ends inside takes the passes below (its state
     // from the chunk's first rows).
-    const loop = TUNING.chunkLoop > 0 && both && "nativeProgram" in this.gpu ? this.chunkLoopSpec({ ...heads, chunk }) : null
+    // (Not a draft batch: the loop doesn't write the delta accept replays.)
+    const loop = !draftRows && TUNING.chunkLoop > 0 && both && "nativeProgram" in this.gpu ? this.chunkLoopSpec({ ...heads, chunk }) : null
     const end = (c0: number) => Math.min(c0 + (c0 === 0 ? first : chunk), rows)
     for (let c0 = 0; c0 < rows;) {
       if (loop && "nativeProgram" in this.gpu) {
@@ -7009,7 +7172,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           this.gpu.run({
             name: "recurrence",
             program: this.gpu.nativeProgram(loop),
-            inputs: { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp, uQK: t.qk, uCum: c.cum },
+            inputs: { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp, uQK: qk, uCum: c.cum },
             uniforms: { uK4: { int: K4 }, uC0: { int: c0 }, uC1: { int: to }, uFirst: { int: first } },
             output: [t.o, layer.state[1]],
             rect: { x: 0, y: c0, width: V4, height: to - c0 },
@@ -7027,9 +7190,9 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const outIn = { uS: layer.state[0], uU: c.u, uW: c.w, uOi: c.oi, uQp: c.qp }
       const rect = { x: 0, y: c0, width: V4, height: c1 - c0 }
       if (both)
-        run(K.linChunkOut({ ...heads, out: "both" }), outIn, [t.delta, t.o], V4, {}, rect, dk)
+        run(K.linChunkOut({ ...heads, out: "both" }), outIn, [deltaOut, oOut], V4, {}, rect, dk)
       else
-        for (const [out, tex] of [["delta", t.delta], ["o", t.o]] as const)
+        for (const [out, tex] of [["delta", deltaOut], ["o", oOut]] as const)
           run(K.linChunkOut({ ...heads, out }), outIn, tex, V4, {}, rect, dk)
       const prefixRow = this.prefixSaving?.row
       if (prefixRow !== undefined && c0 < prefixRow && prefixRow < c1) {
@@ -7037,14 +7200,14 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         this.prefixSaving!.state.linear.push(copy)
         run(
           K.linChunkState(heads),
-          { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
+          { uS: layer.state[0], uQK: qk, uDelta: deltaOut, uCum: c.cum },
           copy, V4, { uC0: { int: c0 }, uC1: { int: prefixRow } },
           { x: 0, y: 0, width: V4, height: dk }, prefixRow - c0
         )
       }
       run(
         K.linChunkState(heads),
-        { uS: layer.state[0], uQK: t.qk, uDelta: t.delta, uCum: c.cum },
+        { uS: layer.state[0], uQK: qk, uDelta: deltaOut, uCum: c.cum },
         layer.state[1],
         V4,
         { uC0: { int: c0 }, uC1: { int: c1 } },
@@ -7326,7 +7489,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       const groupEnd = i > 0 && decodeLayers > 0 && this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
       if (paced) await this.charge(0)
       else {
-        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        if (groupEnd) await this.gpu.pace(2, true, 0, decodeLayers)
         if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
           TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
           this.gpu.flush()
@@ -8043,6 +8206,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         `The cache holds ${this.contextLength} tokens; this would need ${this.position + tokens.length}.`
       )
     }
+    if (this.config.linear) this.growHeadForDrafts()
     const pos0 = this.position
     this.keepPrefixes = true
     try {
@@ -8081,8 +8245,44 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
           rect: { x: 0, y: 0, width: layer.conv.state[0].width, height: rows }
         })
       }
+      this.replayLinear(count)
     }
     this.position = d.pos0 + count
+  }
+
+  /**
+   * After a draft batch: each Gated DeltaNet layer's state after its first
+   * `count` tokens. The batch was one chunk, so the state before it is
+   * still in the other state texture; the recurrence runs again from there
+   * over those rows, and the conv state is read off the rows kept.
+   */
+  private replayLinear(count: number) {
+    const lin = this.linDims()
+    if (!lin) return
+    const dk = lin.l.keyHeadDim
+    const heads = { keyHeadDim: dk, valueHeadDim: lin.l.valueHeadDim }
+    for (const { linear: layer } of this.layers) {
+      if (!layer) continue
+      const kept = layer.draftRows
+      if (!kept) throw new Error("A Gated DeltaNet layer read no draft batch to go back in.")
+      this.gpu.run({
+        name: "recurrence",
+        program: this.gpu.program(K.linChunkState(heads)),
+        inputs: { uS: layer.state[1], uQK: kept.qk, uDelta: kept.delta, uCum: kept.cum },
+        uniforms: { uK4: { int: lin.K / 4 }, uC0: { int: 0 }, uC1: { int: count } },
+        output: layer.state[0],
+        rect: { x: 0, y: 0, width: lin.V / 4, height: dk },
+        work: count
+      })
+      this.gpu.run({
+        name: "linear",
+        program: this.gpu.program(K.COPY_ROWS),
+        inputs: { uX: kept.conv },
+        uniforms: { uOff: { int: count } },
+        output: layer.convState[0],
+        rect: { x: 0, y: 0, width: lin.C / 4, height: lin.l.convKernel - 1 }
+      })
+    }
   }
 
   /**
@@ -8112,6 +8312,8 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
     if (this.position + 1 > this.contextLength) return
     // A token's per-layer table row is read from the file, by its id: nothing to read ahead of the pick.
     if (this.config.perLayer) return
+    // Its state pass would overwrite the state accept replays a draft batch from.
+    if (this.draft && this.config.linear) return
     const at = this.position
     await this.forwardBatch([0], undefined, true)
     this.guessAt = at
@@ -8544,7 +8746,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
       // (Room for a draft batch's rows where the model reads them.)
       this.headScratch = this.f32(
         OUT_WIDTH * 4,
-        Math.max(height, split * (this.canDraft ? SPLIT_ROWS : 1) * sliceRows)
+        Math.max(height, split * (this.headRowsAtLoad) * sliceRows)
       )
     }
     return this.headScratch
@@ -9109,7 +9311,7 @@ void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec4 a=vec4(0);for(int i=0;i<64;i++){
         this.gpu.readsPerSlice > 0 && i % decodeLayers === 0
       if (paced) await this.charge(0)
       else {
-        if (groupEnd) await this.gpu.pace(rows > 1 ? 0 : 2, true, 0, decodeLayers)
+        if (groupEnd) await this.gpu.pace(2, true, 0, decodeLayers)
         // Grouped decode's fence flushes its own layers.
         if ((!this.gpu.groupsDecode || decodeLayers <= 0 || this.gpu.readsPerSlice <= 0) &&
           TUNING.flushLayers > 0 && i > 0 && i % TUNING.flushLayers === 0)
