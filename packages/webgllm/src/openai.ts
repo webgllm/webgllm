@@ -294,12 +294,12 @@ export type ChatCompletionChunk = {
 /** A model load's progress, from any load however it started. */
 export type LoadProgress = {
   model: string
-  /** Downloading files, or reading them into the GPU. */
+  /** Downloading files, or loading them: reading them into the GPU, and a first load's calibration for it. */
   phase: "download" | "load"
   /**
    * 0–1 across both phases: downloading takes 0–0.9 and loading the rest;
-   * a model already in storage loads across 0–1. `downloadModel` reports
-   * its download across 0–1.
+   * a model already in storage loads across 0–1. It reaches 1 once the
+   * model is ready. `downloadModel` reports its download across 0–1.
    */
   progress: number
   /** True when the files come from the browser's storage, not the network. */

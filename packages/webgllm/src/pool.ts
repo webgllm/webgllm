@@ -927,7 +927,8 @@ const bytes = (data: WorkerProgress) =>
 
 /**
  * A load's progress as the worker counts it: downloading takes 0–0.9 and
- * reading into the GPU the rest; from storage, reading takes 0–1.
+ * loading (reading into the GPU, and a first load's calibration) the rest;
+ * from storage, loading takes 0–1. It reaches 1 once the model is ready.
  */
 export function loadProgress(data: WorkerProgress): LoadProgress {
   return {
