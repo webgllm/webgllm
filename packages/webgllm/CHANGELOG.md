@@ -1,3 +1,13 @@
+## 0.3.13 (2026-11-27)
+
+### 🩹 Fixes
+
+- load progress reaches 1 only once the model is ready ([53796d2](https://github.com/webgllm/webgllm/commit/53796d2))
+
+### ❤️ Thank You
+
+- daveycodez
+
 ## 0.3.12 (2026-11-24)
 
 ### 🩹 Fixes

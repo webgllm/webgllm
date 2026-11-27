@@ -1,6 +1,6 @@
 {
   "name": "webgllm",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "LLM inference in the browser: WebGPU where the browser has it, WebGL 2 everywhere else.",
   "license": "Apache-2.0",
   "author": "daveycodez",
