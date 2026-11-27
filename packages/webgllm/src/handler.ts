@@ -612,6 +612,16 @@ async function load(
             data: onnxDataSources(meta.files, weightSources.slice(2))
           })
     ggufHeader = undefined
+    // The load's progress, from 0 to 1 of its share (after the download's
+    // 0.9, or all of it from storage): 1 only once it's ready. A first load
+    // on this GPU calibrates after the weights (probes, tuning, warm-up and
+    // the self-check), which takes as long as reading them or longer: the
+    // weights take half the share then, and each step after them a part of
+    // the rest. Otherwise the weights take nearly all of it.
+    const calibrating = !note?.calibrated
+    const loaded = (fraction: number) =>
+      post({ type: "progress", model, progress: (cached ? 0 : 0.9) + (cached ? 1 : 0.1) * fraction, cached })
+    const weightsShare = calibrating ? 0.5 : 0.95
     let layers = 0
     await engine.load(pieces, (piece) => {
       if (signal.aborted) throw new Superseded()
@@ -622,16 +632,12 @@ async function load(
         piece.kind === "finalNorm"
       ) {
         const count = piece.kind === "layer" ? piece.layer + 1 : layers
-        post({
-          type: "progress",
-          model,
-          progress:
-            (cached ? 0 : 0.9) +
-            (cached ? 1 : 0.1) * Math.min(count / layers, 1),
-          cached
-        })
+        // (The last piece is the weights' end: probes may still run after it.)
+        loaded(weightsShare * 0.9 * Math.min(count / layers, 1))
       }
     }, signal).finally(stored.close)
+    if (signal.aborted) throw new Superseded()
+    loaded(weightsShare)
     if (signal.aborted) throw new Superseded()
     if (perLayerTable && TUNING.syncReads > 0) {
       // Through a handle kept open from here on (see keptSource), now that the load's are closed: they lock the same file.
@@ -680,9 +686,11 @@ async function load(
       if (signal.aborted) throw new Superseded()
       post({ type: "log", text: `startup tuning: ${JSON.stringify(engine.tuneReport)}` })
       lap("initialTuning")
+      loaded(0.8)
     }
     await engine.warmUp()
     lap("warmUp")
+    loaded(calibrating ? 0.9 : 0.97)
     timings.programs = engine.gpu.compiled.count
     timings.compileMs = Math.round(engine.gpu.compiled.ms)
     for (const [k, v] of Object.entries(engine.warmCounts))
@@ -746,6 +754,7 @@ async function load(
     // What it took, in place of the estimate.
     await claimMemory(model, engine.gpu.bytes, signal)
     if (signal.aborted) throw new Superseded()
+    loaded(1)
     if (measured && JSON.stringify(measured) !== JSON.stringify(checkedNote))
       void writeGpuNote(noteKey, measured)
     return {
